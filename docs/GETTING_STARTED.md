@@ -2,7 +2,7 @@
 
 ## Install
 
-Diri requires macOS 15 or newer. Install the signed, notarized universal build:
+On macOS 15 or newer, install the signed and notarized universal build:
 
 ```sh
 brew install --cask cristicretu/diri/diri
@@ -11,6 +11,12 @@ brew install --cask cristicretu/diri/diri
 Alternatively, download the latest DMG from [GitHub Releases](https://github.com/cristicretu/diri/releases/latest),
 open it, and drag Diri to Applications. The app checks the same release feed for
 updates; it never installs one until you click restart.
+
+On x86_64 Ubuntu 22.04 or 24.04, use an AppImage or Debian package from a
+[GitHub release](https://github.com/cristicretu/diri/releases) that includes Linux
+artifacts, or build from source. Linux packages are not included in every
+release. The [Linux beta guide](../diri/LINUX.md) covers installation, source
+builds, and current platform limits.
 
 ## Your first session
 
@@ -25,6 +31,31 @@ updates; it never installs one until you click restart.
 Claude Code and Codex have first-class status detection and resume support.
 Other agents may offer partial detection; every agent can still run as a normal
 terminal.
+
+Install each agent's CLI separately. For local agents, Diri checks your login
+shell's PATH and common package-manager locations, including pnpm's global
+executables in both `PNPM_HOME` and `PNPM_HOME/bin` (pnpm 11). After installing
+an agent while Diri is open, use **Settings → Agents → Refresh**. For a custom
+location that still isn't detected, use **Add…** on that agent's row to select
+its executable.
+
+## Drag and drop in the sidebar
+
+Drag a session between two rows to reorder it among its siblings; an insertion
+line shows where it will land. Drop it onto another session's row to review a
+handoff of its work to that session, or onto the zone that appears below the
+last project to fan out a sibling with the same prompt. Project headers reorder
+the same way. Escape cancels a drag, and releasing where nothing accepts the
+drop does nothing.
+
+## Working from the keyboard
+
+⌘N opens the launcher, ⌘T starts a session with the default agent, ⌘K is the
+command palette, and ⌃⇥ switches between running sessions. ⌘P goes straight to
+the palette’s project page; ⇧⌘H searches past chats. In the palette, choose
+Settings → Color theme to preview themes with the arrow keys and save with Enter. The
+[keyboard shortcuts reference](KEYBOARD_SHORTCUTS.md) lists every binding grouped
+by task, and explains which surface wins when two of them want the same key.
 
 ## Parallel work with worktrees
 
@@ -42,9 +73,17 @@ it to agents you trust and review requested actions.
 
 ## Remote hosts
 
-Remote sessions use SSH and tmux; Diri does not run a hosted relay. Start with
-the [remote-node guide](../diri/NODE.md), use a dedicated non-admin account when
-possible, and avoid forwarding credentials the remote job does not need.
+Remote sessions connect directly over SSH; Diri does not run a hosted relay.
+On first use, Diri probes the host and installs a verified matching Helper in
+the remote user's private cache. Each session gets an independent PTY Holder,
+so the remote host needs neither `tmux` nor a preinstalled Diri service.
+
+Diri reports whether the host can keep user processes alive after logout. Use
+a dedicated non-admin account when possible, and avoid forwarding credentials
+the remote job does not need. The [remote architecture](../diri/REMOTE_PORT.md)
+documents the transport and persistence model. The
+[remote-node guide](../diri/NODE.md) covers the optional enhanced mode for VPS
+accounts, fleet usage, and transactional handoff.
 
 ## Diagnostics
 

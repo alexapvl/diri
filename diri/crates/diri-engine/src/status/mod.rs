@@ -21,6 +21,7 @@ use std::time::{Duration, SystemTime};
 
 use diri_proto::{
     ExitInfo, ExitReason, NeedsInputDetail, NeedsInputKind, NeedsInputSource, SessionStatus,
+    StatusEvidence, StatusEvidenceSource, StatusFallbackReason,
 };
 
 use crate::detect::{ManifestState, ScreenObservation, redact};
@@ -43,7 +44,6 @@ pub struct ReducerTiming {
     pub recheck_interval: Duration,
     pub idle_confirm_cap: Duration,
     pub startup_grace: Duration,
-    pub hook_authority_window: Duration,
     pub blocker_clear_scans: u32,
     pub staleness_timeout: Duration,
 }
@@ -55,7 +55,6 @@ impl Default for ReducerTiming {
             recheck_interval: Duration::from_millis(100),
             idle_confirm_cap: Duration::from_millis(700),
             startup_grace: Duration::from_secs(3),
-            hook_authority_window: Duration::from_secs(7),
             blocker_clear_scans: 2,
             staleness_timeout: Duration::from_secs(60),
         }
@@ -90,8 +89,14 @@ pub enum StatusSignal {
     ClaudeHook {
         hook: ClaudeHook,
         is_subagent: bool,
+        /// Optional aggregate from the payload or the durable recovery seed.
+        pending_work: Option<bool>,
     },
     CodexTurnComplete,
+    /// Cursor jsonl tail: last object is a user prompt or `tool_use`.
+    CursorTranscriptWorking,
+    /// Cursor jsonl tail: last object is assistant text or `turn_ended`.
+    CursorTranscriptIdle,
     Screen(ScreenObservation),
     PtyOutputActivity,
     UserKeystroke,
@@ -108,6 +113,10 @@ pub enum StatusSignal {
 pub struct ReducerOutcome {
     /// Set when the canonical status changed.
     pub status_change: Option<SessionStatus>,
+    /// A privacy-safe explanation of the canonical status. Emitted only when
+    /// its structured meaning changes, so evidence does not turn every screen
+    /// scan into a persisted/UI record update.
+    pub status_evidence: Option<StatusEvidence>,
     /// Set when a needs-input detail was produced or updated.
     pub needs_input: Option<NeedsInputDetail>,
     /// Set when a turn just completed.
@@ -134,6 +143,12 @@ struct InternalState {
     idle_strong: bool,
     /// Fire `turn_completed` exactly once on the next committed working→idle.
     pending_turn_completed: bool,
+    /// A parent work hook owns its turn until a strong completion signal.
+    /// Tool calls and thinking have no time limit; an idle-looking input box
+    /// must not expire hook authority and announce completion mid-turn.
+    hook_turn_in_flight: bool,
+    /// Retained across idle reminders, which omit background task metadata.
+    claude_pending_work: bool,
 
     // On-screen blocker tracking.
     screen_blocker_active: bool,
@@ -142,6 +157,7 @@ struct InternalState {
     // Screen belief.
     screen_belief: Option<ManifestState>,
     last_screen_seq: Option<u64>,
+    last_matched_rule_id: Option<String>,
 
     /// A `skip` screen (transcript viewer, model picker) is being held.
     skip_active: bool,
@@ -149,6 +165,10 @@ struct InternalState {
     responding_since: Option<SystemTime>,
     /// Last needs-input detail produced, for dedupe upstream.
     pending_needs_input: Option<NeedsInputDetail>,
+    /// Cursor jsonl said the turn ended. Ignore leftover Working OSC until
+    /// the transcript shows work again — cursor-agent does not update the
+    /// title to Ready at end of turn.
+    hold_idle_against_screen: bool,
 }
 
 impl InternalState {
@@ -162,13 +182,17 @@ impl InternalState {
             idle_confirms: 0,
             idle_strong: false,
             pending_turn_completed: false,
+            hook_turn_in_flight: false,
+            claude_pending_work: false,
             screen_blocker_active: false,
             blocker_miss_scans: 0,
             screen_belief: None,
             last_screen_seq: None,
+            last_matched_rule_id: None,
             skip_active: false,
             responding_since: None,
             pending_needs_input: None,
+            hold_idle_against_screen: false,
         }
     }
 }
@@ -178,6 +202,9 @@ pub struct StatusReducer {
     authority: Authority,
     timing: ReducerTiming,
     state: InternalState,
+    manifest_id: Option<String>,
+    manifest_version: Option<String>,
+    evidence: Option<StatusEvidence>,
 }
 
 impl StatusReducer {
@@ -187,7 +214,23 @@ impl StatusReducer {
             authority,
             timing: ReducerTiming::default(),
             state: InternalState::new(spawned_at),
+            manifest_id: None,
+            manifest_version: None,
+            evidence: None,
         }
+    }
+
+    /// Associates the reducer with manifest metadata safe to expose over the
+    /// control protocol. Manifest contents and terminal captures stay inside
+    /// the detection engine.
+    pub fn with_manifest(
+        mut self,
+        id: impl Into<String>,
+        version: Option<impl Into<String>>,
+    ) -> Self {
+        self.manifest_id = Some(id.into());
+        self.manifest_version = version.map(Into::into);
+        self
     }
 
     pub fn with_timing(mut self, timing: ReducerTiming) -> Self {
@@ -201,6 +244,10 @@ impl StatusReducer {
 
     pub fn authority(&self) -> Authority {
         self.authority
+    }
+
+    pub fn evidence(&self) -> Option<&StatusEvidence> {
+        self.evidence.as_ref()
     }
 
     pub fn active_subagents(&self) -> usize {
@@ -240,6 +287,13 @@ impl StatusReducer {
                 }),
                 &mut outcome,
             );
+            self.publish_evidence(
+                StatusEvidenceSource::ProcessLiveness,
+                None,
+                Some(StatusFallbackReason::ProcessExited),
+                now,
+                &mut outcome,
+            );
             return outcome;
         }
 
@@ -251,35 +305,188 @@ impl StatusReducer {
                     self.set_status(SessionStatus::Working, &mut outcome);
                 }
                 self.state.last_signal_at = now;
+                self.publish_evidence(
+                    StatusEvidenceSource::ProcessLiveness,
+                    None,
+                    Some(StatusFallbackReason::ProcessOnly),
+                    now,
+                    &mut outcome,
+                );
             }
             return outcome;
         }
 
+        let evidence_hint = match &signal {
+            StatusSignal::ClaudeHook { .. } => Some((StatusEvidenceSource::Hook, None, None)),
+            StatusSignal::CodexTurnComplete | StatusSignal::CursorTranscriptIdle => {
+                Some((StatusEvidenceSource::Notify, None, None))
+            }
+            StatusSignal::CursorTranscriptWorking => Some((StatusEvidenceSource::Hook, None, None)),
+            StatusSignal::Screen(observation) => Some((
+                StatusEvidenceSource::ScreenRule,
+                Some(observation.matched_rule_id.clone()),
+                None,
+            )),
+            StatusSignal::Tick => None,
+            StatusSignal::PtyOutputActivity
+            | StatusSignal::UserKeystroke
+            | StatusSignal::ProcessExit { .. } => None,
+        };
+
         match signal {
             StatusSignal::ProcessExit { .. } => {} // handled above
             StatusSignal::PtyOutputActivity => {
-                // Refreshes the recency of `working`; for full status models it
-                // never by itself means work is happening.
+                // Bytes alone do not establish work: late terminal repaints,
+                // title updates and status lines continue after a turn ends.
                 self.state.last_signal_at = now;
             }
             StatusSignal::UserKeystroke => {
                 self.state.last_signal_at = now;
+                self.state.hold_idle_against_screen = false;
                 if matches!(self.status, SessionStatus::NeedsInput(_)) {
                     self.state.responding_since = Some(now);
                 }
             }
-            StatusSignal::ClaudeHook { hook, is_subagent } => {
-                self.handle_claude_hook(hook, is_subagent, now, &mut outcome)
-            }
+            StatusSignal::ClaudeHook {
+                hook,
+                is_subagent,
+                pending_work,
+            } => self.handle_claude_hook(hook, is_subagent, pending_work, now, &mut outcome),
             StatusSignal::CodexTurnComplete => {
                 self.state.last_signal_at = now;
                 self.handle_strong_idle(now, &mut outcome);
+            }
+            StatusSignal::CursorTranscriptWorking => {
+                if matches!(self.status, SessionStatus::NeedsInput(_)) {
+                    return outcome;
+                }
+                self.go_working(now, false, &mut outcome);
+            }
+            StatusSignal::CursorTranscriptIdle => {
+                self.state.last_signal_at = now;
+                if self.status == SessionStatus::Working {
+                    self.state.hold_idle_against_screen = true;
+                    self.handle_strong_idle(now, &mut outcome);
+                }
             }
             StatusSignal::Screen(observation) => self.handle_screen(observation, now, &mut outcome),
             StatusSignal::Tick => self.handle_tick(now, &mut outcome),
         }
 
+        if self.status == SessionStatus::Unknown {
+            self.publish_evidence(
+                StatusEvidenceSource::Staleness,
+                None,
+                Some(StatusFallbackReason::StaleSignals),
+                now,
+                &mut outcome,
+            );
+        } else if let Some((source, rule, fallback)) = evidence_hint {
+            let source_is_authoritative = outcome.status_change.is_some()
+                || (source == StatusEvidenceSource::ScreenRule
+                    && self.authority == Authority::ScreenPrimary)
+                || matches!(self.status, SessionStatus::NeedsInput(_))
+                || self.state.idle_candidate_since.is_some();
+            if source_is_authoritative {
+                self.publish_evidence(source, rule, fallback, now, &mut outcome);
+            }
+        } else if self.status == SessionStatus::Starting {
+            self.publish_evidence(
+                StatusEvidenceSource::ProcessLiveness,
+                None,
+                Some(StatusFallbackReason::StartupGrace),
+                now,
+                &mut outcome,
+            );
+        } else if outcome.status_change.is_some()
+            && let Some(previous) = self.evidence.clone()
+            && previous.anti_flicker_active
+            && matches!(
+                previous.source,
+                StatusEvidenceSource::Hook | StatusEvidenceSource::Notify
+            )
+        {
+            // The Tick only closes an anti-flicker window opened by this
+            // strong signal. A previously matched screen rule may describe
+            // the old status, so the initiating hook/notify wins here.
+            self.publish_evidence(
+                previous.source,
+                previous.matched_rule_id,
+                previous.fallback_reason,
+                now,
+                &mut outcome,
+            );
+        } else if outcome.status_change.is_some()
+            && let Some(rule) = self.state.last_matched_rule_id.clone()
+        {
+            // A Tick can commit an already-observed screen decision after the
+            // startup grace or anti-flicker window. Preserve that rule rather
+            // than labelling the timer itself as the authority.
+            self.publish_evidence(
+                StatusEvidenceSource::ScreenRule,
+                Some(rule),
+                None,
+                now,
+                &mut outcome,
+            );
+        } else if outcome.status_change.is_some()
+            && let Some(previous) = self.evidence.clone()
+        {
+            // A delayed hook/notify idle decision is committed by a Tick, but
+            // the timer is not the reason for the decision. Carry the source
+            // which opened the anti-flicker window into the final status.
+            self.publish_evidence(
+                previous.source,
+                previous.matched_rule_id,
+                previous.fallback_reason,
+                now,
+                &mut outcome,
+            );
+        }
+
         outcome
+    }
+
+    fn publish_evidence(
+        &mut self,
+        source: StatusEvidenceSource,
+        matched_rule_id: Option<String>,
+        fallback_reason: Option<StatusFallbackReason>,
+        now: SystemTime,
+        outcome: &mut ReducerOutcome,
+    ) {
+        let startup_grace_active = self.status == SessionStatus::Starting
+            && now
+                .duration_since(self.state.spawned_at)
+                .unwrap_or_default()
+                < self.timing.startup_grace;
+        let anti_flicker_active = self.state.idle_candidate_since.is_some()
+            || (self.state.screen_blocker_active && self.state.blocker_miss_scans > 0);
+        let candidate = StatusEvidence {
+            status: self.status.clone(),
+            source,
+            signal_at: now.into(),
+            matched_rule_id,
+            startup_grace_active,
+            anti_flicker_active,
+            manifest_id: self.manifest_id.clone(),
+            manifest_version: self.manifest_version.clone(),
+            fallback_reason,
+        };
+        let meaning_changed = self.evidence.as_ref().is_none_or(|previous| {
+            previous.status != candidate.status
+                || previous.source != candidate.source
+                || previous.matched_rule_id != candidate.matched_rule_id
+                || previous.startup_grace_active != candidate.startup_grace_active
+                || previous.anti_flicker_active != candidate.anti_flicker_active
+                || previous.manifest_id != candidate.manifest_id
+                || previous.manifest_version != candidate.manifest_version
+                || previous.fallback_reason != candidate.fallback_reason
+        });
+        if meaning_changed {
+            self.evidence = Some(candidate.clone());
+            outcome.status_evidence = Some(candidate);
+        }
     }
 
     fn set_status(&mut self, new: SessionStatus, outcome: &mut ReducerOutcome) {
@@ -306,12 +513,16 @@ impl StatusReducer {
         clear_screen_blocker: bool,
         outcome: &mut ReducerOutcome,
     ) {
+        self.state.hold_idle_against_screen = false;
         self.cancel_idle_candidacy();
         if clear_screen_blocker {
             self.state.screen_blocker_active = false;
             self.state.blocker_miss_scans = 0;
         }
         self.state.turn_in_flight = true;
+        if clear_screen_blocker {
+            self.state.hook_turn_in_flight = true;
+        }
         self.state.last_signal_at = now;
         self.set_status(SessionStatus::Working, outcome);
     }
@@ -324,15 +535,24 @@ impl StatusReducer {
             self.set_status(SessionStatus::Idle, outcome);
             return;
         }
-        if self.status != SessionStatus::Working {
+        if !matches!(
+            self.status,
+            SessionStatus::Working | SessionStatus::NeedsInput(_) | SessionStatus::Unknown
+        ) {
             return;
         }
+        self.state.screen_blocker_active = false;
+        self.state.blocker_miss_scans = 0;
+        self.state.pending_needs_input = None;
+        self.state.hold_idle_against_screen = true;
         self.state.idle_strong = true;
         self.state.pending_turn_completed = self.state.turn_in_flight;
         if self.state.idle_candidate_since.is_none() {
             self.state.idle_candidate_since = Some(now);
         }
-        if self.state.screen_belief == Some(ManifestState::Idle) {
+        if self.state.screen_belief == Some(ManifestState::Idle)
+            || self.status != SessionStatus::Working
+        {
             self.state.idle_confirms += 1;
             self.commit_idle(now, outcome);
         }
@@ -340,13 +560,18 @@ impl StatusReducer {
 
     /// Register one idle-confirming observation.
     fn confirm_idle(&mut self, now: SystemTime, outcome: &mut ReducerOutcome) {
-        if self.status != SessionStatus::Working {
+        if self.status != SessionStatus::Working
+            || (self.authority == Authority::HooksPrimary
+                && self.state.hook_turn_in_flight
+                && !self.state.idle_strong)
+        {
             return;
         }
         if self.state.idle_candidate_since.is_none() {
             self.state.idle_candidate_since = Some(now);
             self.state.idle_confirms = 0;
         }
+        self.state.pending_turn_completed = self.state.turn_in_flight;
         self.state.idle_confirms += 1;
         let required = if self.state.idle_strong {
             1
@@ -369,6 +594,7 @@ impl StatusReducer {
         let fire = self.state.pending_turn_completed;
         self.set_status(SessionStatus::Idle, outcome);
         self.state.turn_in_flight = false;
+        self.state.hook_turn_in_flight = false;
         if fire {
             outcome.turn_completed = true;
         }
@@ -382,6 +608,7 @@ impl StatusReducer {
         &mut self,
         hook: ClaudeHook,
         is_subagent: bool,
+        pending_work: Option<bool>,
         now: SystemTime,
         outcome: &mut ReducerOutcome,
     ) {
@@ -403,6 +630,9 @@ impl StatusReducer {
         // state must not move because a child of it did something.
         if is_subagent {
             return;
+        }
+        if let Some(pending) = pending_work {
+            self.state.claude_pending_work = pending;
         }
 
         match hook {
@@ -433,11 +663,30 @@ impl StatusReducer {
             ClaudeHook::Notification {
                 notification_type,
                 message,
-            } => self.handle_notification(notification_type, message, now, outcome),
-            ClaudeHook::Stop => self.handle_strong_idle(now, outcome),
+            } => self.handle_notification(notification_type, message, pending_work, now, outcome),
+            ClaudeHook::Stop => {
+                self.handle_claude_completion(pending_work.unwrap_or(false), now, outcome)
+            }
             // A hint only.
             ClaudeHook::SessionEnd => {}
             ClaudeHook::SubagentStart(_) | ClaudeHook::SubagentStop(_) => {}
+        }
+    }
+
+    fn handle_claude_completion(
+        &mut self,
+        pending_work: bool,
+        now: SystemTime,
+        outcome: &mut ReducerOutcome,
+    ) {
+        self.state.claude_pending_work = pending_work;
+        if pending_work {
+            // The foreground response ended, but Claude still has live work.
+            // Keep screen idle and subsequent metadata-free reminders from
+            // announcing completion until a fresh completion says it drained.
+            self.go_working(now, true, outcome);
+        } else {
+            self.handle_strong_idle(now, outcome);
         }
     }
 
@@ -445,6 +694,7 @@ impl StatusReducer {
         &mut self,
         notification_type: Option<String>,
         message: Option<String>,
+        pending_work: Option<bool>,
         now: SystemTime,
         outcome: &mut ReducerOutcome,
     ) {
@@ -469,7 +719,19 @@ impl StatusReducer {
                     outcome,
                 );
             }
-            Some("idle_prompt") | Some("agent_needs_input") | Some("elicitation_dialog") => {
+            // An idle reminder is not a question or an approval request.
+            // It must not overwrite a completed turn or an actual blocker.
+            Some("idle_prompt") => {
+                if pending_work == Some(true)
+                    && !matches!(self.status, SessionStatus::NeedsInput(_))
+                {
+                    // A recovered reminder can be the first signal after a
+                    // daemon restart. Its retained work fact still outranks
+                    // the word "idle", without dismissing a live blocker.
+                    self.handle_claude_completion(true, now, outcome);
+                }
+            }
+            Some("agent_needs_input") | Some("elicitation_dialog") => {
                 let text = message.unwrap_or_else(|| "Waiting for input".into());
                 let detail = NeedsInputDetail {
                     kind: NeedsInputKind::Question,
@@ -486,7 +748,11 @@ impl StatusReducer {
                 self.cancel_idle_candidacy();
                 self.set_status(SessionStatus::NeedsInput(NeedsInputKind::Question), outcome);
             }
-            Some("agent_completed") => self.handle_strong_idle(now, outcome),
+            Some("agent_completed") => self.handle_claude_completion(
+                pending_work.unwrap_or(self.state.claude_pending_work),
+                now,
+                outcome,
+            ),
             _ => {}
         }
     }
@@ -515,6 +781,7 @@ impl StatusReducer {
         }
         self.state.last_screen_seq = Some(observation.content_seq);
         self.state.screen_belief = Some(observation.state);
+        self.state.last_matched_rule_id = Some(observation.matched_rule_id.clone());
 
         // A visible blocker beats everything except process exit.
         if let Some(kind) = needs_input_kind(observation.state) {
@@ -523,6 +790,7 @@ impl StatusReducer {
             let detail = screen_detail(kind, &observation, now);
             self.state.pending_needs_input = Some(detail.clone());
             outcome.needs_input = Some(detail);
+            self.state.hold_idle_against_screen = false;
             self.cancel_idle_candidacy();
             self.set_status(SessionStatus::NeedsInput(kind), outcome);
             return;
@@ -567,16 +835,26 @@ impl StatusReducer {
         outcome: &mut ReducerOutcome,
     ) {
         match observation.state {
-            ManifestState::Working => self.go_working(now, false, outcome),
+            ManifestState::Working => {
+                if self.state.hold_idle_against_screen {
+                    return;
+                }
+                self.go_working(now, false, outcome);
+            }
             ManifestState::Idle => {
                 if self.status == SessionStatus::Working {
                     self.confirm_idle(now, outcome);
                 } else if self.status == SessionStatus::Starting {
                     self.set_status(SessionStatus::Idle, outcome);
                 } else if cleared_blocker && matches!(self.status, SessionStatus::NeedsInput(_)) {
-                    // The blocker was released and the screen now reads idle.
-                    self.cancel_idle_candidacy();
-                    self.set_status(SessionStatus::Idle, outcome);
+                    if self.authority == Authority::HooksPrimary && self.state.hook_turn_in_flight {
+                        // Dismissing a permission/question does not finish the
+                        // turn whose tool call was waiting for that answer.
+                        self.go_working(now, false, outcome);
+                    } else {
+                        self.cancel_idle_candidacy();
+                        self.set_status(SessionStatus::Idle, outcome);
+                    }
                 }
             }
             // Handled elsewhere.
@@ -623,6 +901,18 @@ impl StatusReducer {
                 self.set_status(SessionStatus::Unknown, outcome);
                 return;
             }
+        }
+        // A settled screen often stops emitting new content sequences. One
+        // idle observation held for the debounce cap is enough; requiring
+        // more redraws leaves quiet agents stuck Working forever.
+        if self.status == SessionStatus::Working
+            && self.state.screen_belief == Some(ManifestState::Idle)
+            && !self.state.idle_strong
+            && self.state.idle_candidate_since.is_some_and(|since| {
+                now.duration_since(since).unwrap_or_default() >= self.timing.idle_confirm_cap
+            })
+        {
+            self.commit_idle(now, outcome);
         }
         // A tick can supply the single confirmation a strong idle still needs.
         if self.status == SessionStatus::Working

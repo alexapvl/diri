@@ -6,7 +6,9 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use diri_proto::{ExitReason, NeedsInputKind, RiskHint, SessionStatus};
+use diri_proto::{
+    ExitReason, NeedsInputKind, RiskHint, SessionStatus, StatusEvidenceSource, StatusFallbackReason,
+};
 
 use super::*;
 use crate::detect::{ManifestState, ScreenObservation};
@@ -24,6 +26,95 @@ fn observation(state: ManifestState, seq: u64) -> ScreenObservation {
         prompt_excerpt: None,
         options: None,
     }
+}
+
+#[test]
+fn evidence_covers_every_authority_without_terminal_content() {
+    let mut hooks =
+        StatusReducer::new(Authority::HooksPrimary, t0()).with_manifest("claude-code", Some("4"));
+    let now = settled(&mut hooks, t0());
+    let hook_outcome = hooks.reduce(hook(ClaudeHook::UserPromptSubmit), now);
+    let hook_evidence = hook_outcome.status_evidence.expect("hook evidence");
+    assert_eq!(hook_evidence.source, StatusEvidenceSource::Hook);
+    assert_eq!(hook_evidence.status, SessionStatus::Working);
+    assert_eq!(hook_evidence.manifest_id.as_deref(), Some("claude-code"));
+    assert_eq!(hook_evidence.manifest_version.as_deref(), Some("4"));
+    assert_eq!(hook_evidence.matched_rule_id, None);
+
+    let mut screen =
+        StatusReducer::new(Authority::ScreenPrimary, t0()).with_manifest("codex", Some("8"));
+    let now = settled(&mut screen, t0());
+    let screen_outcome = screen.reduce(
+        StatusSignal::Screen(ScreenObservation {
+            matched_rule_id: "codex-working-spinner".into(),
+            ..observation(ManifestState::Working, 1)
+        }),
+        now,
+    );
+    let screen_evidence = screen_outcome.status_evidence.expect("screen evidence");
+    assert_eq!(screen_evidence.source, StatusEvidenceSource::ScreenRule);
+    assert_eq!(
+        screen_evidence.matched_rule_id.as_deref(),
+        Some("codex-working-spinner")
+    );
+
+    let mut process =
+        StatusReducer::new(Authority::ProcessOnly, t0()).with_manifest("shell", Some("1"));
+    let process_outcome = process.reduce(StatusSignal::PtyOutputActivity, t0());
+    let process_evidence = process_outcome.status_evidence.expect("process evidence");
+    assert_eq!(
+        process_evidence.source,
+        StatusEvidenceSource::ProcessLiveness
+    );
+    assert_eq!(
+        process_evidence.fallback_reason,
+        Some(StatusFallbackReason::ProcessOnly)
+    );
+
+    let serialized = serde_json::to_string(&[hook_evidence, screen_evidence, process_evidence])
+        .expect("serialize evidence");
+    for forbidden in ["prompt", "terminal", "/Users/", "SECRET="] {
+        assert!(!serialized.contains(forbidden));
+    }
+}
+
+#[test]
+fn stale_working_status_gets_staleness_evidence() {
+    let mut reducer =
+        StatusReducer::new(Authority::HooksPrimary, t0()).with_manifest("claude-code", Some("4"));
+    let now = settled(&mut reducer, t0());
+    reducer.reduce(hook(ClaudeHook::UserPromptSubmit), now);
+    let outcome = reducer.reduce(StatusSignal::Tick, now + Duration::from_secs(61));
+    assert_eq!(outcome.status_change, Some(SessionStatus::Unknown));
+    let evidence = outcome.status_evidence.expect("staleness evidence");
+    assert_eq!(evidence.source, StatusEvidenceSource::Staleness);
+    assert_eq!(
+        evidence.fallback_reason,
+        Some(StatusFallbackReason::StaleSignals)
+    );
+    assert_eq!(evidence.status, SessionStatus::Unknown);
+}
+
+#[test]
+fn anti_flicker_is_visible_in_evidence_before_idle_commits() {
+    let mut reducer =
+        StatusReducer::new(Authority::ScreenPrimary, t0()).with_manifest("codex", Some("8"));
+    let now = settled(&mut reducer, t0());
+    reducer.reduce(
+        StatusSignal::Screen(observation(ManifestState::Working, 1)),
+        now,
+    );
+    let pending = reducer.reduce(
+        StatusSignal::Screen(ScreenObservation {
+            matched_rule_id: "codex-idle".into(),
+            ..observation(ManifestState::Idle, 2)
+        }),
+        now + Duration::from_millis(100),
+    );
+    let evidence = pending.status_evidence.expect("anti-flicker evidence");
+    assert_eq!(evidence.status, SessionStatus::Working);
+    assert!(evidence.anti_flicker_active);
+    assert_eq!(evidence.matched_rule_id.as_deref(), Some("codex-idle"));
 }
 
 fn blocker(seq: u64, excerpt: &str) -> ScreenObservation {
@@ -48,6 +139,7 @@ fn hook(hook: ClaudeHook) -> StatusSignal {
     StatusSignal::ClaudeHook {
         hook,
         is_subagent: false,
+        pending_work: None,
     }
 }
 
@@ -291,6 +383,7 @@ fn subagent_events_never_move_the_parent() {
         StatusSignal::ClaudeHook {
             hook: ClaudeHook::Stop,
             is_subagent: true,
+            pending_work: None,
         },
         now + Duration::from_millis(100),
     );
@@ -343,7 +436,7 @@ fn a_notification_asking_a_question_needs_input() {
 
     let outcome = reducer.reduce(
         hook(ClaudeHook::Notification {
-            notification_type: Some("idle_prompt".into()),
+            notification_type: Some("agent_needs_input".into()),
             message: Some("Waiting for your answer".into()),
         }),
         now,
@@ -374,6 +467,60 @@ fn codex_turn_complete_then_a_tick_settles_to_idle() {
     let outcome = reducer.reduce(StatusSignal::Tick, now);
     assert_eq!(outcome.status_change, Some(SessionStatus::Idle));
     assert!(outcome.turn_completed);
+    let evidence = outcome
+        .status_evidence
+        .expect("the delayed decision keeps its notify authority");
+    assert_eq!(evidence.status, SessionStatus::Idle);
+    assert_eq!(evidence.source, StatusEvidenceSource::Notify);
+}
+
+#[test]
+fn late_codex_output_keeps_completion_without_completing_twice() {
+    let mut reducer = StatusReducer::new(Authority::ScreenPrimary, t0());
+    let now = settled(&mut reducer, t0());
+    reducer.reduce(
+        StatusSignal::Screen(observation(ManifestState::Working, 1)),
+        now,
+    );
+
+    let completed_at = now + Duration::from_millis(100);
+    reducer.reduce(StatusSignal::CodexTurnComplete, completed_at);
+    let settled = reducer.reduce(
+        StatusSignal::Tick,
+        completed_at + Duration::from_millis(100),
+    );
+    assert_eq!(settled.status_change, Some(SessionStatus::Idle));
+    assert!(settled.turn_completed);
+
+    let repaint = reducer.reduce(
+        StatusSignal::PtyOutputActivity,
+        completed_at + Duration::from_secs(4),
+    );
+    assert_eq!(
+        repaint.status_change, None,
+        "ordinary stop repaint is ignored"
+    );
+
+    let continuing = reducer.reduce(
+        StatusSignal::PtyOutputActivity,
+        completed_at + Duration::from_secs(6),
+    );
+    assert_eq!(continuing.status_change, None);
+    assert!(!continuing.turn_completed);
+
+    reducer.reduce(
+        StatusSignal::CodexTurnComplete,
+        completed_at + Duration::from_secs(7),
+    );
+    let settled_again = reducer.reduce(
+        StatusSignal::Tick,
+        completed_at + Duration::from_secs(7) + Duration::from_millis(100),
+    );
+    assert_eq!(settled_again.status_change, None);
+    assert!(
+        !settled_again.turn_completed,
+        "rearming the same logical turn must not notify twice"
+    );
 }
 
 #[test]
@@ -492,4 +639,258 @@ fn a_repeated_screen_sequence_is_not_reprocessed() {
     );
     assert_eq!(outcome.status_change, None);
     assert_eq!(*reducer.status(), SessionStatus::Working);
+}
+
+#[test]
+fn cursor_transcript_idle_commits_even_when_the_osc_still_says_working() {
+    let mut reducer = StatusReducer::new(Authority::ScreenPrimary, t0());
+    let mut now = settled(&mut reducer, t0());
+
+    reducer.reduce(
+        StatusSignal::Screen(observation(ManifestState::Working, 1)),
+        now,
+    );
+    now += Duration::from_millis(100);
+    reducer.reduce(StatusSignal::CursorTranscriptIdle, now);
+    now += Duration::from_millis(100);
+    let still_working = reducer.reduce(
+        StatusSignal::Screen(observation(ManifestState::Working, 2)),
+        now,
+    );
+    assert_eq!(still_working.status_change, None);
+    assert_eq!(*reducer.status(), SessionStatus::Working);
+
+    now += Duration::from_millis(100);
+    let outcome = reducer.reduce(StatusSignal::Tick, now);
+    assert_eq!(outcome.status_change, Some(SessionStatus::Idle));
+    assert!(outcome.turn_completed);
+
+    now += Duration::from_millis(100);
+    let stale_osc = reducer.reduce(
+        StatusSignal::Screen(observation(ManifestState::Working, 3)),
+        now,
+    );
+    assert_eq!(stale_osc.status_change, None);
+    assert_eq!(*reducer.status(), SessionStatus::Idle);
+
+    now += Duration::from_millis(100);
+    reducer.reduce(StatusSignal::CursorTranscriptWorking, now);
+    assert_eq!(*reducer.status(), SessionStatus::Working);
+}
+
+#[test]
+fn idle_reminder_does_not_turn_a_finished_agent_into_a_question() {
+    let mut reducer = StatusReducer::new(Authority::HooksPrimary, t0());
+    let now = settled(&mut reducer, t0());
+    reducer.reduce(hook(ClaudeHook::UserPromptSubmit), now);
+    reducer.reduce(hook(ClaudeHook::Stop), now + Duration::from_millis(10));
+    reducer.reduce(StatusSignal::Tick, now + Duration::from_millis(100));
+    reducer.reduce(
+        hook(ClaudeHook::Notification {
+            notification_type: Some("idle_prompt".into()),
+            message: Some("Claude is waiting for your input".into()),
+        }),
+        now + Duration::from_secs(60),
+    );
+    assert_eq!(*reducer.status(), SessionStatus::Idle);
+}
+
+#[test]
+fn stop_resolves_a_stale_permission_and_completes_the_turn() {
+    let mut reducer = StatusReducer::new(Authority::HooksPrimary, t0());
+    let now = settled(&mut reducer, t0());
+    reducer.reduce(hook(ClaudeHook::UserPromptSubmit), now);
+    reducer.reduce(
+        hook(ClaudeHook::PermissionRequest {
+            tool_name: None,
+            input_summary: None,
+        }),
+        now,
+    );
+    let stopped = reducer.reduce(hook(ClaudeHook::Stop), now + Duration::from_secs(1));
+    let tick = reducer.reduce(StatusSignal::Tick, now + Duration::from_secs(2));
+    assert_eq!(*reducer.status(), SessionStatus::Idle);
+    assert!(stopped.turn_completed || tick.turn_completed);
+}
+
+#[test]
+fn redraw_after_codex_completion_does_not_invent_work() {
+    let mut reducer = StatusReducer::new(Authority::ScreenPrimary, t0());
+    let now = settled(&mut reducer, t0());
+    reducer.reduce(
+        StatusSignal::Screen(observation(ManifestState::Working, 1)),
+        now,
+    );
+    reducer.reduce(StatusSignal::CodexTurnComplete, now);
+    reducer.reduce(StatusSignal::Tick, now + Duration::from_millis(100));
+    reducer.reduce(
+        StatusSignal::PtyOutputActivity,
+        now + Duration::from_secs(6),
+    );
+    assert_eq!(*reducer.status(), SessionStatus::Idle);
+}
+
+#[test]
+fn a_completed_claude_turn_is_not_reopened_by_a_stale_working_title() {
+    let mut reducer = StatusReducer::new(Authority::HooksPrimary, t0());
+    let now = settled(&mut reducer, t0());
+    reducer.reduce(hook(ClaudeHook::UserPromptSubmit), now);
+    reducer.reduce(hook(ClaudeHook::Stop), now);
+    reducer.reduce(StatusSignal::Tick, now + Duration::from_millis(100));
+    reducer.reduce(
+        StatusSignal::Screen(observation(ManifestState::Working, 2)),
+        now + Duration::from_secs(1),
+    );
+    assert_eq!(*reducer.status(), SessionStatus::Idle);
+    reducer.reduce(
+        hook(ClaudeHook::UserPromptSubmit),
+        now + Duration::from_secs(2),
+    );
+    assert_eq!(*reducer.status(), SessionStatus::Working);
+}
+
+#[test]
+fn a_quiet_screen_completes_once_without_waiting_for_more_redraws() {
+    let mut reducer = StatusReducer::new(Authority::ScreenPrimary, t0());
+    reducer.reduce(
+        StatusSignal::Screen(observation(ManifestState::Working, 1)),
+        t0(),
+    );
+    reducer.reduce(
+        StatusSignal::Screen(observation(ManifestState::Idle, 2)),
+        t0() + Duration::from_secs(1),
+    );
+    assert_eq!(reducer.status(), &SessionStatus::Working);
+    let completed = reducer.reduce(StatusSignal::Tick, t0() + Duration::from_secs(2));
+    assert!(completed.turn_completed);
+    assert_eq!(reducer.status(), &SessionStatus::Idle);
+    assert!(
+        !reducer
+            .reduce(
+                StatusSignal::CodexTurnComplete,
+                t0() + Duration::from_secs(3)
+            )
+            .turn_completed
+    );
+}
+
+#[test]
+fn a_recent_work_hook_outranks_an_idle_prompt_during_a_tool_call() {
+    let mut reducer = StatusReducer::new(Authority::HooksPrimary, t0());
+    reducer.reduce(hook(ClaudeHook::UserPromptSubmit), t0());
+    for seq in 1..5 {
+        reducer.reduce(
+            StatusSignal::Screen(observation(ManifestState::Idle, seq)),
+            t0() + Duration::from_millis(seq * 200),
+        );
+    }
+    assert_eq!(reducer.status(), &SessionStatus::Working);
+    assert!(
+        !reducer
+            .reduce(StatusSignal::Tick, t0() + Duration::from_secs(2))
+            .turn_completed
+    );
+    assert!(
+        reducer
+            .reduce(hook(ClaudeHook::Stop), t0() + Duration::from_secs(3))
+            .turn_completed
+    );
+}
+
+#[test]
+fn claude_long_tool_calls_do_not_publish_finished_between_tools() {
+    let mut reducer = StatusReducer::new(Authority::HooksPrimary, t0());
+    let mut now = settled(&mut reducer, t0());
+    reducer.reduce(hook(ClaudeHook::UserPromptSubmit), now);
+    let mut completions = 0;
+    for seq in 1..=3 {
+        reducer.reduce(hook(ClaudeHook::PreToolUse), now);
+        // Claude's input box can remain visible throughout a long tool call.
+        reducer.reduce(
+            StatusSignal::Screen(observation(ManifestState::Idle, seq)),
+            now + Duration::from_millis(100),
+        );
+        for seconds in 1..=30 {
+            let outcome = reducer.reduce(StatusSignal::Tick, now + Duration::from_secs(seconds));
+            completions += usize::from(outcome.turn_completed);
+        }
+        now += Duration::from_secs(30);
+    }
+    assert_eq!(
+        completions, 0,
+        "active Claude tools must not emit finished notifications"
+    );
+    assert_eq!(reducer.status(), &SessionStatus::Working);
+    assert!(reducer.reduce(hook(ClaudeHook::Stop), now).turn_completed);
+    assert!(!reducer.reduce(hook(ClaudeHook::Stop), now).turn_completed);
+}
+
+#[test]
+fn claude_idle_redraws_and_subagent_completion_do_not_finish_the_parent_turn() {
+    let mut reducer = StatusReducer::new(Authority::HooksPrimary, t0());
+    let now = settled(&mut reducer, t0());
+    reducer.reduce(hook(ClaudeHook::UserPromptSubmit), now);
+    reducer.reduce(hook(ClaudeHook::SubagentStart("child".into())), now);
+    for seq in 1..=120 {
+        let at = now + Duration::from_secs(seq);
+        if seq == 30 {
+            reducer.reduce(hook(ClaudeHook::SubagentStop("child".into())), at);
+        }
+        let frame = reducer.reduce(
+            StatusSignal::Screen(observation(ManifestState::Idle, seq)),
+            at,
+        );
+        let tick = reducer.reduce(StatusSignal::Tick, at);
+        assert!(!frame.turn_completed && !tick.turn_completed);
+        assert_eq!(reducer.status(), &SessionStatus::Working);
+    }
+    assert!(
+        reducer
+            .reduce(hook(ClaudeHook::Stop), now + Duration::from_secs(121))
+            .turn_completed
+    );
+}
+
+#[test]
+fn claude_screen_fallback_still_completes_when_no_work_hook_was_received() {
+    let mut reducer = StatusReducer::new(Authority::HooksPrimary, t0());
+    let now = settled(&mut reducer, t0());
+    // Remote/adopted sessions may only have terminal observations.
+    reducer.reduce(
+        StatusSignal::Screen(observation(ManifestState::Working, 1)),
+        now,
+    );
+    reducer.reduce(
+        StatusSignal::Screen(observation(ManifestState::Idle, 2)),
+        now,
+    );
+    let completed = reducer.reduce(StatusSignal::Tick, now + Duration::from_secs(1));
+    assert!(completed.turn_completed);
+    assert_eq!(reducer.status(), &SessionStatus::Idle);
+    assert!(
+        !reducer
+            .reduce(StatusSignal::Tick, now + Duration::from_secs(2))
+            .turn_completed
+    );
+}
+
+#[test]
+fn claude_answering_a_screen_blocker_resumes_the_hook_owned_turn() {
+    let mut reducer = StatusReducer::new(Authority::HooksPrimary, t0());
+    let now = settled(&mut reducer, t0());
+    reducer.reduce(hook(ClaudeHook::UserPromptSubmit), now);
+    reducer.reduce(StatusSignal::Screen(blocker(1, "Allow tool?")), now);
+    for seq in 2..=4 {
+        let outcome = reducer.reduce(
+            StatusSignal::Screen(observation(ManifestState::Idle, seq)),
+            now + Duration::from_secs(seq * 10),
+        );
+        assert!(!outcome.turn_completed);
+    }
+    assert_eq!(reducer.status(), &SessionStatus::Working);
+    assert!(
+        reducer
+            .reduce(hook(ClaudeHook::Stop), now + Duration::from_secs(41))
+            .turn_completed
+    );
 }

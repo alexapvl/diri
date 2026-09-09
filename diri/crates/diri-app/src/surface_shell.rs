@@ -1,3 +1,7 @@
+#[path = "usage_page.rs"]
+mod usage_page;
+mod worktree_settings;
+
 use std::cell::Cell;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -5,56 +9,51 @@ use std::rc::Rc;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::macos::sf_symbols::{SymbolWeight, sf_symbol, sf_symbol_weighted};
+use crate::delegation::worktree_move_proposal;
+use crate::icons::{SymbolWeight, sf_symbol, sf_symbol_weighted};
 use crate::navigation::query_label;
 use crate::query_editor::{self, ClipboardEdit, Edit, QueryEditor};
-use crate::settings::{HostDraft, SettingsTab, default_agent_label, theme};
-use crate::store::{DefaultAgent, Prefs, SessionStore, StoreRuntime};
+use crate::settings::{HostDraft, SettingsNav, SettingsTab, theme};
+mod account_settings;
+use crate::sidebar::DraggedSidebarItem;
+use crate::store::{Prefs, SessionStore, StoreRuntime};
 use crate::updates::{UpdateCommand, UpdateHandle, UpdatePhase};
 use crate::worktrees::WorktreesSheet;
-use diri_proto::{AgentKind as ProtoAgentKind, HistoryEntry, HostEntry, HostsConfig};
+use account_settings::AccountsState;
+use diri_proto::{AgentKind as ProtoAgentKind, HostEntry, HostsConfig};
 use diri_term::theme::{TermTheme, ThemeAppearance};
 use diri_ui::{
     AgentLogo, Fill, FloatingSurface, HairlineDivider, Ink, LoadingIndicator, Metrics, Palette,
-    Radius, SemanticColors, Space, Typo,
+    Radius, SemanticColors, Typo,
 };
 use gpui::{
-    AnyElement, App, Bounds, ClickEvent, Context, CursorStyle, FocusHandle, Focusable, FontWeight,
-    IntoElement, KeyDownEvent, MouseButton, Pixels, Render, Rgba, SharedString, Task, TextRun,
-    Window, actions, canvas, deferred, div, font, prelude::*, px, rgba,
+    Animation, AnimationExt, AnyElement, App, Bounds, ClickEvent, Context, CursorStyle,
+    FocusHandle, Focusable, FontWeight, IntoElement, KeyDownEvent, MouseButton, PathPromptOptions,
+    Pixels, Render, Rgba, ScrollHandle, SharedString, Task, TextRun, Window, canvas, deferred, div,
+    ease_out_quint, font, point, prelude::*, px, rgba,
 };
 use tokio::runtime::Runtime;
 
-const SETTINGS_WIDTH: f32 = 600.0;
-const SETTINGS_HEIGHT: f32 = 420.0;
-const SETTINGS_NAV_WIDTH: f32 = 150.0;
+use crate::commands::{
+    COMMANDS, CloseSurface, CommandId, OpenSettings, OpenWorktrees, ShortcutCategory,
+    UTILITY_CONTEXT,
+};
+const SETTINGS_CONTENT_MAX_WIDTH: f32 = 760.0;
+const SETTINGS_TRANSITION_DURATION: Duration = Duration::from_millis(190);
 const SETTINGS_SECTION_GAP: f32 = 16.0;
 const SETTINGS_ROW_HEIGHT: f32 = 50.0;
-const RESULT_LIMIT: usize = 200;
+const HOST_FIELD_HORIZONTAL_PADDING: f32 = 10.0;
 /// Reinstall success is confirmation, not persistent host state. Errors stay
 /// actionable and first-time setup keeps its "Use by default" action.
 const HOST_REINSTALL_SUCCESS_VISIBILITY: Duration = Duration::from_secs(3);
-
-actions!(
-    diri,
-    [
-        ToggleHistory,
-        OpenWorktrees,
-        OpenSettings,
-        CloseSurface,
-        MoveUp,
-        MoveDown,
-        Activate
-    ]
-);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Surface {
     #[default]
     None,
-    History,
     Worktrees,
     Settings,
+    Diagnostics,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,6 +63,18 @@ enum SettingsMenu {
     TerminalTheme,
     HibernateAfter,
     MemoryLimit,
+}
+
+#[derive(Default)]
+enum ReleaseNotesState {
+    #[default]
+    Idle,
+    Loading,
+    Loaded {
+        release: diri_updater::ReleaseNotes,
+        document: Arc<crate::markdown::MarkdownDocument>,
+    },
+    Failed(String),
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -106,17 +117,6 @@ impl HostFormField {
             Self::NodeId => "NODE_ID",
         }
     }
-
-    const fn index(self) -> usize {
-        match self {
-            Self::Name => 0,
-            Self::Ssh => 1,
-            Self::DefaultCwd => 2,
-            Self::NodeEndpoint => 3,
-            Self::NodeTokenFile => 4,
-            Self::NodeId => 5,
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -131,6 +131,20 @@ struct HostEditor {
     active_field: HostFormField,
     error: Option<String>,
     confirm_remove: bool,
+}
+
+struct AgentPathEditor {
+    kind: ProtoAgentKind,
+    host: Option<String>,
+    path: QueryEditor,
+    show_in_quick_create: bool,
+    error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ShortcutEditor {
+    command: CommandId,
+    error: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -250,28 +264,43 @@ impl HostEditor {
 }
 
 pub struct UtilitySurfaces {
+    skills: gpui::Entity<crate::skills_page::SkillsPage>,
+    accounts: AccountsState,
+    phone_access: Option<crate::phone_access::PhoneAccess>,
+    phone_loading: bool,
+    phone_error: Option<String>,
+    phone_setup: Option<crate::phone_access::TailscaleSetup>,
     focus: FocusHandle,
     surface: Surface,
-    history: Vec<HistoryEntry>,
-    history_query: QueryEditor,
-    history_highlight: usize,
-    history_loading: bool,
-    history_error: Option<String>,
     worktrees: WorktreesSheet,
     settings_tab: SettingsTab,
+    usage: crate::usage::UsageSnapshot,
+    usage_days: usize,
+    usage_tokens: bool,
+    usage_by_day: bool,
+    release_notes: ReleaseNotesState,
+    settings_scroll: ScrollHandle,
+    settings_search: QueryEditor,
+    settings_search_active: bool,
+    shortcut_search: QueryEditor,
+    shortcut_search_active: bool,
+    shortcut_editor: Option<ShortcutEditor>,
+    settings_transition_generation: u64,
     settings_menu: Option<SettingsMenu>,
+    agents_host: Option<String>,
+    agent_path_editor: Option<AgentPathEditor>,
     hosts_path: PathBuf,
     hosts: Vec<HostEntry>,
     host_editor: Option<HostEditor>,
     host_initialization: Option<HostInitialization>,
     host_initialization_generation: u64,
-    host_field_bounds: [Rc<Cell<Option<Bounds<Pixels>>>>; 6],
     prefs: Prefs,
     store: Arc<RwLock<SessionStore>>,
     store_runtime: Arc<StoreRuntime>,
     runtime: Arc<Runtime>,
     updates: UpdateHandle,
     activity: String,
+    diagnostics_report: Option<String>,
     _update_changes: Task<()>,
     _store_changes: Task<()>,
 }
@@ -289,22 +318,42 @@ impl UtilitySurfaces {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/nonexistent"));
         let hosts_path = diri_proto::paths::DirijorPaths::hosts_config_file(&home);
-        let (prefs, hosts) = {
+        let (prefs, hosts, agents_host) = {
             let store = store_runtime
                 .store
                 .read()
                 .expect("session store lock poisoned");
-            (store.preferences().clone(), store.hosts().to_vec())
+            (
+                store.preferences().clone(),
+                store.hosts().to_vec(),
+                store.default_spawn_host(),
+            )
         };
         let settings_preview = std::env::var("DIRI_SETTINGS_PREVIEW")
             .ok()
             .map(|value| value.to_ascii_lowercase());
         let settings_tab = match settings_preview.as_deref() {
-            Some("terminal") => SettingsTab::Terminal,
+            Some("terminal" | "appearance") => SettingsTab::Terminal,
+            Some("whats-new" | "what's-new") => SettingsTab::WhatsNew,
+            Some("agents") => SettingsTab::Agents,
+            Some("skills") => SettingsTab::Skills,
+            Some("accounts") => SettingsTab::Accounts,
+            Some("shortcuts") => SettingsTab::Shortcuts,
+            Some("worktrees") => SettingsTab::Worktrees,
             Some("resources") => SettingsTab::Resources,
             Some("remote") => SettingsTab::Remote,
+            Some("phone") => SettingsTab::Phone,
+            Some("usage") => SettingsTab::Usage,
             _ => SettingsTab::General,
         };
+        let diagnostics_preview = settings_preview.as_deref() == Some("diagnostics");
+        let diagnostics_report = diagnostics_preview.then(|| {
+            let store = store_runtime
+                .store
+                .read()
+                .expect("session store lock poisoned");
+            build_diagnostics_report(&store)
+        });
         // The Settings pane renders update state it does not own, so it has to
         // be woken when that state moves.
         let update_changes = {
@@ -325,7 +374,18 @@ impl UtilitySurfaces {
                 loop {
                     match changes.recv().await {
                         Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                            if this.update(cx, |_, cx| cx.notify()).is_err() {
+                            if this
+                                .update(cx, |this, cx| {
+                                    let store = this.store.read().expect("store lock");
+                                    this.prefs.terminal_theme =
+                                        store.preferences().terminal_theme.clone();
+                                    this.prefs.follow_system_theme =
+                                        store.preferences().follow_system_theme;
+                                    drop(store);
+                                    cx.notify();
+                                })
+                                .is_err()
+                            {
                                 return;
                             }
                         }
@@ -334,157 +394,204 @@ impl UtilitySurfaces {
                 }
             })
         };
+        let skills =
+            cx.new(|cx| crate::skills_page::SkillsPage::new(Arc::clone(&store_runtime.store), cx));
+        if settings_tab == SettingsTab::Skills {
+            let project = store_runtime
+                .store
+                .read()
+                .expect("session store lock poisoned")
+                .selected_session()
+                .filter(|session| session.host.is_none())
+                .map(|session| PathBuf::from(&session.cwd));
+            skills.update(cx, |skills, cx| skills.open(project, cx));
+        }
         Self {
             focus,
-            surface: if settings_preview.is_some() {
+            skills,
+            accounts: AccountsState::default(),
+            phone_access: None,
+            phone_loading: false,
+            phone_error: None,
+            phone_setup: None,
+            surface: if diagnostics_preview {
+                Surface::Diagnostics
+            } else if settings_preview.is_some() {
                 Surface::Settings
             } else {
                 Surface::None
             },
-            history: Vec::new(),
-            history_query: QueryEditor::default(),
-            history_highlight: 0,
-            history_loading: false,
-            history_error: None,
             worktrees: WorktreesSheet::default(),
             settings_tab,
+            usage: crate::usage::UsageSnapshot::default(),
+            usage_days: 30,
+            usage_tokens: false,
+            usage_by_day: false,
+            release_notes: ReleaseNotesState::default(),
+            settings_scroll: ScrollHandle::new(),
+            settings_search: QueryEditor::default(),
+            settings_search_active: false,
+            shortcut_search: QueryEditor::default(),
+            shortcut_search_active: false,
+            shortcut_editor: None,
+            settings_transition_generation: 0,
             settings_menu: None,
+            agents_host,
+            agent_path_editor: None,
             hosts_path,
             hosts,
             host_editor: None,
             host_initialization: None,
             host_initialization_generation: 0,
-            host_field_bounds: std::array::from_fn(|_| Rc::new(Cell::new(None))),
             prefs,
             store: Arc::clone(&store_runtime.store),
             store_runtime,
             runtime,
             updates,
             activity: "Connected client · shared daemon remains untouched".to_owned(),
+            diagnostics_report,
             _update_changes: update_changes,
             _store_changes: store_changes,
         }
     }
 
     fn colors(&self) -> SemanticColors {
-        crate::app_theme::colors(&self.prefs.terminal_theme)
+        crate::app_theme::colors(
+            self.store
+                .read()
+                .expect("session store lock poisoned")
+                .preview_theme_id()
+                .unwrap_or(&self.prefs.terminal_theme),
+        )
     }
 
     fn settings_colors(&self) -> SemanticColors {
-        crate::app_theme::sidebar_colors(&self.prefs.terminal_theme)
+        crate::app_theme::sidebar_colors(
+            self.store
+                .read()
+                .expect("session store lock poisoned")
+                .preview_theme_id()
+                .unwrap_or(&self.prefs.terminal_theme),
+        )
     }
 
-    pub(crate) fn open_history(&mut self, cx: &mut Context<Self>) {
-        self.surface = Surface::History;
-        self.history_query.clear();
-        self.history_highlight = 0;
-        self.history_loading = true;
-        self.history_error = None;
-        cx.notify();
+    pub(crate) fn open_worktrees(&mut self, cx: &mut Context<Self>) {
+        self.prefs = self
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .preferences()
+            .clone();
+        self.surface = Surface::Worktrees;
+        self.load_worktrees(cx);
+    }
 
-        let roots = crate::history::HistoryRoots::current_user();
+    fn load_worktrees(&mut self, cx: &mut Context<Self>) {
+        // Tab navigation preserves checked results. A new window joins the
+        // engine's existing job/cache rather than requesting another scan.
+        if self.worktrees.scan_generation.is_none() || self.worktrees.error.is_some() {
+            self.start_worktree_scan(false, false, cx);
+        }
+        cx.notify();
+    }
+
+    fn refresh_worktrees(&mut self, cx: &mut Context<Self>) {
+        self.start_worktree_scan(true, false, cx);
+    }
+
+    fn start_worktree_scan(&mut self, refresh: bool, measure_disk: bool, cx: &mut Context<Self>) {
+        if self.worktrees.loading {
+            return;
+        }
+        self.worktrees.begin_refresh();
+        let epoch = self.worktrees.poll_epoch;
+        cx.notify();
         let client = Arc::clone(self.store_runtime.client());
         let runtime = Arc::clone(&self.runtime);
         cx.spawn(async move |this, cx| {
-            let task = runtime.spawn(async move {
-                let tracked = if client
-                    .wait_until_connected(Duration::from_secs(5))
-                    .await
-                    .is_ok()
-                {
-                    client
-                        .sessions()
-                        .await
-                        .map(|result| {
-                            result
-                                .sessions
-                                .into_iter()
-                                .filter_map(|session| session.agent_session_id)
-                                .collect()
-                        })
-                        .unwrap_or_default()
-                } else {
-                    HashSet::new()
-                };
-                tokio::task::spawn_blocking(move || crate::history::scan(&roots, &tracked))
-                    .await
-                    .map_err(|error| error.to_string())
-            });
-            let result = task
-                .await
-                .map_err(|error| error.to_string())
-                .and_then(|r| r);
-            let _ = this.update(cx, |this, cx| {
-                this.history_loading = false;
-                match result {
-                    Ok(entries) => {
-                        this.activity = format!("{} past conversations found", entries.len());
-                        this.history = entries;
-                    }
-                    Err(error) => this.history_error = Some(error),
+            let mut params = diri_proto::WorktreeScanParams {
+                refresh,
+                measure_disk,
+                ..Default::default()
+            };
+            loop {
+                let active = this
+                    .update(cx, |this, _| this.worktrees.poll_epoch == epoch)
+                    .unwrap_or(false);
+                if !active {
+                    break;
                 }
-                cx.notify();
-            });
+                let client = Arc::clone(&client);
+                let request = params.clone();
+                let task = runtime.spawn(async move {
+                    client.wait_until_connected(Duration::from_secs(5)).await?;
+                    client.worktree_scan(request).await
+                });
+                let result = match task.await {
+                    Ok(Ok(result)) => Ok(result),
+                    Ok(Err(error)) => Err(error.to_string()),
+                    Err(error) => Err(error.to_string()),
+                };
+                let mut has_more = false;
+                if let Ok(result) = &result {
+                    params.refresh = false;
+                    params.generation = Some(result.generation);
+                    params.cursor = result.cursor;
+                    has_more = result.has_more;
+                }
+                let again = this
+                    .update(cx, |this, cx| {
+                        if this.worktrees.poll_epoch != epoch {
+                            return false;
+                        }
+                        match result {
+                            Ok(result) => this.worktrees.apply_scan(result),
+                            Err(error) => this.worktrees.finish_refresh(Err(error)),
+                        }
+                        cx.notify();
+                        this.worktrees.loading
+                    })
+                    .unwrap_or(false);
+                if !again {
+                    break;
+                }
+                // Drain bounded pages promptly, including while the sidebar is
+                // closed. Stop polling once the engine job and pages finish.
+                cx.background_executor()
+                    .timer(Duration::from_millis(if has_more { 16 } else { 500 }))
+                    .await;
+            }
         })
         .detach();
     }
 
-    pub(crate) fn open_worktrees(&mut self, cx: &mut Context<Self>) {
-        self.surface = Surface::Worktrees;
-        self.refresh_worktrees(cx);
-    }
-
-    fn refresh_worktrees(&mut self, cx: &mut Context<Self>) {
-        self.worktrees.begin_refresh();
+    fn refresh_release_notes(&mut self, cx: &mut Context<Self>) {
+        if matches!(
+            self.release_notes,
+            ReleaseNotesState::Loading | ReleaseNotesState::Loaded { .. }
+        ) {
+            return;
+        }
+        self.release_notes = ReleaseNotesState::Loading;
         cx.notify();
-        let client = Arc::clone(self.store_runtime.client());
+
         let runtime = Arc::clone(&self.runtime);
         cx.spawn(async move |this, cx| {
-            let task = runtime.spawn(async move {
-                client.wait_until_connected(Duration::from_secs(5)).await?;
-                client.worktree_overview().await
-            });
+            let task = runtime.spawn_blocking(diri_updater::fetch_latest_release_notes);
             let result = match task.await {
-                Ok(Ok(entries)) => Ok(entries),
+                Ok(Ok(release)) => Ok(release),
                 Ok(Err(error)) => Err(error.to_string()),
                 Err(error) => Err(error.to_string()),
             };
             let _ = this.update(cx, |this, cx| {
-                this.worktrees.finish_refresh(result);
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    fn resume_history(&mut self, entry: HistoryEntry, cx: &mut Context<Self>) {
-        let Some(params) = crate::history::resume_spawn(&entry) else {
-            self.history_error = Some("The conversation folder is no longer available".to_owned());
-            cx.notify();
-            return;
-        };
-        self.history_loading = true;
-        self.history_error = None;
-        let client = Arc::clone(self.store_runtime.client());
-        let runtime = Arc::clone(&self.runtime);
-        cx.spawn(async move |this, cx| {
-            let task = runtime.spawn(async move {
-                client.wait_until_connected(Duration::from_secs(5)).await?;
-                client.spawn(params).await
-            });
-            let result = match task.await {
-                Ok(result) => result.map_err(|error| error.to_string()),
-                Err(error) => Err(error.to_string()),
-            };
-            let _ = this.update(cx, |this, cx| {
-                this.history_loading = false;
-                match result {
-                    Ok(id) => {
-                        this.surface = Surface::None;
-                        this.activity = format!("Resumed conversation in session {id}");
+                this.release_notes = match result {
+                    Ok(release) => {
+                        let document =
+                            Arc::new(crate::markdown::MarkdownDocument::parse(&release.body));
+                        ReleaseNotesState::Loaded { release, document }
                     }
-                    Err(error) => this.history_error = Some(error),
-                }
+                    Err(error) => ReleaseNotesState::Failed(error),
+                };
                 cx.notify();
             });
         })
@@ -501,23 +608,38 @@ impl UtilitySurfaces {
         cx.spawn(async move |this, cx| {
             let task = runtime.spawn(async move {
                 client.wait_until_connected(Duration::from_secs(5)).await?;
-                client.worktree_remove(params).await?;
-                client.worktree_overview().await
+                client.worktree_cleanup(params).await
             });
             let result = match task.await {
-                Ok(Ok(entries)) => Ok(entries),
+                Ok(Ok(())) => Ok(()),
                 Ok(Err(error)) => Err(error.to_string()),
                 Err(error) => Err(error.to_string()),
             };
             let _ = this.update(cx, |this, cx| {
-                this.worktrees.finish_refresh(result);
+                this.worktrees.loading = false;
+                match result {
+                    Ok(()) => this.refresh_worktrees(cx),
+                    Err(error) => this.worktrees.error = Some(error),
+                }
                 cx.notify();
             });
         })
         .detach();
     }
 
-    fn persist_prefs(&mut self) {
+    fn confirm_worktree_move(&mut self, cx: &mut Context<Self>) {
+        let Some(params) = self.worktrees.confirm_move() else {
+            return;
+        };
+        self.store
+            .read()
+            .expect("session store lock poisoned")
+            .reparent_worktree(params);
+        self.activity = "Moving session to worktree…".to_owned();
+        cx.notify();
+    }
+
+    fn persist_prefs(&mut self) -> bool {
         self.prefs.normalize();
         let prefs = self.prefs.clone();
         if let Err(error) = self
@@ -527,8 +649,11 @@ impl UtilitySurfaces {
             .update_preferences(|shared| *shared = prefs)
         {
             self.activity = format!("Could not save settings: {error}");
+            false
         } else {
+            self.store_runtime.publish_local_change();
             self.activity = "Settings saved for diri".to_owned();
+            true
         }
     }
 
@@ -659,6 +784,10 @@ impl UtilitySurfaces {
                 }
                 match outcome {
                     Ok(result) => {
+                        this.store
+                            .write()
+                            .expect("session store lock poisoned")
+                            .request_agent_catalog(Some(host.id.clone()), true);
                         this.activity = match kind {
                             HostPreparationKind::Initialize => {
                                 format!("{} is ready", host.display_name())
@@ -860,46 +989,91 @@ impl UtilitySurfaces {
         true
     }
 
-    fn visible_history(&self) -> Vec<HistoryEntry> {
-        self.history
-            .iter()
-            .filter(|entry| crate::history::matches_query(entry, self.history_query.text()))
-            .take(RESULT_LIMIT)
-            .cloned()
-            .collect()
-    }
-
-    fn move_history(&mut self, delta: isize, cx: &mut Context<Self>) {
-        if self.surface != Surface::History {
-            return;
+    fn handle_agent_path_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        if self.surface != Surface::Settings
+            || self.settings_tab != SettingsTab::Agents
+            || self.agent_path_editor.is_none()
+        {
+            return false;
         }
-        let count = self.visible_history().len();
-        if count == 0 {
-            return;
+        let key = &event.keystroke;
+        match key.key.as_str() {
+            "escape" => {
+                self.agent_path_editor = None;
+                cx.notify();
+            }
+            "enter" => {
+                let Some(editor) = &self.agent_path_editor else {
+                    return true;
+                };
+                let path = editor.path.text().trim();
+                if path.is_empty() {
+                    if let Some(editor) = &mut self.agent_path_editor {
+                        editor.error = Some("Enter an executable path.".into());
+                    }
+                } else {
+                    self.store
+                        .write()
+                        .expect("session store lock poisoned")
+                        .configure_agent(diri_proto::AgentConfigureParams {
+                            host: editor.host.clone(),
+                            kind: editor.kind.clone(),
+                            executable_path: Some(path.to_owned()),
+                            show_in_quick_create: editor.show_in_quick_create,
+                        });
+                    self.agent_path_editor = None;
+                }
+                cx.notify();
+            }
+            _ => {
+                let Some(edit) = query_editor::edit_for(key) else {
+                    return false;
+                };
+                let Some(editor) = &mut self.agent_path_editor else {
+                    return false;
+                };
+                match edit {
+                    Edit::Local(local) => {
+                        editor.path.apply(local);
+                    }
+                    Edit::Clipboard(ClipboardEdit::Copy) => {
+                        query_editor::copy_selection(&editor.path, cx);
+                    }
+                    Edit::Clipboard(ClipboardEdit::Cut) => {
+                        query_editor::cut_selection(&mut editor.path, cx);
+                    }
+                    Edit::Clipboard(ClipboardEdit::Paste) => {
+                        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                            editor.path.insert(&text);
+                        }
+                    }
+                }
+                editor.error = None;
+                cx.notify();
+            }
         }
-        self.history_highlight =
-            (self.history_highlight as isize + delta).rem_euclid(count as isize) as usize;
-        cx.notify();
-    }
-
-    fn activate_history(&mut self, cx: &mut Context<Self>) {
-        if self.surface != Surface::History {
-            return;
-        }
-        if let Some(entry) = self.visible_history().get(self.history_highlight).cloned() {
-            self.resume_history(entry, cx);
-        }
+        true
     }
 
     fn close_surface(&mut self, cx: &mut Context<Self>) {
         if self.worktrees.pending_cleanup.is_some() {
             self.worktrees.cancel_cleanup();
+        } else if self.worktrees.pending_move.is_some() || self.worktrees.move_refusal.is_some() {
+            self.worktrees.cancel_move();
         } else {
             self.surface = Surface::None;
+            self.clear_account_continuation();
             self.settings_menu = None;
             self.host_editor = None;
+            self.agent_path_editor = None;
         }
         cx.notify();
+    }
+
+    pub(crate) fn dismiss(&mut self, cx: &mut Context<Self>) {
+        if self.surface != Surface::None {
+            self.close_surface(cx);
+        }
     }
 
     pub(crate) fn is_open(&self) -> bool {
@@ -914,8 +1088,395 @@ impl UtilitySurfaces {
             .preferences()
             .clone();
         self.surface = Surface::Settings;
+        self.settings_scroll.set_offset(point(px(0.0), px(0.0)));
+        self.settings_search.clear();
+        self.settings_search_active = false;
+        self.settings_transition_generation = self.settings_transition_generation.wrapping_add(1);
         self.settings_menu = None;
         self.host_editor = None;
+        self.agent_path_editor = None;
+        self.shortcut_search.clear();
+        self.shortcut_search_active = false;
+        self.shortcut_editor = None;
+        if self.settings_tab == SettingsTab::Skills {
+            self.refresh_skills(cx);
+        }
+        if self.settings_tab == SettingsTab::WhatsNew {
+            self.refresh_release_notes(cx);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_settings(&mut self, cx: &mut Context<Self>) {
+        if self.surface == Surface::Settings {
+            self.close_surface(cx);
+        } else {
+            self.open_settings(cx);
+        }
+    }
+
+    fn visible_settings_tabs(&self) -> Vec<SettingsTab> {
+        SettingsTab::ALL
+            .into_iter()
+            .filter(|tab| settings_tab_matches(*tab, self.settings_search.text()))
+            .collect()
+    }
+
+    pub(crate) fn is_settings_open(&self) -> bool {
+        self.surface == Surface::Settings
+    }
+
+    /// What the app sidebar paints while settings owns the workbench. `None`
+    /// puts the sidebar back on sessions.
+    pub(crate) fn settings_nav(&self) -> Option<SettingsNav> {
+        (self.surface == Surface::Settings).then(|| SettingsNav {
+            tabs: self.visible_settings_tabs(),
+            active: self.settings_tab,
+            search: self.settings_search.clone(),
+            search_active: self.settings_search_active,
+        })
+    }
+
+    /// The sidebar rendered the navigation, so it is the sidebar that reports
+    /// a click on it. Every other entry point into a page goes through the
+    /// same method.
+    pub(crate) fn open_settings_tab(&mut self, tab: SettingsTab, cx: &mut Context<Self>) {
+        if self.surface != Surface::Settings {
+            return;
+        }
+        self.select_settings_tab(tab, cx);
+    }
+
+    /// Clicking the sidebar's search field types into settings, so keyboard
+    /// focus has to come back across with it.
+    pub(crate) fn focus_settings_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.surface != Surface::Settings {
+            return;
+        }
+        self.settings_search_active = true;
+        self.focus.focus(window, cx);
+        cx.notify();
+    }
+
+    pub(crate) fn clear_settings_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.surface != Surface::Settings {
+            return;
+        }
+        self.settings_search.clear();
+        self.settings_search_active = true;
+        self.focus.focus(window, cx);
+        cx.notify();
+    }
+
+    fn select_settings_tab(&mut self, tab: SettingsTab, cx: &mut Context<Self>) {
+        if tab != SettingsTab::Accounts {
+            self.clear_account_continuation();
+        }
+        if self.settings_tab != tab {
+            self.settings_scroll.set_offset(point(px(0.0), px(0.0)));
+        }
+        self.settings_tab = tab;
+        if tab == SettingsTab::WhatsNew {
+            self.refresh_release_notes(cx);
+        }
+        if tab == SettingsTab::Worktrees {
+            self.load_worktrees(cx);
+        }
+        if tab == SettingsTab::Skills {
+            self.refresh_skills(cx);
+        }
+        if tab == SettingsTab::Accounts {
+            self.refresh_accounts(cx);
+        }
+        self.settings_search_active = false;
+        self.settings_menu = None;
+        self.host_editor = None;
+        self.agent_path_editor = None;
+        self.shortcut_search_active = false;
+        self.shortcut_editor = None;
+        if tab == SettingsTab::Remote {
+            self.reload_hosts();
+        } else if tab == SettingsTab::Agents {
+            self.store
+                .write()
+                .expect("session store lock poisoned")
+                .request_agent_catalog(self.agents_host.clone(), false);
+        }
+        cx.notify();
+    }
+
+    fn refresh_skills(&mut self, cx: &mut Context<Self>) {
+        let project = self
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .selected_session()
+            .filter(|session| session.host.is_none())
+            .map(|session| PathBuf::from(&session.cwd));
+        self.skills
+            .update(cx, |skills, cx| skills.open(project, cx));
+    }
+
+    fn begin_shortcut_edit(
+        &mut self,
+        command: CommandId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.settings_search_active = false;
+        self.shortcut_search_active = false;
+        self.shortcut_editor = Some(ShortcutEditor {
+            command,
+            error: None,
+        });
+        self.focus.focus(window, cx);
+        cx.notify();
+    }
+
+    fn focus_shortcut_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.shortcut_editor = None;
+        self.settings_search_active = false;
+        self.shortcut_search_active = true;
+        self.focus.focus(window, cx);
+        cx.notify();
+    }
+
+    fn clear_shortcut_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.shortcut_search.clear();
+        self.focus_shortcut_search(window, cx);
+    }
+
+    fn save_shortcut_override(
+        &mut self,
+        command: CommandId,
+        value: Option<Option<String>>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let stable_id = crate::commands::command(command).stable_id.to_owned();
+        let previous = match value {
+            Some(value) => self
+                .prefs
+                .shortcut_overrides
+                .insert(stable_id.clone(), value),
+            None => self.prefs.shortcut_overrides.remove(&stable_id),
+        };
+        if !self.persist_prefs() {
+            match previous {
+                Some(previous) => {
+                    self.prefs.shortcut_overrides.insert(stable_id, previous);
+                }
+                None => {
+                    self.prefs.shortcut_overrides.remove(&stable_id);
+                }
+            }
+            return false;
+        }
+
+        crate::commands::rebind_keys(cx, &self.prefs.shortcut_overrides);
+        crate::refresh_app_menus(cx);
+        self.activity = format!("Updated {}", command.shortcut_metadata().title);
+        true
+    }
+
+    fn assign_shortcut(&mut self, command: CommandId, binding: String, cx: &mut Context<Self>) {
+        if let Some(conflict) =
+            crate::commands::shortcut_conflict(command, &binding, &self.prefs.shortcut_overrides)
+        {
+            if let Some(editor) = &mut self.shortcut_editor {
+                editor.error = Some(format!(
+                    "Already used by {}.",
+                    conflict.id.shortcut_metadata().title
+                ));
+            }
+            cx.notify();
+            return;
+        }
+        if self.save_shortcut_override(command, Some(Some(binding)), cx) {
+            self.shortcut_editor = None;
+        } else if let Some(editor) = &mut self.shortcut_editor {
+            editor.error = Some("Could not save this shortcut.".to_owned());
+        }
+        cx.notify();
+    }
+
+    fn unassign_shortcut(&mut self, command: CommandId, cx: &mut Context<Self>) {
+        if self.save_shortcut_override(command, Some(None), cx) {
+            self.shortcut_editor = None;
+        }
+        cx.notify();
+    }
+
+    fn restore_shortcut(&mut self, command: CommandId, cx: &mut Context<Self>) {
+        if self.save_shortcut_override(command, None, cx) {
+            self.shortcut_editor = None;
+        }
+        cx.notify();
+    }
+
+    fn restore_all_shortcuts(&mut self, cx: &mut Context<Self>) {
+        if self.prefs.shortcut_overrides.is_empty() {
+            return;
+        }
+        let previous = std::mem::take(&mut self.prefs.shortcut_overrides);
+        if self.persist_prefs() {
+            crate::commands::rebind_keys(cx, &self.prefs.shortcut_overrides);
+            crate::refresh_app_menus(cx);
+            self.shortcut_editor = None;
+            self.activity = "Restored every keyboard shortcut".to_owned();
+        } else {
+            self.prefs.shortcut_overrides = previous;
+        }
+        cx.notify();
+    }
+
+    fn handle_shortcut_editor_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        if self.surface != Surface::Settings || self.settings_tab != SettingsTab::Shortcuts {
+            return false;
+        }
+        let Some(command) = self.shortcut_editor.as_ref().map(|editor| editor.command) else {
+            return false;
+        };
+        let key = &event.keystroke;
+        if key.key == "escape" {
+            self.shortcut_editor = None;
+            cx.notify();
+            return true;
+        }
+        if matches!(key.key.as_str(), "backspace" | "delete") && !key.modifiers.modified() {
+            self.unassign_shortcut(command, cx);
+            return true;
+        }
+        if matches!(
+            key.key.as_str(),
+            "shift" | "control" | "ctrl" | "alt" | "platform" | "function" | "fn"
+        ) {
+            return true;
+        }
+        let function_key = key
+            .key
+            .strip_prefix('f')
+            .and_then(|number| number.parse::<u8>().ok())
+            .is_some_and(|number| (1..=35).contains(&number));
+        if !key.modifiers.modified() && !function_key {
+            if let Some(editor) = &mut self.shortcut_editor {
+                editor.error = Some("Include Command, Control, Option, or a function key.".into());
+            }
+            cx.notify();
+            return true;
+        }
+        self.assign_shortcut(command, key.unparse(), cx);
+        true
+    }
+
+    fn handle_shortcut_search_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        if self.surface != Surface::Settings
+            || self.settings_tab != SettingsTab::Shortcuts
+            || !self.shortcut_search_active
+        {
+            return false;
+        }
+        match event.keystroke.key.as_str() {
+            "escape" => {
+                if self.shortcut_search.is_empty() {
+                    self.shortcut_search_active = false;
+                } else {
+                    self.shortcut_search.clear();
+                }
+                cx.notify();
+            }
+            _ => {
+                let Some(edit) = query_editor::edit_for(&event.keystroke) else {
+                    return true;
+                };
+                match edit {
+                    Edit::Local(local) => {
+                        self.shortcut_search.apply(local);
+                    }
+                    Edit::Clipboard(ClipboardEdit::Copy) => {
+                        query_editor::copy_selection(&self.shortcut_search, cx);
+                    }
+                    Edit::Clipboard(ClipboardEdit::Cut) => {
+                        query_editor::cut_selection(&mut self.shortcut_search, cx);
+                    }
+                    Edit::Clipboard(ClipboardEdit::Paste) => {
+                        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                            self.shortcut_search.insert(&text);
+                        }
+                    }
+                }
+                cx.notify();
+            }
+        }
+        true
+    }
+
+    fn handle_settings_search_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        if self.surface != Surface::Settings || !self.settings_search_active {
+            return false;
+        }
+        match event.keystroke.key.as_str() {
+            "escape" => {
+                if self.settings_search.is_empty() {
+                    self.settings_search_active = false;
+                } else {
+                    self.settings_search.clear();
+                }
+                cx.notify();
+            }
+            "enter" => {
+                if let Some(tab) = self.visible_settings_tabs().first().copied() {
+                    self.select_settings_tab(tab, cx);
+                }
+            }
+            _ => {
+                let Some(edit) = query_editor::edit_for(&event.keystroke) else {
+                    return true;
+                };
+                match edit {
+                    Edit::Local(local) => {
+                        self.settings_search.apply(local);
+                    }
+                    Edit::Clipboard(ClipboardEdit::Copy) => {
+                        query_editor::copy_selection(&self.settings_search, cx);
+                    }
+                    Edit::Clipboard(ClipboardEdit::Cut) => {
+                        query_editor::cut_selection(&mut self.settings_search, cx);
+                    }
+                    Edit::Clipboard(ClipboardEdit::Paste) => {
+                        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                            self.settings_search.insert(&text);
+                        }
+                    }
+                }
+                cx.notify();
+            }
+        }
+        true
+    }
+
+    pub(crate) fn open_agent_settings(&mut self, host: Option<String>, cx: &mut Context<Self>) {
+        self.open_settings(cx);
+        self.settings_tab = SettingsTab::Agents;
+        self.agents_host = host.clone();
+        self.store
+            .write()
+            .expect("session store lock poisoned")
+            .request_agent_catalog(host, false);
+        cx.notify();
+    }
+
+    pub(crate) fn open_whats_new(&mut self, cx: &mut Context<Self>) {
+        self.open_settings(cx);
+        self.select_settings_tab(SettingsTab::WhatsNew, cx);
+    }
+
+    fn open_diagnostics(&mut self, cx: &mut Context<Self>) {
+        let store = self.store.read().expect("session store lock poisoned");
+        let report = build_diagnostics_report(&store);
+        drop(store);
+        self.diagnostics_report = Some(report);
+        self.surface = Surface::Diagnostics;
+        self.settings_menu = None;
         cx.notify();
     }
 
@@ -924,14 +1485,6 @@ impl UtilitySurfaces {
         self.settings_tab = SettingsTab::Remote;
         self.reload_hosts();
         self.begin_adding_host(window, cx);
-    }
-
-    pub(crate) fn toggle_history(&mut self, cx: &mut Context<Self>) {
-        if self.surface == Surface::History {
-            self.close_surface(cx);
-        } else {
-            self.open_history(cx);
-        }
     }
 
     pub(crate) fn key_down(
@@ -943,189 +1496,65 @@ impl UtilitySurfaces {
         if self.surface == Surface::None {
             return;
         }
-        if self.handle_host_editor_key(event, cx) {
+        if self.handle_shortcut_editor_key(event, cx) || self.handle_shortcut_search_key(event, cx)
+        {
+            cx.stop_propagation();
+            return;
+        }
+        if self.handle_account_key(event, cx)
+            || self.handle_agent_path_key(event, cx)
+            || self.handle_host_editor_key(event, cx)
+        {
+            return;
+        }
+        if self.handle_settings_search_key(event, cx) {
+            cx.stop_propagation();
+            return;
+        }
+        if self.surface == Surface::Settings
+            && self.settings_tab == SettingsTab::Skills
+            && self
+                .skills
+                .update(cx, |skills, cx| skills.handle_key(event, cx))
+        {
             return;
         }
         let key = &event.keystroke;
-        if key.key == "escape" && self.surface == Surface::Settings && self.settings_menu.is_some()
+        if key.key == "escape"
+            && (self.worktrees.pending_move.is_some() || self.worktrees.move_refusal.is_some())
+        {
+            self.worktrees.cancel_move();
+            cx.notify();
+        } else if key.key == "escape"
+            && self.surface == Surface::Settings
+            && self.settings_menu.is_some()
         {
             self.settings_menu = None;
             cx.notify();
         } else if key.key == "escape" {
             self.close_surface(cx);
-        } else if key.key == "up" {
-            self.move_history(-1, cx);
-        } else if key.key == "down" {
-            self.move_history(1, cx);
-        } else if key.key == "enter" {
-            self.activate_history(cx);
-        } else if self.surface == Surface::History {
-            let Some(edit) = query_editor::edit_for(key) else {
-                return;
-            };
-            let changed = match edit {
-                Edit::Local(local) => self.history_query.apply(local),
-                Edit::Clipboard(ClipboardEdit::Copy) => {
-                    query_editor::copy_selection(&self.history_query, cx);
-                    false
-                }
-                Edit::Clipboard(ClipboardEdit::Cut) => {
-                    query_editor::cut_selection(&mut self.history_query, cx)
-                }
-                Edit::Clipboard(ClipboardEdit::Paste) => cx
-                    .read_from_clipboard()
-                    .and_then(|item| item.text())
-                    .is_some_and(|text| self.history_query.insert(&text)),
-            };
-            if changed {
-                self.history_highlight = 0;
-            }
-            cx.notify();
         }
-    }
-
-    fn render_history(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let colors = self.colors();
-        let entries = self.visible_history();
-        let empty = entries.is_empty() && !self.history_loading;
-        let rows = entries.into_iter().enumerate().map(|(index, entry)| {
-            let selected = index == self.history_highlight;
-            let resumable = entry.cwd_exists;
-            let folder = folder_name(&entry.cwd).to_owned();
-            let parent = relative_parent(&entry.cwd);
-            let title = entry
-                .title
-                .clone()
-                .unwrap_or_else(|| "Untitled conversation".to_owned());
-            let age = relative_time(entry.last_active_at.0);
-            let agent = ui_agent(&entry.kind);
-            div()
-                .id(("history-row", index))
-                .h(px(46.0))
-                .px(px(10.0))
-                .rounded(px(Radius::ROW))
-                .flex()
-                .items_center()
-                .gap(px(9.0))
-                .opacity(if resumable { 1.0 } else { 0.45 })
-                .bg(Fill::selected(colors, selected))
-                .cursor_pointer()
-                .hover(move |style| style.bg(Fill::hover(colors, true)))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    if resumable {
-                        this.resume_history(entry.clone(), cx);
-                    }
-                }))
-                .child(AgentLogo::new(agent, 18.0, colors))
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .gap(px(2.0))
-                        .child(
-                            div()
-                                .text_size(px(13.0))
-                                .text_color(colors.primary)
-                                .overflow_hidden()
-                                .child(title),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .gap(px(5.0))
-                                .text_size(px(11.0))
-                                .child(div().text_color(colors.secondary).child(folder))
-                                .child(div().text_color(colors.tertiary).child(parent)),
-                        ),
-                )
-                .child(chip(
-                    if !resumable {
-                        "folder gone".to_owned()
-                    } else if selected {
-                        "↵ resume".to_owned()
-                    } else {
-                        age
-                    },
-                    colors,
-                ))
-        });
-
-        FloatingSurface::new(
-            self.colors(),
-            div()
-                .w(px(560.0))
-                .max_h(px(440.0))
-                .flex()
-                .flex_col()
-                .child(
-                    div()
-                        .h(px(48.0))
-                        .px(px(16.0))
-                        .flex()
-                        .items_center()
-                        .gap(px(10.0))
-                        .text_size(px(15.0))
-                        .child(sf_symbol("magnifyingglass", 13.0, colors.tertiary))
-                        .child(
-                            div()
-                                .flex_1()
-                                .text_color(if self.history_query.is_empty() {
-                                    colors.tertiary
-                                } else {
-                                    colors.primary
-                                })
-                                .child(if self.history_query.is_empty() {
-                                    div().child("Search past conversations…").into_any_element()
-                                } else {
-                                    query_label(&self.history_query)
-                                }),
-                        )
-                        .child(chip("esc".to_owned(), colors)),
-                )
-                .child(HairlineDivider::horizontal(colors))
-                .child(
-                    div()
-                        .id("history-results")
-                        .max_h(px(380.0))
-                        .overflow_y_scroll()
-                        .p(px(6.0))
-                        .flex()
-                        .flex_col()
-                        .gap(px(1.0))
-                        .when(self.history_loading, |view| {
-                            view.child(empty_label(
-                                "Scanning Claude and Codex transcripts…",
-                                colors,
-                            ))
-                        })
-                        .when_some(self.history_error.clone(), |view, error| {
-                            view.child(empty_label(&error, colors))
-                        })
-                        .when(empty, |view| {
-                            view.child(empty_label(
-                                if self.history_query.is_empty() {
-                                    "No past conversations"
-                                } else {
-                                    "No matches"
-                                },
-                                colors,
-                            ))
-                        })
-                        .children(rows),
-                ),
-        )
     }
 
     fn render_worktrees(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = self.colors();
+        let entity = cx.entity();
+        let page_rows = worktree_settings::PAGE_ROWS;
+        let page = self
+            .worktrees
+            .page
+            .min(self.worktrees.entries.len().saturating_sub(1) / page_rows);
         let cards = self
             .worktrees
             .entries
             .iter()
+            .skip(page * page_rows)
+            .take(page_rows)
             .map(|entry| {
                 let path = entry.path.clone();
+                let drop_entry = entry.clone();
+                let hover_entry = entry.clone();
+                let hover_entity = entity.clone();
                 let branch = entry
                     .branch
                     .clone()
@@ -1144,6 +1573,58 @@ impl UtilitySurfaces {
                         colors.primary.alpha(0.06)
                     })
                     .bg(Fill::subtle(colors))
+                    .drag_over::<DraggedSidebarItem>(move |card, dragged, _, cx| {
+                        let Some(source_id) = dragged.session_id() else {
+                            return card;
+                        };
+                        let valid = {
+                            let this = hover_entity.read(cx);
+                            let store = this.store.read().expect("session store lock poisoned");
+                            store.sessions().get(source_id).is_some_and(|source| {
+                                worktree_move_proposal(
+                                    source,
+                                    store.projects().get(&source.project_id),
+                                    &hover_entry,
+                                )
+                                .is_ok()
+                            })
+                        };
+                        if valid {
+                            card.border_1()
+                                .border_color(Palette::CLAY.alpha(0.72))
+                                .bg(Palette::CLAY.alpha(0.14))
+                                .cursor(CursorStyle::DragCopy)
+                        } else {
+                            card.border_1()
+                                .border_color(Ink::DANGER.alpha(0.56))
+                                .bg(Ink::DANGER.alpha(0.08))
+                                .cursor(CursorStyle::OperationNotAllowed)
+                        }
+                    })
+                    .on_drop(
+                        cx.listener(move |this, dragged: &DraggedSidebarItem, _, cx| {
+                            if let Some(source_id) = dragged.session_id() {
+                                let result = {
+                                    let store =
+                                        this.store.read().expect("session store lock poisoned");
+                                    store.sessions().get(source_id).map_or_else(
+                                        || Err("The dragged session no longer exists.".to_owned()),
+                                        |source| {
+                                            worktree_move_proposal(
+                                                source,
+                                                store.projects().get(&source.project_id),
+                                                &drop_entry,
+                                            )
+                                            .map_err(|refusal| refusal.0)
+                                        },
+                                    )
+                                };
+                                this.worktrees.propose_move(result);
+                            }
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    )
                     .flex()
                     .flex_col()
                     .gap(px(8.0))
@@ -1202,6 +1683,8 @@ impl UtilitySurfaces {
             })
             .collect::<Vec<_>>();
         let pending = self.worktrees.pending_cleanup.clone();
+        let pending_move = self.worktrees.pending_move.clone();
+        let move_refusal = self.worktrees.move_refusal.clone();
         FloatingSurface::new(
             self.colors(),
             div()
@@ -1226,6 +1709,12 @@ impl UtilitySurfaces {
                             div()
                                 .flex()
                                 .gap(px(8.0))
+                                .when(page > 0, |row| row.child(surface_button("Previous", "worktree-sheet-previous", colors, cx, move |this, cx| {
+                                    this.worktrees.page = page - 1; this.worktrees.cancel_cleanup(); cx.notify();
+                                })))
+                                .when((page + 1) * page_rows < self.worktrees.entries.len(), |row| row.child(surface_button("Next", "worktree-sheet-next", colors, cx, move |this, cx| {
+                                    this.worktrees.page = page + 1; this.worktrees.cancel_cleanup(); cx.notify();
+                                })))
                                 .child(surface_button(
                                     "Refresh",
                                     "refresh-worktrees",
@@ -1265,7 +1754,7 @@ impl UtilitySurfaces {
                         })
                         .when(
                             self.worktrees.entries.is_empty() && !self.worktrees.loading,
-                            |view| view.child(empty_label("No worktrees", colors)),
+                            |view| view.child(empty_label("No worktrees yet. Start a session with a new worktree to work on a separate branch.", colors)),
                         )
                         .children(cards),
                 )
@@ -1335,175 +1824,421 @@ impl UtilitySurfaces {
                                     })),
                             )),
                     )
+                })
+                .when_some(pending_move, |sheet, proposal| {
+                    let branch = proposal.branch.as_deref().unwrap_or("detached");
+                    sheet.child(
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .occlude()
+                            .bg(rgba(0x00000088))
+                            .flex()
+                            .items_end()
+                            .justify_center()
+                            .pb(px(18.0))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.worktrees.cancel_move();
+                                    cx.notify();
+                                    cx.stop_propagation();
+                                }),
+                            )
+                            .child(FloatingSurface::new(
+                                self.colors(),
+                                div()
+                                    .w(px(560.0))
+                                    .p(px(16.0))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(12.0))
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation()
+                                    })
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w(px(0.0))
+                                            .flex()
+                                            .flex_col()
+                                            .gap(px(4.0))
+                                            .child(
+                                                div()
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .child("Move session to this worktree?"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_size(px(11.0))
+                                                    .text_color(colors.secondary)
+                                                    .child(format!(
+                                                        "{} → {branch} · {}",
+                                                        proposal.source_title,
+                                                        proposal.worktree_path
+                                                    )),
+                                            ),
+                                    )
+                                    .child(surface_button(
+                                        "Cancel",
+                                        "cancel-worktree-move",
+                                        colors,
+                                        cx,
+                                        |this, cx| {
+                                            this.worktrees.cancel_move();
+                                            cx.notify();
+                                        },
+                                    ))
+                                    .child(surface_button(
+                                        "Move Session",
+                                        "confirm-worktree-move",
+                                        colors,
+                                        cx,
+                                        |this, cx| this.confirm_worktree_move(cx),
+                                    )),
+                            )),
+                    )
+                })
+                .when_some(move_refusal, |sheet, reason| {
+                    sheet.child(
+                        div()
+                            .absolute()
+                            .left(px(16.0))
+                            .right(px(16.0))
+                            .bottom(px(16.0))
+                            .p(px(11.0))
+                            .rounded(px(Radius::ROW))
+                            .bg(colors.floating_surface())
+                            .border_1()
+                            .border_color(Ink::DANGER.alpha(0.36))
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(sf_symbol(
+                                "exclamationmark.triangle.fill",
+                                12.0,
+                                Ink::DANGER,
+                            ))
+                            .child(
+                                div()
+                                    .min_w(px(0.0))
+                                    .flex_1()
+                                    .text_size(px(11.0))
+                                    .text_color(colors.secondary)
+                                    .child(reason),
+                            )
+                            .child(
+                                div()
+                                    .id("dismiss-worktree-refusal")
+                                    .size(px(20.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.worktrees.cancel_move();
+                                        cx.notify();
+                                    }))
+                                    .child(sf_symbol("xmark", 9.0, colors.tertiary)),
+                            ),
+                    )
                 }),
         )
     }
 
     fn render_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        /* ─────────────────────────────────────────────────────────
+         * SETTINGS SHELL STORYBOARD
+         *
+         *    0ms   the workbench is replaced in place; the app sidebar swaps
+         *          its own body over to settings navigation
+         *   70ms   the page follows the navigation in, from 12px right
+         *  190ms   both surfaces settle at their final position and opacity
+         *
+         * Navigation is deliberately absent here: it is the window sidebar,
+         * which this surface is inset against, so settings never paints a
+         * second rail beside the app's own. Reduced motion mounts the final
+         * layout immediately.
+         * ───────────────────────────────────────────────────────── */
         let colors = self.settings_colors();
-        let tabs = SettingsTab::ALL
-            .into_iter()
-            .map(|tab| {
-                let selected = tab == self.settings_tab;
-                div()
-                    .id(SharedString::from(format!("settings-{}", tab.label())))
-                    .h(px(30.0))
-                    .px(px(8.0))
-                    .rounded(px(Radius::ROW))
-                    .flex()
-                    .items_center()
-                    .gap(px(8.0))
-                    .bg(Fill::selected(colors, selected))
-                    .text_color(if selected {
-                        colors.primary
-                    } else {
-                        colors.secondary
-                    })
-                    .cursor_pointer()
-                    .hover(move |style| style.bg(Fill::hover(colors, true)))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.settings_tab = tab;
-                        this.settings_menu = None;
-                        this.host_editor = None;
-                        if tab == SettingsTab::Remote {
-                            this.reload_hosts();
-                        }
-                        cx.notify();
-                    }))
-                    .child(sf_symbol(
-                        tab.icon(),
-                        13.0,
-                        if selected {
-                            colors.primary
-                        } else {
-                            colors.tertiary
-                        },
-                    ))
-                    .child(
-                        div()
-                            .text_size(px(Typo::ROW.size))
-                            .font_weight(if selected {
-                                FontWeight::MEDIUM
-                            } else {
-                                FontWeight::NORMAL
-                            })
-                            .child(tab.label()),
-                    )
-                    .into_any_element()
-            })
-            .collect::<Vec<_>>();
+        let unread = self
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .notifications()
+            .unread_count();
+        let generation = self.settings_transition_generation;
         let pane = match self.settings_tab {
             SettingsTab::General => self.general_settings(cx).into_any_element(),
+            SettingsTab::WhatsNew => self.whats_new_settings(cx).into_any_element(),
+            SettingsTab::Agents => self.agents_settings(cx).into_any_element(),
+            SettingsTab::Skills => self.skills.clone().into_any_element(),
+            SettingsTab::Accounts => self.accounts_settings(cx).into_any_element(),
+            SettingsTab::Shortcuts => self.shortcuts_settings(cx).into_any_element(),
             SettingsTab::Terminal => self.terminal_settings(cx).into_any_element(),
+            SettingsTab::Worktrees => self.worktree_settings(cx).into_any_element(),
             SettingsTab::Resources => self.resource_settings(cx).into_any_element(),
             SettingsTab::Remote => self.remote_settings(cx).into_any_element(),
+            SettingsTab::Phone => self.phone_settings(cx).into_any_element(),
+            SettingsTab::Usage => self.usage_settings(cx).into_any_element(),
         };
-        FloatingSurface::new(
-            colors,
-            div()
-                .id("settings-dialog")
-                .debug_selector(|| "settings-dialog".into())
-                .w(px(SETTINGS_WIDTH))
-                .h(px(SETTINGS_HEIGHT))
-                .rounded(px(Radius::PANEL))
-                .overflow_hidden()
-                .flex()
-                // The dialog owns clicks within its bounds. When a select is
-                // open, any click elsewhere in Settings dismisses that select
-                // before the clicked control runs its own action.
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, _, cx| {
-                        if this.settings_menu.take().is_some() {
+        let pane = div()
+            .id("settings-pane")
+            .debug_selector(|| "settings-pane".into())
+            .relative()
+            .track_scroll(&self.settings_scroll)
+            .flex_1()
+            .min_w(px(0.0))
+            .h_full()
+            .overflow_y_scroll()
+            .bg(colors.background)
+            .child(
+                div()
+                    .w_full()
+                    .max_w(px(
+                        if matches!(
+                            self.settings_tab,
+                            SettingsTab::Usage | SettingsTab::Worktrees
+                        ) {
+                            1040.0
+                        } else {
+                            SETTINGS_CONTENT_MAX_WIDTH
+                        },
+                    ))
+                    .mx_auto()
+                    .child(pane),
+            );
+        let pane = if cx.reduce_motion() {
+            pane.into_any_element()
+        } else {
+            pane.with_animation(
+                SharedString::from(format!("settings-canvas-enter-{generation}")),
+                Animation::new(SETTINGS_TRANSITION_DURATION).with_easing(ease_out_quint()),
+                |pane, delta| {
+                    pane.left(px((1.0 - delta) * 12.0))
+                        .opacity(0.64 + 0.36 * delta)
+                },
+            )
+            .into_any_element()
+        };
+
+        div()
+            .id("settings-shell")
+            .debug_selector(|| "settings-shell".into())
+            .relative()
+            .size_full()
+            .pt(px(Metrics::TITLE_BAR))
+            .overflow_hidden()
+            .bg(colors.background)
+            .flex()
+            // Settings owns the workbench beside the sidebar. Clicking inside
+            // still closes any open select before the clicked control handles
+            // its action.
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if this.settings_menu.take().is_some() {
+                        cx.notify();
+                    }
+                    cx.stop_propagation();
+                }),
+            )
+            .child(pane)
+            .child(notification_titlebar_button(unread, colors))
+    }
+
+    fn phone_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        use crate::phone_access::TailscaleSetup;
+        let colors = self.settings_colors();
+        let content = div().flex().flex_col().gap(px(20.0))
+            .child(setting_section("Your Mac does the work. Your phone is the remote.",
+                div().flex().flex_col().gap(px(10.0))
+                    .child("A one-time setup, with no commands, router settings or addresses to type.")
+                    .child("Keep Diri running and your Mac plugged in with its lid open. The display can turn off; closing the lid or choosing Sleep disconnects your phone."), colors))
+            .when(self.phone_access.is_none(), |view| {
+                view.child(setting_section("1. Connect this Mac", div().flex().flex_col().gap(px(10.0))
+                    .child(self.phone_setup.map(TailscaleSetup::message).unwrap_or("We’ll check whether Tailscale is ready. It keeps the connection between your devices private."))
+                    .when(self.phone_setup.is_some() && !matches!(self.phone_setup, Some(TailscaleSetup::Ready(_))), |view| {
+                        view.child(surface_button("Get Tailscale for Mac", "phone-install-tailscale", colors, cx, |_, cx| {
+                            cx.open_url("https://tailscale.com/download/mac");
+                        }))
+                        .when(self.phone_setup != Some(TailscaleSetup::NotInstalled), |view| view.child(surface_button("Open Tailscale", "phone-open-tailscale", colors, cx, |_, cx| {
+                            cx.open_url("file:///Applications/Tailscale.app");
+                        })))
+                        .child("In Tailscale, follow the setup prompts and sign in. Diri never asks for your Tailscale password.")
+                    })
+                    .when(!self.phone_loading, |view| view.child(surface_button(
+                        if self.phone_setup.is_none() { "Check this Mac" } else { "Check again" }, "phone-check", colors, cx, |this, cx| {
+                            this.phone_loading = true;
+                            this.phone_error = None;
+                            let task = this.runtime.spawn(crate::phone_access::check_tailscale());
+                            cx.spawn(async move |this, cx| {
+                                let state = task.await.unwrap_or(TailscaleSetup::Unavailable);
+                                let _ = this.update(cx, |this, cx| {
+                                    this.phone_loading = false;
+                                    this.phone_setup = Some(state);
+                                    cx.notify();
+                                });
+                            }).detach();
                             cx.notify();
                         }
-                        cx.stop_propagation();
-                    }),
-                )
+                    ))), colors))
+            })
+            .when_some(self.phone_error.clone(), |view, error| view.child(error))
+            .when(self.phone_loading, |view| view.child("Checking your Mac…"))
+            .when(!self.phone_loading && self.phone_access.is_none() && matches!(self.phone_setup, Some(TailscaleSetup::Ready(_))), |view| {
+                view.child(setting_section("2. Connect your iPhone", div().flex().flex_col().gap(px(10.0))
+                    .child("Open Diri on your iPhone. Its setup guide links to Tailscale in the App Store. Sign in there with the same account as this Mac and allow the VPN connection.")
+                    .child("No exit node, Tailscale SSH, port forwarding or other advanced settings are needed.")
+                    .child(settings_primary_button("Enable phone access & show code", "phone-enable", Some("iphone"), cx, |this, _, cx| {
+                    this.phone_loading = true;
+                    this.phone_error = None;
+                    let client = Arc::clone(this.store_runtime.client());
+                    let task = this.runtime.spawn(crate::phone_access::PhoneAccess::start(client));
+                    cx.spawn(async move |this, cx| {
+                        let result = task.await.map_err(|error| error.to_string()).and_then(|result| result);
+                        let _ = this.update(cx, |this, cx| {
+                            this.phone_loading = false;
+                            match result {
+                                Ok(access) => this.phone_access = Some(access),
+                                Err(error) => this.phone_error = Some(error),
+                            }
+                            cx.notify();
+                        });
+                    }).detach();
+                    cx.notify();
+                })), colors))
+            })
+            .when_some(self.phone_access.as_ref(), |view, access| {
+                let size = access.qr.width();
+                let module = (240.0 / (size + 8) as f32).floor();
+                let qr = div().flex().flex_col().p(px(module * 4.0)).bg(gpui::white())
+                    .children((0..size).map(|y| div().flex().children((0..size).map(|x| {
+                        div().w(px(module)).h(px(module)).bg(if access.qr[(x,y)] == qrcode::Color::Dark { gpui::black() } else { gpui::white() })
+                    }))));
+                view.child(if access.is_running() { "Phone access is on" } else { "Phone access stopped. Disable it and enable again." })
+                    .child("In Diri on your iPhone, tap Scan pairing code. We’ll check the connection before saving it.")
+                    .child(div().flex().child(qr))
+                    .child("This code grants control of your sessions. Treat it like a password. Turning access off disconnects all phones; enabling again creates a new code.")
+                    .child(surface_button("Copy pairing link", "phone-copy", colors, cx, |this, cx| {
+                        if let Some(access) = &this.phone_access {
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(access.url.clone()));
+                        }
+                    }))
+                    .child(settings_danger_button("Turn off phone access", "phone-disable", cx, |this, cx| {
+                        this.phone_access = None;
+                        cx.notify();
+                    }))
+            });
+        settings_page("Phone access", content, colors)
+    }
+
+    fn whats_new_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.settings_colors();
+        let content = match &self.release_notes {
+            ReleaseNotesState::Idle | ReleaseNotesState::Loading => div()
+                .id("release-notes-loading")
+                .p(px(16.0))
+                .flex()
+                .items_center()
+                .gap(px(9.0))
+                .text_size(px(Typo::ROW.size))
+                .text_color(colors.secondary)
+                .child(LoadingIndicator::new(
+                    "release-notes-loading-indicator",
+                    14.0,
+                    colors.tertiary,
+                ))
+                .child("Loading the latest release notes…")
+                .into_any_element(),
+            ReleaseNotesState::Failed(error) => div()
+                .id("release-notes-error")
+                .p(px(16.0))
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(16.0))
                 .child(
                     div()
-                        .w(px(SETTINGS_NAV_WIDTH))
-                        .h_full()
-                        .bg(colors.primary.alpha(0.018))
+                        .min_w(px(0.0))
+                        .flex_1()
                         .flex()
                         .flex_col()
+                        .gap(px(3.0))
                         .child(
                             div()
-                                .h(px(Metrics::TITLE_BAR))
-                                .px(px(Metrics::TOOLBAR_EDGE_INSET))
-                                .flex()
-                                .items_center()
-                                .gap(px(Metrics::TOOLBAR_ITEM_GAP))
-                                .child(sf_symbol("gearshape", 15.0, colors.secondary))
-                                .child(
-                                    div()
-                                        .text_size(px(Typo::TITLE.size))
-                                        .font_weight(Typo::TITLE.weight)
-                                        .child("Settings"),
-                                ),
+                                .text_size(px(Typo::ROW_EMPHASIZED.size))
+                                .font_weight(Typo::ROW_EMPHASIZED.weight)
+                                .text_color(colors.primary)
+                                .child("Release notes couldn't be loaded"),
                         )
                         .child(
                             div()
-                                .px(px(Space::INSET))
-                                .pt(px(2.0))
-                                .pb(px(10.0))
-                                .flex_1()
-                                .flex()
-                                .flex_col()
-                                .gap(px(2.0))
-                                .children(tabs),
-                        )
-                        .child(
-                            div()
-                                .px(px(Metrics::TOOLBAR_EDGE_INSET))
-                                .pb(px(10.0))
+                                .whitespace_normal()
                                 .text_size(px(Typo::META.size))
+                                .line_height(px(14.0))
                                 .text_color(colors.tertiary)
-                                .child(format!("diri {}", crate::updates::CURRENT_VERSION)),
+                                .child(wrappable_setting_copy(error.clone().into())),
                         ),
                 )
-                .child(HairlineDivider::vertical(colors))
-                .child(
-                    div()
-                        .relative()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .h_full()
-                        .child(
-                            div()
-                                .id("settings-pane")
-                                .debug_selector(|| "settings-pane".into())
-                                .absolute()
-                                .inset_0()
-                                .overflow_y_scroll()
-                                .child(pane),
-                        )
-                        .child(
-                            div()
-                                .id("close-settings")
-                                .debug_selector(|| "close-settings".into())
-                                .absolute()
-                                .top(px(8.0))
-                                .right(px(Metrics::TOOLBAR_EDGE_INSET))
-                                .size(px(Metrics::TOOLBAR_CONTROL_SIZE))
-                                .rounded(px(Radius::BADGE))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .cursor_pointer()
-                                .hover(move |style| style.bg(Fill::subtle(colors)))
-                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.close_surface(cx);
-                                }))
-                                .child(sf_symbol_weighted(
-                                    "xmark",
-                                    13.5,
-                                    SymbolWeight::Bold,
-                                    colors.secondary,
-                                )),
-                        ),
-                ),
+                .child(surface_button(
+                    "Try Again",
+                    "retry-release-notes",
+                    colors,
+                    cx,
+                    |this, cx| this.refresh_release_notes(cx),
+                ))
+                .into_any_element(),
+            ReleaseNotesState::Loaded { release, document } => {
+                let version = release.tag_name.trim_start_matches('v');
+                let published = release
+                    .published_at
+                    .as_deref()
+                    .and_then(|date| date.split('T').next())
+                    .unwrap_or("Publication date unavailable");
+                div()
+                    .id("release-notes-content")
+                    .debug_selector(|| "release-notes-content".into())
+                    .p(px(16.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(14.0))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(12.0))
+                            .child(
+                                div()
+                                    .text_size(px(Typo::TITLE.size))
+                                    .font_weight(Typo::TITLE.weight)
+                                    .text_color(colors.primary)
+                                    .child(
+                                        release
+                                            .name
+                                            .clone()
+                                            .unwrap_or_else(|| format!("diri {version}")),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_size(px(Typo::META.size))
+                                    .text_color(colors.tertiary)
+                                    .child(format!("Released {published}")),
+                            ),
+                    )
+                    .child(HairlineDivider::horizontal(colors))
+                    .child(crate::markdown_view::render_markdown(document, colors))
+                    .into_any_element()
+            }
+        };
+
+        settings_page(
+            "What's New",
+            setting_section("LATEST RELEASE", content, colors),
+            colors,
         )
     }
 
@@ -1524,7 +2259,12 @@ impl UtilitySurfaces {
                     "New sessions",
                     setting_row(
                         "Default agent",
-                        "Used by ⌘T and Quick Open.",
+                        format!(
+                            "Used by {} and Quick Open.",
+                            crate::commands::command(CommandId::NewDefaultSession)
+                                .shortcut_label()
+                                .unwrap_or_default()
+                        ),
                         self.default_agent_dropdown(cx),
                         colors,
                     ),
@@ -1535,20 +2275,23 @@ impl UtilitySurfaces {
                     div()
                         .flex()
                         .flex_col()
-                        .child(toggle_row(
-                            "Start diri at login",
-                            "Open diri automatically after you sign in.",
-                            self.prefs.start_at_login,
-                            "toggle-login",
-                            colors,
-                            cx,
-                            |this, cx| {
-                                this.prefs.start_at_login = !this.prefs.start_at_login;
-                                this.persist_prefs();
-                                cx.notify();
-                            },
-                        ))
-                        .child(setting_divider(colors))
+                        .when(cfg!(target_os = "macos"), |behavior| {
+                            behavior
+                                .child(toggle_row(
+                                    "Start diri at login",
+                                    "Open diri automatically after you sign in.",
+                                    self.prefs.start_at_login,
+                                    "toggle-login",
+                                    colors,
+                                    cx,
+                                    |this, cx| {
+                                        this.prefs.start_at_login = !this.prefs.start_at_login;
+                                        this.persist_prefs();
+                                        cx.notify();
+                                    },
+                                ))
+                                .child(setting_divider(colors))
+                        })
                         .child(toggle_row(
                             "Confirm before closing a session",
                             "Ask before closing a session with a running process.",
@@ -1580,6 +2323,22 @@ impl UtilitySurfaces {
                     colors,
                 ))
                 .child(self.update_settings(cx))
+                .child(setting_section(
+                    "Support",
+                    setting_row(
+                        "Copy diagnostics",
+                        "Preview a privacy-safe report before copying it.",
+                        surface_button(
+                            "Preview…",
+                            "preview-diagnostics",
+                            colors,
+                            cx,
+                            |this, cx| this.open_diagnostics(cx),
+                        ),
+                        colors,
+                    ),
+                    colors,
+                ))
                 .child(setting_section(
                     "Quick Open",
                     div()
@@ -1630,12 +2389,655 @@ impl UtilitySurfaces {
         )
     }
 
+    fn shortcuts_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.settings_colors();
+        let query = self.shortcut_search.text();
+        let search_content = if self.shortcut_search_active {
+            query_label(&self.shortcut_search)
+        } else if self.shortcut_search.is_empty() {
+            div()
+                .text_color(colors.tertiary)
+                .child("Search shortcuts…")
+                .into_any_element()
+        } else {
+            div()
+                .text_color(colors.primary)
+                .child(query.to_owned())
+                .into_any_element()
+        };
+
+        let search = div()
+            .id("shortcut-search")
+            .debug_selector(|| "shortcut-search".into())
+            .relative()
+            .h(px(34.0))
+            .flex_1()
+            .min_w(px(0.0))
+            .px(px(10.0))
+            .rounded(px(17.0))
+            .border_1()
+            .border_color(colors.primary.alpha(if self.shortcut_search_active {
+                0.22
+            } else {
+                0.10
+            }))
+            .bg(colors.primary.alpha(0.025))
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .cursor(CursorStyle::IBeam)
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.focus_shortcut_search(window, cx);
+            }))
+            .child(sf_symbol("magnifyingglass", 12.0, colors.tertiary))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_size(px(Typo::ROW.size))
+                    .child(search_content),
+            )
+            .when(!self.shortcut_search.is_empty(), |search| {
+                search.child(
+                    div()
+                        .id("clear-shortcut-search")
+                        .debug_selector(|| "clear-shortcut-search".into())
+                        .size(px(18.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_full()
+                        .cursor_pointer()
+                        .hover(move |style| style.bg(Fill::subtle(colors)))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.clear_shortcut_search(window, cx);
+                        }))
+                        .child(sf_symbol("xmark", 8.0, colors.tertiary)),
+                )
+            })
+            .child(sf_symbol("keyboard", 12.0, colors.tertiary));
+
+        let mut groups = div()
+            .debug_selector(|| "shortcut-groups".into())
+            .flex()
+            .flex_col()
+            .gap(px(SETTINGS_SECTION_GAP));
+        let mut found = false;
+        for category in ShortcutCategory::ALL {
+            let commands = COMMANDS
+                .iter()
+                .filter(|command| {
+                    command.id.shortcut_metadata().category == category
+                        && shortcut_matches(command, query, &self.prefs.shortcut_overrides)
+                })
+                .collect::<Vec<_>>();
+            if commands.is_empty() {
+                continue;
+            }
+            found = true;
+            let mut rows = div().flex().flex_col();
+            for (index, command) in commands.into_iter().enumerate() {
+                if index > 0 {
+                    rows = rows.child(setting_divider(colors));
+                }
+                rows = rows.child(shortcut_row(
+                    command,
+                    self.shortcut_editor.as_ref(),
+                    &self.prefs.shortcut_overrides,
+                    colors,
+                    cx,
+                ));
+            }
+            groups = groups.child(setting_section(category.label(), rows, colors));
+        }
+
+        let results = if found {
+            groups.into_any_element()
+        } else {
+            div()
+                .min_h(px(180.0))
+                .rounded(px(Radius::ROW))
+                .border_1()
+                .border_color(colors.primary.alpha(0.065))
+                .bg(colors.primary.alpha(0.02))
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap(px(8.0))
+                .child(sf_symbol("keyboard", 22.0, colors.tertiary))
+                .child(
+                    div()
+                        .text_size(px(Typo::ROW_EMPHASIZED.size))
+                        .font_weight(Typo::ROW_EMPHASIZED.weight)
+                        .text_color(colors.primary)
+                        .child("No shortcuts found"),
+                )
+                .child(
+                    div()
+                        .text_size(px(Typo::META.size))
+                        .text_color(colors.tertiary)
+                        .child("Try an action name, description, or key."),
+                )
+                .into_any_element()
+        };
+
+        let modified_count = self.prefs.shortcut_overrides.len();
+        settings_page(
+            "Keyboard shortcuts",
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(16.0))
+                .child(
+                    div()
+                        .text_size(px(Typo::ROW.size))
+                        .line_height(px(18.0))
+                        .text_color(colors.secondary)
+                        .child(
+                            "Choose an action, then press a new key combination. Changes apply immediately.",
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(10.0))
+                        .child(search)
+                        .when(modified_count > 0, |toolbar| {
+                            toolbar.child(surface_button(
+                                format!("Reset all ({modified_count})"),
+                                "reset-all-shortcuts",
+                                colors,
+                                cx,
+                                |this, cx| this.restore_all_shortcuts(cx),
+                            ))
+                        }),
+                )
+                .child(results),
+            colors,
+        )
+    }
+
+    fn agents_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.settings_colors();
+        let host = self.agents_host.clone();
+        let (catalog, loading, error, hosts) = {
+            let store = self.store.read().expect("session store lock poisoned");
+            (
+                store.agent_catalog(host.as_deref()).cloned(),
+                store.agent_catalog_is_loading(host.as_deref()),
+                store
+                    .agent_catalog_error(host.as_deref())
+                    .map(str::to_owned),
+                store.hosts().to_vec(),
+            )
+        };
+        let mut targets = div().p(px(8.0)).flex().flex_wrap().gap(px(6.0));
+        let mut choices = vec![(
+            None,
+            crate::platform::local_machine_label().to_owned(),
+            "desktopcomputer",
+        )];
+        choices.extend(hosts.iter().map(|entry| {
+            (
+                Some(entry.id.clone()),
+                entry.display_name().to_owned(),
+                "network",
+            )
+        }));
+        for (index, (target, label, symbol)) in choices.into_iter().enumerate() {
+            let selected = target == host;
+            targets = targets.child(
+                div()
+                    .id(format!("agent-target-{index}"))
+                    .h(px(28.0))
+                    .px(px(8.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .rounded(px(Radius::CHIP))
+                    .border_1()
+                    .border_color(colors.primary.alpha(if selected { 0.18 } else { 0.07 }))
+                    .bg(Fill::selected(colors, selected))
+                    .cursor_pointer()
+                    .hover(move |row| row.bg(colors.primary.alpha(0.07)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.agents_host.clone_from(&target);
+                        this.agent_path_editor = None;
+                        this.store
+                            .write()
+                            .expect("session store lock poisoned")
+                            .request_agent_catalog(target.clone(), false);
+                        cx.notify();
+                    }))
+                    .child(sf_symbol(symbol, 10.0, colors.secondary))
+                    .child(div().text_size(px(11.0)).child(label)),
+            );
+        }
+
+        let mut catalog_rows = div().flex().flex_col();
+        if let Some(catalog) = catalog {
+            let agents = crate::agent_catalog::settings_agent_items(catalog.agents);
+            let agent_count = agents.len();
+            for (index, item) in agents.into_iter().enumerate() {
+                catalog_rows = catalog_rows.child(self.agent_settings_row(index, item, colors, cx));
+                if index + 1 < agent_count {
+                    catalog_rows = catalog_rows.child(setting_divider(colors));
+                }
+            }
+        } else if loading {
+            catalog_rows = catalog_rows.child(empty_label("Checking installed Agents…", colors));
+        } else {
+            catalog_rows = catalog_rows.child(empty_label(
+                "Agent detection has not run for this host.",
+                colors,
+            ));
+        }
+        if let Some(error) = error {
+            catalog_rows = catalog_rows.child(
+                div()
+                    .px(px(12.0))
+                    .py(px(9.0))
+                    .whitespace_normal()
+                    .text_size(px(11.0))
+                    .text_color(Ink::DANGER)
+                    .child(error),
+            );
+        }
+        if let Some(editor) = &self.agent_path_editor {
+            catalog_rows = catalog_rows.child(self.agent_path_editor_row(editor, colors, cx));
+        }
+
+        let refresh_host = host.clone();
+        settings_page(
+            "Agents",
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(SETTINGS_SECTION_GAP))
+                .child(setting_section("Execution target", targets, colors))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_size(px(10.0))
+                                .text_color(colors.tertiary)
+                                .child("Detected from the account login PATH."),
+                        )
+                        .child(surface_button(
+                            if loading { "Checking…" } else { "Refresh" },
+                            "refresh-agent-catalog",
+                            colors,
+                            cx,
+                            move |this, cx| {
+                                this.store
+                                    .write()
+                                    .expect("session store lock poisoned")
+                                    .request_agent_catalog(refresh_host.clone(), true);
+                                cx.notify();
+                            },
+                        )),
+                )
+                .child(setting_section("Supported Agents", catalog_rows, colors)),
+            colors,
+        )
+    }
+
+    fn agent_settings_row(
+        &self,
+        index: usize,
+        item: diri_proto::AgentReadinessItem,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let label = item
+            .descriptor
+            .as_ref()
+            .map(|descriptor| descriptor.display_name.clone())
+            .filter(|label| !label.is_empty())
+            .unwrap_or_else(|| item.kind.id().to_owned());
+        let path = item.path.clone().unwrap_or_else(|| "Not found".into());
+        let status = match item.path_source {
+            Some(diri_proto::AgentPathSource::Manual) => "Manual",
+            Some(diri_proto::AgentPathSource::SystemPath) => "Installed",
+            None => "Not found",
+        };
+        let status_color = if item.available() {
+            Ink::FRESH
+        } else {
+            colors.tertiary
+        };
+        let host = self.agents_host.clone();
+        let toggle_kind = item.kind.clone();
+        let toggle_path = item.configured_path.clone();
+        let show = item.show_in_quick_create;
+        let mut actions = div().flex_none().flex().items_center().gap(px(6.0));
+        if item.available() {
+            actions = actions.child(
+                div()
+                    .id(format!("agent-quick-toggle-{index}"))
+                    .h(px(24.0))
+                    .px(px(7.0))
+                    .rounded(px(Radius::CHIP))
+                    .bg(if show {
+                        Ink::FRESH.alpha(0.12)
+                    } else {
+                        colors.primary.alpha(0.06)
+                    })
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.store
+                            .write()
+                            .expect("session store lock poisoned")
+                            .configure_agent(diri_proto::AgentConfigureParams {
+                                host: host.clone(),
+                                kind: toggle_kind.clone(),
+                                executable_path: toggle_path.clone(),
+                                show_in_quick_create: !show,
+                            });
+                        cx.notify();
+                    }))
+                    .flex()
+                    .items_center()
+                    .gap(px(4.0))
+                    .child(sf_symbol(
+                        if show {
+                            "checkmark.circle.fill"
+                        } else {
+                            "circle"
+                        },
+                        10.0,
+                        if show { Ink::FRESH } else { colors.tertiary },
+                    ))
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(colors.secondary)
+                            .child("Quick"),
+                    ),
+            );
+        }
+        if let Some(url) = item
+            .descriptor
+            .as_ref()
+            .and_then(|descriptor| descriptor.setup.as_ref())
+            .and_then(|setup| setup.url.as_deref())
+            .and_then(crate::agent_catalog::normal_web_url)
+        {
+            actions = actions.child(
+                div()
+                    .id(format!("agent-website-{index}"))
+                    .size(px(24.0))
+                    .rounded(px(Radius::CHIP))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .hover(move |button| button.bg(colors.primary.alpha(0.07)))
+                    .on_click(move |_, _, cx| cx.open_url(&url))
+                    .child(sf_symbol("arrow.up.right.square", 10.0, colors.secondary)),
+            );
+        }
+        let edit_kind = item.kind.clone();
+        let edit_path = item.configured_path.clone().unwrap_or_default();
+        let edit_host = self.agents_host.clone();
+        let edit_show = !item.available() || item.show_in_quick_create;
+        actions = actions.child(
+            div()
+                .id(format!("agent-bind-{index}"))
+                .h(px(24.0))
+                .px(px(7.0))
+                .rounded(px(Radius::CHIP))
+                .bg(colors.primary.alpha(0.06))
+                .cursor_pointer()
+                .hover(move |button| button.bg(colors.primary.alpha(0.09)))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    if edit_host.is_none() {
+                        let paths = cx.prompt_for_paths(PathPromptOptions {
+                            files: true,
+                            directories: false,
+                            multiple: false,
+                            prompt: Some("Choose Agent Executable".into()),
+                        });
+                        let kind = edit_kind.clone();
+                        cx.spawn_in(window, async move |this, cx| {
+                            let Ok(Ok(Some(mut paths))) = paths.await else {
+                                return;
+                            };
+                            let Some(path) = paths.pop() else {
+                                return;
+                            };
+                            let _ = this.update_in(cx, |this, _, cx| {
+                                this.store
+                                    .write()
+                                    .expect("session store lock poisoned")
+                                    .configure_agent(diri_proto::AgentConfigureParams {
+                                        host: None,
+                                        kind: kind.clone(),
+                                        executable_path: Some(path.to_string_lossy().into_owned()),
+                                        show_in_quick_create: edit_show,
+                                    });
+                                cx.notify();
+                            });
+                        })
+                        .detach();
+                    } else {
+                        this.agent_path_editor = Some(AgentPathEditor {
+                            kind: edit_kind.clone(),
+                            host: edit_host.clone(),
+                            path: text_editor(&edit_path),
+                            show_in_quick_create: edit_show,
+                            error: None,
+                        });
+                        cx.notify();
+                    }
+                }))
+                .flex()
+                .items_center()
+                .child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(colors.secondary)
+                        .child(if item.available() { "Change" } else { "Add…" }),
+                ),
+        );
+        if item.configured_path.is_some() {
+            let reset_host = self.agents_host.clone();
+            let reset_kind = item.kind.clone();
+            let reset_show = item.show_in_quick_create;
+            actions = actions.child(
+                div()
+                    .id(format!("agent-reset-{index}"))
+                    .size(px(24.0))
+                    .rounded(px(Radius::CHIP))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .hover(move |button| button.bg(colors.primary.alpha(0.07)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.store
+                            .write()
+                            .expect("session store lock poisoned")
+                            .configure_agent(diri_proto::AgentConfigureParams {
+                                host: reset_host.clone(),
+                                kind: reset_kind.clone(),
+                                executable_path: None,
+                                show_in_quick_create: reset_show,
+                            });
+                        cx.notify();
+                    }))
+                    .child(sf_symbol("arrow.uturn.backward", 10.0, colors.secondary)),
+            );
+        }
+
+        div()
+            .id(format!("agent-settings-row-{index}"))
+            .min_h(px(58.0))
+            .px(px(12.0))
+            .py(px(8.0))
+            .flex()
+            .items_center()
+            .gap(px(10.0))
+            .child(AgentLogo::new(ui_agent(&item.kind), 22.0, colors).badged(false))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(colors.primary)
+                                    .child(label),
+                            )
+                            .child(colored_status_badge(status, status_color)),
+                    )
+                    .child(
+                        div()
+                            .min_w(px(0.0))
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .text_size(px(10.0))
+                            .text_color(if item.error.is_some() {
+                                Ink::DANGER
+                            } else {
+                                colors.tertiary
+                            })
+                            .child(item.error.unwrap_or(path)),
+                    ),
+            )
+            .child(actions)
+            .into_any_element()
+    }
+
+    fn agent_path_editor_row(
+        &self,
+        editor: &AgentPathEditor,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut row = div()
+            .px(px(12.0))
+            .py(px(10.0))
+            .border_t_1()
+            .border_color(colors.primary.alpha(0.06))
+            .flex()
+            .flex_col()
+            .gap(px(7.0))
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(colors.secondary)
+                    .child("Remote executable path (absolute or ~/…)"),
+            )
+            .child(
+                div()
+                    .h(px(30.0))
+                    .px(px(8.0))
+                    .rounded(px(Radius::CHIP))
+                    .border_1()
+                    .border_color(colors.primary.alpha(0.14))
+                    .flex()
+                    .items_center()
+                    .text_size(px(11.0))
+                    .text_color(colors.primary)
+                    .child(query_label(&editor.path)),
+            );
+        if let Some(error) = &editor.error {
+            row = row.child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(Ink::DANGER)
+                    .child(error.clone()),
+            );
+        }
+        row.child(
+            div()
+                .flex()
+                .justify_end()
+                .gap(px(7.0))
+                .child(surface_button(
+                    "Cancel",
+                    "cancel-agent-path",
+                    colors,
+                    cx,
+                    |this, cx| {
+                        this.agent_path_editor = None;
+                        cx.notify();
+                    },
+                ))
+                .child(surface_button(
+                    "Save Path",
+                    "save-agent-path",
+                    colors,
+                    cx,
+                    |this, cx| {
+                        let Some(editor) = &this.agent_path_editor else {
+                            return;
+                        };
+                        let path = editor.path.text().trim();
+                        if path.is_empty() {
+                            if let Some(editor) = &mut this.agent_path_editor {
+                                editor.error = Some("Enter an executable path.".into());
+                            }
+                            cx.notify();
+                            return;
+                        }
+                        this.store
+                            .write()
+                            .expect("session store lock poisoned")
+                            .configure_agent(diri_proto::AgentConfigureParams {
+                                host: editor.host.clone(),
+                                kind: editor.kind.clone(),
+                                executable_path: Some(path.to_owned()),
+                                show_in_quick_create: editor.show_in_quick_create,
+                            });
+                        this.agent_path_editor = None;
+                        cx.notify();
+                    },
+                )),
+        )
+        .into_any_element()
+    }
+
     fn default_agent_dropdown(&self, cx: &mut Context<Self>) -> AnyElement {
         let colors = self.settings_colors();
-        let selected = self.prefs.default_agent;
+        let selected = self.prefs.default_agent.clone();
+        let agents = {
+            let store = self.store.read().expect("session store lock poisoned");
+            // The default agent is a global preference repaired against the
+            // local catalog (see set_agent_catalog); listing the default spawn
+            // host's catalog instead would let a remote host's thinner install
+            // set — or its not-yet-fetched catalog — shrink the choices.
+            crate::agent_catalog::installed_agent_options(store.agent_catalog(None))
+        };
+        let selected_label = agents
+            .iter()
+            .find(|agent| agent.kind == selected)
+            .map(|agent| agent.display_name.clone())
+            .unwrap_or_else(|| crate::agent_catalog::title_case_id(selected.id()));
         let open = self.settings_menu == Some(SettingsMenu::DefaultAgent);
         let trigger = settings_select_button(
-            default_agent_label(selected),
+            selected_label,
             "default-agent-dropdown",
             open,
             SettingsMenu::DefaultAgent,
@@ -1646,13 +3048,15 @@ impl UtilitySurfaces {
         let mut control = div().relative().min_w(px(154.0)).child(trigger);
         if open {
             let mut options = div().p(px(4.0)).flex().flex_col();
-            for (index, agent) in DefaultAgent::ALL.into_iter().enumerate() {
-                let is_selected = agent == selected;
+            for (index, option) in agents.into_iter().enumerate() {
+                let is_selected = option.kind == selected;
+                let agent = option.kind.clone();
                 options = options.child(
                     div()
                         .id(SharedString::from(format!("default-agent-option-{index}")))
-                        .h(px(Metrics::ROW_HEIGHT))
+                        .min_h(px(Metrics::ROW_HEIGHT))
                         .px(px(8.0))
+                        .py(px(5.0))
                         .flex()
                         .items_center()
                         .gap(px(8.0))
@@ -1661,18 +3065,21 @@ impl UtilitySurfaces {
                         .cursor_pointer()
                         .hover(move |style| style.bg(colors.primary.alpha(0.08)))
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.prefs.default_agent = agent;
+                            this.prefs.default_agent = agent.clone();
                             this.settings_menu = None;
                             this.persist_prefs();
                             cx.notify();
                         }))
-                        .child(AgentLogo::new(ui_default_agent(agent), 16.0, colors).badged(false))
+                        .child(AgentLogo::new(ui_agent(&option.kind), 16.0, colors).badged(false))
                         .child(
                             div()
+                                .min_w_0()
                                 .flex_1()
+                                .flex()
+                                .flex_col()
                                 .text_size(px(Typo::ROW.size))
                                 .text_color(colors.primary)
-                                .child(default_agent_label(agent)),
+                                .child(option.display_name),
                         )
                         .when(is_selected, |row| {
                             row.child(sf_symbol_weighted(
@@ -1754,8 +3161,8 @@ impl UtilitySurfaces {
         }
         if !unsupported {
             rows = rows.child(setting_divider(colors)).child(toggle_row(
-                "Check automatically",
-                "Look for new releases in the background.",
+                "Update automatically",
+                "Download verified GitHub releases and install when diri quits.",
                 self.prefs.automatic_updates,
                 "toggle-automatic-updates",
                 colors,
@@ -1775,95 +3182,191 @@ impl UtilitySurfaces {
     fn terminal_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = self.settings_colors();
         let selected = theme(&self.prefs.terminal_theme);
+        let can_make_smaller = self.prefs.terminal_font_size > 10.0;
+        let can_make_larger = self.prefs.terminal_font_size < 20.0;
         let font_control = div()
-            .h(px(28.0))
-            .rounded(px(Radius::BADGE))
+            .h(px(32.0))
+            .rounded(px(Radius::ROW))
             .border_1()
-            .border_color(colors.primary.alpha(0.11))
-            .bg(colors.primary.alpha(0.045))
+            .border_color(colors.primary.alpha(0.12))
+            .bg(colors.primary.alpha(0.04))
+            .overflow_hidden()
             .flex()
             .items_center()
             .child(
                 div()
                     .id("font-smaller")
-                    .w(px(30.0))
+                    .w(px(34.0))
                     .h_full()
                     .flex()
                     .items_center()
                     .justify_center()
-                    .text_size(px(15.0))
-                    .cursor_pointer()
-                    .hover(move |style| style.bg(colors.primary.alpha(0.08)))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.prefs.zoom_terminal(-1.0);
-                        this.persist_prefs();
-                        cx.notify();
-                    }))
+                    .text_size(px(16.0))
+                    .text_color(if can_make_smaller {
+                        colors.primary
+                    } else {
+                        colors.tertiary
+                    })
+                    .when(can_make_smaller, |button| {
+                        button
+                            .cursor_pointer()
+                            .hover(move |style| style.bg(colors.primary.alpha(0.08)))
+                            .active(move |style| style.bg(colors.primary.alpha(0.12)))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.prefs.zoom_terminal(-1.0);
+                                this.persist_prefs();
+                                cx.notify();
+                            }))
+                    })
                     .child("−"),
             )
             .child(HairlineDivider::vertical(colors))
             .child(
                 div()
-                    .w(px(52.0))
+                    .w(px(58.0))
                     .flex()
                     .items_center()
                     .justify_center()
                     .font_family(crate::fonts::mono_family())
                     .text_size(px(11.0))
-                    .text_color(colors.secondary)
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(colors.primary)
                     .child(format!("{:.0} pt", self.prefs.terminal_font_size)),
             )
             .child(HairlineDivider::vertical(colors))
             .child(
                 div()
                     .id("font-larger")
-                    .w(px(30.0))
+                    .w(px(34.0))
                     .h_full()
                     .flex()
                     .items_center()
                     .justify_center()
-                    .text_size(px(15.0))
-                    .cursor_pointer()
-                    .hover(move |style| style.bg(colors.primary.alpha(0.08)))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.prefs.zoom_terminal(1.0);
-                        this.persist_prefs();
-                        cx.notify();
-                    }))
+                    .text_size(px(16.0))
+                    .text_color(if can_make_larger {
+                        colors.primary
+                    } else {
+                        colors.tertiary
+                    })
+                    .when(can_make_larger, |button| {
+                        button
+                            .cursor_pointer()
+                            .hover(move |style| style.bg(colors.primary.alpha(0.08)))
+                            .active(move |style| style.bg(colors.primary.alpha(0.12)))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.prefs.zoom_terminal(1.0);
+                                this.persist_prefs();
+                                cx.notify();
+                            }))
+                    })
                     .child("+"),
             );
 
-        settings_page(
-            "Terminal",
+        let choices = div().w_full().flex().gap(px(12.0)).children(
+            [(0, "System"), (1, "Light"), (2, "Dark")]
+                .into_iter()
+                .map(|(index, label)| {
+                    let active = if index == 0 {
+                        self.prefs.follow_system_theme
+                    } else {
+                        !self.prefs.follow_system_theme
+                            && (selected.appearance == ThemeAppearance::Light) == (index == 1)
+                    };
+                    appearance_mode_card(index, label, active, colors, cx).into_any_element()
+                }),
+        );
+        let hex = |color: gpui::Rgba| {
+            format!(
+                "#{:02X}{:02X}{:02X}",
+                (color.r * 255.0).round() as u8,
+                (color.g * 255.0).round() as u8,
+                (color.b * 255.0).round() as u8
+            )
+        };
+        let swatch = |color: gpui::Rgba| {
+            let ink = if color.r * 0.2126 + color.g * 0.7152 + color.b * 0.0722 > 0.5 {
+                rgba(0x202020ff)
+            } else {
+                rgba(0xf5f5f5ff)
+            };
+            div()
+                .h(px(30.0))
+                .w(px(148.0))
+                .px(px(10.0))
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .rounded(px(9.0))
+                .bg(color)
+                .border_1()
+                .border_color(colors.primary.alpha(0.12))
+                .child(
+                    div()
+                        .size(px(12.0))
+                        .rounded_full()
+                        .border_1()
+                        .border_color(ink.alpha(0.3)),
+                )
+                .child(div().text_size(px(12.0)).text_color(ink).child(hex(color)))
+        };
+        appearance_settings_page(
             div()
                 .flex()
                 .flex_col()
-                .gap(px(SETTINGS_SECTION_GAP))
-                .child(setting_section(
-                    "Appearance",
+                .gap(px(18.0))
+                .child(
                     div()
+                        .text_size(px(13.0))
+                        .text_color(colors.primary)
+                        .child("Theme"),
+                )
+                .child(choices)
+                .child(appearance_diff_preview(
+                    selected,
+                    self.prefs.terminal_font_size,
+                ))
+                .child(
+                    div()
+                        .rounded(px(16.0))
+                        .border_1()
+                        .border_color(colors.primary.alpha(0.08))
+                        .bg(colors.primary.alpha(0.035))
+                        .px(px(16.0))
                         .flex()
                         .flex_col()
-                        .child(setting_row(
+                        .child(appearance_setting_row(
                             "Color theme",
-                            "Applies immediately across the app and every open terminal.",
                             self.terminal_theme_dropdown(cx),
                             colors,
                         ))
-                        .child(setting_divider(colors))
-                        .child(div().p(px(12.0)).child(theme_preview(selected, colors))),
-                    colors,
-                ))
-                .child(setting_section(
-                    "Text",
-                    setting_row(
-                        "Font size",
-                        "Adjust terminal text without changing the rest of the app.",
-                        font_control,
-                        colors,
-                    ),
-                    colors,
-                )),
+                        .child(appearance_divider(colors))
+                        .child(appearance_setting_row(
+                            "Background",
+                            swatch(selected.background),
+                            colors,
+                        ))
+                        .child(appearance_divider(colors))
+                        .child(appearance_setting_row(
+                            "Foreground",
+                            swatch(selected.foreground),
+                            colors,
+                        ))
+                        .child(appearance_divider(colors))
+                        .child(appearance_setting_row(
+                            "Code font",
+                            div()
+                                .text_size(px(12.0))
+                                .text_color(colors.secondary)
+                                .child(crate::fonts::mono_family()),
+                            colors,
+                        ))
+                        .child(appearance_divider(colors))
+                        .child(appearance_setting_row(
+                            "Code font size",
+                            font_control,
+                            colors,
+                        )),
+                ),
             colors,
         )
     }
@@ -1883,14 +3386,14 @@ impl UtilitySurfaces {
                         .flex_col()
                         .child(setting_row(
                             "Hibernate idle sessions",
-                            "Freeze inactive sessions after this amount of time.",
+                            "Freeze a session once it has sat idle, with no output or CPU activity, for this long.",
                             self.hibernate_dropdown(cx),
                             colors,
                         ))
                         .child(setting_divider(colors))
                         .child(setting_row(
                             "Memory limit",
-                            "Freeze an individual session when it reaches this size.",
+                            "Freeze an idle session when its process tree reaches this size.",
                             self.memory_dropdown(cx),
                             colors,
                         )),
@@ -2457,7 +3960,7 @@ impl UtilitySurfaces {
         if let Some(error) = &editor.error {
             form = form.child(
                 div()
-                    .px(px(10.0))
+                    .px(px(HOST_FIELD_HORIZONTAL_PADDING))
                     .py(px(8.0))
                     .rounded(px(Radius::BADGE))
                     .bg(Ink::DANGER.alpha(0.08))
@@ -2602,8 +4105,15 @@ impl UtilitySurfaces {
             .host_editor
             .as_ref()
             .is_some_and(|host_editor| host_editor.active_field == field);
-        let value = host_field_value(editor, placeholder, active, field, colors);
-        let bounds_slot = Rc::clone(&self.host_field_bounds[field.index()]);
+        let bounds_slot = Rc::new(Cell::new(None));
+        let value = host_field_value(
+            editor,
+            placeholder,
+            active,
+            field,
+            colors,
+            Rc::clone(&bounds_slot),
+        );
         div()
             .min_w(px(0.0))
             .flex()
@@ -2624,7 +4134,7 @@ impl UtilitySurfaces {
                     .relative()
                     .min_w(px(0.0))
                     .h(px(34.0))
-                    .px(px(10.0))
+                    .px(px(HOST_FIELD_HORIZONTAL_PADDING))
                     .rounded(px(Radius::BADGE))
                     .border_1()
                     .border_color(colors.primary.alpha(if active { 0.26 } else { 0.11 }))
@@ -2638,10 +4148,10 @@ impl UtilitySurfaces {
                     .cursor(CursorStyle::IBeam)
                     .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                         this.select_host_field(field, window, cx);
-                        let Some(bounds) = this.host_field_bounds[field.index()].get() else {
+                        let Some(bounds) = bounds_slot.get() else {
                             return;
                         };
-                        let x = (event.position().x - bounds.left() - px(10.0)).max(px(0.0));
+                        let x = (event.position().x - bounds.left()).max(px(0.0));
                         let offset = this.host_editor.as_ref().map_or(0, |editor| {
                             text_offset_for_x(editor.field(field).text(), x, window, colors)
                         });
@@ -2653,14 +4163,6 @@ impl UtilitySurfaces {
                         cx.notify();
                     }))
                     .child(value)
-                    .child(
-                        canvas(
-                            move |bounds, _, _| bounds_slot.set(Some(bounds)),
-                            |_, _, _, _| {},
-                        )
-                        .absolute()
-                        .inset_0(),
-                    )
             })
     }
 
@@ -2719,6 +4221,7 @@ impl UtilitySurfaces {
                                 .cursor_pointer()
                                 .hover(move |style| style.bg(colors.primary.alpha(0.08)))
                                 .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.prefs.follow_system_theme = false;
                                     this.prefs.terminal_theme = candidate.id.to_owned();
                                     this.settings_menu = None;
                                     this.persist_prefs();
@@ -2764,12 +4267,13 @@ impl UtilitySurfaces {
     }
 
     fn hibernate_dropdown(&self, cx: &mut Context<Self>) -> AnyElement {
-        const OPTIONS: [(u32, &str); 5] = [
+        const OPTIONS: [(u32, &str); 6] = [
             (0, "Off"),
-            (5, "5 minutes"),
             (15, "15 minutes"),
             (30, "30 minutes"),
             (60, "1 hour"),
+            (120, "2 hours"),
+            (240, "4 hours"),
         ];
         let colors = self.settings_colors();
         let selected_label = OPTIONS
@@ -2814,7 +4318,7 @@ impl UtilitySurfaces {
     }
 
     fn memory_dropdown(&self, cx: &mut Context<Self>) -> AnyElement {
-        const OPTIONS: [u64; 4] = [2, 4, 6, 8];
+        const OPTIONS: [u64; 6] = [4, 8, 16, 32, 64, 128];
         let colors = self.settings_colors();
         let open = self.settings_menu == Some(SettingsMenu::MemoryLimit);
         let mut control = div()
@@ -2850,6 +4354,168 @@ impl UtilitySurfaces {
         }
         control.into_any_element()
     }
+
+    fn render_diagnostics(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.settings_colors();
+        let report = self.diagnostics_report.clone().unwrap_or_else(|| {
+            "Diagnostics are not available yet. Close this preview and try again.".to_owned()
+        });
+        FloatingSurface::new(
+            colors,
+            div()
+                .id("diagnostics-preview")
+                .debug_selector(|| "diagnostics-preview".into())
+                .w(px(620.0))
+                .h(px(500.0))
+                .flex()
+                .flex_col()
+                .overflow_hidden()
+                .child(
+                    div()
+                        .h(px(54.0))
+                        .px(px(16.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .gap(px(10.0))
+                        .child(sf_symbol("stethoscope", 15.0, colors.secondary))
+                        .child(
+                            div()
+                                .min_w(px(0.0))
+                                .flex_1()
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.0))
+                                .child(
+                                    div()
+                                        .text_size(px(Typo::TITLE.size))
+                                        .font_weight(Typo::TITLE.weight)
+                                        .child("Copy Diagnostics"),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(Typo::META.size))
+                                        .text_color(colors.tertiary)
+                                        .child("This is the exact text that will be copied."),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("close-diagnostics")
+                                .size(px(Metrics::TOOLBAR_CONTROL_SIZE))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(Radius::BADGE))
+                                .cursor_pointer()
+                                .hover(move |style| style.bg(Fill::subtle(colors)))
+                                .child(sf_symbol_weighted(
+                                    "xmark",
+                                    13.5,
+                                    SymbolWeight::Bold,
+                                    colors.secondary,
+                                ))
+                                .on_click(cx.listener(|this, _, _, cx| this.close_surface(cx))),
+                        ),
+                )
+                .child(HairlineDivider::horizontal(colors))
+                .child(
+                    div()
+                        .id("diagnostics-report-scroll")
+                        .min_h(px(0.0))
+                        .flex_1()
+                        .overflow_y_scroll()
+                        .p(px(16.0))
+                        .child(
+                            div()
+                                .w_full()
+                                .p(px(14.0))
+                                .rounded(px(Radius::CARD))
+                                .bg(colors.primary.alpha(0.035))
+                                .border_1()
+                                .border_color(colors.primary.alpha(0.065))
+                                .font_family(crate::fonts::mono_family())
+                                .text_size(px(11.0))
+                                .line_height(px(17.0))
+                                .text_color(colors.secondary)
+                                .whitespace_normal()
+                                .child(wrappable_setting_copy(report.clone().into())),
+                        ),
+                )
+                .child(HairlineDivider::horizontal(colors))
+                .child(
+                    div()
+                        .px(px(16.0))
+                        .h(px(62.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .max_w(px(390.0))
+                                .text_size(px(Typo::META.size))
+                                .text_color(colors.tertiary)
+                                .child("Diagnostics exclude terminal content and paths by design. Review them before posting anyway."),
+                        )
+                        .child(
+                            div()
+                                .id("copy-diagnostics")
+                                .h(px(32.0))
+                                .px(px(12.0))
+                                .flex()
+                                .items_center()
+                                .gap(px(7.0))
+                                .rounded(px(Radius::ROW))
+                                .cursor_pointer()
+                                .bg(colors.primary.alpha(0.10))
+                                .hover(move |button| button.bg(colors.primary.alpha(0.14)))
+                                .text_size(px(Typo::ROW_EMPHASIZED.size))
+                                .font_weight(Typo::ROW_EMPHASIZED.weight)
+                                .child(sf_symbol("doc.on.doc", 12.0, colors.secondary))
+                                .child("Copy report")
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                        report.clone(),
+                                    ));
+                                })),
+                        ),
+                ),
+        )
+    }
+}
+
+fn build_diagnostics_report(store: &SessionStore) -> String {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/nonexistent"));
+    let platform = crate::diagnostics::PlatformMetadata::current();
+    let active_host_ids = store
+        .sessions()
+        .values()
+        .filter_map(|session| session.host.clone())
+        .collect::<HashSet<_>>();
+    // The report describes this Mac; remote hosts appear via their sessions.
+    let empty_catalog = diri_proto::AgentReadinessResult::default();
+    let local_catalog = store.agent_catalog(None).unwrap_or(&empty_catalog);
+    crate::diagnostics::DiagnosticsReport::generate(crate::diagnostics::DiagnosticsInput {
+        app_version: crate::updates::CURRENT_VERSION,
+        app_build: option_env!("DIRI_BUILD_ID").unwrap_or(env!("CARGO_PKG_VERSION")),
+        update_channel: if cfg!(debug_assertions) {
+            "development"
+        } else {
+            "stable"
+        },
+        platform: &platform,
+        daemon_state: store.daemon_state(),
+        daemon_identity: store.daemon_identity(),
+        agents: local_catalog,
+        hosts: store.hosts(),
+        active_host_ids: &active_host_ids,
+        storage_reachable: crate::diagnostics::storage_reachable(&home),
+    })
+    .as_str()
+    .to_owned()
 }
 
 impl Focusable for UtilitySurfaces {
@@ -2860,34 +4526,31 @@ impl Focusable for UtilitySurfaces {
 
 impl Render for UtilitySurfaces {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Worktree delegation starts in the sidebar, so that one surface
+        // deliberately leaves the visible sidebar interactive. The shaded
+        // workspace and sheet remain modal once the pointer crosses the seam.
+        let leave_sidebar_exposed =
+            self.surface == Surface::Worktrees && self.prefs.sidebar_visible;
+        let sidebar_width = self.prefs.sidebar_width;
         let overlay = match self.surface {
             Surface::None => None,
-            Surface::History => Some(self.render_history(cx).into_any_element()),
             Surface::Worktrees => Some(self.render_worktrees(cx).into_any_element()),
             Surface::Settings => Some(self.render_settings(cx).into_any_element()),
+            Surface::Diagnostics => Some(self.render_diagnostics(cx).into_any_element()),
         };
         let root = div()
             .id("utility-surfaces")
             .track_focus(&self.focus)
-            .key_context("Diri")
+            .key_context(UTILITY_CONTEXT)
             .on_key_down(cx.listener(Self::key_down))
-            .on_action(cx.listener(|this, _: &ToggleHistory, _, cx| {
-                if this.surface == Surface::History {
-                    this.close_surface(cx);
-                } else {
-                    this.open_history(cx);
-                }
-            }))
             .on_action(cx.listener(|this, _: &OpenWorktrees, _, cx| {
                 this.open_worktrees(cx);
             }))
             .on_action(cx.listener(|this, _: &OpenSettings, _, cx| {
-                this.open_settings(cx);
+                this.toggle_settings(cx);
+                cx.stop_propagation();
             }))
             .on_action(cx.listener(|this, _: &CloseSurface, _, cx| this.close_surface(cx)))
-            .on_action(cx.listener(|this, _: &MoveUp, _, cx| this.move_history(-1, cx)))
-            .on_action(cx.listener(|this, _: &MoveDown, _, cx| this.move_history(1, cx)))
-            .on_action(cx.listener(|this, _: &Activate, _, cx| this.activate_history(cx)))
             .absolute()
             // Cached entity roots are laid out independently, so insets alone
             // leave this absolute root without a definite size: its height
@@ -2897,33 +4560,54 @@ impl Render for UtilitySurfaces {
             .size_full()
             .text_color(self.colors().primary);
         if let Some(overlay) = overlay {
-            root.inset_0().child(
-                div()
-                    .absolute()
-                    .inset_0()
-                    .debug_selector(|| "surface-backdrop".into())
-                    // The modal backdrop dismisses the topmost surface while
-                    // still protecting terminal selection and scrollback.
-                    .occlude()
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| {
-                            this.close_surface(cx);
-                            cx.stop_propagation();
-                        }),
-                    )
-                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-                    .bg(rgba(0x00000040))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        div()
-                            .occlude()
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                            .child(overlay),
-                    ),
-            )
+            if self.surface == Surface::Settings {
+                root.inset_0().child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .debug_selector(|| "surface-backdrop".into())
+                        .occlude()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                        .bg(self.colors().background)
+                        .child(overlay),
+                )
+            } else {
+                root.inset_0().child(
+                    div()
+                        .absolute()
+                        .when(leave_sidebar_exposed, |backdrop| {
+                            backdrop
+                                .top(px(0.0))
+                                .right(px(0.0))
+                                .bottom(px(0.0))
+                                .left(px(sidebar_width))
+                        })
+                        .when(!leave_sidebar_exposed, |backdrop| backdrop.inset_0())
+                        .debug_selector(|| "surface-backdrop".into())
+                        // Modal sheets still dismiss from their backdrop;
+                        // Settings is the full workbench branch above.
+                        .occlude()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.close_surface(cx);
+                                cx.stop_propagation();
+                            }),
+                        )
+                        .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                        .bg(rgba(0x00000040))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            div()
+                                .occlude()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .child(overlay),
+                        ),
+                )
+            }
         } else {
             root.size(px(0.0))
         }
@@ -3016,6 +4700,7 @@ fn host_field_value(
     active: bool,
     field: HostFormField,
     colors: SemanticColors,
+    bounds_slot: Rc<Cell<Option<Bounds<Pixels>>>>,
 ) -> AnyElement {
     let debug_name = field.debug_name();
     let content = if active {
@@ -3033,17 +4718,27 @@ fn host_field_value(
         div().child(editor.text().to_owned()).into_any_element()
     };
     div()
+        .debug_selector(move || format!("HOST_FIELD_TEXT_{debug_name}"))
+        .relative()
         .min_w(px(0.0))
         .w_full()
         .overflow_hidden()
         .whitespace_nowrap()
         .text_ellipsis()
         .child(content)
+        .child(
+            canvas(
+                move |bounds, _, _| bounds_slot.set(Some(bounds)),
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .inset_0(),
+        )
         .into_any_element()
 }
 
 fn text_offset_for_x(text: &str, x: Pixels, window: &Window, colors: SemanticColors) -> usize {
-    if text.is_empty() {
+    if text.is_empty() || x <= px(0.0) {
         return 0;
     }
     let run = TextRun {
@@ -3166,6 +4861,237 @@ fn setting_row(
         .child(control)
 }
 
+fn shortcut_matches(
+    command: &crate::commands::CommandSpec,
+    query: &str,
+    overrides: &crate::commands::ShortcutOverrides,
+) -> bool {
+    let query = query.trim().to_ascii_lowercase();
+    if query.is_empty() {
+        return true;
+    }
+    let metadata = command.id.shortcut_metadata();
+    let searchable = format!(
+        "{} {} {} {} {}",
+        metadata.title,
+        metadata.description,
+        metadata.category.label(),
+        command.stable_id,
+        command.shortcut_label_for(overrides).unwrap_or_default()
+    )
+    .to_ascii_lowercase();
+    query
+        .split_whitespace()
+        .all(|word| searchable.contains(word))
+}
+
+fn shortcut_row(
+    command: &'static crate::commands::CommandSpec,
+    editor: Option<&ShortcutEditor>,
+    overrides: &crate::commands::ShortcutOverrides,
+    colors: SemanticColors,
+    cx: &mut Context<UtilitySurfaces>,
+) -> AnyElement {
+    let metadata = command.id.shortcut_metadata();
+    let editing = editor.is_some_and(|editor| editor.command == command.id);
+    let error = editor
+        .filter(|editor| editor.command == command.id)
+        .and_then(|editor| editor.error.as_deref());
+    let assignment = command.shortcut_label_for(overrides);
+    let modified = command.is_overridden(overrides);
+    let command_id = command.id;
+    let binding_label: SharedString = if editing {
+        "Press keys…".into()
+    } else {
+        spaced_shortcut_label(assignment.as_deref().unwrap_or("Unassigned")).into()
+    };
+    let detail: SharedString = error.unwrap_or(metadata.description).to_owned().into();
+
+    let binding = div()
+        .id(SharedString::from(format!(
+            "shortcut-binding-{}",
+            command.stable_id
+        )))
+        .debug_selector({
+            let stable_id = command.stable_id;
+            move || format!("SHORTCUT_BINDING_{stable_id}")
+        })
+        .h(px(31.0))
+        .min_w(px(if editing { 96.0 } else { 48.0 }))
+        .px(px(11.0))
+        .rounded(px(Radius::BADGE))
+        .border_1()
+        .border_color(if error.is_some() {
+            Ink::DANGER.alpha(0.60)
+        } else if editing {
+            Palette::CLAY.alpha(0.72)
+        } else {
+            colors.primary.alpha(0.09)
+        })
+        .bg(if editing {
+            Palette::CLAY.alpha(0.10)
+        } else {
+            colors.primary.alpha(0.045)
+        })
+        .flex()
+        .items_center()
+        .justify_center()
+        .font_family(crate::fonts::mono_family())
+        .text_size(px(Typo::ROW.size))
+        .text_color(if assignment.is_none() && !editing {
+            colors.tertiary
+        } else {
+            colors.primary
+        })
+        .cursor_pointer()
+        .hover(move |style| style.bg(colors.primary.alpha(0.08)))
+        .on_click(cx.listener(move |this, _, window, cx| {
+            this.begin_shortcut_edit(command_id, window, cx);
+        }))
+        .child(binding_label);
+
+    let mut actions = div()
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap(px(4.0))
+        .child(binding)
+        .child(
+            div()
+                .id(SharedString::from(format!(
+                    "edit-shortcut-{}",
+                    command.stable_id
+                )))
+                .size(px(26.0))
+                .rounded(px(Radius::BADGE))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .hover(move |style| style.bg(colors.primary.alpha(0.07)))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    if editing {
+                        this.shortcut_editor = None;
+                        cx.notify();
+                    } else {
+                        this.begin_shortcut_edit(command_id, window, cx);
+                    }
+                }))
+                .child(sf_symbol(
+                    if editing { "xmark" } else { "pencil" },
+                    10.0,
+                    if editing {
+                        colors.secondary
+                    } else {
+                        colors.tertiary
+                    },
+                )),
+        );
+
+    if modified {
+        actions = actions.child(
+            div()
+                .id(SharedString::from(format!(
+                    "restore-shortcut-{}",
+                    command.stable_id
+                )))
+                .debug_selector({
+                    let stable_id = command.stable_id;
+                    move || format!("RESTORE_SHORTCUT_{stable_id}")
+                })
+                .size(px(26.0))
+                .rounded(px(Radius::BADGE))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .hover(move |style| style.bg(colors.primary.alpha(0.07)))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.restore_shortcut(command_id, cx);
+                }))
+                .child(sf_symbol("arrow.counterclockwise", 10.0, colors.tertiary)),
+        );
+    }
+    if assignment.is_some() {
+        actions = actions.child(
+            div()
+                .id(SharedString::from(format!(
+                    "clear-shortcut-{}",
+                    command.stable_id
+                )))
+                .debug_selector({
+                    let stable_id = command.stable_id;
+                    move || format!("CLEAR_SHORTCUT_{stable_id}")
+                })
+                .size(px(26.0))
+                .rounded(px(Radius::BADGE))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .hover(move |style| style.bg(Ink::DANGER.alpha(0.10)))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.unassign_shortcut(command_id, cx);
+                }))
+                .child(sf_symbol("trash", 10.0, colors.tertiary)),
+        );
+    }
+
+    div()
+        .id(SharedString::from(format!(
+            "shortcut-row-{}",
+            command.stable_id
+        )))
+        .debug_selector({
+            let stable_id = command.stable_id;
+            move || format!("SHORTCUT_ROW_{stable_id}")
+        })
+        .min_h(px(58.0))
+        .px(px(12.0))
+        .py(px(8.0))
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap(px(12.0))
+        .bg(if editing {
+            Palette::CLAY.alpha(0.035)
+        } else {
+            colors.background.alpha(0.0)
+        })
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .whitespace_normal()
+                        .text_size(px(Typo::ROW_EMPHASIZED.size))
+                        .font_weight(Typo::ROW_EMPHASIZED.weight)
+                        .text_color(colors.primary)
+                        .child(metadata.title),
+                )
+                .child(
+                    div()
+                        .whitespace_normal()
+                        .text_size(px(Typo::META.size))
+                        .line_height(px(14.0))
+                        .text_color(if error.is_some() {
+                            Ink::DANGER
+                        } else {
+                            colors.tertiary
+                        })
+                        .child(wrappable_setting_copy(detail)),
+                ),
+        )
+        .child(actions)
+        .into_any_element()
+}
+
 fn setting_text_stack(
     label: SharedString,
     detail: SharedString,
@@ -3275,6 +5201,121 @@ fn settings_note(
         .into_any_element()
 }
 
+fn settings_tab_matches(tab: SettingsTab, query: &str) -> bool {
+    let query = query.trim().to_ascii_lowercase();
+    if query.is_empty() {
+        return true;
+    }
+    let searchable = match tab {
+        SettingsTab::General => {
+            "general default startup login sessions close confirmation sounds chimes support diagnostics quick open search roots updates"
+        }
+        SettingsTab::WhatsNew => {
+            "what's new whats new release notes latest version changes features improvements"
+        }
+        SettingsTab::Agents => {
+            "agents codex claude cursor gemini executable installed command line quick create default"
+        }
+        SettingsTab::Skills => {
+            "skills catalogue catalog instructions personal project plugins search SKILL.md"
+        }
+        SettingsTab::Accounts => {
+            "accounts profiles work personal login authentication codex claude default config home"
+        }
+        SettingsTab::Shortcuts => {
+            "shortcuts keyboard bindings hotkeys commands keys navigation sessions workspace terminal"
+        }
+        SettingsTab::Terminal => "terminal appearance color theme font text size zoom",
+        SettingsTab::Usage => "usage cost tokens spending cache savings model daily claude codex",
+        SettingsTab::Worktrees => {
+            "worktrees git branches pull requests merged old stale disk space cleanup"
+        }
+        SettingsTab::Resources => {
+            "resources idle sessions hibernate freeze memory limit performance"
+        }
+        SettingsTab::Remote => {
+            "remote ssh openssh hosts machines connections execution tailscale network"
+        }
+        SettingsTab::Phone => "phone iphone ios mobile pairing qr tailscale awake",
+    };
+    query
+        .split_whitespace()
+        .all(|word| searchable.contains(word))
+}
+
+fn notification_titlebar_button(unread: usize, colors: SemanticColors) -> AnyElement {
+    div()
+        .id("notification-inbox-button")
+        .debug_selector(|| "notification-inbox-button".into())
+        .absolute()
+        .top(px(7.0))
+        .right(px(14.0))
+        .size(px(Metrics::TOOLBAR_CONTROL_SIZE))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(Radius::BADGE))
+        .cursor_pointer()
+        .hover(move |button| button.bg(Fill::subtle(colors)))
+        .child(sf_symbol(
+            if unread > 0 { "bell.fill" } else { "bell" },
+            14.0,
+            if unread > 0 {
+                Ink::FRESH
+            } else {
+                colors.secondary
+            },
+        ))
+        .when(unread > 0, |button| {
+            button.child(
+                div()
+                    .absolute()
+                    .top(px(2.0))
+                    .right(px(2.0))
+                    .size(px(5.0))
+                    .rounded_full()
+                    .bg(Ink::FRESH),
+            )
+        })
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_click(|_, window, cx| {
+            window.dispatch_action(Box::new(crate::commands::ToggleNotifications), cx);
+            cx.stop_propagation();
+        })
+        .into_any_element()
+}
+
+fn spaced_shortcut_label(label: &str) -> String {
+    if label.contains('+') {
+        return label.replace('+', "\u{2009}+\u{2009}");
+    }
+
+    let mut rest = label;
+    let mut parts = Vec::new();
+    if let Some(without_fn) = rest.strip_prefix("fn") {
+        parts.push("fn");
+        rest = without_fn;
+    }
+    while let Some(modifier) = rest
+        .chars()
+        .next()
+        .filter(|character| matches!(character, '⌃' | '⌥' | '⇧' | '⌘'))
+    {
+        parts.push(match modifier {
+            '⌃' => "⌃",
+            '⌥' => "⌥",
+            '⇧' => "⇧",
+            '⌘' => "⌘",
+            _ => unreachable!(),
+        });
+        rest = &rest[modifier.len_utf8()..];
+    }
+    if !rest.is_empty() {
+        parts.push(rest);
+    }
+    parts.join("\u{2009}")
+}
+
 fn settings_page(
     title: &'static str,
     content: impl IntoElement,
@@ -3300,6 +5341,50 @@ fn settings_page(
                 .child(title),
         )
         .child(content)
+}
+
+fn appearance_settings_page(content: impl IntoElement, colors: SemanticColors) -> impl IntoElement {
+    div()
+        .w_full()
+        .px(px(24.0))
+        .pt(px(28.0))
+        .pb(px(36.0))
+        .flex()
+        .flex_col()
+        .gap(px(36.0))
+        .child(
+            div()
+                .text_size(px(24.0))
+                .font_weight(FontWeight::NORMAL)
+                .text_color(colors.primary)
+                .child("Appearance"),
+        )
+        .child(content)
+}
+
+fn appearance_setting_row(
+    label: &'static str,
+    control: impl IntoElement,
+    colors: SemanticColors,
+) -> impl IntoElement {
+    div()
+        .min_h(px(52.0))
+        .py(px(9.0))
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap(px(16.0))
+        .child(
+            div()
+                .text_size(px(13.0))
+                .text_color(colors.primary)
+                .child(label),
+        )
+        .child(control)
+}
+
+fn appearance_divider(colors: SemanticColors) -> impl IntoElement {
+    div().h(px(1.0)).bg(colors.primary.alpha(0.055))
 }
 
 fn setting_divider(colors: SemanticColors) -> impl IntoElement {
@@ -3404,34 +5489,268 @@ fn settings_choice_row(
         })
 }
 
-fn theme_preview(theme: TermTheme, colors: SemanticColors) -> impl IntoElement {
+fn appearance_mode_card(
+    index: usize,
+    label: &'static str,
+    selected: bool,
+    colors: SemanticColors,
+    cx: &mut Context<UtilitySurfaces>,
+) -> impl IntoElement {
+    let light = index == 1;
+    let ink = if light {
+        rgba(0x737373ff)
+    } else {
+        rgba(0xa0a0a0ff)
+    };
     div()
-        .p(px(10.0))
-        .rounded(px(Radius::BADGE))
-        .border_1()
-        .border_color(colors.primary.alpha(0.10))
-        .bg(theme.background)
+        .id(SharedString::from(format!("appearance-mode-{index}")))
+        .debug_selector(move || format!("FEATURED_THEME_{index}"))
+        .flex_1()
+        .min_w(px(0.0))
         .flex()
         .flex_col()
-        .gap(px(6.0))
-        .font_family(crate::fonts::mono_family())
-        .text_size(px(11.0))
+        .gap(px(8.0))
+        .role(gpui::Role::Button)
+        .aria_label(format!("Use {label} appearance"))
+        .cursor_pointer()
+        .on_click(cx.listener(move |this, _, window, cx| {
+            this.prefs.follow_system_theme = index == 0;
+            if index == 0 {
+                this.prefs.apply_system_theme(matches!(
+                    window.appearance(),
+                    gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark
+                ));
+            } else if (theme(&this.prefs.terminal_theme).appearance == ThemeAppearance::Light)
+                != light
+            {
+                this.prefs.terminal_theme = if light {
+                    "dirijor-light"
+                } else {
+                    "dirijor-dark"
+                }
+                .into();
+            }
+            this.settings_menu = None;
+            this.persist_prefs();
+            cx.notify();
+        }))
         .child(
             div()
-                .flex()
-                .child(div().text_color(theme.ansi[2]).child("❯ "))
-                .child(div().text_color(theme.foreground).child("cargo test"))
-                .child(div().text_color(theme.cursor).child("█")),
+                .relative()
+                .h(px(148.0))
+                .w_full()
+                .rounded(px(11.0))
+                .overflow_hidden()
+                .border_2()
+                .border_color(if selected {
+                    colors.primary
+                } else {
+                    colors.primary.alpha(0.07)
+                })
+                .bg(if light {
+                    rgba(0xedededff)
+                } else {
+                    rgba(0x555555ff)
+                })
+                .hover(move |card| {
+                    card.border_color(colors.primary.alpha(if selected { 1.0 } else { 0.4 }))
+                })
+                .when(index == 0, |card| {
+                    card.child(
+                        div()
+                            .absolute()
+                            .left_0()
+                            .top_0()
+                            .bottom_0()
+                            .w(gpui::relative(0.5))
+                            .rounded_tl(px(9.0))
+                            .rounded_bl(px(9.0))
+                            .bg(rgba(0xb3b3b3ff)),
+                    )
+                })
+                .child(
+                    div()
+                        .absolute()
+                        .top(px(30.0))
+                        .left(gpui::relative(0.28))
+                        .w(gpui::relative(0.44))
+                        .h(px(7.0))
+                        .rounded_full()
+                        .bg(ink.alpha(0.6)),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .top(px(42.0))
+                        .left(gpui::relative(0.2))
+                        .w(gpui::relative(0.6))
+                        .h(px(4.0))
+                        .rounded_full()
+                        .bg(ink.alpha(0.3)),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .top(px(62.0))
+                        .left(px(11.0))
+                        .right(px(11.0))
+                        .h(px(120.0))
+                        .rounded_tl(px(11.0))
+                        .rounded_tr(px(11.0))
+                        .overflow_hidden()
+                        .bg(if index == 2 {
+                            rgba(0x262626ff)
+                        } else {
+                            rgba(0xfafafaff)
+                        })
+                        .when(index == 0, |card| {
+                            card.child(
+                                div()
+                                    .absolute()
+                                    .right_0()
+                                    .top_0()
+                                    .bottom_0()
+                                    .w(gpui::relative(0.5))
+                                    .rounded_tr(px(11.0))
+                                    .bg(rgba(0x262626ff)),
+                            )
+                        })
+                        .child(
+                            div()
+                                .relative()
+                                .p(px(11.0))
+                                .flex()
+                                .flex_col()
+                                .gap(px(12.0))
+                                .children([0.44, 0.7, 0.54].into_iter().map(|width| {
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(5.0))
+                                        .child(
+                                            div()
+                                                .w(gpui::relative(width))
+                                                .h(px(7.0))
+                                                .rounded_full()
+                                                .bg(ink.alpha(0.4)),
+                                        )
+                                        .child(div().w_full().h(px(2.0)).bg(ink.alpha(0.12)))
+                                })),
+                        ),
+                ),
         )
-        .child(div().text_color(theme.ansi[8]).child("test result: ok"))
         .child(
-            div().flex().gap(px(3.0)).children(
-                theme
-                    .ansi
-                    .into_iter()
-                    .map(|color| div().flex_1().h(px(10.0)).rounded(px(2.0)).bg(color)),
-            ),
+            div()
+                .w_full()
+                .text_center()
+                .text_size(px(12.0))
+                .text_color(if selected {
+                    colors.primary
+                } else {
+                    colors.secondary
+                })
+                .child(label),
         )
+}
+
+fn appearance_diff_preview(theme: TermTheme, font_size: f32) -> impl IntoElement {
+    let line_height = (font_size * 1.5).ceil();
+    let column = |added: bool| {
+        let tint = if added { theme.ansi[2] } else { theme.ansi[1] };
+        div()
+            .flex_1()
+            .min_w(px(0.0))
+            .overflow_hidden()
+            .flex()
+            .flex_col()
+            .children(
+                [
+                    "const themePreview = {".to_owned(),
+                    format!(
+                        "  surface: \"{}\",",
+                        if added { "sidebar-elevated" } else { "sidebar" }
+                    ),
+                    format!(
+                        "  accent: \"{}\",",
+                        if added { "#0ea5e9" } else { "#2563eb" }
+                    ),
+                    format!("  contrast: {},", if added { 68 } else { 42 }),
+                    "};".to_owned(),
+                ]
+                .into_iter()
+                .enumerate()
+                .map(move |(index, text)| {
+                    let changed = (1..=3).contains(&index);
+                    let color = |color: gpui::Rgba| gpui::HighlightStyle {
+                        color: Some(color.into()),
+                        ..Default::default()
+                    };
+                    let highlights = match index {
+                        0 => vec![(0..5, color(theme.ansi[5].alpha(0.85)))],
+                        1..=3 => {
+                            let colon = text.find(':').expect("preview property");
+                            vec![
+                                (2..colon, color(theme.ansi[3].alpha(0.7))),
+                                (
+                                    colon + 2..text.len() - 1,
+                                    color(
+                                        if index == 3 {
+                                            theme.ansi[6]
+                                        } else {
+                                            theme.ansi[2]
+                                        }
+                                        .alpha(0.85),
+                                    ),
+                                ),
+                            ]
+                        }
+                        _ => Vec::new(),
+                    };
+                    div()
+                        .h(px(line_height))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .border_l_2()
+                        .border_color(if changed { tint } else { theme.background })
+                        .when(changed, |line| line.bg(tint.alpha(0.16)))
+                        .child(
+                            div()
+                                .w(px(33.0))
+                                .flex_none()
+                                .text_right()
+                                .pr(px(10.0))
+                                .text_color(if changed {
+                                    tint.alpha(0.8)
+                                } else {
+                                    theme.foreground.alpha(0.35)
+                                })
+                                .child((index + 1).to_string()),
+                        )
+                        .child(
+                            div()
+                                .whitespace_nowrap()
+                                .text_color(theme.foreground.alpha(0.7))
+                                .child(gpui::StyledText::new(text).with_highlights(highlights)),
+                        )
+                }),
+            )
+    };
+    div()
+        .debug_selector(|| "APPEARANCE_WORKSPACE_PREVIEW".into())
+        .w_full()
+        .rounded(px(12.0))
+        .overflow_hidden()
+        .border_1()
+        .border_color(theme.foreground.alpha(0.09))
+        .bg(theme.background)
+        .font_family(crate::fonts::mono_family())
+        .font_weight(FontWeight::NORMAL)
+        .text_size(px(font_size))
+        .flex()
+        .child(column(false))
+        .child(div().w(px(1.0)).bg(theme.foreground.alpha(0.1)))
+        .child(column(true))
 }
 
 fn chip(label: String, colors: SemanticColors) -> impl IntoElement {
@@ -3456,6 +5775,10 @@ fn colored_badge(label: &'static str, color: Rgba) -> impl IntoElement {
         .child(label)
 }
 
+fn colored_status_badge(label: &'static str, color: Rgba) -> impl IntoElement {
+    colored_badge(label, color)
+}
+
 fn empty_label(label: &str, colors: SemanticColors) -> impl IntoElement {
     div()
         .h(px(42.0))
@@ -3467,7 +5790,7 @@ fn empty_label(label: &str, colors: SemanticColors) -> impl IntoElement {
         .child(label.to_owned())
 }
 
-fn ui_agent(kind: &ProtoAgentKind) -> diri_ui::AgentKind {
+pub(crate) fn ui_agent(kind: &ProtoAgentKind) -> diri_ui::AgentKind {
     // Brand vocabulary, not a protocol type: a manifest agent the client has
     // no hand-drawn mark for falls back to the generic terminal treatment.
     match kind.id() {
@@ -3480,36 +5803,11 @@ fn ui_agent(kind: &ProtoAgentKind) -> diri_ui::AgentKind {
     }
 }
 
-fn ui_default_agent(agent: DefaultAgent) -> diri_ui::AgentKind {
-    match agent {
-        DefaultAgent::ClaudeCode => diri_ui::AgentKind::ClaudeCode,
-        DefaultAgent::Codex => diri_ui::AgentKind::Codex,
-        DefaultAgent::Cursor => diri_ui::AgentKind::Cursor,
-        DefaultAgent::Gemini => diri_ui::AgentKind::Gemini,
-    }
-}
-
 fn folder_name(path: &str) -> &str {
     Path::new(path)
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or(path)
-}
-
-fn relative_parent(path: &str) -> String {
-    let Some(parent) = Path::new(path).parent() else {
-        return String::new();
-    };
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    if home.as_deref() == Some(parent) {
-        return "~".to_owned();
-    }
-    if let Some(home) = home
-        && let Ok(relative) = parent.strip_prefix(home)
-    {
-        return format!("~/{}", relative.display());
-    }
-    parent.to_string_lossy().into_owned()
 }
 
 /// Second line under the update summary: why updates are off, or when the last
@@ -3561,24 +5859,15 @@ fn expire_completed_reinstall(
     should_expire
 }
 
-fn relative_time(milliseconds: f64) -> String {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0.0, |duration| duration.as_secs_f64() * 1000.0);
-    let seconds = ((now - milliseconds).max(0.0) / 1000.0) as u64;
-    match seconds {
-        0..=59 => "now".to_owned(),
-        60..=3_599 => format!("{}m", seconds / 60),
-        3_600..=86_399 => format!("{}h", seconds / 3_600),
-        _ => format!("{}d", seconds / 86_400),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    #[cfg(target_os = "macos")]
+    use gpui::HeadlessAppContext;
     use gpui::{
         Entity, Modifiers, MouseDownEvent, ScrollDelta, ScrollWheelEvent, StyleRefinement,
         TestAppContext, point, size,
@@ -3588,10 +5877,15 @@ mod tests {
     /// entity root is laid out independently of its content, so mount the
     /// surfaces the way the app does -- not bare -- and a root that cannot size
     /// itself fails here instead of on screen.
+    ///
+    /// Only the screenshot fixtures mount a surface this way now; the settings
+    /// tests compose it against a real sidebar, which is what the window does.
+    #[cfg(target_os = "macos")]
     struct CachedOverlayHarness {
         surfaces: Entity<UtilitySurfaces>,
     }
 
+    #[cfg(target_os = "macos")]
     impl Render for CachedOverlayHarness {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
             div().size_full().child(
@@ -3600,6 +5894,469 @@ mod tests {
                     .cached(StyleRefinement::default().absolute().inset_0()),
             )
         }
+    }
+
+    /// Regenerates the issue/PR screenshot without Screen Recording access or
+    /// live user state. It is ignored because its only output is an artifact;
+    /// the ordinary layout assertions below remain part of every test run.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes the deterministic diagnostics screenshot artifact"]
+    fn render_diagnostics_preview_screenshot() {
+        let output = std::env::var_os("DIRI_VISUAL_OUTPUT")
+            .map(PathBuf::from)
+            .expect("set DIRI_VISUAL_OUTPUT to the target PNG path");
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(diri_ui::IconAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.update(|cx| crate::fonts::init(cx));
+
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime"),
+        );
+        let updates = crate::updates::inert();
+        let window = cx
+            .open_window(size(px(1100.0), px(700.0)), move |window, cx| {
+                let surfaces = cx.new(|cx| {
+                    let mut surfaces =
+                        UtilitySurfaces::new(runtime, tokio, updates, window, cx);
+                    surfaces.surface = Surface::Diagnostics;
+                    surfaces.diagnostics_report = Some(
+                        "# Diri diagnostics\nReview this report before posting it publicly.\n\nApp: 0.5.0 (build preview, channel development)\nmacOS: 15.5 (aarch64)\nDaemon: connecting automatically\nSession/state storage: reachable\n\nAgents:\n- codex: installed\n- claude-code: unavailable\n\nRemote hosts:\n- none configured\n\nExcluded by design: terminal content, prompts, logs, environment variables, paths, SSH destinations, tokens, and account identifiers."
+                            .to_owned(),
+                    );
+                    surfaces
+                });
+                cx.new(|_| CachedOverlayHarness { surfaces })
+            })
+            .expect("open headless diagnostics window");
+        cx.run_until_parked();
+        cx.update_window(window.into(), |_, window, _| window.refresh())
+            .expect("refresh diagnostics window");
+        cx.run_until_parked();
+        let screenshot = cx
+            .capture_screenshot(window.into())
+            .expect("capture diagnostics screenshot");
+        if let Some(parent) = output.parent() {
+            std::fs::create_dir_all(parent).expect("create screenshot directory");
+        }
+        screenshot
+            .save(output)
+            .expect("save diagnostics screenshot");
+    }
+
+    /// Renders the full settings destination -- navigation in the app sidebar,
+    /// page beside it -- after its entrance transition, so layout and visual
+    /// hierarchy can be reviewed without live user state.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes the deterministic settings-shell screenshot artifact"]
+    fn render_settings_shell_preview_screenshot() {
+        let output = std::env::var_os("DIRI_VISUAL_OUTPUT")
+            .map(PathBuf::from)
+            .expect("set DIRI_VISUAL_OUTPUT to the target PNG path");
+        let tab = match std::env::var("DIRI_VISUAL_SETTINGS_TAB").as_deref() {
+            Ok("shortcuts") => SettingsTab::Shortcuts,
+            Ok("general") => SettingsTab::General,
+            Ok("whats-new") => SettingsTab::WhatsNew,
+            Ok("agents") => SettingsTab::Agents,
+            Ok("skills") => SettingsTab::Skills,
+            Ok("accounts") => SettingsTab::Accounts,
+            Ok("terminal") => SettingsTab::Terminal,
+            Ok("worktrees") => SettingsTab::Worktrees,
+            Ok("resources") => SettingsTab::Resources,
+            _ => SettingsTab::Remote,
+        };
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(diri_ui::IconAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.update(|cx| {
+            crate::fonts::init(cx);
+            // Entrance animations run on the wall clock, which a headless
+            // capture does not advance. Reduced motion mounts the settled
+            // layout, which is the only thing a still image can show anyway.
+            cx.set_reduce_motion(true);
+        });
+
+        let window = cx
+            .open_window(size(px(1200.0), px(800.0)), move |window, cx| {
+                // Exercise the requested destination from a sidebar the user
+                // had previously widened. Remote remains the default capture.
+                let harness = cx.new(|cx| SettingsWorkbenchHarness::open_at(tab, window, cx));
+                harness.update(cx, |harness, cx| {
+                    harness
+                        .sidebar
+                        .update(cx, |sidebar, cx| sidebar.set_width(320.0, cx));
+                });
+                harness
+            })
+            .expect("open headless settings window");
+        cx.run_until_parked();
+        cx.advance_clock(SETTINGS_TRANSITION_DURATION + Duration::from_millis(300));
+        cx.update_window(window.into(), |_, window, _| window.refresh())
+            .expect("refresh settings window");
+        cx.run_until_parked();
+        let screenshot = cx
+            .capture_screenshot(window.into())
+            .expect("capture settings screenshot");
+        if let Some(parent) = output.parent() {
+            std::fs::create_dir_all(parent).expect("create screenshot directory");
+        }
+        screenshot.save(output).expect("save settings screenshot");
+    }
+
+    #[gpui::test]
+    fn whats_new_is_searchable_and_renders_release_markdown(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        surfaces.update(cx, |surfaces, cx| {
+            let release = diri_updater::ReleaseNotes {
+                tag_name: "v0.6.0".into(),
+                name: Some("diri 0.6.0".into()),
+                body: "## Highlights\n\n- Faster sessions".into(),
+                published_at: Some("2026-09-05T12:17:55Z".into()),
+            };
+            let document = Arc::new(crate::markdown::MarkdownDocument::parse(&release.body));
+            surfaces.release_notes = ReleaseNotesState::Loaded { release, document };
+            surfaces.settings_tab = SettingsTab::WhatsNew;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        assert!(cx.debug_bounds("release-notes-content").is_some());
+        assert!(settings_tab_matches(SettingsTab::WhatsNew, "release notes"));
+        assert!(settings_tab_matches(
+            SettingsTab::WhatsNew,
+            "latest changes"
+        ));
+    }
+
+    #[gpui::test]
+    fn worktree_checks_keep_running_after_closing_the_sidebar(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces.open_settings_tab(SettingsTab::Worktrees, cx);
+            assert!(surfaces.worktrees.loading);
+            surfaces.close_surface(cx);
+        });
+        cx.run_until_parked();
+        surfaces.read_with(cx, |surfaces, _| {
+            assert!(
+                surfaces.worktrees.loading,
+                "hiding the sidebar must not stop progress updates"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn worktree_checks_survive_reopening_both_entry_points(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        surfaces.update(cx, |surfaces, cx| {
+            let entries = worktree_settings::preview_entries();
+            surfaces
+                .worktrees
+                .apply_scan(diri_proto::WorktreeScanResult {
+                    generation: 7,
+                    cursor: entries.len(),
+                    total: entries.len(),
+                    checked: entries.len(),
+                    entries: entries.clone(),
+                    running: false,
+                    has_more: false,
+                    error: None,
+                });
+            let entries = surfaces.worktrees.entries.clone();
+            let epoch = surfaces.worktrees.poll_epoch;
+            surfaces.open_settings_tab(SettingsTab::General, cx);
+            surfaces.open_settings_tab(SettingsTab::Worktrees, cx);
+            assert!(
+                !surfaces.worktrees.loading,
+                "reopening settings must keep checked results"
+            );
+            assert_eq!(surfaces.worktrees.poll_epoch, epoch);
+            assert_eq!(surfaces.worktrees.entries, entries);
+            surfaces.close_surface(cx);
+            surfaces.open_worktrees(cx);
+            assert!(
+                !surfaces.worktrees.loading,
+                "reopening the sheet must keep checked results"
+            );
+            assert_eq!(surfaces.worktrees.poll_epoch, epoch);
+            assert_eq!(surfaces.worktrees.entries, entries);
+            surfaces.refresh_worktrees(cx);
+            assert!(
+                surfaces.worktrees.loading,
+                "explicit refresh still starts a scan"
+            );
+            assert_eq!(surfaces.worktrees.poll_epoch, epoch + 1);
+        });
+    }
+
+    #[gpui::test]
+    fn worktree_settings_bounds_rendering_for_10000_entries(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        let start = std::time::Instant::now();
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces.settings_tab = SettingsTab::Worktrees;
+            let template = worktree_settings::preview_entries().remove(0);
+            surfaces.worktrees.entries = (0..10_000)
+                .map(|i| {
+                    let mut entry = template.clone();
+                    entry.path = format!("/fixture/tree-{i}");
+                    entry
+                })
+                .collect();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("worktree-row-/fixture/tree-0").is_some());
+        assert!(cx.debug_bounds("worktree-row-/fixture/tree-40").is_none());
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces.worktrees.page = 249;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("worktree-row-/fixture/tree-0").is_none());
+        assert!(cx.debug_bounds("worktree-row-/fixture/tree-9960").is_some());
+        eprintln!(
+            "10,000 worktrees, two rendered pages: {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[gpui::test]
+    fn worktree_settings_filters_and_navigation(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces.open_settings_tab(SettingsTab::Worktrees, cx);
+            surfaces
+                .worktrees
+                .finish_refresh(Ok(worktree_settings::preview_entries()));
+        });
+        cx.run_until_parked();
+        for (selector, ready, old) in [
+            ("worktrees-filter-Ready to clean", true, false),
+            ("worktrees-filter-Older than 30 days", false, true),
+            ("worktrees-filter-All", false, false),
+        ] {
+            let bounds = cx.debug_bounds(selector).expect("visible worktree filter");
+            cx.simulate_click(bounds.center(), Modifiers::default());
+            cx.run_until_parked();
+            surfaces.read_with(cx, |surfaces, _| {
+                assert_eq!(
+                    surfaces.settings_nav().unwrap().active,
+                    SettingsTab::Worktrees
+                );
+                assert_eq!(surfaces.worktrees.cleanup_only, ready);
+                assert_eq!(surfaces.worktrees.old_only, old);
+            });
+        }
+        assert!(settings_tab_matches(SettingsTab::Worktrees, "disk cleanup"));
+        assert!(settings_tab_matches(
+            SettingsTab::Worktrees,
+            "pull requests"
+        ));
+    }
+
+    #[gpui::test]
+    fn usage_settings_controls_and_search(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces.open_settings_tab(SettingsTab::Usage, cx);
+            surfaces.usage.updated_at = 1_788_523_200;
+        });
+        cx.run_until_parked();
+        for selector in ["usage-range-7", "usage-tokens", "usage-by-day"] {
+            let bounds = cx.debug_bounds(selector).expect("visible usage control");
+            cx.simulate_click(bounds.center(), Modifiers::default());
+            cx.run_until_parked();
+        }
+        surfaces.read_with(cx, |surfaces, _| {
+            assert_eq!(surfaces.usage_days, 7);
+            assert!(surfaces.usage_tokens);
+            assert!(surfaces.usage_by_day);
+        });
+        assert!(settings_tab_matches(SettingsTab::Usage, "cache savings"));
+        assert!(settings_tab_matches(SettingsTab::Usage, "cost"));
+    }
+
+    /// Fixture-only visual review, never populates the live usage tracker.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes the usage settings screenshot artifact"]
+    fn render_usage_settings_preview_screenshot() {
+        let output = std::env::var_os("DIRI_VISUAL_OUTPUT")
+            .map(PathBuf::from)
+            .expect("output PNG path");
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(diri_ui::IconAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.update(|cx| {
+            crate::fonts::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let width = std::env::var("DIRI_VISUAL_WIDTH")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(1200.0);
+        let window = cx
+            .open_window(size(px(width), px(900.0)), move |window, cx| {
+                let harness =
+                    cx.new(|cx| SettingsWorkbenchHarness::open_at(SettingsTab::Usage, window, cx));
+                harness.update(cx, |harness, cx| {
+                    harness.surfaces.update(cx, |surfaces, cx| {
+                        let mut history = crate::usage::dashboard::UsageHistory::default();
+                        let mut models = crate::usage::dashboard::ModelHours::default();
+                        let now = 1_788_523_200;
+                        for day in 0..30 {
+                            if day % 5 == 0 {
+                                continue;
+                            }
+                            for (index, model) in ["claude-opus-4-6", "claude-sonnet-4-6"]
+                                .into_iter()
+                                .enumerate()
+                            {
+                                let volume = ((day * 7 + index * 11) % 19 + 1) as i64;
+                                crate::usage::dashboard::record(
+                                    &mut models,
+                                    model,
+                                    now / 3600 - day as i64 * 24,
+                                    crate::usage::UsageHourAgg {
+                                        i: volume * 1000,
+                                        o: volume * 10_000,
+                                        cr: volume * 1_000_000,
+                                        cw: volume * 100_000,
+                                        c: volume as f64 * 0.9,
+                                    },
+                                    diri_usage::match_claude(model),
+                                    0,
+                                );
+                            }
+                        }
+                        history.merge(crate::usage::UsageProvider::Claude, &models);
+                        models.clear();
+                        for day in 0..30 {
+                            let volume = (day * 3) % 13 + 1;
+                            crate::usage::dashboard::record(
+                                &mut models,
+                                "gpt-5.4",
+                                now / 3600 - day * 24,
+                                crate::usage::UsageHourAgg {
+                                    i: volume * 2000,
+                                    o: volume * 8000,
+                                    cr: volume * 200_000,
+                                    cw: 0,
+                                    c: volume as f64 * 0.3,
+                                },
+                                diri_usage::match_openai("gpt-5.4"),
+                                volume * 3000,
+                            );
+                        }
+                        history.merge(crate::usage::UsageProvider::Codex, &models);
+                        if std::env::var_os("DIRI_VISUAL_EMPTY").is_some() {
+                            history = Default::default();
+                        }
+                        if std::env::var_os("DIRI_VISUAL_LIGHT").is_some() {
+                            surfaces.prefs.terminal_theme = "dirijor-light".into();
+                        }
+                        surfaces.usage_days = std::env::var("DIRI_VISUAL_DAYS")
+                            .ok()
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(30);
+                        surfaces.set_usage(
+                            crate::usage::UsageSnapshot {
+                                updated_at: now,
+                                history: Arc::new(history),
+                                ..Default::default()
+                            },
+                            cx,
+                        );
+                    });
+                });
+                harness
+            })
+            .expect("open usage screenshot");
+        cx.run_until_parked();
+        let screenshot = cx
+            .capture_screenshot(window.into())
+            .expect("capture usage settings");
+        if let Some(parent) = output.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        screenshot.save(output).expect("save usage settings");
+    }
+
+    /// Renders the Appearance destination at a realistic desktop size so the
+    /// theme cards, live workspace, and typography specimen can be reviewed as
+    /// one composition instead of as isolated components.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes the deterministic appearance-settings screenshot artifact"]
+    fn render_appearance_settings_preview_screenshot() {
+        let output = std::env::var_os("DIRI_VISUAL_OUTPUT")
+            .map(PathBuf::from)
+            .expect("set DIRI_VISUAL_OUTPUT to the target PNG path");
+        let preview_theme = std::env::var("DIRI_APPEARANCE_THEME").ok();
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(diri_ui::IconAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.update(|cx| {
+            crate::fonts::init(cx);
+            cx.set_reduce_motion(true);
+        });
+
+        let window = cx
+            .open_window(size(px(1200.0), px(900.0)), move |window, cx| {
+                let harness = cx
+                    .new(|cx| SettingsWorkbenchHarness::open_at(SettingsTab::Terminal, window, cx));
+                harness.update(cx, |harness, cx| {
+                    harness
+                        .sidebar
+                        .update(cx, |sidebar, cx| sidebar.set_width(292.0, cx));
+                    if let Some(theme_id) = &preview_theme {
+                        harness.surfaces.update(cx, |surfaces, cx| {
+                            surfaces.prefs.terminal_theme.clone_from(theme_id);
+                            surfaces.persist_prefs();
+                            cx.notify();
+                        });
+                    }
+                });
+                harness
+            })
+            .expect("open headless appearance settings window");
+        cx.run_until_parked();
+        cx.advance_clock(SETTINGS_TRANSITION_DURATION + Duration::from_millis(300));
+        cx.update_window(window.into(), |_, window, _| window.refresh())
+            .expect("refresh appearance settings window");
+        cx.run_until_parked();
+        let screenshot = cx
+            .capture_screenshot(window.into())
+            .expect("capture appearance settings screenshot");
+        if let Some(parent) = output.parent() {
+            std::fs::create_dir_all(parent).expect("create screenshot directory");
+        }
+        screenshot.save(output).expect("save appearance screenshot");
     }
 
     struct SettingsModalHarness {
@@ -3661,6 +6418,169 @@ mod tests {
 
     struct CachedSettingsModalHarness {
         surfaces: Entity<UtilitySurfaces>,
+    }
+
+    /// Settings as the window actually composes it: the app sidebar paints the
+    /// navigation, and the page is laid out beside it rather than over it.
+    struct SettingsWorkbenchHarness {
+        sidebar: Entity<crate::sidebar::Sidebar>,
+        surfaces: Entity<UtilitySurfaces>,
+        _subscriptions: [gpui::Subscription; 2],
+    }
+
+    impl SettingsWorkbenchHarness {
+        fn open(window: &mut Window, cx: &mut Context<Self>) -> Self {
+            Self::open_at(SettingsTab::General, window, cx)
+        }
+
+        fn open_at(tab: SettingsTab, window: &mut Window, cx: &mut Context<Self>) -> Self {
+            let runtime = Arc::new(StoreRuntime::inert());
+            if std::env::var_os("DIRI_VISUAL_LIGHT").is_some() {
+                runtime
+                    .store
+                    .write()
+                    .expect("preview store")
+                    .update_preferences(|prefs| prefs.terminal_theme = "dirijor-light".into())
+                    .expect("preview theme");
+            }
+            let tokio = Arc::new(
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test runtime"),
+            );
+            let sidebar = cx.new(|cx| {
+                crate::sidebar::Sidebar::new(
+                    Some(Arc::clone(&runtime)),
+                    false,
+                    crate::sidebar::PreviewScenario::Typical,
+                    cx,
+                )
+            });
+            let surfaces = cx.new(|cx| {
+                let mut surfaces = UtilitySurfaces::new(
+                    Arc::clone(&runtime),
+                    tokio,
+                    crate::updates::inert(),
+                    window,
+                    cx,
+                );
+                surfaces.open_settings(cx);
+                surfaces.settings_tab = tab;
+                if tab == SettingsTab::WhatsNew {
+                    let release = diri_updater::ReleaseNotes {
+                        tag_name: "v0.6.0".into(),
+                        name: Some("diri 0.6.0 — Your agent workspace".into()),
+                        body: "## Everything in one place\n\n- Open browser and shell tabs beside a session.\n- Search conversation history and resume previous work.\n\n### Polish and reliability\n\nSettings, navigation, and session recovery now feel more at home on macOS."
+                            .into(),
+                        published_at: Some("2026-09-05T12:17:55Z".into()),
+                    };
+                    let document = Arc::new(crate::markdown::MarkdownDocument::parse(&release.body));
+                    surfaces.release_notes = ReleaseNotesState::Loaded { release, document };
+                }
+                if tab == SettingsTab::Worktrees {
+                    surfaces.worktrees.entries = worktree_settings::preview_entries();
+                    if std::env::var_os("DIRI_VISUAL_WORKTREE_PROGRESS").is_some() {
+                        surfaces.worktrees.loading = true;
+                        surfaces.worktrees.checked = 2;
+                        for entry in surfaces.worktrees.entries.iter_mut().skip(2) {
+                            entry.stale_suggestion = false;
+                            entry.health.pr_state = "Checking…".into();
+                            entry.health.protection = Some("Checking…".into());
+                            entry.health.disk_bytes = None;
+                        }
+                    }
+                    if std::env::var_os("DIRI_VISUAL_WORKTREE_ERROR").is_some() {
+                        surfaces.worktrees.entries.clear();
+                        surfaces.worktrees.error = Some("Couldn't connect to the engine. Refresh to retry.".into());
+                    }
+                }
+                if tab == SettingsTab::Skills {
+                    surfaces.skills.update(cx, |skills, _| {
+                        skills.seed_preview(std::env::var_os("DIRI_VISUAL_SKILL_DETAIL").is_some())
+                    });
+                }
+                if tab == SettingsTab::Accounts {
+                    surfaces.seed_account_preview(
+                        std::env::var_os("DIRI_VISUAL_ACCOUNT_EDITOR").is_some(),
+                    );
+                    if std::env::var_os("DIRI_VISUAL_ACCOUNT_HANDOFF").is_some() {
+                        surfaces.seed_account_handoff_preview();
+                    }
+                }
+                surfaces
+            });
+            // RootView re-renders on the sidebar's own events; this harness
+            // only needs to notice its measure change.
+            cx.observe(&sidebar, |_, _, cx| cx.notify()).detach();
+            let subscriptions = crate::root::wire_settings_navigation(
+                sidebar.clone(),
+                surfaces.clone(),
+                window,
+                cx,
+            );
+            // The mirror runs on notifies; settings was already open before
+            // anything was watching it.
+            let nav = surfaces.read(cx).settings_nav();
+            sidebar.update(cx, |sidebar, cx| {
+                // Match RootView: opening Settings reveals its navigation even
+                // when fresh preferences start with the sidebar closed.
+                sidebar.reveal(cx);
+                sidebar.set_settings_nav(nav, cx);
+            });
+            Self {
+                sidebar,
+                surfaces,
+                _subscriptions: subscriptions,
+            }
+        }
+
+        fn sidebar_width(&self, cx: &App) -> f32 {
+            let sidebar = self.sidebar.read(cx);
+            if sidebar.is_visible() {
+                sidebar.width()
+            } else {
+                0.0
+            }
+        }
+    }
+
+    impl Render for SettingsWorkbenchHarness {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let seam = self.sidebar_width(cx);
+            div()
+                .size_full()
+                .flex()
+                .child(
+                    div().flex_none().w(px(seam)).h_full().child(
+                        self.sidebar
+                            .clone()
+                            .cached(StyleRefinement::default().size_full()),
+                    ),
+                )
+                .child(
+                    self.surfaces.clone().cached(
+                        StyleRefinement::default()
+                            .absolute()
+                            .inset_0()
+                            .left(px(seam)),
+                    ),
+                )
+        }
+    }
+
+    fn open_settings_workbench(
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<SettingsWorkbenchHarness>,
+        &mut gpui::VisualTestContext,
+    ) {
+        let (harness, cx) = cx.add_window_view(SettingsWorkbenchHarness::open);
+        cx.simulate_resize(size(px(1200.0), px(800.0)));
+        cx.executor()
+            .advance_clock(SETTINGS_TRANSITION_DURATION + Duration::from_millis(300));
+        cx.run_until_parked();
+        (harness, cx)
     }
 
     struct SettingRowHarness;
@@ -3889,11 +6809,16 @@ mod tests {
                 background_events: Arc::new(AtomicUsize::new(0)),
             }
         });
+        cx.executor()
+            .advance_clock(SETTINGS_TRANSITION_DURATION + Duration::from_millis(10));
+        cx.run_until_parked();
         let surfaces = view.read_with(cx, |harness, _| harness.surfaces.clone());
         let field = cx.debug_bounds("HOST_FIELD_NAME").expect("name field");
 
+        // Click inside the field's left padding, which is unambiguously before
+        // the first glyph across text-shaping backends and display scales.
         cx.simulate_click(
-            point(field.left() + px(11.0), field.center().y),
+            point(field.left() + px(2.0), field.center().y),
             Modifiers::default(),
         );
         assert_eq!(
@@ -3906,6 +6831,10 @@ mod tests {
             0
         );
 
+        cx.run_until_parked();
+        let field = cx
+            .debug_bounds("HOST_FIELD_NAME")
+            .expect("focused name field");
         cx.simulate_click(
             point(field.right() - px(11.0), field.center().y),
             Modifiers::default(),
@@ -3961,7 +6890,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn cached_settings_modal_stays_inside_window(cx: &mut TestAppContext) {
+    fn cached_settings_shell_fills_the_window(cx: &mut TestAppContext) {
         let runtime = Arc::new(StoreRuntime::inert());
         let tokio = Arc::new(
             tokio::runtime::Builder::new_current_thread()
@@ -3982,17 +6911,15 @@ mod tests {
         let root = cx
             .debug_bounds("cached-settings-root")
             .expect("settings root should render");
-        let dialog = cx
-            .debug_bounds("settings-dialog")
-            .expect("settings dialog should render");
+        let shell = cx
+            .debug_bounds("settings-shell")
+            .expect("settings shell should render");
 
-        assert_eq!(dialog.center(), root.center());
-        assert!(dialog.top() >= root.top());
-        assert!(dialog.bottom() <= root.bottom());
+        assert_eq!(shell, root);
     }
 
     #[gpui::test]
-    fn settings_modal_blocks_background_selection_and_scroll(cx: &mut TestAppContext) {
+    fn settings_shell_blocks_background_selection_and_scroll(cx: &mut TestAppContext) {
         let runtime = Arc::new(StoreRuntime::inert());
         let tokio = Arc::new(
             tokio::runtime::Builder::new_current_thread()
@@ -4028,10 +6955,9 @@ mod tests {
         assert_eq!(background_events.load(Ordering::Relaxed), 0);
         assert_eq!(
             surfaces.read_with(cx, |surfaces, _| surfaces.surface),
-            Surface::None
+            Surface::Settings
         );
 
-        surfaces.update(cx, |surfaces, cx| surfaces.open_settings(cx));
         cx.simulate_event(ScrollWheelEvent {
             position: outside_panel,
             delta: ScrollDelta::Pixels(point(px(0.0), px(-40.0))),
@@ -4072,13 +6998,10 @@ mod tests {
             }
         });
 
-        let dialog = cx
-            .debug_bounds("settings-dialog")
-            .expect("settings dialog should render");
-        cx.simulate_click(
-            point(dialog.center().x, dialog.top() + px(29.0)),
-            Modifiers::default(),
-        );
+        let pane = cx
+            .debug_bounds("settings-pane")
+            .expect("settings pane should render");
+        cx.simulate_click(pane.center(), Modifiers::default());
 
         let surfaces = view.read_with(cx, |harness, _| harness.surfaces.clone());
         assert_eq!(
@@ -4093,50 +7016,87 @@ mod tests {
     }
 
     #[gpui::test]
-    fn settings_dialog_centers_in_the_window_through_the_cached_wrapper(cx: &mut TestAppContext) {
-        let runtime = Arc::new(StoreRuntime::inert());
-        let tokio = Arc::new(
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("test runtime"),
+    fn settings_navigates_from_the_app_sidebar_rather_than_a_second_rail(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+
+        let sidebar = cx
+            .debug_bounds("sidebar")
+            .expect("the app sidebar should stay mounted while settings is open");
+        let navigation = cx
+            .debug_bounds("sidebar-settings")
+            .expect("settings navigation should render inside the app sidebar");
+        let shell = cx
+            .debug_bounds("settings-shell")
+            .expect("settings shell should render");
+        assert!(
+            cx.debug_bounds("settings-rail").is_none(),
+            "settings should navigate from the app sidebar, not a rail of its own"
         );
-        let updates = crate::updates::inert();
-        let (_, cx) = cx.add_window_view(move |window, cx| {
-            let surfaces = cx.new(|cx| {
-                let mut surfaces = UtilitySurfaces::new(runtime, tokio, updates, window, cx);
-                surfaces.open_settings(cx);
-                surfaces
-            });
-            CachedOverlayHarness { surfaces }
+        assert_eq!(navigation.left(), sidebar.left());
+        assert_eq!(navigation.size.width, sidebar.size.width);
+        assert_eq!(
+            shell.left(),
+            sidebar.right(),
+            "the settings page should begin where the sidebar ends"
+        );
+        assert_eq!(shell.right(), px(1200.0));
+        assert!(cx.debug_bounds("SETTINGS_TAB_General").is_some());
+        harness.read_with(cx, |harness, cx| {
+            assert!(harness.sidebar.read(cx).shows_settings());
         });
-
-        let viewport = size(px(1200.0), px(800.0));
-        cx.simulate_resize(viewport);
-
-        // The backdrop must cover the window. A collapsed root leaves it
-        // 1200x0, which dims nothing and blocks nothing.
-        let backdrop = cx
-            .debug_bounds("surface-backdrop")
-            .expect("modal backdrop should render");
-        assert_eq!(backdrop.size, viewport);
-
-        let dialog = cx
-            .debug_bounds("settings-dialog")
-            .expect("settings dialog should render");
-        assert_eq!(dialog.size.width, px(SETTINGS_WIDTH));
-        assert_eq!(dialog.size.height, px(SETTINGS_HEIGHT));
-
-        // The dialog is taller than a collapsed root, so a zero-height root
-        // parks it half above the window instead of in the middle.
-        let center = dialog.center();
-        assert_eq!(center.x, viewport.width / 2.0);
-        assert_eq!(center.y, viewport.height / 2.0);
-        assert!(dialog.top() > px(0.0), "dialog hangs above the window top");
     }
 
     #[gpui::test]
-    fn settings_content_close_control_dismisses_the_surface(cx: &mut TestAppContext) {
+    fn opening_settings_swaps_the_sidebar_body_and_leaves_its_frame_alone(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+
+        let in_settings = cx.debug_bounds("sidebar").expect("sidebar");
+        assert!(
+            cx.debug_bounds("new-agent").is_none(),
+            "the session body should give way to navigation"
+        );
+
+        surfaces.update(cx, |surfaces, cx| surfaces.dismiss(cx));
+        cx.executor()
+            .advance_clock(SETTINGS_TRANSITION_DURATION + Duration::from_millis(300));
+        cx.run_until_parked();
+
+        let in_sessions = cx.debug_bounds("sidebar").expect("sidebar");
+        assert_eq!(
+            in_settings, in_sessions,
+            "the panel itself should hold still while its body swaps"
+        );
+        assert!(
+            cx.debug_bounds("sidebar-settings").is_none(),
+            "leaving settings should return the sidebar to sessions"
+        );
+        assert!(cx.debug_bounds("new-agent").is_some());
+    }
+
+    #[gpui::test]
+    fn the_sidebar_back_control_dismisses_settings(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        surfaces.update_in(cx, |surfaces, window, cx| {
+            surfaces.focus.focus(window, cx);
+        });
+
+        let back = cx
+            .debug_bounds("close-settings")
+            .expect("the sidebar should offer the way back out of settings");
+        cx.simulate_click(back.center(), Modifiers::default());
+        cx.run_until_parked();
+
+        assert_eq!(
+            surfaces.read_with(cx, |surfaces, _| surfaces.surface),
+            Surface::None
+        );
+        assert!(!harness.read_with(cx, |harness, cx| harness.sidebar.read(cx).shows_settings()));
+    }
+
+    #[gpui::test]
+    fn settings_shortcut_action_toggles_the_shell(cx: &mut TestAppContext) {
         let runtime = Arc::new(StoreRuntime::inert());
         let tokio = Arc::new(
             tokio::runtime::Builder::new_current_thread()
@@ -4146,26 +7106,267 @@ mod tests {
         );
         let updates = crate::updates::inert();
         let (view, cx) = cx.add_window_view(move |window, cx| {
-            let surfaces = cx.new(|cx| {
-                let mut surfaces = UtilitySurfaces::new(runtime, tokio, updates, window, cx);
-                surfaces.open_settings(cx);
-                surfaces
-            });
+            let surfaces = cx.new(|cx| UtilitySurfaces::new(runtime, tokio, updates, window, cx));
             SettingsModalHarness {
                 surfaces,
                 background_events: Arc::new(AtomicUsize::new(0)),
             }
         });
-
         let surfaces = view.read_with(cx, |harness, _| harness.surfaces.clone());
-        let close = cx
-            .debug_bounds("close-settings")
-            .expect("settings close control should render");
-        cx.simulate_click(close.center(), Modifiers::default());
+        surfaces.update_in(cx, |surfaces, window, cx| {
+            surfaces.focus.focus(window, cx);
+        });
 
+        cx.dispatch_action(OpenSettings);
         assert_eq!(
             surfaces.read_with(cx, |surfaces, _| surfaces.surface),
-            Surface::None
+            Surface::Settings
+        );
+
+        cx.dispatch_action(OpenSettings);
+        assert_eq!(
+            surfaces.read_with(cx, |surfaces, _| surfaces.surface),
+            Surface::None,
+            "a second Command-, action should return to the app"
+        );
+    }
+
+    #[gpui::test]
+    fn settings_navigation_takes_the_workspace_sidebar_measure(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let sidebar = harness.read_with(cx, |harness, _| harness.sidebar.clone());
+
+        sidebar.update(cx, |sidebar, cx| sidebar.set_width(320.0, cx));
+        cx.run_until_parked();
+
+        let navigation = cx
+            .debug_bounds("sidebar-settings")
+            .expect("settings navigation should render inside the app sidebar");
+        let shell = cx
+            .debug_bounds("settings-shell")
+            .expect("settings shell should render");
+        assert_eq!(
+            navigation.size.width,
+            px(320.0),
+            "navigation shares the sidebar the user sized, rather than a measure of its own"
+        );
+        assert_eq!(
+            shell.left(),
+            px(320.0),
+            "the page stays against the sidebar as the seam is dragged"
+        );
+    }
+
+    #[test]
+    fn settings_search_matches_page_copy_not_only_tab_titles() {
+        assert!(settings_tab_matches(SettingsTab::Remote, "ssh"));
+        assert!(settings_tab_matches(SettingsTab::Resources, "memory"));
+        assert!(settings_tab_matches(SettingsTab::General, "login"));
+        assert!(settings_tab_matches(SettingsTab::Shortcuts, "keyboard"));
+        assert!(settings_tab_matches(SettingsTab::Terminal, "appearance"));
+        assert!(!settings_tab_matches(SettingsTab::Terminal, "ssh"));
+    }
+
+    #[test]
+    fn shortcut_labels_separate_modifiers_from_each_other_and_the_key() {
+        assert_eq!(
+            spaced_shortcut_label("⌥⇧⌘C"),
+            "⌥\u{2009}⇧\u{2009}⌘\u{2009}C"
+        );
+        assert_eq!(spaced_shortcut_label("⌘Space"), "⌘\u{2009}Space");
+        assert_eq!(
+            spaced_shortcut_label("Ctrl+Shift+C"),
+            "Ctrl\u{2009}+\u{2009}Shift\u{2009}+\u{2009}C"
+        );
+        assert_eq!(spaced_shortcut_label("Unassigned"), "Unassigned");
+    }
+
+    #[gpui::test]
+    fn shortcut_page_searches_edits_unassigns_and_restores(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces.open_settings_tab(SettingsTab::Shortcuts, cx);
+        });
+
+        let search = cx
+            .debug_bounds("shortcut-search")
+            .expect("shortcut search should render");
+        cx.simulate_click(search.center(), Modifiers::default());
+        cx.simulate_input("new session");
+        assert!(cx.debug_bounds("SHORTCUT_ROW_open-launcher").is_some());
+        assert!(cx.debug_bounds("SHORTCUT_ROW_terminal-paste").is_none());
+
+        let binding = cx
+            .debug_bounds("SHORTCUT_BINDING_open-launcher")
+            .expect("filtered shortcut binding should render");
+        cx.simulate_click(binding.center(), Modifiers::default());
+        cx.simulate_keystrokes("cmd-shift-y");
+        surfaces.read_with(cx, |surfaces, _| {
+            assert_eq!(
+                surfaces
+                    .prefs
+                    .shortcut_overrides
+                    .get("open-launcher")
+                    .and_then(|binding| binding.as_deref()),
+                Some("cmd-shift-y")
+            );
+            assert!(surfaces.shortcut_editor.is_none());
+        });
+
+        let clear = cx
+            .debug_bounds("CLEAR_SHORTCUT_open-launcher")
+            .expect("assigned shortcut should offer unassign");
+        cx.simulate_click(clear.center(), Modifiers::default());
+        surfaces.read_with(cx, |surfaces, _| {
+            assert_eq!(
+                surfaces.prefs.shortcut_overrides.get("open-launcher"),
+                Some(&None)
+            );
+        });
+
+        let restore = cx
+            .debug_bounds("RESTORE_SHORTCUT_open-launcher")
+            .expect("modified shortcut should offer restore");
+        cx.simulate_click(restore.center(), Modifiers::default());
+        surfaces.read_with(cx, |surfaces, _| {
+            assert!(
+                !surfaces
+                    .prefs
+                    .shortcut_overrides
+                    .contains_key("open-launcher")
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn appearance_modes_switch_the_palette_and_persist_system_following(cx: &mut TestAppContext) {
+        let (harness, cx) = cx.add_window_view(|window, cx| {
+            SettingsWorkbenchHarness::open_at(SettingsTab::Terminal, window, cx)
+        });
+        cx.simulate_resize(size(px(1200.0), px(800.0)));
+        cx.run_until_parked();
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+
+        for (index, palette, selector) in [
+            (1, "dirijor-light", "FEATURED_THEME_1"),
+            (2, "dirijor-dark", "FEATURED_THEME_2"),
+            (0, "", "FEATURED_THEME_0"),
+        ] {
+            let card = cx
+                .debug_bounds(selector)
+                .expect("appearance mode should render");
+            cx.simulate_click(card.center(), Modifiers::default());
+            cx.run_until_parked();
+            surfaces.read_with(cx, |surfaces, _| {
+                assert_eq!(surfaces.prefs.follow_system_theme, index == 0);
+                if index != 0 {
+                    assert_eq!(surfaces.prefs.terminal_theme, palette);
+                }
+                let store = surfaces.store.read().unwrap();
+                assert_eq!(store.preferences().follow_system_theme, index == 0);
+                assert_eq!(
+                    store.preferences().terminal_theme,
+                    surfaces.prefs.terminal_theme
+                );
+            });
+            assert!(cx.debug_bounds("APPEARANCE_WORKSPACE_PREVIEW").is_some());
+        }
+    }
+
+    #[gpui::test]
+    fn appearance_theme_cards_fit_inside_a_narrow_settings_pane(cx: &mut TestAppContext) {
+        let (_harness, cx) = cx.add_window_view(|window, cx| {
+            SettingsWorkbenchHarness::open_at(SettingsTab::Terminal, window, cx)
+        });
+        cx.simulate_resize(size(px(760.0), px(760.0)));
+        cx.run_until_parked();
+
+        let pane = cx.debug_bounds("settings-pane").expect("settings pane");
+        for (index, selector) in ["FEATURED_THEME_0", "FEATURED_THEME_1", "FEATURED_THEME_2"]
+            .into_iter()
+            .enumerate()
+        {
+            let card = cx.debug_bounds(selector).expect("quick theme card");
+            assert!(
+                card.left() >= pane.left() && card.right() <= pane.right(),
+                "theme card {index} escaped the narrow pane: {card:?} vs {pane:?}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn the_sidebar_search_field_filters_settings_and_opens_the_first_result(
+        cx: &mut TestAppContext,
+    ) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+
+        let search = cx
+            .debug_bounds("settings-search")
+            .expect("settings search should render in the sidebar");
+        cx.simulate_click(search.center(), Modifiers::default());
+        cx.simulate_input("ssh");
+
+        assert!(cx.debug_bounds("SETTINGS_TAB_Remote").is_some());
+        assert!(cx.debug_bounds("SETTINGS_TAB_General").is_none());
+        surfaces.read_with(cx, |surfaces, _| {
+            assert_eq!(surfaces.settings_search.text(), "ssh");
+            assert!(surfaces.settings_search_active);
+        });
+
+        cx.simulate_keystrokes("enter");
+        surfaces.read_with(cx, |surfaces, _| {
+            assert_eq!(surfaces.settings_tab, SettingsTab::Remote);
+            assert!(!surfaces.settings_search_active);
+        });
+        assert!(cx.debug_bounds("SETTINGS_NOTE_COPY").is_some());
+    }
+
+    #[gpui::test]
+    fn choosing_a_page_in_the_sidebar_resets_the_shared_pane_scroll(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+
+        let pane = cx
+            .debug_bounds("settings-pane")
+            .expect("settings pane should render");
+        // Read the row before scrolling: a cached view that is reused rather
+        // than re-rendered leaves no debug bounds behind, and the sidebar has
+        // no reason to re-render while the page scrolls.
+        let remote = cx
+            .debug_bounds("SETTINGS_TAB_Remote")
+            .expect("the Remote page should be listed in the sidebar");
+        for _ in 0..8 {
+            cx.simulate_event(ScrollWheelEvent {
+                position: pane.center(),
+                delta: ScrollDelta::Pixels(point(px(0.0), px(-120.0))),
+                ..ScrollWheelEvent::default()
+            });
+        }
+
+        cx.simulate_click(remote.center(), Modifiers::default());
+        cx.run_until_parked();
+
+        surfaces.read_with(cx, |surfaces, _| {
+            assert_eq!(surfaces.settings_tab, SettingsTab::Remote);
+            assert_eq!(surfaces.settings_scroll.offset(), point(px(0.0), px(0.0)));
+        });
+        assert_eq!(
+            harness.read_with(cx, |harness, cx| harness.sidebar.read(cx).settings_page()),
+            Some(SettingsTab::Remote),
+            "the sidebar should show the page the click opened as current"
+        );
+
+        let pane = cx
+            .debug_bounds("settings-pane")
+            .expect("settings pane should remain visible");
+        let copy = cx
+            .debug_bounds("SETTINGS_NOTE_COPY")
+            .expect("Remote page content should render");
+        assert!(
+            copy.bottom() > pane.top() && copy.top() < pane.bottom(),
+            "switching pages left the Remote page scrolled out of view: {copy:?} vs {pane:?}"
         );
     }
 }

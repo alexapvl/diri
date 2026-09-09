@@ -1,4 +1,4 @@
-//! State shared by the four settings tabs.
+//! State shared by the settings tabs.
 //!
 //! General, Terminal, and Resources mutate diri's preferences. Remote manages
 //! the shared execution-host catalog used by the SSH Remote Holder transport.
@@ -6,44 +6,138 @@
 use diri_proto::{HostEntry, HostNodeConfig};
 use diri_term::theme::TermTheme;
 
-use crate::store::{DefaultAgent, Prefs};
+use crate::query_editor::QueryEditor;
+use crate::store::Prefs;
+
+/// The two groups the navigation list is split into.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettingsSection {
+    Personal,
+    System,
+}
+
+impl SettingsSection {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Personal => "Personal",
+            Self::System => "System",
+        }
+    }
+}
+
+/// Everything the window sidebar needs to paint settings navigation.
+///
+/// Settings state itself stays in `UtilitySurfaces`, which owns the page the
+/// navigation drives. The sidebar renders this projection rather than keeping
+/// a second copy, so the list and the page can never disagree about which tab
+/// is selected or what the search field says.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SettingsNav {
+    pub tabs: Vec<SettingsTab>,
+    pub active: SettingsTab,
+    pub search: QueryEditor,
+    pub search_active: bool,
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SettingsTab {
     #[default]
     General,
+    WhatsNew,
+    Agents,
+    Skills,
+    Accounts,
+    Shortcuts,
     Terminal,
+    Usage,
+    Worktrees,
     Resources,
     Remote,
+    Phone,
 }
 
 impl SettingsTab {
-    pub const ALL: [Self; 4] = [Self::General, Self::Terminal, Self::Resources, Self::Remote];
+    pub const ALL: [Self; 12] = [
+        Self::General,
+        Self::WhatsNew,
+        Self::Agents,
+        Self::Skills,
+        Self::Accounts,
+        Self::Shortcuts,
+        Self::Terminal,
+        Self::Usage,
+        Self::Worktrees,
+        Self::Resources,
+        Self::Remote,
+        Self::Phone,
+    ];
 
     pub const fn label(self) -> &'static str {
         match self {
             Self::General => "General",
-            Self::Terminal => "Terminal",
+            Self::WhatsNew => "What's New",
+            Self::Agents => "Agents",
+            Self::Skills => "Skills",
+            Self::Accounts => "Accounts",
+            Self::Shortcuts => "Shortcuts",
+            Self::Terminal => "Appearance",
+            Self::Usage => "Usage",
+            Self::Worktrees => "Worktrees",
             Self::Resources => "Resources",
             Self::Remote => "Remote",
+            Self::Phone => "Phone access",
         }
     }
 
     pub const fn subtitle(self) -> &'static str {
         match self {
             Self::General => "Startup, sessions, and updates",
-            Self::Terminal => "Appearance and text size",
+            Self::WhatsNew => "Latest release notes",
+            Self::Agents => "Installed CLIs and quick create",
+            Self::Skills => "Browse local and project skills",
+            Self::Accounts => "Profiles for work and personal accounts",
+            Self::Shortcuts => "Keyboard commands and bindings",
+            Self::Terminal => "Themes and terminal type",
+            Self::Usage => "Costs, tokens, and cache savings",
+            Self::Worktrees => "Pull requests and disk cleanup",
             Self::Resources => "Idle sessions and memory",
             Self::Remote => "SSH execution hosts",
+            Self::Phone => "Code from your iPhone",
+        }
+    }
+
+    /// Personal pages change how diri behaves for this user; System pages
+    /// describe the machines and resources sessions run on.
+    pub const fn section(self) -> SettingsSection {
+        match self {
+            Self::General
+            | Self::WhatsNew
+            | Self::Agents
+            | Self::Skills
+            | Self::Accounts
+            | Self::Shortcuts
+            | Self::Terminal
+            | Self::Usage => SettingsSection::Personal,
+            Self::Worktrees | Self::Resources | Self::Remote | Self::Phone => {
+                SettingsSection::System
+            }
         }
     }
 
     pub const fn icon(self) -> &'static str {
         match self {
             Self::General => "gearshape",
+            Self::WhatsNew => "sparkles",
+            Self::Agents => "sparkles",
+            Self::Skills => "doc.text",
+            Self::Accounts => "account.circle",
+            Self::Shortcuts => "keyboard",
             Self::Terminal => "terminal",
+            Self::Usage => "chart.bar.xaxis",
+            Self::Worktrees => "arrow.branch",
             Self::Resources => "server.rack",
             Self::Remote => "network",
+            Self::Phone => "iphone",
         }
     }
 }
@@ -169,15 +263,6 @@ fn unique_host_id<'a>(name: &str, existing: impl Iterator<Item = &'a str>) -> St
     unreachable!()
 }
 
-pub fn default_agent_label(agent: DefaultAgent) -> &'static str {
-    match agent {
-        DefaultAgent::ClaudeCode => "Claude Code",
-        DefaultAgent::Codex => "Codex",
-        DefaultAgent::Cursor => "Cursor",
-        DefaultAgent::Gemini => "Gemini",
-    }
-}
-
 pub fn theme(id: &str) -> TermTheme {
     crate::app_theme::terminal_theme(id)
 }
@@ -223,7 +308,7 @@ mod tests {
         assert_eq!(cycle_hibernate_minutes(60), 0);
         assert_eq!(cycle_memory_limit(2), 4);
         assert_eq!(cycle_memory_limit(8), 2);
-        assert_eq!(DefaultAgent::ALL.len(), 4);
+        assert_eq!(SettingsTab::Terminal.label(), "Appearance");
         assert!(
             SettingsTab::ALL
                 .into_iter()

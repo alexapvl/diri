@@ -1,9 +1,13 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use diri_proto::paths::DirijorPaths;
 use diri_proto::{AgentKind, ProjectId, SessionId};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+use crate::launch_recipe::{LaunchRecipeBook, deserialize_recipe_book};
 
 const DEFAULT_THEME: &str = "dirijor-dark";
 
@@ -40,31 +44,62 @@ pub enum InspectorTab {
     Artifacts,
 }
 
+/// How the leading sidebar presents sessions. This is deliberately a view
+/// preference: projects remain attached to every session even when their
+/// headers are hidden by the recency view.
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub enum DefaultAgent {
+pub enum SidebarGrouping {
     #[default]
-    ClaudeCode,
-    Codex,
-    Cursor,
-    Gemini,
+    Project,
+    Recency,
 }
 
-impl DefaultAgent {
-    pub fn kind(self) -> AgentKind {
-        match self {
-            Self::ClaudeCode => AgentKind::CLAUDE_CODE,
-            Self::Codex => AgentKind::CODEX,
-            Self::Cursor => AgentKind::CURSOR,
-            Self::Gemini => AgentKind::GEMINI,
-        }
-    }
+/// Sort policy for sidebar sessions. `Custom` preserves the long-standing
+/// drag order; the chronological choices never overwrite that saved order.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SidebarOrdering {
+    #[default]
+    Custom,
+    NewestFirst,
+    OldestFirst,
+}
+
+/// Preferences intentionally persist the manifest id as a plain string. The
+/// four pre-catalog enum spellings are accepted forever because prefs survive
+/// upgrades; new saves use the canonical manifest ids (for example
+/// `"claude-code"` and `"opencode"`).
+fn serialize_default_agent<S>(agent: &AgentKind, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(agent.id())
+}
+
+fn deserialize_default_agent<'de, D>(deserializer: D) -> Result<AgentKind, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let saved = String::deserialize(deserializer)?;
+    Ok(match saved.as_str() {
+        "claudeCode" | AgentKind::CLAUDE_CODE_ID => AgentKind::CLAUDE_CODE,
+        "codex" => AgentKind::CODEX,
+        "cursor" => AgentKind::CURSOR,
+        "gemini" => AgentKind::GEMINI,
+        "shell" => AgentKind::SHELL,
+        _ => AgentKind::new(saved),
+    })
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Prefs {
-    pub default_agent: DefaultAgent,
+    #[serde(
+        serialize_with = "serialize_default_agent",
+        deserialize_with = "deserialize_default_agent"
+    )]
+    pub default_agent: AgentKind,
     /// Persistent destination for global new-session shortcuts. `None` means
     /// this Mac; a host id means that configured remote host. The alias
     /// migrates preferences written by the earlier last-used implementation.
@@ -73,21 +108,39 @@ pub struct Prefs {
     pub start_at_login: bool,
     pub confirm_before_closing_session: bool,
     pub status_sounds: bool,
-    /// Check the releases feed in the background. Downloading and installing
-    /// always stay manual — see `crate::updates`.
+    pub status_notifications: bool,
+    pub muted_notification_sessions: std::collections::BTreeSet<String>,
+    /// Check, download, and verify releases in the background. A staged update
+    /// installs on quit or when the user requests a restart.
     pub automatic_updates: bool,
     /// A release the user chose not to install. Persisted so "Skip" outlives
     /// the session that clicked it; empty means nothing is skipped.
     pub skipped_update_version: String,
     pub hibernate_after_minutes: u32,
     pub memory_hard_limit_gb: u64,
+    /// Which generation of hibernation defaults this file was last brought
+    /// up to. Prefs are written wholesale, so an old default is
+    /// indistinguishable from a choice; this lets a raised default reach
+    /// users who never touched the setting, once, without ever moving a
+    /// value that differs from the old default. Field-level default so a
+    /// file written before the field existed reads as revision 0, not as
+    /// whatever `Prefs::default()` currently carries.
+    #[serde(default)]
+    pub hibernation_defaults_revision: u32,
     pub terminal_theme: String,
+    /// Follow native appearance changes; terminal_theme stores the resolved palette.
+    pub follow_system_theme: bool,
     pub terminal_font_size: f32,
     /// Last size, position, and presentation mode of the main window.
     pub window_placement: Option<WindowPlacement>,
     /// Whether the leading sidebar was mounted when the app last ran.
     pub sidebar_visible: bool,
     pub sidebar_width: f32,
+    pub sidebar_grouping: SidebarGrouping,
+    pub sidebar_ordering: SidebarOrdering,
+    /// The projectless recency view has one shared archive disclosure rather
+    /// than one disclosure per hidden project header.
+    pub sidebar_recency_archives_expanded: bool,
     /// Whether the trailing workbench inspector is mounted.
     pub inspector_open: bool,
     /// Width of the trailing workbench inspector in points.
@@ -107,6 +160,15 @@ pub struct Prefs {
     /// Sessions whose spawned children are folded away.
     pub sidebar_collapsed_sessions: Vec<SessionId>,
     pub sidebar_expanded_archives: Vec<ProjectId>,
+    /// Versioned, locally owned one-action Agent workflows.
+    #[serde(default, deserialize_with = "deserialize_recipe_book")]
+    pub launch_recipes: LaunchRecipeBook,
+    /// Per-command keyboard overrides keyed by the command registry's stable
+    /// id. A missing entry uses the shipped binding, `null` leaves the command
+    /// unassigned, and a string contains a GPUI keystroke such as `cmd-shift-p`.
+    /// Unknown ids are retained so opening these preferences in an older diri
+    /// build does not erase settings written by a newer one.
+    pub shortcut_overrides: BTreeMap<String, Option<String>>,
     /// Session that should regain focus after the daemon's initial hydrate.
     pub last_selected_session: Option<SessionId>,
 }
@@ -114,21 +176,28 @@ pub struct Prefs {
 impl Default for Prefs {
     fn default() -> Self {
         Self {
-            default_agent: DefaultAgent::ClaudeCode,
+            default_agent: AgentKind::CLAUDE_CODE,
             default_spawn_host: None,
             start_at_login: false,
             confirm_before_closing_session: true,
             status_sounds: true,
+            status_notifications: true,
+            muted_notification_sessions: Default::default(),
             automatic_updates: true,
             skipped_update_version: String::new(),
-            hibernate_after_minutes: 15,
-            memory_hard_limit_gb: 6,
+            hibernate_after_minutes: 60,
+            memory_hard_limit_gb: 16,
+            hibernation_defaults_revision: Self::HIBERNATION_DEFAULTS_REVISION,
             terminal_theme: DEFAULT_THEME.to_owned(),
+            follow_system_theme: false,
             terminal_font_size: 13.0,
             window_placement: None,
-            sidebar_visible: true,
+            sidebar_visible: false,
             sidebar_width: 248.0,
-            inspector_open: true,
+            sidebar_grouping: SidebarGrouping::Project,
+            sidebar_ordering: SidebarOrdering::Custom,
+            sidebar_recency_archives_expanded: false,
+            inspector_open: false,
             inspector_width: 440.0,
             inspector_tab: InspectorTab::Info,
             workbench_primary_fraction: crate::workbench::DEFAULT_PRIMARY_FRACTION,
@@ -140,6 +209,8 @@ impl Default for Prefs {
             sidebar_collapsed_projects: Vec::new(),
             sidebar_collapsed_sessions: Vec::new(),
             sidebar_expanded_archives: Vec::new(),
+            launch_recipes: LaunchRecipeBook::default(),
+            shortcut_overrides: BTreeMap::new(),
             last_selected_session: None,
         }
     }
@@ -157,14 +228,19 @@ impl Prefs {
     }
 
     pub fn path_in_home(home: &Path) -> PathBuf {
-        home.join("Library/Application Support/diri/prefs.json")
+        DirijorPaths::prefs_file(home)
     }
+
+    /// Bump when a hibernation default changes, and teach
+    /// [`Self::migrate_hibernation_defaults`] the old value to move.
+    pub const HIBERNATION_DEFAULTS_REVISION: u32 = 1;
 
     pub fn load(path: &Path) -> io::Result<Self> {
         match fs::read(path) {
             Ok(bytes) => {
                 let mut prefs: Self = serde_json::from_slice(&bytes)
                     .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                prefs.migrate_hibernation_defaults();
                 prefs.normalize();
                 Ok(prefs)
             }
@@ -196,6 +272,38 @@ impl Prefs {
         self.terminal_font_size = 13.0;
     }
 
+    /// Moves values still sitting on a superseded default onto the current
+    /// one. Anything the user changed from the old default is left alone.
+    pub fn migrate_hibernation_defaults(&mut self) {
+        if self.hibernation_defaults_revision < 1 {
+            // Revision 1 (2026-09): 15 min → 1 h, 6 GB → 16 GB. Sessions
+            // were being frozen mid-work far too readily.
+            if self.hibernate_after_minutes == 15 {
+                self.hibernate_after_minutes = 60;
+            }
+            if self.memory_hard_limit_gb == 6 {
+                self.memory_hard_limit_gb = 16;
+            }
+        }
+        self.hibernation_defaults_revision = Self::HIBERNATION_DEFAULTS_REVISION;
+    }
+
+    pub fn apply_system_theme(&mut self, dark: bool) -> bool {
+        if !self.follow_system_theme {
+            return false;
+        }
+        let id = if dark {
+            "dirijor-dark"
+        } else {
+            "dirijor-light"
+        };
+        if self.terminal_theme == id {
+            return false;
+        }
+        self.terminal_theme = id.to_owned();
+        true
+    }
+
     pub fn normalize(&mut self) {
         if !self.terminal_font_size.is_finite() {
             self.terminal_font_size = 13.0;
@@ -225,6 +333,11 @@ impl Prefs {
             self.inspector_width = 440.0;
         }
         self.inspector_width = self.inspector_width.clamp(300.0, 720.0);
+        if self.sidebar_grouping == SidebarGrouping::Recency
+            && self.sidebar_ordering == SidebarOrdering::Custom
+        {
+            self.sidebar_ordering = SidebarOrdering::NewestFirst;
+        }
         if !self.workbench_primary_fraction.is_finite() {
             self.workbench_primary_fraction = crate::workbench::DEFAULT_PRIMARY_FRACTION;
         }
@@ -232,5 +345,165 @@ impl Prefs {
         if self.terminal_theme.is_empty() {
             self.terminal_theme = DEFAULT_THEME.to_owned();
         }
+        self.launch_recipes.normalize();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::launch_recipe::{LaunchRecipe, RecipeProject};
+
+    #[test]
+    fn system_appearance_is_opt_in_persisted_and_only_changes_with_the_os() {
+        let mut prefs: Prefs = serde_json::from_str(r#"{"terminalTheme":"vesper"}"#).unwrap();
+        assert!(!prefs.follow_system_theme);
+        assert!(!prefs.apply_system_theme(false));
+        assert_eq!(prefs.terminal_theme, "vesper");
+
+        prefs.follow_system_theme = true;
+        assert!(prefs.apply_system_theme(false));
+        assert_eq!(prefs.terminal_theme, "dirijor-light");
+        assert!(!prefs.apply_system_theme(false));
+        let mut restored: Prefs =
+            serde_json::from_slice(&serde_json::to_vec(&prefs).unwrap()).unwrap();
+        assert!(restored.follow_system_theme);
+        assert!(restored.apply_system_theme(true));
+        assert_eq!(restored.terminal_theme, "dirijor-dark");
+        assert!(!restored.apply_system_theme(true));
+        restored.follow_system_theme = false;
+        assert!(!restored.apply_system_theme(false));
+        assert_eq!(restored.terminal_theme, "dirijor-dark");
+    }
+
+    fn prefs_with_hibernation(minutes: u32, gb: u64, revision: Option<u32>) -> Prefs {
+        let mut value = serde_json::to_value(Prefs::default()).expect("serialize prefs");
+        value["hibernateAfterMinutes"] = serde_json::json!(minutes);
+        value["memoryHardLimitGb"] = serde_json::json!(gb);
+        match revision {
+            Some(revision) => value["hibernationDefaultsRevision"] = serde_json::json!(revision),
+            None => {
+                value
+                    .as_object_mut()
+                    .expect("prefs object")
+                    .remove("hibernationDefaultsRevision");
+            }
+        }
+        let mut prefs: Prefs = serde_json::from_value(value).expect("readable");
+        prefs.migrate_hibernation_defaults();
+        prefs
+    }
+
+    #[test]
+    fn stale_hibernation_defaults_move_to_the_current_ones_once() {
+        // A file written before the revision field existed, still on the
+        // old defaults: both move.
+        let migrated = prefs_with_hibernation(15, 6, None);
+        assert_eq!(migrated.hibernate_after_minutes, 60);
+        assert_eq!(migrated.memory_hard_limit_gb, 16);
+        assert_eq!(
+            migrated.hibernation_defaults_revision,
+            Prefs::HIBERNATION_DEFAULTS_REVISION
+        );
+        // A deliberate choice away from the old defaults is untouched.
+        let chosen = prefs_with_hibernation(30, 8, None);
+        assert_eq!(chosen.hibernate_after_minutes, 30);
+        assert_eq!(chosen.memory_hard_limit_gb, 8);
+        // Choosing the old default AFTER the migration ran sticks.
+        let rechosen = prefs_with_hibernation(15, 6, Some(1));
+        assert_eq!(rechosen.hibernate_after_minutes, 15);
+        assert_eq!(rechosen.memory_hard_limit_gb, 6);
+    }
+
+    #[test]
+    fn fresh_preferences_close_panels_but_saved_choices_survive() {
+        let fresh: Prefs = serde_json::from_str("{}").expect("missing preferences use defaults");
+        assert!(!fresh.sidebar_visible);
+        assert!(!fresh.inspector_open);
+        assert_eq!(fresh.sidebar_grouping, SidebarGrouping::Project);
+        assert_eq!(fresh.sidebar_ordering, SidebarOrdering::Custom);
+        for sidebar in [false, true] {
+            for inspector in [false, true] {
+                let saved = Prefs {
+                    sidebar_visible: sidebar,
+                    inspector_open: inspector,
+                    ..Prefs::default()
+                };
+                let restored: Prefs =
+                    serde_json::from_slice(&serde_json::to_vec(&saved).unwrap()).unwrap();
+                assert_eq!(restored.sidebar_visible, sidebar);
+                assert_eq!(restored.inspector_open, inspector);
+            }
+        }
+
+        let saved = Prefs {
+            sidebar_grouping: SidebarGrouping::Recency,
+            sidebar_ordering: SidebarOrdering::OldestFirst,
+            sidebar_recency_archives_expanded: true,
+            ..Prefs::default()
+        };
+        let restored: Prefs = serde_json::from_slice(&serde_json::to_vec(&saved).unwrap()).unwrap();
+        assert_eq!(restored.sidebar_grouping, SidebarGrouping::Recency);
+        assert_eq!(restored.sidebar_ordering, SidebarOrdering::OldestFirst);
+        assert!(restored.sidebar_recency_archives_expanded);
+    }
+
+    #[test]
+    fn older_preferences_migrate_to_an_empty_recipe_book() {
+        let mut value = serde_json::to_value(Prefs::default()).expect("serialize prefs");
+        value
+            .as_object_mut()
+            .expect("prefs object")
+            .remove("launchRecipes");
+        let prefs: Prefs = serde_json::from_value(value).expect("old preferences remain readable");
+        assert!(prefs.launch_recipes.items().is_empty());
+    }
+
+    #[test]
+    fn older_preferences_migrate_to_default_shortcuts() {
+        let mut value = serde_json::to_value(Prefs::default()).expect("serialize prefs");
+        value
+            .as_object_mut()
+            .expect("prefs object")
+            .remove("shortcutOverrides");
+        let prefs: Prefs = serde_json::from_value(value).expect("old preferences remain readable");
+        assert!(prefs.shortcut_overrides.is_empty());
+    }
+
+    #[test]
+    fn malformed_recipe_data_does_not_discard_other_preferences() {
+        let mut value = serde_json::to_value(Prefs {
+            status_sounds: false,
+            ..Prefs::default()
+        })
+        .expect("serialize prefs");
+        value["launchRecipes"] = serde_json::json!({"version": 1, "items": "broken"});
+        let prefs: Prefs =
+            serde_json::from_value(value).expect("malformed recipe field is isolated");
+        assert!(!prefs.status_sounds);
+        assert!(prefs.launch_recipes.items().is_empty());
+    }
+
+    #[test]
+    fn recipe_book_round_trips_through_preferences() {
+        let mut prefs = Prefs::default();
+        prefs
+            .launch_recipes
+            .add(LaunchRecipe::draft(
+                "Review",
+                AgentKind::CODEX,
+                RecipeProject::Path {
+                    path: "/tmp".into(),
+                },
+                None,
+                "Review this branch",
+            ))
+            .expect("add recipe");
+        let json = serde_json::to_vec(&prefs).expect("serialize prefs");
+        let restored: Prefs = serde_json::from_slice(&json).expect("deserialize prefs");
+        assert_eq!(
+            restored.launch_recipes.items(),
+            prefs.launch_recipes.items()
+        );
     }
 }

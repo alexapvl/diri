@@ -29,6 +29,207 @@ cargo build -p diri-app --release
 The shared target is measurement/build cache only. It must never be packaged or
 shipped.
 
+## Twenty-terminal performance pass (2026-09-06)
+
+Measured on Apple Silicon, macOS 26.5.2, Rust 1.95.0 release builds. These are
+workload-specific results, not proof that Diri is universally faster than
+Ghostty, Kitty, or every other terminal.
+
+### Retained heap and resizing
+
+`cargo bench -p diri-terminal-state --bench terminal_fleet` counts requested
+live Rust heap bytes for twenty real `HeadlessScreen` instances. It fills each
+80×50 terminal with 6,000 hard-newline log lines, widens all to 320 columns,
+then performs 600 mixed width/height resizes. The initial baseline used the
+same harness before the production changes. Values exclude agents, Holders,
+output logs, the desktop, and GPU resources. Reserved heap is **not** physical
+footprint; allocator row slack also means a 4 MiB history-cell allowance does
+not imply a 4 MiB terminal process.
+
+| Twenty terminal cores | Before | After |
+| --- | ---: | ---: |
+| Fresh, 80×50 | 43.88 MiB | 3.88 MiB |
+| Full history, 80×50 | 157.49 MiB | 117.49 MiB |
+| Full history after widening to 320×50 | 381.00 MiB | 101.06 MiB |
+| After repeated resizing | 373.49 MiB | 92.55 MiB |
+| Live allocations after dropping all cores | 0 bytes | 0 bytes |
+| Allocations across 2,000 cursor-only updates | 4,000 | 0 |
+
+The original implementation retained the construction-time history row limit
+through width changes. A regression test first failed with 2,184 history rows
+after widening to 320 columns; the current-width allowance is 546. The fix
+updates primary history even while the alternate screen is active, preserves
+reflow ordering, and removes the minimum-64-row exception that could exceed
+the budget at very wide dimensions. Same-size resizes return immediately.
+Tests reconstruct incremental updates through split UTF-8, ANSI styles,
+alternate screens, insert/delete lines, synchronization, and resizing and
+compare them with independent full snapshots.
+
+Cursor-only publications now compare/update the existing cell baseline in
+place, allocating outgoing rows only when cells differ. VTE's unconditional
+2 MiB synchronization reserve is now lazy; see
+[vendor/vte/DIRI-PATCH.md](vendor/vte/DIRI-PATCH.md). All 54 upstream VTE tests
+pass, including split, nested, and oversized synchronized updates. First-use
+synchronized frames can allocate; subsequent frames reuse their capacity.
+The default Remote Helper Build ID includes the vendored sources.
+
+The fleet benchmark gates fresh heap below 8 MiB, widened and churned heap
+below 140 MiB, zero warmed cursor-update allocations, and zero leaked heap.
+It runs from `scripts/terminal-perf-gate.sh`.
+
+### Scrolling renderer
+
+The production Metal benchmark exposed zero reused shapes on full-height
+scrolling: the cache followed screen row numbers rather than surviving rows.
+The renderer now rotates its existing cache with a detected scroll, verifies
+complete cell equality before reuse, and translates backgrounds and decorations
+with their text. Render-context changes still force rebuilding. No new cache,
+protocol, lock, or dependency was introduced for rendering.
+
+The same 160×50 benchmark improved from a Criterion estimate of 845.48 µs to
+795.43 µs (Criterion's paired estimate: 7.2% faster). Steady scrolling reuses
+49 of 50 row shapes; a new gate requires over 90% reuse once startup amortizes.
+Tests cover both scroll directions, multi-row movement, sparse damage,
+background/decoration positions, and an edited cell that must be reshaped.
+This measures the real headless Metal renderer, not input-to-photon latency.
+The after run had one 120 Hz overrun during calibration; steady-state medians
+are not a guarantee about every frame.
+
+The older `terminal_throughput` typing fixture repeatedly overwrote `x` with
+`x`. It now alternates `x` and `y` so every operation changes a real cell.
+Do not compare its updated typing time directly with the historical table.
+
+### Sessions and remote latency
+
+Twenty simultaneously released local sessions each drained 16 MiB of colored
+build logs: **108.2 MiB/s aggregate**, 2.96 s wall time, fastest/median/slowest
+2.79/2.95/2.96 s. This measures production PTYs, the Holder manager, output
+logging, parsing, and status handling, with no desktop attached. The revised
+`fleetbench` uses a shared start gate, passes payload paths as argv data,
+fails on unfinished sessions, and terminates owned sessions on failure.
+
+The corrected `sessionbench idle 20` measured **59.68 MiB physical footprint
+and 0.97% of one CPU core** over ten seconds across 22 processes: the benchmark
+engine, its private Holder manager, and twenty sleeping children. Real Agent
+runtimes and model workloads are excluded. The old `RUSAGE_CHILDREN` metric
+missed live children; the probe now samples the actual process set through the
+Engine's platform resource collector. These are observations, not portable
+hard gates or before/after daemon comparisons.
+
+The release Remote Holder UDS gate passed:
+
+| Metric | Measured | Architecture ceiling |
+| --- | ---: | ---: |
+| Snapshot p90 | 10 µs | 100 ms |
+| Input-to-PTY p95 | 131 µs | 10 ms |
+| Output-to-diff p90 | 23 µs | 50 ms |
+| Loopback median / p90 | 102 / 148 µs | 75 / 150 ms |
+
+These are same-host UDS timings, not SSH/WAN or display latency. The real SSH
+soak and native Linux architecture jobs remain CI release gates.
+
+### Comparison scope and reproduction
+
+`cargo build --release -p diri-engine --example termcompare` builds a Rust
+probe that writes identical 64 KiB chunks to the terminal in raw mode and waits
+for a cursor report behind the payload. It records five runs after warmup and
+the terminal dimensions, and fails rather than substituting drain-only timing
+for an unanswered query. Run `termcompare <payload> <results.json>` inside each
+terminal at the same geometry; compare medians, versions, and configurations.
+
+Exploratory local runs were made with Diri, Ghostty 1.2.3, and Kitty 0.48.2.
+They are **not an accepted ranking**: Diri's run was headless, competitor GUI
+launch/exit was inconsistent, and initial records lacked verified geometry.
+Use a separate input-to-photon/resize capture and comparable rendered workloads
+before publishing superiority claims. Actual 20-Agent CPU, long-duration
+memory behavior, and sustained loaded input latency require broader workloads
+than twenty synthetic terminal producers.
+
+### Verification of this pass
+
+- `cargo fmt --all -- --check` and workspace Clippy with `-D warnings`: pass.
+- `cargo test --workspace`: 1,336 passed, zero failed, 24 intentionally ignored.
+- `cargo build --workspace --release`: pass.
+- `scripts/terminal-perf-gate.sh`: pass, including the added heap/allocation and
+  shape-reuse gates, VTE tests, persistent input, and attach tests. The final
+  state fixture measured typing 753 ns, scrolling 30,889 ns, and cursor-only
+  721 ns per operation. Local input-to-grid median was 337 µs.
+- Release Remote Holder UDS gate: pass. After including the vendored parser in
+  the Helper source identity, remote package tests passed again: 40 passed,
+  zero failed, five opt-in tests ignored. The native macOS arm64 Helper probe
+  reports protocol 1.4 and all required capabilities.
+- The inert packaged-process gate passed on a disposable, ad-hoc-signed copy
+  containing the new release executable: normal/large footprints 33.8/33.6 MB,
+  sampled idle CPU 0%. Window visibility was not independently verified in
+  this run, so these process-only readings are not accepted visible-window
+  memory comparisons. No production bundle was replaced or published.
+
+PTY/UDS and Metal tests required running outside the execution sandbox. Initial
+sandbox-only attempts could not launch their private Holder sockets or macOS
+graphics services; the authorized runs above completed successfully.
+
+## Terminal interaction hot path (2026-08-13)
+
+Release-mode measurements below compare untouched `main` at `39af365` with the
+terminal performance branch on the same Apple Silicon Mac running macOS 26.5.2.
+The terminal-state fixture is 160×50 and reports the median of five 5,000-
+interaction rounds. The renderer fixture scrolls the same 160×50 build log
+through GPUI's production text system and the real headless Metal renderer.
+The input-to-grid fixture reports the median of 101 echoed writes, long enough
+to include the viewport's scrolling phase.
+
+| Interaction | `main` | Optimized | Change |
+| --- | ---: | ---: | ---: |
+| Prompt typing, parser through grid diff | 36,322 ns | 771 ns | 47.1× faster |
+| Cursor-only traffic | 34,814 ns | 796 ns | 43.7× faster |
+| Full-height build-log scroll | 34,543 ns | 32,242 ns | 6.7% faster |
+| Metal scrolling frame, Criterion estimate | 881.59 µs | 868.24 µs | 1.5% faster |
+| Metal scrolling frame p95 | 872 µs | 869 µs | no regression |
+| Holder write p50, legacy vs persistent stream | 32 µs | 12 µs | 2.7× faster |
+| Holder write p95, legacy vs persistent stream | 40 µs | 15 µs | 2.7× faster |
+| Local input-to-grid median, including scroll | 75 µs | 64 µs | 15% faster |
+
+The Metal sample recorded one invalidation per frame and zero 120 Hz frame-
+budget overruns. The renderer benchmark rejects a steady-state average CPU
+frame cost at or above 8 ms; Criterion's tiny cold-start calibration batches
+are excluded until at least 32 frames have been observed. The terminal-state
+benchmark has absolute budgets for typing,
+scrolling, and cursor traffic, while the Holder and attach tests enforce their
+release latency ceilings.
+
+The measured changes are deliberately distributed along the existing deep
+terminal interface rather than hidden behind another wrapper:
+
+- Alacritty damage is preserved at row granularity, so typing and cursor motion
+  no longer hash and compare the entire viewport. Grid publication still
+  compares actual cells before sending a row.
+- Adjacent grid frames coalesce before one authoritative buffer mutation and
+  one selected-pane notification. The client handoff is bounded; offscreen
+  terminals remain current without invalidating the window.
+- The daemon publishes the leading edge immediately, lets two interactive
+  response publications bypass coalescing, and caps only continuous output at
+  8 ms (120 Hz). A destructive erase may wait up to 16 ms for its redraw bytes,
+  but the wait ends as soon as they arrive and never applies to typed echo or
+  additive scrolling. GPUI's display link is the sole client-side repaint
+  pacer.
+- Held sessions negotiate an additive persistent binary input/resize stream.
+  Old live Holders reject the optional negotiation and continue over the exact
+  legacy JSON/base64 request path. On Apple platforms the dedicated input lane
+  uses interactive QoS. The daemon's held-output follower uses the same class
+  only during its existing recently-attached/input hot window, then restores
+  default QoS; together they improve end-to-grid latency without elevating idle
+  or background sessions indefinitely.
+- Font metrics are retained by font and size, and ordinary undecorated rows
+  skip two independent quad scans through a single plain-row check.
+- Frame decoding advances a read cursor and compacts occasionally instead of
+  shifting the receive buffer after every decoded frame.
+
+Run all terminal-specific gates with:
+
+```sh
+diri/scripts/terminal-perf-gate.sh
+```
+
 ## Memory
 
 `DIRI_PERF_LARGE_WINDOW=1` is a retained profiling switch that starts the app at
@@ -77,14 +278,14 @@ are opaque, avoiding a persistent WindowServer backdrop/blur composition pass.
   the current viewport. Evicted rows remain daemon-owned and are fetched again
   if revisited. Three resident terminals therefore cannot retain an entire
   repeatedly traversed history indefinitely.
-- Every incoming terminal diff still updates its authoritative buffer, but
-  selected-session paints are paced to one every 50 ms and background residents
-  never invalidate the window. An active find arms only one output-rescan timer.
-- The daemon source uses the same 20 fps grid ceiling and skips screen-to-cell
-  extraction entirely while no output sink is attached. A later attachment
-  receives a fresh full grid. These daemon changes take effect only after a
-  future daemon restart; this optimization work never signaled or replaced the
-  daemon that was already running.
+- Every incoming terminal diff still updates its authoritative buffer, but a
+  receiver burst folds adjacent rows into one final update and one selected-
+  session notification. Background residents never invalidate the window. An
+  active find arms only one output-rescan timer.
+- The daemon skips screen-to-cell extraction entirely while no output sink is
+  attached. With a sink, leading-edge and interactive output is immediate;
+  continuous output is capped at 120 publications per second. A later
+  attachment receives a fresh full grid.
 
 ### Acceptance
 
@@ -154,8 +355,56 @@ historical development-binary numbers.
 ```sh
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
+diri/scripts/terminal-perf-gate.sh
 diri/scripts/perf-gate.sh --app diri/dist/diri.app --scenario all
 ```
 
 The packaged probe is the release acceptance authority; the historical command
 results above apply only to the dated T16 sample.
+
+## Sidebar activity marks (2026-09-08)
+
+Session rows separate activity (left) from agent identity (right). Working
+marks use eight embedded SVG frames, shared through GPUI's existing SVG atlas.
+The sidebar samples one phase per existing render, quantized to 125 ms; it
+never requests another render for the activity mark. There is no timer per
+row or per sidebar, and no animated-image decoder. Between existing sidebar
+repaints the mark stays still. Reduce Motion fixes the phase at zero.
+Sleeping and ended rows have no animated mark. This deliberately preserves
+the no-periodic-wake contract instead of promising a continuous spinner.
+
+The following measurements are from the initial layout at `1ca2efb`, before
+aligning the leading activity column with the project icon and moving parent
+fold controls to the trailing edge. That refinement removes the empty leading
+fold slot; the animation policy is unchanged.
+
+On this Apple Silicon workstation running macOS 26.5.2, an optimized native
+headless benchmark with **30 visible working rows**, a 360×1120 pt window,
+32 warmup repaints, and 500 measured forced repaints produced:
+
+| Three alternating runs | Median repaint (ms) | p90 repaint (ms) |
+| --- | --- | --- |
+| `main` at `5b6b46e` | 1.011 / 1.018 / 1.014 | 1.059 / 1.091 / 1.050 |
+| Separate activity/identity | 1.043 / 1.041 / 1.045 | 1.153 / 1.109 / 1.105 |
+
+The additional mark costs approximately **0.03 ms per forced full sidebar
+repaint** in this fixture. Whole-process CPU time (including startup, warmup,
+and PNG capture) was 0.710–0.739 s before and 0.726–0.759 s after. These are
+rendering measurements, not a packaged idle-CPU gate or a guarantee about
+live terminal workloads. No added timer means the activity marks introduce
+no autonomous wakeups, including with 30 working sessions.
+
+Reproduce from `diri/` using an isolated Cargo target directory:
+
+```sh
+DIRI_VISUAL_SCENARIO=fleet DIRI_VISUAL_WIDTH=360 \
+DIRI_VISUAL_POPOVER=none DIRI_VISUAL_BENCH=1 \
+DIRI_VISUAL_OUTPUT=/tmp/sidebar-fleet.png \
+cargo test --release -p diri-app render_sidebar_preview_screenshot -- --ignored --nocapture
+```
+
+For a before/after comparison, use the same fixture and screenshot benchmark
+harness on both revisions. `DIRIJOR_SIDEBAR_PREVIEW=fleet` also opens the
+30-session fixture interactively without an Engine connection. Use
+`DIRI_VISUAL_SCENARIO=stress` and `DIRI_VISUAL_LIGHT=1` for layout checks of
+loading, sleeping, nested, and long-title rows.

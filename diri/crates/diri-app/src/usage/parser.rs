@@ -18,6 +18,7 @@ pub(crate) fn parse_claude(
     offset: u64,
     cutoff_hour: i64,
     hours: &mut BTreeMap<i64, UsageHourAgg>,
+    details: &mut super::dashboard::ModelHours,
     seen_all: &mut HashSet<u64>,
     seen_by_hour: &mut BTreeMap<i64, Vec<u64>>,
 ) -> io::Result<u64> {
@@ -97,9 +98,19 @@ pub(crate) fn parse_claude(
                 + write_1h as f64 * pricing.cache_write_1h())
                 / 1_000_000.0;
         }
+        super::dashboard::record(details, model, hour, aggregate, match_claude(model), 0);
         hours.entry(hour).or_default().merge(aggregate);
     }
     Ok(consumed)
+}
+
+/// Cumulative counters identify a re-emitted usage event without confusing it
+/// with a separate request that happens to have the same token counts.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+pub(crate) struct CodexTotal {
+    input_tokens: i64,
+    cached_input_tokens: i64,
+    output_tokens: i64,
 }
 
 pub(crate) fn parse_codex(
@@ -107,7 +118,9 @@ pub(crate) fn parse_codex(
     offset: u64,
     cutoff_hour: i64,
     hours: &mut BTreeMap<i64, UsageHourAgg>,
+    details: &mut super::dashboard::ModelHours,
     model: &mut Option<String>,
+    previous_total: &mut Option<CodexTotal>,
 ) -> io::Result<u64> {
     let Some((data, consumed)) = read_complete_lines(path, offset)? else {
         return Ok(0);
@@ -158,6 +171,26 @@ pub(crate) fn parse_codex(
         let Some(timestamp) = parse_timestamp(timestamp) else {
             continue;
         };
+        // Update even outside retention, so a recent re-emission of old usage
+        // cannot become new spend. Persist across incremental scans.
+        if let Some(total) = payload
+            .pointer("/info/total_token_usage")
+            .filter(|total| total.is_object())
+        {
+            let current = CodexTotal {
+                input_tokens: integer(total.get("input_tokens")),
+                cached_input_tokens: integer(total.get("cached_input_tokens")),
+                output_tokens: integer(total.get("output_tokens")),
+            };
+            if previous_total.as_ref() == Some(&current) {
+                continue;
+            }
+            *previous_total = Some(current);
+        } else {
+            // Old rollouts have only per-request usage. Equal-sized requests
+            // are legitimate; don't deduplicate by token counts alone.
+            *previous_total = None;
+        }
         let hour = timestamp / 3_600;
         if hour < cutoff_hour {
             continue;
@@ -183,6 +216,14 @@ pub(crate) fn parse_codex(
                 + output as f64 * pricing.output)
                 / 1_000_000.0;
         }
+        super::dashboard::record(
+            details,
+            model.as_deref().unwrap_or("Unknown model"),
+            hour,
+            aggregate,
+            model.as_deref().and_then(match_openai),
+            integer(last.get("reasoning_output_tokens")).min(output),
+        );
         hours.entry(hour).or_default().merge(aggregate);
     }
     Ok(consumed)
@@ -222,7 +263,7 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
 }
 
 fn integer(value: Option<&Value>) -> i64 {
-    value.and_then(Value::as_i64).unwrap_or(0)
+    value.and_then(Value::as_i64).unwrap_or(0).max(0)
 }
 
 pub(crate) fn fnv1a(value: &str) -> u64 {

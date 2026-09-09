@@ -1,14 +1,19 @@
 //! Wire types and codecs for control messages, binary frames, grid updates, and daemon paths.
 
+pub mod accounts;
+pub use accounts::*;
 pub mod control;
 pub mod frames;
 pub mod grid;
 pub mod hosts;
 pub mod methods;
 pub mod model;
+pub mod net;
 pub mod node;
 pub mod paths;
+pub mod recovery;
 pub mod remote_pty;
+pub mod terminal;
 
 pub use control::{ControlError, ControlMessage, JsonValue, WIRE_VERSION};
 pub use hosts::{HostEntry, HostNodeConfig, HostsConfig};

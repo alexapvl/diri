@@ -11,7 +11,7 @@ import sys
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-POLICY_PATH = ROOT / "license-policy.json"
+POLICY_PATH = ROOT / "scripts" / "license-policy.json"
 RUST_WORKSPACE = ROOT / "diri"
 
 
@@ -102,19 +102,6 @@ def main() -> int:
         for entry in policy["manually_reviewed_non_rust"]
     }
     found_non_rust: set[tuple[str, str]] = set()
-
-    swift_lock = json.loads((ROOT / "Package.resolved").read_text())
-    for pin in swift_lock["pins"]:
-        key = ("swiftpm", pin["identity"].lower())
-        found_non_rust.add(key)
-        entry = reviewed.get(key)
-        version = pin["state"].get("version", pin["state"]["revision"])
-        if entry is None:
-            failures.append(f"unreviewed SwiftPM dependency {pin['identity']} {version}")
-        elif entry["version"] != version:
-            failures.append(
-                f"SwiftPM dependency {pin['identity']} changed {entry['version']} -> {version}; review its license"
-            )
 
     npm_lock = json.loads((ROOT / "sidecar" / "package-lock.json").read_text())
     for package_path, package in npm_lock["packages"].items():

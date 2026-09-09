@@ -25,6 +25,106 @@ fn engine() -> Arc<ManifestEngine> {
 }
 
 #[test]
+fn hello_overtakes_a_slow_worktree_spawn_on_the_same_connection() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    for args in [
+        vec!["init", "--initial-branch=main"],
+        vec![
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "main",
+        ],
+    ] {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+    }
+    let hook = repo.join(".git/hooks/post-checkout");
+    std::fs::write(&hook, "#!/bin/sh\nsleep 1\n").unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let registry = Arc::new(Mutex::new(Registry::new(
+        engine(),
+        temp.path().join("state.json"),
+    )));
+    let server = Arc::new(ControlServer::new(
+        Arc::clone(&registry),
+        temp.path().join("daemon.sock"),
+    ));
+    let listener = server.bind().unwrap();
+    let worker = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        server.serve(stream).unwrap();
+    });
+    let mut stream = UnixStream::connect(temp.path().join("daemon.sock")).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .unwrap();
+    for message in [
+        ControlMessage::Request {
+            id: 1,
+            method: "session.spawn".into(),
+            params: Some(json!({
+                "kind":{"shell":{}}, "cwd":repo, "newWorktree":true, "worktreeBase":"main", "worktreeBranch":"phone/test",
+                "argv":["/bin/sh", "-c", "printf ready; sleep 5"]
+            })),
+        },
+        ControlMessage::Request {
+            id: 2,
+            method: "hello".into(),
+            params: Some(json!({"proto":WIRE_VERSION,"build":"test"})),
+        },
+    ] {
+        let mut bytes = serde_json::to_vec(&message).unwrap();
+        bytes.push(b'\n');
+        stream.write_all(&bytes).unwrap();
+    }
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    assert!(
+        matches!(
+            serde_json::from_str::<ControlMessage>(&line).unwrap(),
+            ControlMessage::Response {
+                id: 2,
+                result: Ok(_)
+            }
+        ),
+        "Hello must not wait behind Git or a first-prompt wait: {line}"
+    );
+    line.clear();
+    reader.read_line(&mut line).unwrap();
+    let ControlMessage::Response {
+        id: 1,
+        result: Ok(record),
+    } = serde_json::from_str::<ControlMessage>(&line).unwrap()
+    else {
+        panic!("spawn failed: {line}");
+    };
+    registry
+        .lock()
+        .unwrap()
+        .terminate(
+            record["id"].as_str().unwrap(),
+            std::time::Duration::from_secs(2),
+        )
+        .unwrap();
+    drop(reader);
+    drop(stream);
+    worker.join().unwrap();
+}
+
+#[test]
 fn a_client_can_handshake_and_list_over_the_socket() {
     let temp = tempfile::tempdir().expect("temp");
     let registry = Registry::new(engine(), temp.path().join("state.json"));
@@ -243,6 +343,124 @@ fn spawning_a_shell_over_the_socket_produces_a_watched_session() {
         .shutdown(std::net::Shutdown::Write)
         .expect("half-close");
     accepting.join().expect("server thread");
+}
+
+#[test]
+fn shell_started_without_an_inherited_term_can_clear() {
+    const CHILD_MARKER: &str = "DIRI_TERM_REPRO_CHILD";
+    if std::env::var_os(CHILD_MARKER).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "shell_started_without_an_inherited_term_can_clear",
+                "--nocapture",
+            ])
+            .env(CHILD_MARKER, "1")
+            .env_remove("TERM")
+            .output()
+            .expect("run isolated child test");
+        assert!(
+            output.status.success(),
+            "isolated shell test failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+
+    assert!(
+        std::env::var_os("TERM").is_none(),
+        "the isolated repro must start without TERM"
+    );
+
+    let temp = tempfile::tempdir().expect("temp");
+    let registry = Registry::new(engine(), temp.path().join("state.json"));
+    let registry = Arc::new(Mutex::new(registry));
+    let server = ControlServer::new(Arc::clone(&registry), temp.path().join("daemon.sock"))
+        .with_logs_dir(temp.path().join("logs"));
+    let listener = server.bind().expect("bind");
+
+    let server = Arc::new(server);
+    let accepting = {
+        let server = Arc::clone(&server);
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let _ = server.serve(stream);
+        })
+    };
+
+    let client_handle = UnixStream::connect(server.socket_path()).expect("connect");
+    let mut client = client_handle.try_clone().expect("clone for writing");
+    let mut reader = BufReader::new(client_handle.try_clone().expect("clone for reading"));
+    let mut request = |message: ControlMessage| {
+        let mut bytes = serde_json::to_vec(&message).expect("encode");
+        bytes.push(b'\n');
+        client.write_all(&bytes).expect("write");
+        client.flush().expect("flush");
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("read a reply");
+        serde_json::from_str::<ControlMessage>(&line).expect("decode")
+    };
+
+    let spawned = request(ControlMessage::Request {
+        id: 1,
+        method: "session.spawn".into(),
+        params: Some(json!({
+            "kind": { "shell": {} },
+            "cwd": temp.path(),
+            "argv": [
+                "/bin/sh",
+                "-c",
+                "/usr/bin/clear 2>&1; printf '__clear_done__\\n'; sleep 30",
+            ],
+        })),
+    });
+    let id = match spawned {
+        ControlMessage::Response {
+            result: Ok(result), ..
+        } => result["id"].as_str().expect("a session id").to_string(),
+        other => panic!("spawn failed: {other:?}"),
+    };
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut screen = String::new();
+    while std::time::Instant::now() < deadline && !screen.contains("__clear_done__") {
+        if let ControlMessage::Response {
+            result: Ok(result), ..
+        } = request(ControlMessage::Request {
+            id: 2,
+            method: "session.read_screen".into(),
+            params: Some(json!({ "sessionID": id })),
+        }) {
+            screen = result["text"].as_str().unwrap_or_default().to_owned();
+        }
+        if !screen.contains("__clear_done__") {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    let killed = request(ControlMessage::Request {
+        id: 3,
+        method: "session.kill".into(),
+        params: Some(json!({ "sessionID": id })),
+    });
+    assert!(matches!(
+        killed,
+        ControlMessage::Response { result: Ok(_), .. }
+    ));
+    client_handle
+        .shutdown(std::net::Shutdown::Write)
+        .expect("half-close");
+    accepting.join().expect("server thread");
+
+    assert!(
+        screen.contains("__clear_done__"),
+        "clear command never completed: {screen:?}"
+    );
+    assert!(
+        !screen.contains("TERM environment variable not set"),
+        "new Terminal inherited no TERM: {screen:?}"
+    );
 }
 
 /// Subscribing turns the connection into an event sink: a mutation made on a

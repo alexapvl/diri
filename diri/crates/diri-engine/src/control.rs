@@ -24,10 +24,26 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::registry::Registry;
+mod account_handoff;
 
 /// Identifies this engine in the handshake, so a client can tell which
 /// implementation it reached.
-pub const BUILD: &str = concat!("diri-engine-", env!("CARGO_PKG_VERSION"));
+pub const BUILD: &str = concat!(
+    "diri-engine-",
+    env!("CARGO_PKG_VERSION"),
+    "+catalog.",
+    env!("DIRI_AGENT_CATALOG_BUILD_ID")
+);
+
+#[cfg(target_os = "macos")]
+const fn default_shell() -> &'static str {
+    "/bin/zsh"
+}
+
+#[cfg(not(target_os = "macos"))]
+const fn default_shell() -> &'static str {
+    "/bin/sh"
+}
 
 pub struct ControlServer {
     registry: Arc<Mutex<Registry>>,
@@ -43,6 +59,12 @@ pub struct ControlServer {
     governor: std::sync::Arc<Mutex<crate::governor::GovernorConfig>>,
     browser: std::sync::OnceLock<crate::browser::BrowserPool>,
     active_connections: Arc<AtomicUsize>,
+    background_requests: Arc<AtomicUsize>,
+    worktree_scan: crate::worktree_scan::ScanStore,
+    agent_catalog: Arc<Mutex<crate::agent_catalog::AgentCatalogStore>>,
+    accounts: Mutex<crate::accounts::AccountStore>,
+    session_operations: Mutex<std::collections::HashSet<String>>,
+    agent_scans: Arc<Mutex<std::collections::HashMap<String, Arc<Mutex<()>>>>>,
 }
 
 /// Where injection files live and which CLI they point at. Present, spawns
@@ -51,6 +73,38 @@ pub struct ControlServer {
 pub struct InjectionConfig {
     pub inject_dir: PathBuf,
     pub cli_path: PathBuf,
+}
+
+#[derive(Clone, Copy)]
+enum ConversationAction {
+    Resume,
+    Fork,
+}
+
+/// Whether a local session's execution directory is inside `target`.
+///
+/// Session cwd values intentionally preserve the spelling supplied at spawn,
+/// so raw equality misses symlink aliases and sessions started below the
+/// checkout root. Canonicalize when possible and retain a lexical fallback
+/// for a live process whose cwd was unlinked after it started.
+fn local_session_uses_worktree(record: &diri_proto::SessionRecord, target: &Path) -> bool {
+    if record.host.is_some() {
+        return false;
+    }
+    record
+        .worktree_path
+        .as_deref()
+        .into_iter()
+        .chain(std::iter::once(record.cwd.as_str()))
+        .any(|path| {
+            std::fs::canonicalize(path).map_or_else(
+                |_| {
+                    let path = Path::new(path);
+                    path == target || path.starts_with(target)
+                },
+                |path| path == target || path.starts_with(target),
+            )
+        })
 }
 
 impl ControlServer {
@@ -66,6 +120,26 @@ impl ControlServer {
         let remote_bindings = socket_path.parent().and_then(|parent| {
             crate::remote::binding::RemoteBindingStore::new(parent.join("remote-bindings")).ok()
         });
+        let agent_config_path = socket_path
+            .parent()
+            .map(|parent| parent.join("agents.json"))
+            .unwrap_or_else(|| PathBuf::from("agents.json"));
+        let agent_catalog = crate::agent_catalog::AgentCatalogStore::new(&agent_config_path)
+            .unwrap_or_else(|error| {
+                eprintln!("diri-engine: Agent configuration unavailable: {error}");
+                crate::agent_catalog::AgentCatalogStore::empty(&agent_config_path)
+            });
+        let accounts = Mutex::new(crate::accounts::AccountStore::new(
+            agent_config_path.with_file_name("accounts.json"),
+        ));
+        let events = crate::events::EventBus::new();
+        let activity_path = logs_dir
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(diri_proto::paths::ACTIVITY_LOG_FILE_NAME);
+        if let Err(error) = events.enable_activity_log(activity_path) {
+            eprintln!("diri-engine: activity history unavailable: {error}");
+        }
         Self {
             registry,
             socket_path,
@@ -73,13 +147,19 @@ impl ControlServer {
             holder: None,
             remote: None,
             remote_bindings,
-            events: crate::events::EventBus::new(),
+            events,
             attach: crate::attach::AttachHub::new(),
             pr_monitor_wake: crate::pr_monitor::PrMonitorWake::default(),
             injection: None,
             governor: std::sync::Arc::new(Mutex::new(crate::governor::GovernorConfig::default())),
             browser: std::sync::OnceLock::new(),
             active_connections: Arc::new(AtomicUsize::new(0)),
+            background_requests: Arc::new(AtomicUsize::new(0)),
+            worktree_scan: Default::default(),
+            agent_catalog: Arc::new(Mutex::new(agent_catalog)),
+            accounts,
+            session_operations: Mutex::new(std::collections::HashSet::new()),
+            agent_scans: Arc::new(Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -119,6 +199,14 @@ impl ControlServer {
     /// socket, matching the Swift daemon's layout.
     pub fn with_logs_dir(mut self, logs_dir: impl Into<PathBuf>) -> Self {
         self.logs_dir = logs_dir.into();
+        let activity_path = self
+            .logs_dir
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(diri_proto::paths::ACTIVITY_LOG_FILE_NAME);
+        if let Err(error) = self.events.enable_activity_log(activity_path) {
+            eprintln!("diri-engine: activity history unavailable: {error}");
+        }
         self
     }
 
@@ -154,12 +242,6 @@ impl ControlServer {
         if let Err(error) = std::thread::Builder::new()
             .name("diri-remote-restore".into())
             .spawn(move || {
-                // Before adoption, not after: adoption prunes bindings for
-                // sessions it finds dead, and a pruned binding is
-                // indistinguishable from a record that never had one. Running
-                // first is what keeps the legacy test — "has a host and no
-                // binding" — from swallowing this launch's own casualties.
-                server.retire_legacy_remote_sessions();
                 let Some(manager) = manager else {
                     return;
                 };
@@ -176,46 +258,6 @@ impl ControlServer {
         }
     }
 
-    /// One-shot upgrade path for sessions the deleted `ssh -t` + tmux transport
-    /// created. See [`crate::legacy_remote`] for what it does, what it refuses
-    /// to do, and why this is not a tmux fallback.
-    ///
-    /// Deliberately independent of `with_remote`: a build with no Helper
-    /// artifact still has the user's old records and still owes them a working
-    /// Resume button and a cleaned-up host.
-    fn retire_legacy_remote_sessions(&self) {
-        let plan = crate::legacy_remote::Plan {
-            registry: &self.registry,
-            bindings: self.remote_bindings.as_ref(),
-            hosts: &diri_proto::HostsConfig::load(self.hosts_file()),
-            marker_path: self.legacy_remote_marker(),
-        };
-        let outcome =
-            crate::legacy_remote::retire_legacy_remote_sessions(&plan, &crate::hosts::run_shell);
-        if let Some(summary) = outcome.summary() {
-            eprintln!("{summary}");
-        }
-        // These records have no live session, so the registry watcher — which
-        // only diffs live ones — will never announce the rewrite. Without this
-        // the sidebar keeps showing them as running until the next relaunch.
-        if !outcome.migrated.is_empty()
-            && let Ok(registry) = self.registry.lock()
-        {
-            for id in &outcome.migrated {
-                self.publish_updated(&registry, id);
-            }
-        }
-    }
-
-    /// Beside the socket, next to `remote-bindings` — one file, deletable the
-    /// day this migration is retired.
-    fn legacy_remote_marker(&self) -> PathBuf {
-        self.socket_path
-            .parent()
-            .map(|parent| parent.join("legacy-remote-migration.json"))
-            .unwrap_or_else(|| PathBuf::from("legacy-remote-migration.json"))
-    }
-
     fn restore_remote_bindings(
         &self,
         manager: &Arc<crate::remote::manager::RemoteManager>,
@@ -227,15 +269,27 @@ impl ControlServer {
             return Vec::new();
         };
         let hosts = diri_proto::HostsConfig::load(self.hosts_file());
-        let mut registry = match self.registry.lock() {
-            Ok(registry) => registry,
-            Err(_) => return Vec::new(),
+        // Snapshot under the lock, then let it go. Every step below is an SSH
+        // round trip, and a delegated fleet is dozens of bindings on one host:
+        // holding the Registry across all of them blocked attaches, hook
+        // reports, and readiness probes for minutes after boot, which the app
+        // showed as a blank pane for every session, local ones included.
+        let (records, engine) = {
+            let Ok(registry) = self.registry.lock() else {
+                return Vec::new();
+            };
+            let records = registry
+                .records()
+                .into_iter()
+                .map(|record| (record.id.0.clone(), record))
+                .collect::<std::collections::HashMap<_, _>>();
+            (records, registry.engine())
         };
-        let records = registry
-            .records()
-            .into_iter()
-            .map(|record| (record.id.0.clone(), record))
-            .collect::<std::collections::HashMap<_, _>>();
+        // One Helper probe per host and build rather than one per session.
+        let mut helpers = std::collections::HashMap::<
+            (String, String, u16),
+            Option<crate::remote::manager::InstalledHelper>,
+        >::new();
         let mut adopted = Vec::new();
         for binding in bindings {
             let Some(record) = records.get(&binding.session_id) else {
@@ -247,9 +301,17 @@ impl ControlServer {
             let Some(host) = hosts.host(&binding.host_id) else {
                 continue;
             };
-            let Ok(helper) =
-                manager.existing_helper(host, &binding.helper_build_id, binding.protocol)
-            else {
+            let helper_key = (
+                binding.host_id.clone(),
+                binding.helper_build_id.clone(),
+                binding.protocol.major,
+            );
+            let helper = helpers.entry(helper_key).or_insert_with(|| {
+                manager
+                    .existing_helper(host, &binding.helper_build_id, binding.protocol)
+                    .ok()
+            });
+            let Some(helper) = helper.clone() else {
                 continue;
             };
             let selector = diri_proto::remote_pty::SessionSelector {
@@ -282,7 +344,7 @@ impl ControlServer {
                 pty: crate::pty::PtySpec::new(Vec::new(), &record.cwd)
                     .size(inspection.cols, inspection.rows),
                 manifest_id: manifest_id.clone(),
-                authority: crate::session::authority_for(&manifest_id, &registry.engine()),
+                authority: crate::session::authority_for(&manifest_id, &engine),
                 logs_dir: self.logs_dir.clone(),
                 holder: None,
                 remote: None,
@@ -295,6 +357,13 @@ impl ControlServer {
                 incarnation: binding.session_incarnation,
                 binding_store: store.clone(),
                 output_offset: binding.last_output_offset,
+            };
+            // Adoption itself is local (the attach channel opens on the
+            // session's own pump thread), so the lock is held only here.
+            // `adopt_remote` re-checks the record, which covers a session
+            // removed while its inspection was in flight.
+            let Ok(mut registry) = self.registry.lock() else {
+                break;
             };
             if registry.adopt_remote(spec, remote).is_ok() {
                 adopted.push(binding.session_id);
@@ -345,7 +414,7 @@ impl ControlServer {
     /// pushes event frames onto the same socket while this loop keeps
     /// answering requests — one connection carries both, as the Swift daemon's
     /// does.
-    pub fn serve(&self, stream: UnixStream) -> std::io::Result<()> {
+    pub fn serve(self: &Arc<Self>, stream: UnixStream) -> std::io::Result<()> {
         let _connection = ActiveConnectionGuard::new(Arc::clone(&self.active_connections));
         let mut reader = BufReader::new(stream.try_clone()?);
         let writer = Arc::new(Mutex::new(stream));
@@ -353,14 +422,9 @@ impl ControlServer {
 
         let mut first = true;
         loop {
-            let mut line = Vec::new();
-            let read = reader.read_until(b'\n', &mut line)?;
-            if read == 0 {
+            let Some(line) = read_bounded_control_line(&mut reader)? else {
                 return Ok(());
-            }
-            if line.last() == Some(&b'\n') {
-                line.pop();
-            }
+            };
             if line.is_empty() {
                 continue;
             }
@@ -395,14 +459,6 @@ impl ControlServer {
                     return Ok(());
                 }
             }
-            if line.len() > MAX_CONTROL_LINE_BYTES {
-                // A client that sends an oversized frame is out of contract;
-                // answering would mean buffering unbounded input.
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "control line exceeded the protocol maximum",
-                ));
-            }
             let Some(response) = self.handle_line(&line, &writer, &mut subscription) else {
                 continue;
             };
@@ -411,7 +467,7 @@ impl ControlServer {
     }
 
     fn handle_line(
-        &self,
+        self: &Arc<Self>,
         line: &[u8],
         writer: &Arc<Mutex<UnixStream>>,
         subscription: &mut Option<SubscriptionHandle>,
@@ -438,6 +494,60 @@ impl ControlServer {
                     id,
                     result: self.events_subscribe(params, writer, subscription),
                 })
+            }
+            ControlMessage::Request { id, method, params }
+                if matches!(
+                    method.as_str(),
+                    Method::SESSION_SPAWN
+                        | Method::SESSION_CONTINUE_ACCOUNT
+                        | Method::HOST_INITIALIZE
+                        | Method::HOST_LIST_DIRECTORIES
+                        | Method::SESSION_READ_DIFF
+                        | Method::WORKTREE_OVERVIEW
+                        | Method::WORKTREE_CLEANUP
+                ) || ((method == Method::AGENT_READINESS
+                    || method == Method::AGENT_CONFIGURE)
+                    && params
+                        .as_ref()
+                        .and_then(|value| value.get("host"))
+                        .and_then(Value::as_str)
+                        .is_some()) =>
+            {
+                // These operations can wait on SSH, Git, or the agent's first
+                // prompt. Keep this connection readable for input, snapshots
+                // and Hello; otherwise even a private client hits its heartbeat
+                // timeout, and cannot answer the prompt that spawn is waiting on.
+                // The cap bounds cold-path threads; no PTY hot path changes.
+                let Some(permit) = BackgroundRequest::acquire(&self.background_requests) else {
+                    return Some(ControlMessage::Response {
+                        id,
+                        result: Err(ControlError::new(
+                            "busy",
+                            "Too many operations are starting. Wait for one to finish and retry.",
+                        )),
+                    });
+                };
+                let server = Arc::clone(self);
+                let writer = Arc::clone(writer);
+                let spawned = std::thread::Builder::new()
+                    .name("dirijord-background-request".into())
+                    .spawn(move || {
+                        let _permit = permit;
+                        let response = ControlMessage::Response {
+                            id,
+                            result: server.dispatch(&method, params),
+                        };
+                        let _ = write_message(&writer, &response);
+                    });
+                match spawned {
+                    Ok(_) => None,
+                    Err(error) => Some(ControlMessage::Response {
+                        id,
+                        result: Err(ControlError::internal(format!(
+                            "could not start the background request: {error}"
+                        ))),
+                    }),
+                }
             }
             ControlMessage::Request { id, method, params } => Some(ControlMessage::Response {
                 id,
@@ -561,7 +671,23 @@ impl ControlServer {
     }
 
     fn dispatch(&self, method: &str, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        let _operation = account_handoff::SessionOperation::acquire(self, method, params.as_ref())?;
         match method {
+            Method::SESSION_CONTINUE_ACCOUNT => self.session_continue_account(params),
+            Method::ACCOUNT_PROFILES_LIST => {
+                encode(&self.accounts.lock().map_err(poisoned)?.catalog()?)
+            }
+            Method::ACCOUNT_PROFILES_SAVE => {
+                let profile: diri_proto::AgentAccountProfile = decode(params)?;
+                if let Some(host) = &profile.host {
+                    self.resolve_host(host)?;
+                }
+                encode(&self.accounts.lock().map_err(poisoned)?.upsert(profile)?)
+            }
+            Method::ACCOUNT_PROFILES_REMOVE => {
+                let params: diri_proto::AgentAccountId = decode(params)?;
+                encode(&self.accounts.lock().map_err(poisoned)?.remove(&params.id)?)
+            }
             Method::HELLO => self.hello(params),
             Method::SESSION_SPAWN => self.session_spawn(params),
             Method::SESSION_LIST | Method::STATE_SNAPSHOT => self.session_list(),
@@ -577,9 +703,12 @@ impl ControlServer {
             Method::SESSION_ARCHIVE => self.session_archive(params),
             Method::SESSION_UNARCHIVE => self.session_unarchive(params),
             Method::SESSION_HISTORY => self.session_history(),
+            Method::ACTIVITY_LIST => self.activity_list(params),
             Method::WORKTREE_CREATE => self.worktree_create(params),
             Method::WORKTREE_LIST => self.worktree_list(params),
+            Method::WORKTREE_CLEANUP => self.worktree_cleanup(params),
             Method::WORKTREE_REMOVE => self.worktree_remove(params),
+            Method::WORKTREE_SCAN => encode(&self.worktree_scan_page(decode(params)?)?),
             Method::WORKTREE_OVERVIEW => self.worktree_overview(),
             Method::TEST_RUN => self.browser_call("run", params),
             "browser.act" => self.browser_call("browser", params),
@@ -587,13 +716,22 @@ impl ControlServer {
             Method::HOST_SYNC_PREFS => self.host_sync_prefs(params),
             Method::HOST_INITIALIZE => self.host_initialize(params),
             Method::HOST_LIST_DIRECTORIES => self.host_list_directories(params),
+            Method::HOST_LIST => Ok(
+                json!({"hosts": diri_proto::HostsConfig::load(self.hosts_file())
+                .hosts.iter().map(|host| json!({
+                    "id": host.id, "name": host.display_name(), "defaultCwd": host.default_cwd
+                })).collect::<Vec<_>>() }),
+            ),
             Method::SESSION_MIGRATE => self.session_migrate(params),
+            Method::SESSION_REPARENT_WORKTREE => self.session_reparent_worktree(params),
             Method::HOST_LOCATE_REPO => self.host_locate_repo(params),
             Method::HOOK_REPORT => self.hook_report(params),
             Method::SESSION_RESUME => self.session_resume(params),
+            Method::SESSION_FORK => self.session_fork(params),
             Method::SESSION_RESUME_FROM_HISTORY => self.session_resume_from_history(params),
             Method::SESSION_REOPEN_LAST => self.session_reopen_last(),
-            Method::AGENT_READINESS => self.agent_readiness(),
+            Method::AGENT_READINESS => self.agent_readiness(params),
+            Method::AGENT_CONFIGURE => self.agent_configure(params),
             Method::PROJECT_ADD => self.project_add(params),
             Method::SESSION_READ_DIFF => self.session_read_diff(params),
             Method::SESSION_HIBERNATE => self.session_hibernate(params),
@@ -653,19 +791,24 @@ impl ControlServer {
             })
             .unwrap_or_default();
         let p: diri_proto::SessionSpawnParams = decode(Some(raw))?;
+        let mut account_profile = self.accounts.lock().map_err(poisoned)?.resolve(
+            p.account_profile_id.as_deref(),
+            p.kind.id(),
+            p.host.as_deref(),
+        )?;
         if p.host.is_some() {
-            return self.session_spawn_remote(p, argv);
+            return self.session_spawn_remote(p, argv, account_profile);
         }
         let kind = p.kind.id().to_string();
         // A generic kind carries the user's command line inside itself.
         let argv = if argv.is_empty() {
             match p.kind.command() {
                 Some(command) if !command.is_empty() => {
-                    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+                    let shell = std::env::var("SHELL").unwrap_or_else(|_| default_shell().into());
                     vec![shell, "-lc".into(), command.to_string()]
                 }
                 _ if kind == diri_proto::AgentKind::SHELL_ID => {
-                    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+                    let shell = std::env::var("SHELL").unwrap_or_else(|_| default_shell().into());
                     vec![shell, "-l".into()]
                 }
                 _ => Vec::new(),
@@ -679,9 +822,12 @@ impl ControlServer {
         let mut worktree_path = None;
         let mut git_branch = None;
         if p.new_worktree.unwrap_or(false) {
-            let info =
-                crate::git::create_worktree(Path::new(&p.cwd), p.worktree_branch.as_deref(), None)
-                    .map_err(io_control_error)?;
+            let info = crate::git::create_worktree(
+                Path::new(&p.cwd),
+                p.worktree_branch.as_deref(),
+                p.worktree_base.as_deref(),
+            )
+            .map_err(io_control_error)?;
             git_branch.clone_from(&info.branch);
             cwd.clone_from(&info.path);
             worktree_path = Some(info.path);
@@ -698,7 +844,10 @@ impl ControlServer {
         let manifest = engine
             .manifest(&kind)
             .ok_or_else(|| ControlError::not_found(format!("no manifest for agent {kind:?}")))?;
-        let descriptor = manifest.agent.clone().unwrap_or_default();
+        let mut descriptor = manifest.agent.clone().unwrap_or_default();
+        if let Some(binary) = descriptor.binary.as_deref() {
+            descriptor.binary = Some(self.resolve_local_agent_executable(&kind, binary)?);
+        }
         let authority = descriptor.authority();
 
         let id = next_session_id();
@@ -709,19 +858,36 @@ impl ControlServer {
         let mut agent_session_id = None;
         if descriptor.binary.is_some() {
             launch_args.extend(descriptor.spawn_args.iter().cloned());
-            agent_session_id = descriptor.session_id_flag.as_ref().map(|flag| {
-                let uuid = crate::inject::uuid_v4();
-                launch_args.push(flag.clone());
-                launch_args.push(uuid.clone());
-                uuid
-            });
             if let Some(injection) = &self.injection {
-                launch_args.extend(crate::inject::injection_args(
+                launch_args.extend(crate::inject::injection_args_with_cursor(
                     &descriptor.injection,
                     &injection.inject_dir,
                     &injection.cli_path,
+                    Some(crate::inject::CursorInject {
+                        session_id: &id,
+                        socket_path: &self.socket_path,
+                    }),
                 ));
             }
+            let minted = descriptor
+                .mints_conversation_id()
+                .then(crate::inject::uuid_v4);
+            let provider_dir = registry.recovery_directory(&id).join("provider");
+            let plan = descriptor
+                .conversation_plan(
+                    &launch_args,
+                    crate::agent::ConversationLaunch::Fresh {
+                        new_id: minted.as_deref(),
+                        session_dir: Some(&provider_dir),
+                    },
+                )
+                .ok_or_else(|| {
+                    ControlError::bad_request(format!(
+                        "agent {kind:?} has an incomplete fresh conversation grammar"
+                    ))
+                })?;
+            launch_args = plan.args;
+            agent_session_id = plan.agent_session_id;
         }
 
         let inherited: Vec<(String, String)> = std::env::vars().collect();
@@ -731,7 +897,12 @@ impl ControlServer {
             None if !argv.is_empty() => {
                 let mut spec = crate::pty::PtySpec::new(argv.clone(), &cwd_path);
                 spec.env = inherited;
-                crate::agent::apply_terminal_colour(&mut spec.env);
+                // GUI apps launched by launchd commonly inherit no terminal
+                // environment. A binary-free descriptor is still attached to
+                // Diri's colour-capable PTY, so assert the same capabilities
+                // as manifest-backed Agents instead of leaving tools such as
+                // `clear` unable to operate.
+                crate::agent::assert_color_environment(&mut spec.env);
                 spec
             }
             None => {
@@ -741,7 +912,13 @@ impl ControlServer {
             }
         };
 
+        if let Some(profile) = &mut account_profile {
+            crate::accounts::bind_pty(profile, &mut pty)?;
+        }
         let mut record = new_record(&id, &kind, &cwd);
+        record.account_profile = account_profile;
+        record.kind = p.kind.clone();
+        record.originating_prompt = p.initial_prompt.clone();
         // A linked worktree is an execution cwd inside the project selected
         // by the user; it does not become a new first-level sidebar project.
         record.project_id = crate::registry::session_project_id(&p.cwd, None);
@@ -773,6 +950,13 @@ impl ControlServer {
                     crate::inject::CLI_ENV.into(),
                     injection.cli_path.to_string_lossy().into_owned(),
                 ));
+                pty.env.push((
+                    diri_proto::paths::ENV_SESSION_RECOVERY_DIR.into(),
+                    registry
+                        .recovery_directory(&id)
+                        .to_string_lossy()
+                        .into_owned(),
+                ));
             }
             if let Some(uuid) = &agent_session_id {
                 record.agent_session_id = Some(uuid.clone());
@@ -780,7 +964,24 @@ impl ControlServer {
                     && let Ok(home) = std::env::var("HOME")
                 {
                     record.transcript_path = Some(
-                        crate::inject::claude_transcript_path(Path::new(&home), &cwd, uuid)
+                        record
+                            .account_profile
+                            .as_ref()
+                            .map_or_else(
+                                || {
+                                    crate::inject::claude_transcript_path(
+                                        Path::new(&home),
+                                        &cwd,
+                                        uuid,
+                                    )
+                                },
+                                |profile| {
+                                    Path::new(&profile.config_home)
+                                        .join("projects")
+                                        .join(crate::inject::claude_project_slug(&cwd))
+                                        .join(format!("{uuid}.jsonl"))
+                                },
+                            )
                             .to_string_lossy()
                             .into_owned(),
                     );
@@ -809,24 +1010,29 @@ impl ControlServer {
         // raced Claude Code's boot and lost keystrokes into a composer that
         // did not exist yet.
         let prompt = p.initial_prompt.clone().filter(|prompt| !prompt.is_empty());
-        if kind == diri_proto::AgentKind::CLAUDE_CODE_ID || prompt.is_some() {
-            let registry = Arc::clone(&self.registry);
-            let session_id = id.clone();
-            std::thread::spawn(move || {
-                prepare_agent_input(
-                    &registry,
-                    &session_id,
-                    kind == diri_proto::AgentKind::CLAUDE_CODE_ID,
-                    prompt.as_deref(),
-                );
-            });
-        }
-
+        let accept_claude_workspace = kind == diri_proto::AgentKind::CLAUDE_CODE_ID;
         let record = registry
             .records()
             .into_iter()
             .find(|record| record.id.0 == id)
             .ok_or_else(|| ControlError::internal("the new session vanished"))?;
+        drop(registry);
+
+        // A supplied prompt is part of the spawn contract: do not acknowledge
+        // the request until delivery is confirmed. With no prompt, Claude's
+        // workspace-trust convenience remains background work so an ordinary
+        // launch still returns as soon as its session exists.
+        if let Some(prompt) = prompt {
+            prepare_agent_input(&self.registry, &id, accept_claude_workspace, Some(&prompt))
+                .map_err(|error| initial_prompt_control_error(&id, error))?;
+        } else if accept_claude_workspace {
+            let registry = Arc::clone(&self.registry);
+            let session_id = id.clone();
+            std::thread::spawn(move || {
+                let _ = prepare_agent_input(&registry, &session_id, true, None);
+            });
+        }
+
         // SessionSpawnResult is the record itself, as the Swift daemon
         // answers — not wrapped.
         serde_json::to_value(&record).map_err(|error| ControlError::internal(error.to_string()))
@@ -836,6 +1042,7 @@ impl ControlServer {
         &self,
         p: diri_proto::SessionSpawnParams,
         caller_argv: Vec<String>,
+        mut account_profile: Option<diri_proto::AgentAccountProfile>,
     ) -> Result<JsonValue, ControlError> {
         let manager = self
             .remote
@@ -850,11 +1057,6 @@ impl ControlServer {
             .as_deref()
             .ok_or_else(|| ControlError::bad_request("remote host is required"))?;
         let host = self.resolve_host(host_id)?;
-        if p.new_worktree.unwrap_or(false) {
-            return Err(ControlError::bad_request(
-                "remote worktree creation requires the structured workspace RPC",
-            ));
-        }
         if p.same_repo_as.is_some() {
             return Err(ControlError::bad_request(
                 "sameRepoAs requires the structured remote workspace RPC",
@@ -865,29 +1067,27 @@ impl ControlServer {
         let persistence = manager
             .probe_persistence(&host, &helper)
             .map_err(io_control_error)?;
-        let requested_cwd = if p.cwd.trim().is_empty() {
+        let mut requested_cwd = if p.cwd.trim().is_empty() {
             host.default_cwd.clone().unwrap_or_else(|| "~".into())
         } else {
             p.cwd.clone()
         };
-        let captured = manager
-            .capture_environment(
-                &helper,
-                &diri_proto::remote_pty::EnvironmentCaptureRequest {
-                    cwd: Some(requested_cwd),
-                    timeout_millis: 10_000,
-                },
+        let worktree = if p.new_worktree.unwrap_or(false) {
+            let info = crate::git::create_worktree_remote(
+                &manager,
+                &host,
+                &requested_cwd,
+                p.worktree_branch.as_deref(),
+                p.worktree_base.as_deref(),
             )
             .map_err(io_control_error)?;
-        let cwd = PathBuf::from(&captured.cwd);
-        if !cwd.is_absolute() {
-            return Err(ControlError::internal(
-                "remote Helper returned a non-absolute cwd",
-            ));
-        }
-
+            requested_cwd.clone_from(&info.path);
+            Some(info)
+        } else {
+            None
+        };
         let kind = p.kind.id().to_string();
-        let (descriptor, engine) = {
+        let (mut descriptor, engine) = {
             let registry = self.registry.lock().map_err(poisoned)?;
             let engine = registry.engine();
             let manifest = engine.manifest(&kind).ok_or_else(|| {
@@ -896,6 +1096,33 @@ impl ControlServer {
             (manifest.agent.clone().unwrap_or_default(), engine)
         };
         drop(engine);
+        let captured = if let Some(binary) = descriptor.binary.as_deref() {
+            let (executable, captured) = self.discover_remote_agent_for_launch(
+                manager.as_ref(),
+                &host,
+                &kind,
+                binary,
+                requested_cwd,
+            )?;
+            descriptor.binary = Some(executable);
+            captured
+        } else {
+            manager
+                .capture_environment(
+                    &helper,
+                    &diri_proto::remote_pty::EnvironmentCaptureRequest {
+                        cwd: Some(requested_cwd),
+                        timeout_millis: 10_000,
+                    },
+                )
+                .map_err(io_control_error)?
+        };
+        let cwd = PathBuf::from(&captured.cwd);
+        if !cwd.is_absolute() {
+            return Err(ControlError::internal(
+                "remote Helper returned a non-absolute cwd",
+            ));
+        }
         let authority = descriptor.authority();
         let inherited = captured
             .environment
@@ -908,12 +1135,29 @@ impl ControlServer {
         let mut launch_args = caller_argv.clone();
         if descriptor.binary.is_some() {
             launch_args.extend(descriptor.spawn_args.iter().cloned());
-            agent_session_id = descriptor.session_id_flag.as_ref().map(|flag| {
-                let uuid = crate::inject::uuid_v4();
-                launch_args.push(flag.clone());
-                launch_args.push(uuid.clone());
-                uuid
-            });
+            let minted = descriptor
+                .mints_conversation_id()
+                .then(crate::inject::uuid_v4);
+            let provider_dir = inherited
+                .iter()
+                .rev()
+                .find(|(name, value)| name == "HOME" && !value.is_empty())
+                .map(|(_, home)| Path::new(home).join(".diri/session-storage").join(&id));
+            let plan = descriptor
+                .conversation_plan(
+                    &launch_args,
+                    crate::agent::ConversationLaunch::Fresh {
+                        new_id: minted.as_deref(),
+                        session_dir: provider_dir.as_deref(),
+                    },
+                )
+                .ok_or_else(|| {
+                    ControlError::bad_request(format!(
+                        "agent {kind:?} has an incomplete fresh conversation grammar"
+                    ))
+                })?;
+            launch_args = plan.args;
+            agent_session_id = plan.agent_session_id;
         }
 
         let argv = if descriptor.binary.is_some() {
@@ -939,7 +1183,7 @@ impl ControlServer {
         } else {
             let mut spec = crate::pty::PtySpec::new(argv, &cwd);
             spec.env = inherited;
-            crate::agent::apply_terminal_colour(&mut spec.env);
+            crate::agent::assert_color_environment(&mut spec.env);
             spec
         };
         if let (Some(cols), Some(rows)) = (p.initial_cols, p.initial_rows) {
@@ -947,7 +1191,13 @@ impl ControlServer {
             pty.rows = rows.clamp(2, u16::MAX as i64) as u16;
         }
 
+        if let Some(profile) = &mut account_profile {
+            crate::accounts::bind_pty(profile, &mut pty)?;
+        }
         let token = random_session_token()?;
+        if let Some(profile) = &account_profile {
+            crate::accounts::prepare_remote_directory(profile, &host, &manager)?;
+        }
         let launch = diri_proto::remote_pty::LaunchRequest {
             session_id: id.clone(),
             session_token: token,
@@ -969,9 +1219,16 @@ impl ControlServer {
         };
 
         let mut record = new_record(&id, &kind, &captured.cwd);
+        record.account_profile = account_profile;
+        record.kind = p.kind.clone();
+        record.originating_prompt = p.initial_prompt.clone();
         record.host = Some(host.id.clone());
         record.project_id = crate::registry::session_project_id(&captured.cwd, Some(&host.id));
         record.remote_persistence = Some(persistence);
+        if let Some(info) = worktree {
+            record.worktree_path = Some(info.path);
+            record.git_branch = info.branch;
+        }
         record.parent = p.parent.clone();
         record.agent_session_id = agent_session_id;
         if let Some(title) = &p.title {
@@ -1003,23 +1260,24 @@ impl ControlServer {
         self.publish_updated(&registry, &id);
 
         let prompt = p.initial_prompt.filter(|prompt| !prompt.is_empty());
-        if kind == diri_proto::AgentKind::CLAUDE_CODE_ID || prompt.is_some() {
-            let registry = Arc::clone(&self.registry);
-            let session_id = id.clone();
-            std::thread::spawn(move || {
-                prepare_agent_input(
-                    &registry,
-                    &session_id,
-                    kind == diri_proto::AgentKind::CLAUDE_CODE_ID,
-                    prompt.as_deref(),
-                );
-            });
-        }
+        let accept_claude_workspace = kind == diri_proto::AgentKind::CLAUDE_CODE_ID;
         let record = registry
             .records()
             .into_iter()
             .find(|record| record.id.0 == id)
             .ok_or_else(|| ControlError::internal("the new remote session vanished"))?;
+        drop(registry);
+
+        if let Some(prompt) = prompt {
+            prepare_agent_input(&self.registry, &id, accept_claude_workspace, Some(&prompt))
+                .map_err(|error| initial_prompt_control_error(&id, error))?;
+        } else if accept_claude_workspace {
+            let registry = Arc::clone(&self.registry);
+            let session_id = id.clone();
+            std::thread::spawn(move || {
+                let _ = prepare_agent_input(&registry, &session_id, true, None);
+            });
+        }
         serde_json::to_value(&record).map_err(|error| ControlError::internal(error.to_string()))
     }
 
@@ -1048,123 +1306,68 @@ impl ControlServer {
     /// joined with the session (live wins) occupying it, its dirtiness,
     /// merged-ness into the default branch, and age — plus the "safe to
     /// clean up" suggestion.
-    fn worktree_overview(&self) -> Result<JsonValue, ControlError> {
-        let (records, mut roots) = {
-            let registry = self.registry.lock().map_err(poisoned)?;
-            let roots: Vec<String> = registry
-                .projects_raw()
-                .iter()
-                .filter_map(|project| project.get("root").and_then(|value| value.as_str()))
-                .map(str::to_string)
-                .collect();
-            (registry.records(), roots)
-        };
-        roots.sort();
-
-        // Join sessions by worktree path (fallback cwd); a live session wins
-        // over an exited one sharing the path.
-        let mut session_by_path: std::collections::HashMap<String, &diri_proto::SessionRecord> =
-            std::collections::HashMap::new();
-        let running = |record: &diri_proto::SessionRecord| {
-            !matches!(
-                record.status,
-                diri_proto::SessionStatus::Exited(_) | diri_proto::SessionStatus::Unknown
-            )
-        };
-        for record in &records {
-            let path = record
-                .worktree_path
-                .clone()
-                .unwrap_or_else(|| record.cwd.clone());
-            match session_by_path.get(&path) {
-                Some(existing) if running(existing) || !running(record) => {}
-                _ => {
-                    session_by_path.insert(path, record);
-                }
-            }
-        }
-
-        let run_git = |args: &[&str], dir: &str| -> Option<String> {
-            let output = std::process::Command::new("git")
-                .args(args)
-                .current_dir(dir)
-                .env("LC_ALL", "C")
-                .env("LANG", "C")
-                .env("LANGUAGE", "C")
-                .env("GIT_TERMINAL_PROMPT", "0")
-                .output()
-                .ok()?;
-            output
-                .status
-                .success()
-                .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
-        };
-
-        let mut entries = Vec::new();
-        let mut seen_paths = std::collections::HashSet::new();
-        for root in roots {
-            if !crate::git::is_repository(Path::new(&root)) {
-                continue;
-            }
-            let Ok(worktrees) = crate::git::list_worktrees(Path::new(&root)) else {
-                continue;
+    fn worktree_scan_page(
+        &self,
+        p: diri_proto::WorktreeScanParams,
+    ) -> Result<diri_proto::WorktreeScanResult, ControlError> {
+        let registry = Arc::clone(&self.registry);
+        self.worktree_scan.request(p, move |measure_disk, emit| {
+            let (records, roots) = {
+                let registry = registry.lock().map_err(|e| e.to_string())?;
+                (registry.records(), registry.projects_raw().to_vec())
             };
-            // Repo's default branch: origin/HEAD symbolic ref, else "main".
-            let default_branch = run_git(
-                &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
-                &root,
-            )
-            .and_then(|full| full.rsplit('/').next().map(str::to_string))
-            .filter(|short| !short.is_empty())
-            .unwrap_or_else(|| "main".into());
-            let merged_branches: std::collections::HashSet<String> = run_git(
-                &[
-                    "branch",
-                    "--merged",
-                    &default_branch,
-                    "--format=%(refname:short)",
-                ],
-                &root,
-            )
-            .map(|output| output.lines().map(str::to_string).collect())
-            .unwrap_or_default();
+            crate::worktree_health::scan(&roots, &records, measure_disk, emit)
+        })
+    }
 
-            for worktree in worktrees {
-                if worktree.is_bare || !seen_paths.insert(worktree.path.clone()) {
-                    continue;
+    fn worktree_overview(&self) -> Result<JsonValue, ControlError> {
+        // Older clients still receive a complete result, off the connection
+        // loop, but join the same worker as incremental clients.
+        let mut p = diri_proto::WorktreeScanParams {
+            refresh: true,
+            ..Default::default()
+        };
+        let mut entries = std::collections::BTreeMap::new();
+        loop {
+            let page = self.worktree_scan_page(p.clone())?;
+            if p.generation != Some(page.generation) {
+                entries.clear();
+            }
+            for entry in page.entries {
+                entries.insert(entry.path.clone(), entry);
+            }
+            p.refresh = false;
+            p.generation = Some(page.generation);
+            p.cursor = page.cursor;
+            if !page.running && !page.has_more {
+                if let Some(error) = page.error {
+                    return Err(ControlError::internal(error));
                 }
-                let is_main = worktree.path == root;
-                let dirty = run_git(&["status", "--porcelain"], &worktree.path)
-                    .is_some_and(|output| !output.is_empty());
-                let merged = worktree.branch.as_ref().is_some_and(|branch| {
-                    branch != &default_branch && merged_branches.contains(branch)
-                });
-                let age_days = std::fs::metadata(&worktree.path)
-                    .ok()
-                    .and_then(|meta| meta.created().or_else(|_| meta.modified()).ok())
-                    .and_then(|at| at.elapsed().ok())
-                    .map(|elapsed| (elapsed.as_secs() / 86_400) as i64)
-                    .unwrap_or(0);
-                let record = session_by_path.get(&worktree.path);
-                let session_alive = record.is_some_and(|record| running(record));
-                entries.push(diri_proto::WorktreeOverviewEntry {
-                    path: worktree.path.clone(),
-                    branch: worktree.branch.clone(),
-                    project_root: root.clone(),
-                    session_id: record.map(|record| record.id.clone()),
-                    session_status: record.map(|record| record.status.clone()),
-                    dirty,
-                    merged,
-                    age_days,
-                    stale_suggestion: !is_main
-                        && !session_alive
-                        && merged
-                        && !dirty
-                        && age_days > 7,
+                return encode(&diri_proto::WorktreeOverviewResult {
+                    entries: entries.into_values().collect(),
                 });
             }
+            if !page.has_more {
+                std::thread::sleep(Duration::from_millis(20));
+            }
         }
-        encode(&diri_proto::WorktreeOverviewResult { entries })
+    }
+
+    fn worktree_cleanup(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        let p: diri_proto::WorktreeCleanupParams = decode(params)?;
+        // Serialize the final local session check and removal against launches.
+        // Network and disk scans never run while holding the registry lock.
+        let inspection = crate::worktree_health::inspect_cleanup(&p).map_err(io_control_error)?;
+        let registry = self.registry.lock().map_err(poisoned)?;
+        crate::worktree_health::cleanup(&p, &inspection, &registry.records())
+            .map_err(io_control_error)?;
+        drop(registry);
+        self.events.publish(
+            "worktree.removed",
+            json!({"repoPath": p.repo_path, "path": p.worktree_path}),
+            None,
+        );
+        Ok(json!({}))
     }
 
     /// One-click handoff of a live Claude session between hosts: WIP commit
@@ -1182,6 +1385,11 @@ impl ControlServer {
                 .find(|record| record.id.0 == id)
                 .ok_or_else(|| ControlError::not_found(id.clone()))?
         };
+        if record.account_profile.is_some() {
+            return Err(ControlError::bad_request(
+                "Moving an account-bound session requires an explicit destination account; start a new session on the destination host",
+            ));
+        }
         // Handoff needs no terminal multiplexer of its own. Its phases are
         // git preparation over `hosts::run_shell`, stopping the source through
         // the session's own transport (which signals the remote Agent via its
@@ -1285,6 +1493,7 @@ impl ControlServer {
             let target_id = target_host.as_ref().map(|host| host.id.clone());
             let branch = prepared.branch.clone();
             let cwd = prepared.target_repo_root.clone();
+            let worktree = prepared.target_is_worktree.then(|| cwd.clone());
             let transcript = shuttle.local_target_path.clone();
             let local = target_host.is_none();
             registry.ensure_session_project(&cwd, target_id.as_deref());
@@ -1293,7 +1502,7 @@ impl ControlServer {
                 record.cwd = cwd;
                 record.project_id =
                     crate::registry::session_project_id(&record.cwd, record.host.as_deref());
-                record.worktree_path = None;
+                record.worktree_path = worktree;
                 record.git_branch = Some(branch);
                 record.transcript_path = if local { transcript } else { None };
                 record.status = diri_proto::SessionStatus::Exited(diri_proto::ExitInfo {
@@ -1322,6 +1531,81 @@ impl ControlServer {
             transcript_migrated: shuttle.migrated,
             warning: (!warnings.is_empty()).then(|| warnings.join("; ")),
         })
+    }
+
+    /// Moves an ended resumable session record to a different checkout of the
+    /// same repository. The app proposes this from cached overview data, but
+    /// confirmation always lands here for authoritative revalidation.
+    fn session_reparent_worktree(
+        &self,
+        params: Option<JsonValue>,
+    ) -> Result<JsonValue, ControlError> {
+        let p: diri_proto::SessionReparentWorktreeParams = decode(params)?;
+        let project_root = std::fs::canonicalize(&p.project_root).map_err(|error| {
+            ControlError::bad_request(format!("project root is unavailable: {error}"))
+        })?;
+        let worktree_path = std::fs::canonicalize(&p.worktree_path).map_err(|error| {
+            ControlError::bad_request(format!("worktree is unavailable: {error}"))
+        })?;
+        let worktrees = crate::git::list_worktrees(&project_root).map_err(|error| {
+            ControlError::bad_request(format!("could not inspect project worktrees: {error}"))
+        })?;
+        let target = worktrees
+            .iter()
+            .find(|entry| Path::new(&entry.path) == worktree_path)
+            .ok_or_else(|| {
+                ControlError::bad_request("the target is not a worktree of this project")
+            })?;
+        let target_path = worktree_path.to_string_lossy().into_owned();
+
+        let mut registry = self.registry.lock().map_err(poisoned)?;
+        let record = registry
+            .record(&p.session_id.0)
+            .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?;
+        if record.host.is_some() {
+            return Err(ControlError::bad_request(
+                "remote sessions cannot move into a local worktree",
+            ));
+        }
+        if !matches!(record.status, diri_proto::SessionStatus::Exited(_)) {
+            return Err(ControlError::bad_request(
+                "stop or archive the session before moving it to another worktree",
+            ));
+        }
+        if record.resumability != diri_proto::Resumability::Resumable {
+            return Err(ControlError::bad_request(
+                "this session cannot resume after moving to another worktree",
+            ));
+        }
+        // Project identity is derived from the exact root Diri persisted. The
+        // canonical path above is only for authoritative git membership: a
+        // symlinked project root must not suddenly hash to a different id.
+        let expected_project = crate::registry::session_project_id(&p.project_root, None);
+        if record.project_id != expected_project {
+            return Err(ControlError::bad_request(
+                "the target belongs to a different project",
+            ));
+        }
+        if local_session_uses_worktree(&record, &worktree_path) {
+            return Err(ControlError::bad_request(
+                "the session is already attached to this worktree",
+            ));
+        }
+        let occupied = registry.records().into_iter().any(|candidate| {
+            candidate.id != record.id
+                && !matches!(candidate.status, diri_proto::SessionStatus::Exited(_))
+                && local_session_uses_worktree(&candidate, &worktree_path)
+        });
+        if occupied {
+            return Err(ControlError::bad_request(
+                "another live session already owns this worktree",
+            ));
+        }
+        let updated = registry
+            .reparent_worktree(&p.session_id.0, target_path, target.branch.clone())
+            .map_err(|error| ControlError::internal(error.to_string()))?;
+        self.publish_updated(&registry, &p.session_id.0);
+        encode(&updated)
     }
 
     /// `host.sync_prefs`: push the local agent preferences to a host so
@@ -1364,6 +1648,10 @@ impl ControlServer {
                 },
             )
             .map_err(io_control_error)?;
+        self.agent_catalog
+            .lock()
+            .map_err(poisoned)?
+            .invalidate(Some(&host.id));
         encode(&diri_proto::HostInitializeResult {
             helper_build_id: helper.build_id,
             protocol: helper.protocol,
@@ -1378,7 +1666,10 @@ impl ControlServer {
     /// uses the verified Helper over `ssh -T`; the app never executes SSH.
     fn host_list_directories(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
         let p: diri_proto::HostListDirectoriesParams = decode(params)?;
-        let request = diri_proto::remote_pty::DirectoryListRequest { path: p.path };
+        let request = diri_proto::remote_pty::DirectoryListRequest {
+            path: p.path,
+            mode: p.mode,
+        };
         let result = if let Some(host_id) = p.host {
             let manager = self
                 .remote
@@ -1567,19 +1858,30 @@ impl ControlServer {
     fn session_remove(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
         let p: diri_proto::SessionIdParams = decode(params)?;
         let mut registry = self.registry.lock().map_err(poisoned)?;
+        let removed = registry
+            .record(&p.session_id.0)
+            .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?;
         registry
             .remove(&p.session_id.0, &self.logs_dir)
             .map_err(io_control_error)?;
-        let _ = registry.persist();
         if let Some(store) = &self.remote_bindings {
             let _ = store.remove(&p.session_id.0);
         }
+        self.events.record_removed(&removed);
         self.events.publish(
             diri_proto::EventName::SESSION_REMOVED,
             json!({ "id": p.session_id.0, "reason": "released" }),
             Some(&p.session_id.0),
         );
         Ok(json!({}))
+    }
+
+    fn activity_list(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        let p: diri_proto::ActivityListParams = decode(params)?;
+        let limit = usize::from(p.limit.unwrap_or(100).clamp(1, 300));
+        encode(&diri_proto::ActivityListResult {
+            entries: self.events.recent_activity(limit),
+        })
     }
 
     fn session_rename(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
@@ -1617,7 +1919,6 @@ impl ControlServer {
         registry
             .archive(&p.session_id.0)
             .map_err(io_control_error)?;
-        let _ = registry.persist();
         self.publish_updated(&registry, &p.session_id.0);
         Ok(json!({}))
     }
@@ -1628,7 +1929,6 @@ impl ControlServer {
         registry
             .unarchive(&p.session_id.0)
             .map_err(io_control_error)?;
-        let _ = registry.persist();
         self.publish_updated(&registry, &p.session_id.0);
         Ok(json!({}))
     }
@@ -1668,7 +1968,7 @@ impl ControlServer {
     fn session_resume(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
         let p: diri_proto::SessionIdParams = decode(params)?;
         let record = {
-            let registry = self.registry.lock().map_err(poisoned)?;
+            let mut registry = self.registry.lock().map_err(poisoned)?;
             let record = registry
                 .records()
                 .into_iter()
@@ -1683,12 +1983,11 @@ impl ControlServer {
                 && !matches!(record.status, diri_proto::SessionStatus::Exited(_))
             {
                 // Genuinely live: resuming is a no-op, not an error.
-                return serde_json::to_value(&record)
-                    .map_err(|error| ControlError::internal(error.to_string()));
+                return self.restored_resume_result(&mut registry, &p.session_id.0);
             }
             record
         };
-        let spec = if record.host.is_some() {
+        let mut spec = if record.host.is_some() {
             self.remote_resume_spec(&record)?
         } else {
             let registry = self.registry.lock().map_err(poisoned)?;
@@ -1700,6 +1999,16 @@ impl ControlServer {
                 record.agent_session_id.as_deref(),
             )?
         };
+        if record.host.is_none()
+            && let Some(mut profile) = record.account_profile.clone()
+        {
+            if profile.host.is_some() || profile.agent != record.kind.id() {
+                return Err(ControlError::bad_request(
+                    "Session account does not match its Agent or host",
+                ));
+            }
+            crate::accounts::bind_pty(&mut profile, &mut spec.pty)?;
+        }
         let remote_persistence = spec.remote.as_ref().map(|remote| remote.launch.persistence);
         let mut registry = self.registry.lock().map_err(poisoned)?;
         let record = registry
@@ -1711,8 +2020,7 @@ impl ControlServer {
         if registry.get(&p.session_id.0).is_some() {
             if !exited {
                 // Already live: resuming is a no-op, not an error.
-                return serde_json::to_value(&record)
-                    .map_err(|error| ControlError::internal(error.to_string()));
+                return self.restored_resume_result(&mut registry, &p.session_id.0);
             }
             // An agent that died on its own leaves its session behind: only an
             // explicit kill takes one out of the registry, so presence alone
@@ -1729,19 +2037,107 @@ impl ControlServer {
                 record.remote_persistence = Some(persistence);
             });
         }
+        self.restored_resume_result(&mut registry, &p.session_id.0)
+    }
+
+    fn restored_resume_result(
+        &self,
+        registry: &mut Registry,
+        id: &str,
+    ) -> Result<JsonValue, ControlError> {
+        // Resume is also the UI's revive action. Clear the durable archive
+        // only after launch succeeds, including an already-live session.
+        registry.unarchive(id).map_err(io_control_error)?;
         let _ = registry.persist();
-        self.publish_updated(&registry, &p.session_id.0);
+        self.publish_updated(registry, id);
         let record = registry
-            .records()
-            .into_iter()
-            .find(|record| record.id.0 == p.session_id.0)
+            .record(id)
             .ok_or_else(|| ControlError::internal("the resumed session vanished"))?;
         serde_json::to_value(&record).map_err(|error| ControlError::internal(error.to_string()))
+    }
+
+    /// Starts a new Session whose provider conversation is a native fork of
+    /// `source`. The Diri record and provider identity are both new; lineage
+    /// points at the source and the source remains untouched.
+    fn session_fork(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        let p: diri_proto::SessionForkParams = decode(params)?;
+        let source = {
+            let registry = self.registry.lock().map_err(poisoned)?;
+            registry
+                .records()
+                .into_iter()
+                .find(|record| record.id == p.session_id)
+                .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?
+        };
+        let kind = source.effective_kind().clone();
+        let id = next_session_id();
+        let mut spec = if source.host.is_some() {
+            self.remote_conversation_spec(&source, &id, &kind, ConversationAction::Fork)?
+        } else {
+            let registry = self.registry.lock().map_err(poisoned)?;
+            self.local_conversation_spec(
+                &registry,
+                &id,
+                kind.id(),
+                &source.cwd,
+                source.agent_session_id.as_deref(),
+                ConversationAction::Fork,
+            )?
+        };
+        let remote_persistence = spec.remote.as_ref().map(|remote| remote.launch.persistence);
+        if source.host.is_none()
+            && let Some(mut profile) = source.account_profile.clone()
+        {
+            if profile.host.is_some() || profile.agent != kind.id() {
+                return Err(ControlError::bad_request(
+                    "Session account does not match its Agent or host",
+                ));
+            }
+            crate::accounts::bind_pty(&mut profile, &mut spec.pty)?;
+        }
+        let mut record = new_record(&id, kind.id(), &source.cwd);
+        record.account_profile = source.account_profile.clone();
+        record.kind = kind;
+        record.project_id = source.project_id.clone();
+        record.worktree_path = source.worktree_path.clone();
+        record.git_branch = source.git_branch.clone();
+        record.parent = Some(source.id.clone());
+        record.host = source.host.clone();
+        record.remote_persistence = remote_persistence;
+        record.title = format!("Fork of {}", source.title);
+        record.title_source = diri_proto::TitleSource::DirijorAssigned;
+
+        let mut registry = self.registry.lock().map_err(poisoned)?;
+        registry.ensure_session_project(&source.cwd, source.host.as_deref());
+        registry
+            .spawn(spec, record)
+            .map_err(|error| ControlError::internal(error.to_string()))?;
+        let _ = registry.persist();
+        self.publish_updated(&registry, &id);
+        let record = registry
+            .record(&id)
+            .ok_or_else(|| ControlError::internal("the forked session vanished"))?;
+        encode(&record)
     }
 
     fn remote_resume_spec(
         &self,
         record: &diri_proto::SessionRecord,
+    ) -> Result<crate::session::SessionSpec, ControlError> {
+        self.remote_conversation_spec(
+            record,
+            &record.id.0,
+            &record.kind,
+            ConversationAction::Resume,
+        )
+    }
+
+    fn remote_conversation_spec(
+        &self,
+        record: &diri_proto::SessionRecord,
+        target_id: &str,
+        kind: &diri_proto::AgentKind,
+        action: ConversationAction,
     ) -> Result<crate::session::SessionSpec, ControlError> {
         let manager = self
             .remote
@@ -1760,53 +2156,97 @@ impl ControlServer {
         let persistence = manager
             .probe_persistence(&host, &helper)
             .map_err(io_control_error)?;
-        let captured = manager
-            .capture_environment(
-                &helper,
-                &diri_proto::remote_pty::EnvironmentCaptureRequest {
-                    cwd: Some(record.cwd.clone()),
-                    timeout_millis: 10_000,
-                },
-            )
-            .map_err(io_control_error)?;
+        let (mut descriptor, authority) = {
+            let registry = self.registry.lock().map_err(poisoned)?;
+            let engine = registry.engine();
+            let manifest = engine.manifest(kind.id()).ok_or_else(|| {
+                ControlError::not_found(format!("no manifest for agent {}", kind.id()))
+            })?;
+            let descriptor = manifest.agent.clone().unwrap_or_default();
+            let authority = descriptor.authority();
+            (descriptor, authority)
+        };
+        let captured = if let Some(binary) = descriptor.binary.as_deref() {
+            let (executable, captured) = self.discover_remote_agent_for_launch(
+                manager.as_ref(),
+                &host,
+                kind.id(),
+                binary,
+                record.cwd.clone(),
+            )?;
+            descriptor.binary = Some(executable);
+            captured
+        } else {
+            manager
+                .capture_environment(
+                    &helper,
+                    &diri_proto::remote_pty::EnvironmentCaptureRequest {
+                        cwd: Some(record.cwd.clone()),
+                        timeout_millis: 10_000,
+                    },
+                )
+                .map_err(io_control_error)?
+        };
         let cwd = PathBuf::from(&captured.cwd);
         if !cwd.is_absolute() {
             return Err(ControlError::internal(
                 "remote Helper returned a non-absolute cwd",
             ));
         }
-        let (descriptor, authority) = {
-            let registry = self.registry.lock().map_err(poisoned)?;
-            let engine = registry.engine();
-            let manifest = engine.manifest(record.kind.id()).ok_or_else(|| {
-                ControlError::not_found(format!("no manifest for agent {}", record.kind.id()))
-            })?;
-            let descriptor = manifest.agent.clone().unwrap_or_default();
-            let authority = descriptor.authority();
-            (descriptor, authority)
-        };
         let mut launch_args = descriptor.spawn_args.clone();
-        launch_args.extend(
-            descriptor
-                .resume_args(record.agent_session_id.as_deref())
-                .ok_or_else(|| {
-                    ControlError::bad_request(format!(
-                        "agent {} does not support resume",
-                        record.kind.id()
-                    ))
-                })?,
-        );
+        let provider_dir = captured
+            .environment
+            .iter()
+            .rev()
+            .find(|variable| variable.name == "HOME" && !variable.value.is_empty())
+            .map(|variable| {
+                Path::new(&variable.value)
+                    .join(".diri/session-storage")
+                    .join(target_id)
+            });
+        let launch = match action {
+            ConversationAction::Resume => crate::agent::ConversationLaunch::Resume {
+                source_id: record.agent_session_id.as_deref(),
+                session_dir: provider_dir.as_deref(),
+            },
+            ConversationAction::Fork => crate::agent::ConversationLaunch::Fork {
+                source_id: record.agent_session_id.as_deref(),
+                session_dir: provider_dir.as_deref(),
+            },
+        };
+        launch_args = descriptor
+            .conversation_plan(&launch_args, launch)
+            .ok_or_else(|| {
+                ControlError::bad_request(format!(
+                    "agent {} does not support {}",
+                    kind.id(),
+                    match action {
+                        ConversationAction::Resume => "resume",
+                        ConversationAction::Fork => "fork",
+                    }
+                ))
+            })?
+            .args;
         let inherited = captured
             .environment
             .into_iter()
             .map(|variable| (variable.name, variable.value));
-        let pty = descriptor
+        let mut pty = descriptor
             .remote_spawn_spec(&cwd, inherited, &launch_args)
             .ok_or_else(|| {
-                ControlError::bad_request(format!("agent {} declares no binary", record.kind.id()))
+                ControlError::bad_request(format!("agent {} declares no binary", kind.id()))
             })?;
+        if let Some(mut profile) = record.account_profile.clone() {
+            if profile.host != record.host || profile.agent != kind.id() {
+                return Err(ControlError::bad_request(
+                    "Session account binding does not match its execution target",
+                ));
+            }
+            crate::accounts::bind_pty(&mut profile, &mut pty)?;
+            crate::accounts::prepare_remote_directory(&profile, &host, &manager)?;
+        }
         let launch = diri_proto::remote_pty::LaunchRequest {
-            session_id: record.id.0.clone(),
+            session_id: target_id.to_owned(),
             session_token: random_session_token()?,
             argv: pty.argv.clone(),
             cwd: captured.cwd,
@@ -1825,9 +2265,9 @@ impl ControlServer {
             persistence,
         };
         Ok(crate::session::SessionSpec {
-            id: record.id.0.clone(),
+            id: target_id.to_owned(),
             pty,
-            manifest_id: record.kind.id().to_string(),
+            manifest_id: kind.id().to_string(),
             authority,
             logs_dir: self.logs_dir.clone(),
             holder: None,
@@ -1852,6 +2292,7 @@ impl ControlServer {
         let mut registry = self.registry.lock().map_err(poisoned)?;
         let id = next_session_id();
         let kind = p.entry.kind.id().to_string();
+        let prompt = p.initial_prompt.filter(|prompt| !prompt.is_empty());
         let mut record = new_record(&id, &kind, &p.entry.cwd);
         record.agent_session_id = Some(p.entry.id.clone());
         record.transcript_path = Some(p.entry.transcript_path.clone());
@@ -1871,6 +2312,18 @@ impl ControlServer {
             .into_iter()
             .find(|record| record.id.0 == id)
             .ok_or_else(|| ControlError::internal("the resumed session vanished"))?;
+        drop(registry);
+        let accept_claude_workspace = kind == diri_proto::AgentKind::CLAUDE_CODE_ID;
+        if let Some(prompt) = prompt {
+            prepare_agent_input(&self.registry, &id, accept_claude_workspace, Some(&prompt))
+                .map_err(|error| initial_prompt_control_error(&id, error))?;
+        } else if accept_claude_workspace {
+            let registry = Arc::clone(&self.registry);
+            let session_id = id.clone();
+            std::thread::spawn(move || {
+                let _ = prepare_agent_input(&registry, &session_id, true, None);
+            });
+        }
         serde_json::to_value(&record).map_err(|error| ControlError::internal(error.to_string()))
     }
 
@@ -1885,36 +2338,71 @@ impl ControlServer {
         cwd: &str,
         agent_session_id: Option<&str>,
     ) -> Result<crate::session::SessionSpec, ControlError> {
+        self.local_conversation_spec(
+            registry,
+            id,
+            kind,
+            cwd,
+            agent_session_id,
+            ConversationAction::Resume,
+        )
+    }
+
+    fn local_conversation_spec(
+        &self,
+        registry: &Registry,
+        id: &str,
+        kind: &str,
+        cwd: &str,
+        agent_session_id: Option<&str>,
+        action: ConversationAction,
+    ) -> Result<crate::session::SessionSpec, ControlError> {
         let engine = registry.engine();
         let manifest = engine
             .manifest(kind)
             .ok_or_else(|| ControlError::not_found(format!("no manifest for agent {kind}")))?;
-        let descriptor = manifest.agent.clone().unwrap_or_default();
+        let mut descriptor = manifest.agent.clone().unwrap_or_default();
         descriptor
             .binary
             .as_ref()
             .ok_or_else(|| ControlError::bad_request(format!("agent {kind} declares no binary")))?;
-        let tail = descriptor.resume_args(agent_session_id).ok_or_else(|| {
-            ControlError::bad_request(format!("agent {kind} does not support resume"))
-        })?;
-
+        let binary = descriptor.binary.clone().expect("checked above");
+        descriptor.binary = Some(self.resolve_local_agent_executable(kind, &binary)?);
         let mut launch_args = descriptor.spawn_args.clone();
-        launch_args.extend(tail);
         if let Some(injection) = &self.injection {
-            // Only the appendable flag mechanisms replay on resume, exactly
-            // as in Swift: Codex's global `-c` overrides must precede the
-            // resume SUBCOMMAND and are deliberately not replayed.
-            let claude_only = crate::agent::InjectionSpec {
-                claude_hooks: descriptor.injection.claude_hooks,
-                claude_mcp: descriptor.injection.claude_mcp,
-                ..Default::default()
-            };
-            launch_args.extend(crate::inject::injection_args(
-                &claude_only,
+            launch_args.extend(crate::inject::injection_args_with_cursor(
+                &descriptor.injection,
                 &injection.inject_dir,
                 &injection.cli_path,
+                Some(crate::inject::CursorInject {
+                    session_id: id,
+                    socket_path: &self.socket_path,
+                }),
             ));
         }
+        let provider_dir = registry.recovery_directory(id).join("provider");
+        let launch = match action {
+            ConversationAction::Resume => crate::agent::ConversationLaunch::Resume {
+                source_id: agent_session_id,
+                session_dir: Some(&provider_dir),
+            },
+            ConversationAction::Fork => crate::agent::ConversationLaunch::Fork {
+                source_id: agent_session_id,
+                session_dir: Some(&provider_dir),
+            },
+        };
+        launch_args = descriptor
+            .conversation_plan(&launch_args, launch)
+            .ok_or_else(|| {
+                ControlError::bad_request(format!(
+                    "agent {kind} does not support {}",
+                    match action {
+                        ConversationAction::Resume => "resume",
+                        ConversationAction::Fork => "fork",
+                    }
+                ))
+            })?
+            .args;
 
         let inherited: Vec<(String, String)> = std::env::vars().collect();
         let mut pty = descriptor
@@ -1930,6 +2418,13 @@ impl ControlServer {
             pty.env.push((
                 crate::inject::CLI_ENV.into(),
                 injection.cli_path.to_string_lossy().into_owned(),
+            ));
+            pty.env.push((
+                diri_proto::paths::ENV_SESSION_RECOVERY_DIR.into(),
+                registry
+                    .recovery_directory(id)
+                    .to_string_lossy()
+                    .into_owned(),
             ));
         }
         Ok(crate::session::SessionSpec {
@@ -1956,30 +2451,309 @@ impl ControlServer {
         serde_json::to_value(&record).map_err(|error| ControlError::internal(error.to_string()))
     }
 
-    /// Which agent binaries actually resolve, plus each manifest's descriptor
-    /// — this doubles as the agent catalog the client's picker renders.
-    fn agent_readiness(&self) -> Result<JsonValue, ControlError> {
-        let registry = self.registry.lock().map_err(poisoned)?;
-        let engine = registry.engine();
-        let mut agents = Vec::new();
-        for id in engine.ids() {
-            let Some(manifest) = engine.manifest(id) else {
-                continue;
-            };
-            let Some(descriptor) = &manifest.agent else {
-                continue;
-            };
-            let Some(binary) = &descriptor.binary else {
-                continue;
-            };
-            agents.push(json!({
-                "kind": id,
-                "binary": binary,
-                "path": resolve_on_path(binary),
-                "descriptor": engine.raw_agent(id),
-            }));
+    /// Manifest catalog plus executable facts for one execution target. The
+    /// scan is batched and target-keyed; a menu render never invokes this RPC.
+    fn agent_readiness(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        let p: diri_proto::AgentReadinessParams = decode(params).unwrap_or_default();
+        encode(&self.agent_catalog(&p, false)?)
+    }
+
+    fn resolve_local_agent_executable(
+        &self,
+        kind: &str,
+        binary: &str,
+    ) -> Result<String, ControlError> {
+        let preference = self
+            .agent_catalog
+            .lock()
+            .map_err(poisoned)?
+            .preference(None, kind);
+        // Only an explicit user-configured path overrides the manifest. With
+        // no override the binary deliberately stays bare: `spawn_spec` either
+        // hands it to a fresh interactive login shell (which resolves the
+        // nvm/mise/Homebrew PATH the daemon never inherited) or absolutizes
+        // it against the spawn environment. Judging availability by the
+        // daemon's own PATH here would reject agents the login shell can
+        // launch, and pin versions to whatever the daemon saw at startup.
+        let Some(configured) = preference.executable_path.as_deref() else {
+            return Ok(binary.to_owned());
+        };
+        let resolution = crate::agent_catalog::resolve_local(binary, Some(configured));
+        resolution
+            .configured_path
+            .ok_or_else(|| agent_unavailable(kind, None, resolution.configured_error.as_deref()))
+    }
+
+    fn discover_remote_agent_for_launch(
+        &self,
+        manager: &crate::remote::manager::RemoteManager,
+        host: &diri_proto::HostEntry,
+        kind: &str,
+        binary: &str,
+        cwd: String,
+    ) -> Result<(String, diri_proto::remote_pty::EnvironmentCaptureResult), ControlError> {
+        let preference = self
+            .agent_catalog
+            .lock()
+            .map_err(poisoned)?
+            .preference(Some(&host.id), kind);
+        let result = manager
+            .discover_executables(
+                host,
+                &diri_proto::remote_pty::ExecutableDiscoveryRequest {
+                    queries: vec![diri_proto::remote_pty::ExecutableQuery {
+                        id: kind.to_owned(),
+                        binary: binary.to_owned(),
+                        configured_path: preference.executable_path,
+                    }],
+                    cwd: Some(cwd),
+                    timeout_millis: 10_000,
+                },
+            )
+            .map_err(io_control_error)?;
+        let resolution = result.items.into_iter().next().ok_or_else(|| {
+            ControlError::internal("remote Helper omitted the executable discovery result")
+        })?;
+        let host_name = host.display_name();
+        let executable = resolution
+            .configured_path
+            .or(resolution.detected_path)
+            .ok_or_else(|| {
+                agent_unavailable(
+                    kind,
+                    Some(host_name),
+                    resolution.configured_error.as_deref(),
+                )
+            })?;
+        Ok((executable, result.environment))
+    }
+
+    fn agent_configure(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        let p: diri_proto::AgentConfigureParams = decode(params)?;
+        let kind = p.kind.id().to_owned();
+        {
+            let registry = self.registry.lock().map_err(poisoned)?;
+            let engine = registry.engine();
+            let manifest = engine.manifest(&kind).ok_or_else(|| {
+                ControlError::not_found(format!("no manifest for agent {kind:?}"))
+            })?;
+            if manifest
+                .agent
+                .as_ref()
+                .and_then(|agent| agent.binary.as_ref())
+                .is_none()
+            {
+                return Err(ControlError::bad_request(
+                    "terminal and generic manifests cannot be configured as Agents",
+                ));
+            }
         }
-        Ok(json!({ "agents": agents }))
+        if let Some(host) = p.host.as_deref() {
+            self.resolve_host(host)?;
+        }
+        let preference = crate::agent_catalog::AgentPreference {
+            executable_path: p.executable_path,
+            show_in_quick_create: Some(p.show_in_quick_create),
+        };
+        self.agent_catalog
+            .lock()
+            .map_err(poisoned)?
+            .configure(p.host.as_deref(), &kind, preference)
+            .map_err(io_control_error)?;
+        let result = self.agent_catalog(
+            &diri_proto::AgentReadinessParams {
+                host: p.host,
+                force_refresh: true,
+            },
+            true,
+        )?;
+        encode(&result)
+    }
+
+    fn agent_catalog(
+        &self,
+        params: &diri_proto::AgentReadinessParams,
+        _validate_configured: bool,
+    ) -> Result<diri_proto::AgentReadinessResult, ControlError> {
+        if let Some(host) = params.host.as_deref() {
+            self.resolve_host(host)?;
+        }
+        if !params.force_refresh
+            && let Some(cached) = self
+                .agent_catalog
+                .lock()
+                .map_err(poisoned)?
+                .cached(params.host.as_deref())
+        {
+            return Ok(cached);
+        }
+        let force_baseline = if params.force_refresh {
+            self.agent_catalog
+                .lock()
+                .map_err(poisoned)?
+                .cached(params.host.as_deref())
+        } else {
+            None
+        };
+
+        // Single-flight each target. A slow remote never blocks local or a
+        // different host, while concurrent menus/settings share one scan.
+        let target_key = params.host.as_deref().unwrap_or("local").to_owned();
+        let scan_lock = self
+            .agent_scans
+            .lock()
+            .map_err(poisoned)?
+            .entry(target_key)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        let _scan = scan_lock.lock().map_err(poisoned)?;
+        if params.force_refresh {
+            let current = self
+                .agent_catalog
+                .lock()
+                .map_err(poisoned)?
+                .cached(params.host.as_deref());
+            if current != force_baseline
+                && let Some(current) = current
+            {
+                return Ok(current);
+            }
+        }
+        if !params.force_refresh
+            && let Some(cached) = self
+                .agent_catalog
+                .lock()
+                .map_err(poisoned)?
+                .cached(params.host.as_deref())
+        {
+            return Ok(cached);
+        }
+
+        let manifests = {
+            let registry = self.registry.lock().map_err(poisoned)?;
+            let engine = registry.engine();
+            let mut manifests = engine
+                .ids()
+                .into_iter()
+                .filter_map(|id| {
+                    let descriptor = engine.manifest(id)?.agent.as_ref()?;
+                    let binary = descriptor.binary.clone()?;
+                    Some((
+                        id.to_owned(),
+                        binary,
+                        descriptor.catalog_order.unwrap_or(u16::MAX),
+                        engine.raw_agent(id).cloned(),
+                    ))
+                })
+                .collect::<Vec<_>>();
+            manifests
+                .sort_by(|left, right| left.2.cmp(&right.2).then_with(|| left.0.cmp(&right.0)));
+            manifests
+        };
+        let preferences = {
+            let catalog = self.agent_catalog.lock().map_err(poisoned)?;
+            manifests
+                .iter()
+                .map(|(id, _, _, _)| catalog.preference(params.host.as_deref(), id))
+                .collect::<Vec<_>>()
+        };
+
+        let resolutions = if let Some(host_id) = params.host.as_deref() {
+            let manager = self
+                .remote
+                .as_ref()
+                .ok_or_else(crate::remote::transport_unavailable)?;
+            let host = self.resolve_host(host_id)?;
+            let result = manager
+                .discover_executables(
+                    &host,
+                    &diri_proto::remote_pty::ExecutableDiscoveryRequest {
+                        queries: manifests
+                            .iter()
+                            .zip(&preferences)
+                            .map(|((id, binary, _, _), preference)| {
+                                diri_proto::remote_pty::ExecutableQuery {
+                                    id: id.clone(),
+                                    binary: binary.clone(),
+                                    configured_path: preference.executable_path.clone(),
+                                }
+                            })
+                            .collect(),
+                        cwd: None,
+                        timeout_millis: 10_000,
+                    },
+                )
+                .map_err(io_control_error)?;
+            let by_id = result
+                .items
+                .into_iter()
+                .map(|item| (item.id.clone(), item))
+                .collect::<std::collections::HashMap<_, _>>();
+            manifests
+                .iter()
+                .map(|(id, _, _, _)| {
+                    let item = by_id.get(id);
+                    crate::agent_catalog::ExecutableResolution {
+                        detected_path: item.and_then(|item| item.detected_path.clone()),
+                        configured_path: item.and_then(|item| item.configured_path.clone()),
+                        configured_error: item.and_then(|item| item.configured_error.clone()),
+                    }
+                })
+                .collect::<Vec<_>>()
+        } else {
+            manifests
+                .iter()
+                .zip(&preferences)
+                .map(|((_, binary, _, _), preference)| {
+                    crate::agent_catalog::resolve_local(
+                        binary,
+                        preference.executable_path.as_deref(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let mut agents = Vec::with_capacity(manifests.len());
+        for (((id, binary, _, raw_descriptor), preference), resolution) in
+            manifests.into_iter().zip(preferences).zip(resolutions)
+        {
+            let path = resolution
+                .configured_path
+                .clone()
+                .or_else(|| resolution.detected_path.clone());
+            let show = preference.show_in_quick_create.unwrap_or(path.is_some()) && path.is_some();
+            let path_source = if resolution.configured_path.is_some() {
+                Some(diri_proto::AgentPathSource::Manual)
+            } else if resolution.detected_path.is_some() {
+                Some(diri_proto::AgentPathSource::SystemPath)
+            } else {
+                None
+            };
+            let descriptor = raw_descriptor.and_then(|value| {
+                serde_json::from_value::<diri_proto::AgentDescriptor>(value).ok()
+            });
+            agents.push(diri_proto::AgentReadinessItem {
+                kind: diri_proto::AgentKind::new(id),
+                binary,
+                path,
+                detected_path: resolution.detected_path,
+                configured_path: preference.executable_path,
+                path_source,
+                show_in_quick_create: show,
+                error: resolution.configured_error,
+                descriptor,
+            });
+        }
+        let result = diri_proto::AgentReadinessResult {
+            host: params.host.clone(),
+            scanned_at: Some(diri_proto::DateMillis::from(std::time::SystemTime::now())),
+            agents,
+        };
+        self.agent_catalog
+            .lock()
+            .map_err(poisoned)?
+            .cache(params.host.as_deref(), result.clone());
+        Ok(result)
     }
 
     fn project_add(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
@@ -2052,7 +2826,7 @@ impl ControlServer {
 
     fn daemon_prepare_shutdown(&self) -> Result<JsonValue, ControlError> {
         let mut registry = self.registry.lock().map_err(poisoned)?;
-        let _ = registry.persist();
+        registry.persist_for_shutdown().map_err(io_control_error)?;
         Ok(json!({}))
     }
 
@@ -2065,7 +2839,7 @@ impl ControlServer {
             let mut registry = self.registry.lock().map_err(poisoned)?;
             let live_sessions = registry.live_count();
             if live_sessions == 0 {
-                let _ = registry.persist();
+                registry.persist_for_shutdown().map_err(io_control_error)?;
             }
             live_sessions
         };
@@ -2096,7 +2870,7 @@ impl ControlServer {
                         .is_ok_and(|registry| registry.live_count() == 0);
                     if still_idle {
                         if let Some(remote) = remote {
-                            remote.close_control_masters();
+                            let _ = remote.close_control_masters();
                         }
                         if let Some(holder) = holder {
                             let paths = crate::holder::HolderManagerPaths::new(&holder.holders_dir);
@@ -2125,7 +2899,7 @@ impl ControlServer {
     fn daemon_shutdown(&self) -> Result<JsonValue, ControlError> {
         {
             let mut registry = self.registry.lock().map_err(poisoned)?;
-            let _ = registry.persist();
+            registry.persist_for_shutdown().map_err(io_control_error)?;
         }
         let browser = self.browser.get().cloned();
         let socket_path = self.socket_path.clone();
@@ -2275,11 +3049,15 @@ pub(crate) fn new_record(id: &str, kind: &str, cwd: &str) -> diri_proto::Session
         git_branch: None,
         title: kind.to_string(),
         title_source: TitleSource::Placeholder,
+        account_profile: None,
+        originating_prompt: None,
         agent_session_id: None,
         transcript_path: None,
         status: diri_proto::SessionStatus::Starting,
+        status_evidence: None,
         needs_input: None,
         resumability: Resumability::Live,
+        capabilities: None,
         parent: None,
         created_at: now,
         updated_at: now,
@@ -2314,6 +3092,25 @@ impl Drop for SubscriptionHandle {
     }
 }
 
+struct BackgroundRequest(Arc<AtomicUsize>);
+
+impl BackgroundRequest {
+    fn acquire(counter: &Arc<AtomicUsize>) -> Option<Self> {
+        counter
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < 32).then_some(active + 1)
+            })
+            .ok()?;
+        Some(Self(Arc::clone(counter)))
+    }
+}
+
+impl Drop for BackgroundRequest {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Release);
+    }
+}
+
 struct ActiveConnectionGuard {
     connections: Arc<AtomicUsize>,
 }
@@ -2340,6 +3137,34 @@ fn idle_shutdown_refusal(live_sessions: usize, connections: usize) -> Option<&'s
         Some("another control client still requires the Engine")
     } else {
         None
+    }
+}
+
+fn read_bounded_control_line<R: BufRead>(reader: &mut R) -> std::io::Result<Option<Vec<u8>>> {
+    let mut line = Vec::new();
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return if line.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(line))
+            };
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let consumed = newline.map_or(available.len(), |position| position + 1);
+        let payload = newline.unwrap_or(available.len());
+        if line.len().saturating_add(payload) > MAX_CONTROL_LINE_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "control line exceeded the protocol maximum",
+            ));
+        }
+        line.extend_from_slice(&available[..payload]);
+        reader.consume(consumed);
+        if newline.is_some() {
+            return Ok(Some(line));
+        }
     }
 }
 
@@ -2371,33 +3196,6 @@ fn encode<T: serde::Serialize>(value: &T) -> Result<JsonValue, ControlError> {
     serde_json::to_value(value).map_err(|error| ControlError::internal(error.to_string()))
 }
 
-/// Resolves a binary on the daemon's PATH, as the readiness check needs.
-fn resolve_on_path(binary: &str) -> Option<String> {
-    if binary.contains('/') {
-        return Path::new(binary).exists().then(|| binary.to_string());
-    }
-    let path = std::env::var("PATH").ok()?;
-    for dir in path.split(':') {
-        let candidate = Path::new(dir).join(binary);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if std::fs::metadata(&candidate)
-                .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-                .unwrap_or(false)
-            {
-                return Some(candidate.to_string_lossy().into_owned());
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            if candidate.is_file() {
-                return Some(candidate.to_string_lossy().into_owned());
-            }
-        }
-    }
-    None
-}
 fn migrate_control_error(error: crate::migrate::MigrateError) -> ControlError {
     match error {
         crate::migrate::MigrateError::BadRequest(message) => ControlError::bad_request(message),
@@ -2410,6 +3208,17 @@ fn io_control_error(error: std::io::Error) -> ControlError {
         std::io::ErrorKind::NotFound => ControlError::not_found(error.to_string()),
         _ => ControlError::internal(error.to_string()),
     }
+}
+
+fn agent_unavailable(kind: &str, host: Option<&str>, detail: Option<&str>) -> ControlError {
+    let target = host.map_or_else(|| "this Mac".to_owned(), ToOwned::to_owned);
+    let suffix = detail.map_or_else(String::new, |detail| format!(": {detail}"));
+    ControlError::new(
+        "agent_unavailable",
+        format!(
+            "{kind} is not available on {target}; detect it or bind an executable in Settings > Agents{suffix}"
+        ),
+    )
 }
 
 fn history_entry_to_wire(entry: crate::history::HistoryEntry) -> diri_proto::HistoryEntry {
@@ -2461,13 +3270,44 @@ fn prepare_agent_input(
     session_id: &str,
     accept_claude_workspace: bool,
     prompt: Option<&str>,
-) {
+) -> Result<(), InitialPromptFailure> {
     if accept_claude_workspace {
         accept_claude_workspace_trust(registry, session_id);
     }
     if let Some(prompt) = prompt {
-        inject_initial_prompt(registry, session_id, prompt);
+        inject_initial_prompt(registry, session_id, prompt)?;
     }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+enum InitialPromptFailure {
+    SessionEnded,
+    TimedOut,
+    SubmissionUnconfirmed,
+    InputFailed,
+}
+
+impl std::fmt::Display for InitialPromptFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SessionEnded => formatter.write_str("the session ended before accepting it"),
+            Self::TimedOut => formatter.write_str("the agent did not accept it before the timeout"),
+            Self::InputFailed => formatter.write_str("the session could not accept input"),
+            Self::SubmissionUnconfirmed => {
+                formatter.write_str("the agent never confirmed that it submitted")
+            }
+        }
+    }
+}
+
+fn initial_prompt_control_error(session_id: &str, failure: InitialPromptFailure) -> ControlError {
+    ControlError::new(
+        "initial_prompt_delivery_failed",
+        format!(
+            "session {session_id} was created, but initial prompt delivery was not confirmed: {failure}"
+        ),
+    )
 }
 
 /// Answers Claude Code's "do you trust this folder?" picker on the user's
@@ -2543,28 +3383,31 @@ fn is_claude_workspace_trust_screen(screen: &str) -> bool {
 /// one that lands. Nothing here consults the session's status — Codex reads
 /// as `Working` even at an idle composer, so the echo is the only tell worth
 /// trusting.
-fn inject_initial_prompt(registry: &Arc<Mutex<Registry>>, session_id: &str, prompt: &str) {
+fn inject_initial_prompt(
+    registry: &Arc<Mutex<Registry>>,
+    session_id: &str,
+    prompt: &str,
+) -> Result<(), InitialPromptFailure> {
     if !wait_until_ready(registry, session_id) {
-        return;
+        return Err(InitialPromptFailure::SessionEnded);
     }
     let give_up_at = Instant::now() + PROMPT_INJECTION_WINDOW;
     loop {
         let Some(before) = screen_text(registry, session_id) else {
-            return;
+            return Err(InitialPromptFailure::SessionEnded);
         };
         // A word already on screen (a path in the banner, a word from the
         // tips panel) proves nothing, so the probe is chosen against the
         // pre-typing screen.
         let probe = verification_probe(prompt, &before);
-        if with_session(registry, session_id, |session| session.paste_text(prompt)).is_none() {
-            return;
-        }
+        with_session(registry, session_id, |session| session.paste_text(prompt))
+            .ok_or(InitialPromptFailure::SessionEnded)?
+            .map_err(|_| InitialPromptFailure::InputFailed)?;
         match wait_for_echo(registry, session_id, probe.as_deref(), &before, ECHO_WINDOW) {
-            EchoOutcome::Gone => return,
+            EchoOutcome::Gone => return Err(InitialPromptFailure::SessionEnded),
             // The composer is holding our text: the Enter is safe.
             EchoOutcome::Visible => {
-                submit_typed_prompt(registry, session_id, probe.as_deref());
-                return;
+                return submit_typed_prompt(registry, session_id, probe.as_deref());
             }
             EchoOutcome::Missing => {}
         }
@@ -2582,9 +3425,9 @@ fn inject_initial_prompt(registry: &Arc<Mutex<Registry>>, session_id: &str, prom
         // here. The old code sent this same blind Enter on every attempt, so
         // the exposure is unchanged; narrowing it would need the holder to
         // report termios.
-        if with_session(registry, session_id, |session| session.submit_input()).is_none() {
-            return;
-        }
+        with_session(registry, session_id, |session| session.submit_input())
+            .ok_or(InitialPromptFailure::SessionEnded)?
+            .map_err(|_| InitialPromptFailure::InputFailed)?;
         match wait_for_echo(
             registry,
             session_id,
@@ -2592,14 +3435,15 @@ fn inject_initial_prompt(registry: &Arc<Mutex<Registry>>, session_id: &str, prom
             &before,
             LANDED_WINDOW,
         ) {
-            EchoOutcome::Gone | EchoOutcome::Visible => return,
+            EchoOutcome::Gone => return Err(InitialPromptFailure::SessionEnded),
+            EchoOutcome::Visible => return Ok(()),
             EchoOutcome::Missing => {}
         }
 
         // Truly swallowed. Empty the composer before retyping so a late echo
         // cannot concatenate with the retry.
         if with_session(registry, session_id, |session| session.clear_input_line()).is_none() {
-            return;
+            return Err(InitialPromptFailure::SessionEnded);
         }
         if !sleep_until(give_up_at, PROMPT_RETRY_DELAY) {
             break;
@@ -2610,6 +3454,7 @@ fn inject_initial_prompt(registry: &Arc<Mutex<Registry>>, session_id: &str, prom
          {}s — left untyped rather than submitted blind",
         PROMPT_INJECTION_WINDOW.as_secs()
     );
+    Err(InitialPromptFailure::TimedOut)
 }
 
 /// How long a prompt waits for a composer that will take it. Long enough to
@@ -2679,41 +3524,73 @@ fn wait_for_echo(
 /// confirms the composer let go of it. A prompt still sitting there after the
 /// first Enter gets exactly one more — never a retype, which is what would
 /// double-send.
-fn submit_typed_prompt(registry: &Arc<Mutex<Registry>>, session_id: &str, probe: Option<&str>) {
+fn submit_typed_prompt(
+    registry: &Arc<Mutex<Registry>>,
+    session_id: &str,
+    probe: Option<&str>,
+) -> Result<(), InitialPromptFailure> {
+    let submitted_at = diri_proto::DateMillis::from(std::time::SystemTime::now());
     for _ in 0..2 {
-        if with_session(registry, session_id, |session| session.submit_input()).is_none() {
-            return;
-        }
-        let Some(probe) = probe else {
-            return;
-        };
-        // Submitting moves the prompt out of the composer and into the
-        // transcript above it; either way the agent now owns it. Only a
-        // screen that never moved at all means the Enter was swallowed.
+        let (before, process_only) = with_session(registry, session_id, |session| {
+            let view = session.view();
+            (
+                session.screen_lines().join("\n"),
+                view.status_evidence.is_some_and(|evidence| {
+                    evidence.fallback_reason == Some(diri_proto::StatusFallbackReason::ProcessOnly)
+                }),
+            )
+        })
+        .ok_or(InitialPromptFailure::SessionEnded)?;
+        with_session(registry, session_id, |session| session.submit_input())
+            .ok_or(InitialPromptFailure::SessionEnded)?
+            .map_err(|_| InitialPromptFailure::InputFailed)?;
+        // The prompt may remain in the transcript after submission. In that
+        // case require a fresh, authoritative Agent signal; startup output or
+        // a status that predates Enter cannot acknowledge these bytes.
         for _ in 0..20 {
             std::thread::sleep(Duration::from_millis(100));
             match screen_text(registry, session_id) {
-                None => return,
+                None => return Err(InitialPromptFailure::SessionEnded),
                 Some(now)
-                    if !now.contains(probe) || agent_started_working(registry, session_id) =>
+                    if probe.is_some_and(|probe| !now.contains(probe))
+                        // Plain CLI tools have no Agent status signals. A new
+                        // response after Enter is their available confirmation;
+                        // the pasted echo alone must never count as one.
+                        || ((process_only || probe.is_none()) && now != before)
+                        || agent_started_working(registry, session_id, submitted_at) =>
                 {
-                    return;
+                    return Ok(());
                 }
                 Some(_) => {}
             }
         }
     }
+    Err(InitialPromptFailure::SubmissionUnconfirmed)
 }
 
-/// True once the session's own status reducer says the agent is doing
-/// something — the prompt was received even if its text is still echoed in
-/// the transcript above the composer.
-fn agent_started_working(registry: &Arc<Mutex<Registry>>, session_id: &str) -> bool {
+/// Only fresh Agent evidence can acknowledge submission. A running process
+/// or a pre-existing startup/permission status says nothing about this Enter.
+fn agent_started_working(
+    registry: &Arc<Mutex<Registry>>,
+    session_id: &str,
+    submitted_at: diri_proto::DateMillis,
+) -> bool {
     with_session(registry, session_id, |session| {
-        matches!(
-            session.view().status,
-            diri_proto::SessionStatus::Working | diri_proto::SessionStatus::NeedsInput(_)
-        )
+        let view = session.view();
+        view.status_evidence.is_some_and(|evidence| {
+            evidence.status == view.status
+                && evidence.signal_at.0 >= submitted_at.0
+                && matches!(
+                    evidence.source,
+                    diri_proto::StatusEvidenceSource::Hook
+                        | diri_proto::StatusEvidenceSource::Notify
+                        | diri_proto::StatusEvidenceSource::ScreenRule
+                )
+                && matches!(
+                    view.status,
+                    diri_proto::SessionStatus::Working | diri_proto::SessionStatus::NeedsInput(_)
+                )
+        })
     })
     .unwrap_or(false)
 }
@@ -2815,18 +3692,22 @@ fn screen_settled(registry: &Arc<Mutex<Registry>>, session_id: &str) -> bool {
 ///
 /// It has to be a WHOLE word, not a leading slice: composers soft-wrap, and
 /// wrapping happens at word boundaries, so any prefix of the prompt can be
-/// split across two screen lines while a single word survives intact. It also
-/// has to be absent from `before`, or a word the banner already displays
-/// would read as an echo the instant we looked. `None` when the prompt offers
-/// nothing that qualifies — a prompt made entirely of words already on
-/// screen, or of words too long to escape wrapping.
+/// split across two screen lines while a single word survives intact. Prefer
+/// the earliest line that offers a usable word because Codex collapses long
+/// pasted prompts to a leading summary; a probe from the middle can disappear
+/// even though the composer accepted the paste. The word also has to be absent
+/// from `before`, or a word the banner already displays would read as an echo
+/// the instant we looked. `None` when the prompt offers nothing that qualifies
+/// — a prompt made entirely of words already on screen, or of words too long
+/// to escape wrapping.
 fn verification_probe(prompt: &str, before: &str) -> Option<String> {
-    prompt
-        .split_whitespace()
-        .filter(|word| (MIN_PROBE_CHARS..=MAX_PROBE_CHARS).contains(&word.chars().count()))
-        .filter(|word| !before.contains(*word))
-        .max_by_key(|word| word.chars().count())
-        .map(str::to_owned)
+    prompt.lines().find_map(|line| {
+        line.split_whitespace()
+            .filter(|word| (MIN_PROBE_CHARS..=MAX_PROBE_CHARS).contains(&word.chars().count()))
+            .filter(|word| !before.contains(*word))
+            .max_by_key(|word| word.chars().count())
+            .map(str::to_owned)
+    })
 }
 
 /// Short words appear by coincidence; long ones are the ones a narrow
@@ -2837,6 +3718,26 @@ const MAX_PROBE_CHARS: usize = 20;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_control_line_is_rejected_before_unbounded_buffering() {
+        let bytes = vec![b'x'; MAX_CONTROL_LINE_BYTES + 1];
+        let mut reader = std::io::BufReader::new(bytes.as_slice());
+        let error = read_bounded_control_line(&mut reader).expect_err("must reject");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn background_request_capacity_is_bounded_and_released() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let permits: Vec<_> = (0..32)
+            .map(|_| BackgroundRequest::acquire(&counter).unwrap())
+            .collect();
+        assert!(BackgroundRequest::acquire(&counter).is_none());
+        drop(permits);
+        assert_eq!(counter.load(Ordering::Acquire), 0);
+        assert!(BackgroundRequest::acquire(&counter).is_some());
+    }
     use crate::detect::ManifestEngine;
 
     fn engine() -> Arc<ManifestEngine> {
@@ -2847,9 +3748,12 @@ mod tests {
         Arc::new(engine)
     }
 
-    fn server(temp: &Path) -> ControlServer {
+    pub(super) fn server(temp: &Path) -> Arc<ControlServer> {
         let registry = Registry::new(engine(), temp.join("state.json"));
-        ControlServer::new(Arc::new(Mutex::new(registry)), temp.join("daemon.sock"))
+        Arc::new(ControlServer::new(
+            Arc::new(Mutex::new(registry)),
+            temp.join("daemon.sock"),
+        ))
     }
 
     fn test_record(id: &str) -> diri_proto::SessionRecord {
@@ -2863,11 +3767,15 @@ mod tests {
             git_branch: None,
             title: "test".into(),
             title_source: TitleSource::Placeholder,
+            account_profile: None,
+            originating_prompt: None,
             agent_session_id: None,
             transcript_path: None,
             status: SessionStatus::Idle,
+            status_evidence: None,
             needs_input: None,
             resumability: Resumability::NotResumable,
+            capabilities: None,
             parent: None,
             created_at: DateMillis(0.0),
             updated_at: DateMillis(0.0),
@@ -2886,22 +3794,83 @@ mod tests {
         }
     }
 
+    fn repository_with_linked_worktree(temp: &Path) -> (PathBuf, PathBuf) {
+        let repo = temp.join("repo");
+        let target = temp.join("feature-checkout");
+        std::fs::create_dir_all(&repo).expect("mkdir");
+        let git = |arguments: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(arguments)
+                .current_dir(&repo)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .status()
+                .expect("git");
+            assert!(status.success(), "git {arguments:?}");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["commit", "--allow-empty", "-q", "-m", "root"]);
+        git(&[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feature/reparent",
+            target.to_str().expect("utf8 target"),
+        ]);
+        (
+            repo.canonicalize().expect("repo"),
+            target.canonicalize().expect("target"),
+        )
+    }
+
+    fn ended_resumable_record(id: &str, repo: &Path) -> diri_proto::SessionRecord {
+        let mut record = test_record(id);
+        record.cwd = repo.to_string_lossy().into_owned();
+        record.project_id = crate::registry::session_project_id(&record.cwd, None);
+        record.status = diri_proto::SessionStatus::Exited(diri_proto::ExitInfo {
+            reason: diri_proto::ExitReason::Exited,
+            code: Some(0),
+            signal: None,
+        });
+        record.resumability = diri_proto::Resumability::Resumable;
+        record
+    }
+
     /// Round-trips one request through the dispatcher the way a client would.
     /// Dispatches one line the way `serve` would, with a throwaway socket
     /// standing in for the connection's write half.
-    fn handle(server: &ControlServer, line: &[u8]) -> Option<ControlMessage> {
+    fn handle(server: &Arc<ControlServer>, line: &[u8]) -> Option<ControlMessage> {
         let (writer, _peer) = UnixStream::pair().expect("socketpair");
         server.handle_line(line, &Arc::new(Mutex::new(writer)), &mut None)
     }
 
-    fn call(server: &ControlServer, method: &str, params: Option<JsonValue>) -> ControlMessage {
+    fn call(
+        server: &Arc<ControlServer>,
+        method: &str,
+        params: Option<JsonValue>,
+    ) -> ControlMessage {
         let request = ControlMessage::Request {
             id: 1,
             method: method.into(),
             params,
         };
         let line = serde_json::to_vec(&request).expect("encode");
-        handle(server, &line).expect("a request gets a response")
+        let (writer, peer) = UnixStream::pair().expect("socketpair");
+        peer.set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        if let Some(response) = server.handle_line(&line, &Arc::new(Mutex::new(writer)), &mut None)
+        {
+            return response;
+        }
+        // Slow RPCs now respond on the socket instead of blocking handle_line.
+        let mut response = String::new();
+        BufReader::new(peer)
+            .read_line(&mut response)
+            .expect("background response");
+        serde_json::from_str(&response).expect("a request gets a response")
     }
 
     fn ok_of(message: ControlMessage) -> JsonValue {
@@ -2921,6 +3890,14 @@ mod tests {
     }
 
     #[test]
+    fn account_profiles_list_is_available_to_settings() {
+        let temp = tempfile::tempdir().expect("temp");
+        let server = server(temp.path());
+        let result = ok_of(call(&server, "account.profiles.list", None));
+        assert_eq!(result["profiles"], json!([]));
+    }
+
+    #[test]
     fn hello_reports_the_protocol_and_the_engine_build() {
         let temp = tempfile::tempdir().expect("temp");
         let server = server(temp.path());
@@ -2936,6 +3913,12 @@ mod tests {
                 .as_str()
                 .is_some_and(|b| b.contains("diri-engine")),
             "the handshake should say which engine answered: {result}"
+        );
+        assert!(
+            result["build"]
+                .as_str()
+                .is_some_and(|build| build.contains("+catalog.")),
+            "manifest changes must alter the daemon identity: {result}"
         );
         assert!(result["pid"].as_i64().is_some_and(|pid| pid > 0));
         assert_eq!(result["engineKind"], diri_proto::RUST_ENGINE_KIND);
@@ -2958,6 +3941,38 @@ mod tests {
             Some(json!({ "active": false })),
         ));
         assert!(!server.pr_monitor_wake().foreground_active());
+    }
+
+    #[test]
+    fn activity_list_reads_the_durable_publication_history() {
+        let temp = tempfile::tempdir().expect("temp");
+        let server = server(temp.path());
+        {
+            let mut registry = server.registry.lock().expect("registry");
+            let mut record = test_record("s_activity");
+            record.kind = diri_proto::AgentKind::CODEX;
+            record.status = diri_proto::SessionStatus::Working;
+            registry.insert_record(record);
+            server.publish_updated(&registry, "s_activity");
+            registry.update_record("s_activity", |record| {
+                record.status = diri_proto::SessionStatus::Idle;
+            });
+            server.publish_updated(&registry, "s_activity");
+        }
+
+        let result = ok_of(call(
+            &server,
+            diri_proto::Method::ACTIVITY_LIST,
+            Some(json!({"limit": 10})),
+        ));
+        assert_eq!(result["entries"][0]["kind"], "finished");
+        assert_eq!(result["entries"][1]["kind"], "started");
+        assert_eq!(result["entries"][0]["sessionID"], "s_activity");
+        assert!(
+            temp.path()
+                .join(diri_proto::paths::ACTIVITY_LOG_FILE_NAME)
+                .is_file()
+        );
     }
 
     #[test]
@@ -2989,10 +4004,17 @@ mod tests {
             codex_descriptor.injection.codex_notify || codex_descriptor.injection.codex_mcp,
             "codex opts into at least one shim"
         );
+
+        let cursor = engine.manifest("cursor").expect("cursor manifest");
+        let cursor_descriptor = cursor.agent.clone().expect("agent");
+        assert!(cursor_descriptor.injection.cursor_mcp);
+        assert!(cursor_descriptor.injection.cursor_hooks);
     }
 
     #[test]
     fn resuming_an_agent_directly_executes_the_agent() {
+        use std::os::unix::fs::PermissionsExt as _;
+
         let temp = tempfile::tempdir().expect("temp");
         let registry = Registry::new(engine(), temp.path().join("state.json"));
         let server = ControlServer::new(
@@ -3002,6 +4024,23 @@ mod tests {
             ))),
             temp.path().join("daemon.sock"),
         );
+        let executable = temp.path().join("claude");
+        std::fs::write(&executable, b"#!/bin/sh\nexit 0\n").expect("fake claude executable");
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
+            .expect("make fake claude executable");
+        server
+            .agent_catalog
+            .lock()
+            .expect("agent catalog lock")
+            .configure(
+                None,
+                "claude-code",
+                crate::agent_catalog::AgentPreference {
+                    executable_path: Some(executable.to_string_lossy().into_owned()),
+                    show_in_quick_create: Some(true),
+                },
+            )
+            .expect("bind fake claude executable");
 
         let spec = server
             .resume_spec(&registry, "s_resume", "claude-code", "/tmp", Some("uuid-1"))
@@ -3011,8 +4050,270 @@ mod tests {
         // have to reach the agent itself.
         let command = spec.pty.argv.last().expect("argv");
         assert!(
-            command.contains("'claude'") && command.contains("'--resume' 'uuid-1'"),
+            command.contains(&format!("{}'", executable.display()))
+                && command.contains("'--resume' 'uuid-1'"),
             "resume flags must reach the agent: {command:?}"
+        );
+
+        let fork = server
+            .local_conversation_spec(
+                &registry,
+                "s_fork",
+                "claude-code",
+                "/tmp",
+                Some("uuid-1"),
+                ConversationAction::Fork,
+            )
+            .expect("fork spec");
+        let command = fork.pty.argv.last().expect("fork argv");
+        assert!(
+            command.contains("'--resume' 'uuid-1' '--fork-session'"),
+            "fork grammar must reach the agent: {command:?}"
+        );
+    }
+
+    #[test]
+    fn account_binding_survives_profile_edits_removal_resume_and_fork() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let server = server(temp.path());
+        let executable = temp.path().join("codex");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nprintf '%s\\n' launch >> \"$CODEX_HOME/launches\"\nexec /bin/sleep 30\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        server
+            .agent_catalog
+            .lock()
+            .unwrap()
+            .configure(
+                None,
+                "codex",
+                crate::agent_catalog::AgentPreference {
+                    executable_path: Some(executable.to_string_lossy().into_owned()),
+                    show_in_quick_create: Some(true),
+                },
+            )
+            .unwrap();
+        let profile = diri_proto::AgentAccountProfile {
+            id: "work".into(),
+            label: "Work".into(),
+            agent: "codex".into(),
+            host: None,
+            config_home: temp
+                .path()
+                .join("work-account")
+                .to_string_lossy()
+                .into_owned(),
+            is_default: true,
+        };
+        server
+            .accounts
+            .lock()
+            .unwrap()
+            .upsert(profile.clone())
+            .unwrap();
+        let spawned = server.session_spawn(Some(json!({"kind": diri_proto::AgentKind::CODEX, "cwd": temp.path(), "accountProfileId": "work"}))).unwrap();
+        let record: diri_proto::SessionRecord = serde_json::from_value(spawned).unwrap();
+        assert_eq!(record.account_profile.as_ref(), Some(&profile));
+        let wait_for_launches = |count| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while std::fs::read_to_string(Path::new(&profile.config_home).join("launches"))
+                .unwrap_or_default()
+                .lines()
+                .count()
+                < count
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "fake provider launch timed out"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+        wait_for_launches(1);
+        let mut changed = profile.clone();
+        changed.config_home = temp
+            .path()
+            .join("different-account")
+            .to_string_lossy()
+            .into_owned();
+        server.accounts.lock().unwrap().upsert(changed).unwrap();
+        server.accounts.lock().unwrap().remove("work").unwrap();
+        server
+            .registry
+            .lock()
+            .unwrap()
+            .update_record(&record.id.0, |r| {
+                r.agent_session_id = Some("thread-test".into())
+            });
+        server
+            .session_kill(Some(json!({"sessionID": record.id})))
+            .unwrap();
+        let resumed: diri_proto::SessionRecord = serde_json::from_value(
+            server
+                .session_resume(Some(json!({"sessionID": record.id})))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(resumed.account_profile.as_ref(), Some(&profile));
+        wait_for_launches(2);
+        let fork: diri_proto::SessionRecord = serde_json::from_value(
+            server
+                .session_fork(Some(json!({"sessionID": record.id})))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(fork.account_profile.as_ref(), Some(&profile));
+        wait_for_launches(3);
+        server
+            .session_kill(Some(json!({"sessionID": fork.id})))
+            .unwrap();
+        server
+            .session_kill(Some(json!({"sessionID": record.id})))
+            .unwrap();
+        assert!(!temp.path().join("different-account").exists());
+        assert!(server.session_spawn(Some(json!({"kind": diri_proto::AgentKind::CODEX, "cwd": temp.path(), "accountProfileId": "work"}))).is_err());
+    }
+
+    /// Without a manual path the manifest's binary stays bare: the interactive
+    /// login shell (or `spawn_spec`'s PATH absolutization) resolves it at
+    /// launch against nvm/mise/Homebrew PATHs the daemon never inherited.
+    /// Pre-judging availability by the daemon's own PATH would hard-fail
+    /// spawns the login shell can serve, and pin versions to daemon startup.
+    #[test]
+    fn local_spawns_keep_the_bare_binary_unless_a_path_is_configured() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().expect("temp");
+        let server = server(temp.path());
+        assert_eq!(
+            server
+                .resolve_local_agent_executable("claude-code", "not-on-the-daemon-path")
+                .expect("a bare binary is not pre-judged by the daemon's PATH"),
+            "not-on-the-daemon-path"
+        );
+
+        let configured = temp.path().join("claude");
+        std::fs::write(&configured, b"#!/bin/sh\nexit 0\n").expect("fake claude executable");
+        std::fs::set_permissions(&configured, std::fs::Permissions::from_mode(0o700))
+            .expect("make fake claude executable");
+        server
+            .agent_catalog
+            .lock()
+            .expect("agent catalog lock")
+            .configure(
+                None,
+                "claude-code",
+                crate::agent_catalog::AgentPreference {
+                    executable_path: Some(configured.to_string_lossy().into_owned()),
+                    show_in_quick_create: Some(true),
+                },
+            )
+            .expect("bind fake claude executable");
+        assert_eq!(
+            server
+                .resolve_local_agent_executable("claude-code", "claude")
+                .expect("configured path wins"),
+            configured.to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn history_resume_keeps_the_identity_needed_for_another_resume() {
+        let temp = tempfile::tempdir().expect("temp");
+        let manifests = temp.path().join("manifests");
+        std::fs::create_dir_all(&manifests).expect("manifests dir");
+        std::fs::write(
+            manifests.join("probe.json"),
+            json!({
+                "schemaVersion": 2,
+                "id": "probe",
+                "version": "test",
+                "statusModel": "full",
+                "agent": {
+                    "binary": "/bin/sh",
+                    "resume": { "style": "flag", "token": "-c" },
+                },
+                "rules": [],
+            })
+            .to_string(),
+        )
+        .expect("write manifest");
+        let (probe, _) = ManifestEngine::load_dir(&manifests).expect("load");
+        let registry = Arc::new(Mutex::new(Registry::new(
+            Arc::new(probe),
+            temp.path().join("state.json"),
+        )));
+        let server = Arc::new(
+            ControlServer::new(Arc::clone(&registry), temp.path().join("daemon.sock"))
+                .with_logs_dir(temp.path().join("logs")),
+        );
+        let transcript = temp.path().join("conversation.jsonl");
+        std::fs::write(&transcript, "{}\n").expect("transcript");
+        let kind = diri_proto::AgentKind::new("probe");
+
+        let result = ok_of(call(
+            &server,
+            diri_proto::Method::SESSION_RESUME_FROM_HISTORY,
+            Some(json!({
+                "entry": {
+                    "id": "read line",
+                    "kind": serde_json::to_value(&kind).expect("kind"),
+                    "cwd": temp.path(),
+                    "title": "Recovered conversation",
+                    "transcriptPath": transcript,
+                    "lastActiveAt": 10.0,
+                    "cwdExists": true,
+                }
+            })),
+        ));
+
+        assert_eq!(result["kind"], serde_json::to_value(&kind).expect("kind"));
+        assert_eq!(result["agentSessionID"], "read line");
+        assert_eq!(
+            result["transcriptPath"],
+            transcript.to_string_lossy().as_ref()
+        );
+        assert_eq!(result["resumability"], "live");
+
+        let id = result["id"].as_str().expect("session id").to_owned();
+        // End the fixture through its own PTY contract. `kill(-pgid, …)` is a
+        // production path covered by process-tree tests; invoking it here made
+        // this identity-only regression depend on the CI runner granting
+        // process-group signalling (macOS runners intermittently return
+        // EPERM). The resumed command is `sh -c 'read line'`, so one submitted
+        // line exits it naturally and exercises the same status fold.
+        registry
+            .lock()
+            .expect("registry")
+            .get(&id)
+            .expect("resumed probe")
+            .send_text("done", true)
+            .expect("finish resumed probe");
+        for _ in 0..100 {
+            let exited = registry
+                .lock()
+                .expect("registry")
+                .record(&id)
+                .is_some_and(|record| {
+                    matches!(record.status, diri_proto::SessionStatus::Exited(_))
+                });
+            if exited {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            registry
+                .lock()
+                .expect("registry")
+                .record(&id)
+                .expect("record")
+                .resumability,
+            diri_proto::Resumability::Resumable,
+            "the recovered record must remain resumable after its live process is gone"
         );
     }
 
@@ -3023,6 +4324,53 @@ mod tests {
     /// with no way at all to restart it.
     #[test]
     fn resume_relaunches_a_session_whose_agent_died_on_its_own() {
+        check_resume_relaunches(false);
+    }
+
+    #[test]
+    fn revive_archived_session_clears_archive_durably() {
+        check_resume_relaunches(true);
+    }
+
+    #[test]
+    fn failed_revive_keeps_the_archived_conversation() {
+        let temp = tempfile::tempdir().expect("temp");
+        let registry = Arc::new(Mutex::new(Registry::new(
+            engine(),
+            temp.path().join("state.json"),
+        )));
+        let mut record = test_record("s_archived");
+        record.kind = diri_proto::AgentKind::new("missing-manifest");
+        record.agent_session_id = Some("saved-conversation".into());
+        registry.lock().expect("registry").insert_record(record);
+        let server = Arc::new(ControlServer::new(
+            Arc::clone(&registry),
+            temp.path().join("daemon.sock"),
+        ));
+        ok_of(call(
+            &server,
+            "session.archive",
+            Some(json!({ "sessionID": "s_archived" })),
+        ));
+        let error = err_of(call(
+            &server,
+            "session.resume",
+            Some(json!({ "sessionID": "s_archived" })),
+        ));
+        assert_eq!(error.code, "not_found");
+        let record = registry
+            .lock()
+            .expect("registry")
+            .record("s_archived")
+            .expect("saved record");
+        assert!(record.is_archived());
+        assert_eq!(
+            record.agent_session_id.as_deref(),
+            Some("saved-conversation")
+        );
+    }
+
+    fn check_resume_relaunches(archived: bool) {
         let temp = tempfile::tempdir().expect("temp");
         // A manifest that resumes by flag, onto a binary that outlives the
         // call: `sh -c 'read line'` blocks on the PTY instead of exiting.
@@ -3093,12 +4441,40 @@ mod tests {
             "the premise: a dead agent's session stays in the registry"
         );
 
-        let server = ControlServer::new(Arc::clone(&registry), temp.path().join("daemon.sock"));
+        let server = Arc::new(ControlServer::new(
+            Arc::clone(&registry),
+            temp.path().join("daemon.sock"),
+        ));
+        if archived {
+            ok_of(call(
+                &server,
+                "session.archive",
+                Some(json!({ "sessionID": "s_dead" })),
+            ));
+        }
         let result = ok_of(call(
             &server,
             "session.resume",
             Some(json!({ "sessionID": "s_dead" })),
         ));
+        assert!(
+            result.get("archivedAt").is_none(),
+            "revive must leave the archive"
+        );
+        let persisted: JsonValue = serde_json::from_slice(
+            &std::fs::read(temp.path().join("state.json")).expect("persisted state"),
+        )
+        .expect("state JSON");
+        let saved = persisted["sessions"]
+            .as_array()
+            .expect("sessions")
+            .iter()
+            .find(|record| record["id"] == "s_dead")
+            .expect("saved session");
+        assert!(
+            saved.get("archivedAt").is_none(),
+            "revive must survive a resync/restart"
+        );
 
         assert!(
             result["status"].get("exited").is_none(),
@@ -3113,6 +4489,33 @@ mod tests {
                 .is_some_and(|session| !session.view().exited),
             "the resumed session must be a live one"
         );
+        if archived {
+            let pid = {
+                let mut registry = registry.lock().expect("registry");
+                // Older revive attempts could leave a live process archived.
+                registry.update_record("s_dead", |record| {
+                    record.archived_at = Some(diri_proto::DateMillis(42.0));
+                });
+                registry.get("s_dead").expect("live session").child_pid()
+            };
+            let restored = ok_of(call(
+                &server,
+                "session.resume",
+                Some(json!({ "sessionID": "s_dead" })),
+            ));
+            assert!(restored.get("archivedAt").is_none());
+            assert_eq!(restored["agentSessionID"], "conv-1");
+            assert_eq!(
+                registry
+                    .lock()
+                    .expect("registry")
+                    .get("s_dead")
+                    .expect("live session")
+                    .child_pid(),
+                pid,
+                "reviving an already-live archived session must not relaunch it"
+            );
+        }
     }
 
     #[test]
@@ -3165,7 +4568,10 @@ mod tests {
             .lock()
             .expect("registry")
             .insert_record(test_record("s_rec"));
-        let server = ControlServer::new(registry, temp.path().join("daemon.sock"));
+        let server = Arc::new(ControlServer::new(
+            registry,
+            temp.path().join("daemon.sock"),
+        ));
 
         let params = json!({ "sessionID": "s_rec", "title": "renamed by hand" });
         ok_of(call(&server, "session.rename", Some(params)));
@@ -3210,7 +4616,7 @@ mod tests {
     }
 
     #[test]
-    fn a_hook_report_folds_identity_into_the_record() {
+    fn a_hook_report_folds_identity_but_rejects_an_untrusted_transcript_path() {
         let temp = tempfile::tempdir().expect("temp");
         let registry = Arc::new(Mutex::new(Registry::new(
             engine(),
@@ -3220,7 +4626,10 @@ mod tests {
             .lock()
             .expect("registry")
             .insert_record(test_record("s_hook"));
-        let server = ControlServer::new(registry, temp.path().join("daemon.sock"));
+        let server = Arc::new(ControlServer::new(
+            registry,
+            temp.path().join("daemon.sock"),
+        ));
 
         ok_of(call(
             &server,
@@ -3240,7 +4649,7 @@ mod tests {
         let list = ok_of(call(&server, "session.list", None));
         let record = &list["sessions"][0];
         assert_eq!(record["agentSessionID"], "uuid-from-hook");
-        assert_eq!(record["transcriptPath"], "/tmp/t.jsonl");
+        assert_eq!(record["transcriptPath"], Value::Null);
         assert_eq!(
             record["title"], "fix the flaky test in ci",
             "the first prompt titles a placeholder session"
@@ -3277,18 +4686,47 @@ mod tests {
         let server = server(temp.path());
         let result = ok_of(call(&server, "agent.readiness", None));
         let agents = result["agents"].as_array().expect("agents");
-        assert!(!agents.is_empty());
+        // Readiness is the whole supported catalog, not just what happens to be
+        // installed. Naming manifests keeps that honest when one is retired; a
+        // count threshold would only ever be quietly loosened.
+        for id in ["claude-code", "codex", "cursor", "gemini", "amp", "pi"] {
+            assert!(
+                agents.iter().any(|agent| agent["kind"] == id),
+                "readiness must expose the supported Agent {id}"
+            );
+        }
+        assert_eq!(
+            agents
+                .iter()
+                .take(5)
+                .filter_map(|agent| agent["kind"].as_str())
+                .collect::<Vec<_>>(),
+            ["claude-code", "codex", "antigravity", "cursor", "gemini"],
+            "every first-class Agent needs an explicit catalogOrder, or it falls \
+             into the alphabetical tail behind Agents most users never install"
+        );
         let claude = agents
             .iter()
             .find(|agent| agent["kind"] == "claude-code")
             .expect("claude in the catalog");
         assert_eq!(claude["binary"], "claude");
         assert!(
+            claude["descriptor"]["setup"]["url"]
+                .as_str()
+                .is_some_and(|url| url.starts_with("https://"))
+        );
+        assert!(
             claude["descriptor"]["injection"]["claudeHooks"]
                 .as_bool()
                 .unwrap_or(false),
             "the raw manifest descriptor rides along: {claude}"
         );
+        let pi = agents
+            .iter()
+            .find(|agent| agent["kind"] == "pi")
+            .expect("Pi remains in Settings even when its executable is absent");
+        assert_eq!(pi["binary"], "pi");
+        assert_eq!(pi["descriptor"]["displayName"], "Pi");
     }
 
     #[test]
@@ -3302,7 +4740,10 @@ mod tests {
             .lock()
             .expect("registry")
             .insert_record(test_record("s_gone"));
-        let server = ControlServer::new(registry, temp.path().join("daemon.sock"));
+        let server = Arc::new(ControlServer::new(
+            registry,
+            temp.path().join("daemon.sock"),
+        ));
 
         ok_of(call(
             &server,
@@ -3352,7 +4793,10 @@ mod tests {
         let mut record = test_record("s_diff");
         record.cwd = repo.to_string_lossy().into_owned();
         registry.lock().expect("registry").insert_record(record);
-        let server = ControlServer::new(registry, temp.path().join("daemon.sock"));
+        let server = Arc::new(ControlServer::new(
+            registry,
+            temp.path().join("daemon.sock"),
+        ));
 
         let result = ok_of(call(
             &server,
@@ -3437,6 +4881,267 @@ mod tests {
                 .iter()
                 .any(|worktree| worktree["branch"] == "feature/x")
         );
+    }
+
+    #[test]
+    fn worktree_inventory_does_not_block_hello_on_the_same_connection() {
+        let temp = tempfile::tempdir().unwrap();
+        let (repo, _) = repository_with_linked_worktree(temp.path());
+        for n in 0..48 {
+            let status = std::process::Command::new("git")
+                .args(["worktree", "add", "--detach", "--quiet"])
+                .arg(temp.path().join(format!("tree-{n}")))
+                .current_dir(&repo)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        let server = server(temp.path());
+        server
+            .registry
+            .lock()
+            .unwrap()
+            .insert_record(ended_resumable_record("inventory", &repo));
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_millis(250)))
+            .unwrap();
+        let worker = std::thread::spawn(move || server.serve(stream));
+        let start = Instant::now();
+        peer.write_all(
+            b"{\"id\":1,\"method\":\"worktree.overview\"}\n{\"id\":2,\"method\":\"hello\"}\n",
+        )
+        .unwrap();
+        let mut reader = BufReader::new(peer);
+        let mut first = String::new();
+        let result = reader.read_line(&mut first);
+        let latency = start.elapsed();
+        // Always drain the outstanding scan before removing its fixture.
+        reader
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        let mut remaining = String::new();
+        for _ in 0..if result.is_ok() { 1 } else { 2 } {
+            remaining.clear();
+            reader.read_line(&mut remaining).unwrap();
+        }
+        reader.get_ref().shutdown(std::net::Shutdown::Both).unwrap();
+        worker.join().unwrap().unwrap();
+        eprintln!(
+            "50 worktrees: Hello latency {latency:?}; total {:?}",
+            start.elapsed()
+        );
+        assert!(
+            result.is_ok(),
+            "Hello timed out behind worktree inventory: {result:?}"
+        );
+        let first: Value = serde_json::from_str(&first).unwrap();
+        assert_eq!(
+            first["id"], 2,
+            "Hello must arrive before the slow inventory"
+        );
+    }
+
+    #[test]
+    fn settings_worktree_cleanup_over_wire_checks_head_and_keeps_branch() {
+        let temp = tempfile::tempdir().unwrap();
+        let (repo, target) = repository_with_linked_worktree(temp.path());
+        let server = server(temp.path());
+        let head = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&target)
+            .output()
+            .unwrap();
+        let head = String::from_utf8(head.stdout).unwrap().trim().to_owned();
+        let response = call(
+            &server,
+            Method::WORKTREE_CLEANUP,
+            Some(json!({
+                "repoPath": repo, "worktreePath": target, "expectedHead": "stale"
+            })),
+        );
+        assert!(matches!(
+            response,
+            ControlMessage::Response { result: Err(_), .. }
+        ));
+        assert!(target.exists());
+        ok_of(call(
+            &server,
+            Method::WORKTREE_CLEANUP,
+            Some(json!({
+                "repoPath": repo, "worktreePath": target, "expectedHead": head
+            })),
+        ));
+        assert!(!target.exists());
+        assert!(
+            std::process::Command::new("git")
+                .args(["show-ref", "--verify", "refs/heads/feature/reparent"])
+                .current_dir(repo)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+    }
+
+    #[test]
+    fn ended_session_reparents_to_a_confirmed_project_worktree() {
+        let temp = tempfile::tempdir().expect("temp");
+        let (repo, target) = repository_with_linked_worktree(temp.path());
+        let registry = Arc::new(Mutex::new(Registry::new(
+            engine(),
+            temp.path().join("state.json"),
+        )));
+        let record = ended_resumable_record("s_move", &repo);
+        registry.lock().expect("registry").insert_record(record);
+        let server = Arc::new(ControlServer::new(
+            Arc::clone(&registry),
+            temp.path().join("daemon.sock"),
+        ));
+
+        let result = ok_of(call(
+            &server,
+            Method::SESSION_REPARENT_WORKTREE,
+            Some(json!({
+                "sessionID": "s_move",
+                "projectRoot": repo,
+                "worktreePath": target,
+            })),
+        ));
+        assert_eq!(result["cwd"], target.to_string_lossy().as_ref());
+        assert_eq!(result["worktreePath"], target.to_string_lossy().as_ref());
+        assert_eq!(result["gitBranch"], "feature/reparent");
+        assert!(temp.path().join("state.json").is_file(), "move is durable");
+        let state: JsonValue = serde_json::from_slice(
+            &std::fs::read(temp.path().join("state.json")).expect("read durable state"),
+        )
+        .expect("decode durable state");
+        let persisted = state["sessions"]
+            .as_array()
+            .and_then(|sessions| sessions.iter().find(|session| session["id"] == "s_move"))
+            .expect("persisted moved session");
+        assert_eq!(persisted["cwd"], target.to_string_lossy().as_ref());
+        assert_eq!(persisted["worktreePath"], target.to_string_lossy().as_ref());
+    }
+
+    #[test]
+    fn worktree_reparent_revalidates_liveness_without_mutating_the_record() {
+        let temp = tempfile::tempdir().expect("temp");
+        let (repo, target) = repository_with_linked_worktree(temp.path());
+        let registry = Arc::new(Mutex::new(Registry::new(
+            engine(),
+            temp.path().join("state.json"),
+        )));
+        let mut record = test_record("s_live");
+        record.cwd = repo.to_string_lossy().into_owned();
+        record.project_id = crate::registry::session_project_id(&record.cwd, None);
+        record.resumability = diri_proto::Resumability::Resumable;
+        registry.lock().expect("registry").insert_record(record);
+        let server = Arc::new(ControlServer::new(
+            Arc::clone(&registry),
+            temp.path().join("daemon.sock"),
+        ));
+
+        let error = err_of(call(
+            &server,
+            Method::SESSION_REPARENT_WORKTREE,
+            Some(json!({
+                "sessionID": "s_live",
+                "projectRoot": repo,
+                "worktreePath": target,
+            })),
+        ));
+        assert_eq!(error.code, "bad_request");
+        let record = registry
+            .lock()
+            .expect("registry")
+            .record("s_live")
+            .expect("record");
+        assert_eq!(record.cwd, repo.to_string_lossy());
+        assert_eq!(record.worktree_path, None);
+    }
+
+    #[test]
+    fn worktree_reparent_refuses_unknown_session_inside_symlinked_subdirectory() {
+        let temp = tempfile::tempdir().expect("temp");
+        let (repo, target) = repository_with_linked_worktree(temp.path());
+        let nested = target.join("nested");
+        std::fs::create_dir(&nested).expect("nested");
+        let alias = temp.path().join("target-alias");
+        std::os::unix::fs::symlink(&target, &alias).expect("symlink");
+
+        let registry = Arc::new(Mutex::new(Registry::new(
+            engine(),
+            temp.path().join("state.json"),
+        )));
+        let source = ended_resumable_record("source", &repo);
+        let mut occupant = test_record("occupant");
+        occupant.cwd = alias.join("nested").to_string_lossy().into_owned();
+        occupant.status = diri_proto::SessionStatus::Unknown;
+        let original_cwd = source.cwd.clone();
+        {
+            let mut registry = registry.lock().expect("registry");
+            registry.insert_record(source);
+            registry.insert_record(occupant);
+        }
+        let server = Arc::new(ControlServer::new(
+            Arc::clone(&registry),
+            temp.path().join("daemon.sock"),
+        ));
+
+        let error = err_of(call(
+            &server,
+            Method::SESSION_REPARENT_WORKTREE,
+            Some(json!({
+                "sessionID": "source",
+                "projectRoot": repo,
+                "worktreePath": target,
+            })),
+        ));
+        assert_eq!(error.code, "bad_request");
+        assert!(error.message.contains("owns this worktree"));
+        let source = registry
+            .lock()
+            .expect("registry")
+            .record("source")
+            .expect("source");
+        assert_eq!(source.cwd, original_cwd);
+        assert_eq!(source.worktree_path, None);
+    }
+
+    #[test]
+    fn remote_session_with_same_path_does_not_occupy_a_local_worktree() {
+        let temp = tempfile::tempdir().expect("temp");
+        let (repo, target) = repository_with_linked_worktree(temp.path());
+        let registry = Arc::new(Mutex::new(Registry::new(
+            engine(),
+            temp.path().join("state.json"),
+        )));
+        let source = ended_resumable_record("source", &repo);
+        let mut remote = test_record("remote");
+        remote.cwd = target.to_string_lossy().into_owned();
+        remote.host = Some("forge".into());
+        remote.status = diri_proto::SessionStatus::Working;
+        {
+            let mut registry = registry.lock().expect("registry");
+            registry.insert_record(source);
+            registry.insert_record(remote);
+        }
+        let server = Arc::new(ControlServer::new(
+            Arc::clone(&registry),
+            temp.path().join("daemon.sock"),
+        ));
+
+        let result = ok_of(call(
+            &server,
+            Method::SESSION_REPARENT_WORKTREE,
+            Some(json!({
+                "sessionID": "source",
+                "projectRoot": repo,
+                "worktreePath": target,
+            })),
+        ));
+        assert_eq!(result["cwd"], target.to_string_lossy().as_ref());
     }
 
     #[test]
@@ -3611,6 +5316,38 @@ mod tests {
             Some("another control client still requires the Engine")
         );
         assert_eq!(idle_shutdown_refusal(0, 1), None);
+    }
+
+    #[test]
+    fn shutdown_handlers_propagate_persistence_failure_before_scheduling_exit() {
+        let temp = tempfile::tempdir().expect("temp");
+        let blocked_parent = temp.path().join("not-a-directory");
+        std::fs::write(&blocked_parent, b"file").expect("blocking file");
+        let registry = Registry::new(engine(), blocked_parent.join("state.json"));
+        let server = ControlServer::new(
+            Arc::new(Mutex::new(registry)),
+            temp.path().join("daemon.sock"),
+        );
+
+        for error in [
+            server
+                .daemon_prepare_shutdown()
+                .expect_err("prepare must report persistence failure"),
+            server
+                .daemon_shutdown_if_idle()
+                .expect_err("idle shutdown must report persistence failure"),
+            server
+                .daemon_shutdown()
+                .expect_err("forced shutdown must report persistence failure"),
+        ] {
+            assert_eq!(error.code, "internal");
+            assert!(
+                error.message.contains("not-a-directory")
+                    || error.message.contains("Not a directory")
+                    || error.message.contains("File exists"),
+                "unexpected persistence error: {error}"
+            );
+        }
     }
 
     #[test]

@@ -18,6 +18,7 @@ impl Radius {
     pub const ROW: f32 = 7.0;
     pub const CARD: f32 = 10.0;
     pub const PANEL: f32 = 12.0;
+    pub const FLOATING_MENU: f32 = 16.0;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -198,6 +199,16 @@ impl SemanticColors {
         }
     }
 
+    /// Hairline separating persistent sidebar material from the work surface.
+    /// It follows the active theme's foreground hue and stays quieter than a
+    /// floating menu outline because the panel already has tonal separation.
+    pub const fn sidebar_stroke(self) -> Rgba {
+        match self.appearance {
+            Appearance::Dark => rgba_f32(self.primary.r, self.primary.g, self.primary.b, 0.075),
+            Appearance::Light => rgba_f32(self.primary.r, self.primary.g, self.primary.b, 0.095),
+        }
+    }
+
     /// Denser material for transient UI layered over live content.
     ///
     /// Menus, popovers, and dialogs need stronger separation than persistent
@@ -273,6 +284,31 @@ impl Fill {
 
     pub fn subtle(colors: SemanticColors) -> Rgba {
         colors.primary.alpha(Self::SUBTLE_OPACITY)
+    }
+}
+
+/// Shared geometry for the compact state chips (Zzz, Ended, host, …).
+///
+/// GPUI draws them via [`crate::StateChip`]; AppKit menubar rows must use the
+/// same numbers so the two surfaces stay optically identical.
+pub struct Chip;
+
+impl Chip {
+    pub const PAD_X: f32 = 5.0;
+    pub const PAD_Y: f32 = 1.0;
+    /// The chip pins its own line box rather than inheriting GPUI's default for
+    /// the font size. AppKit has no line box at all, so leaving this implicit
+    /// meant the menubar had to guess at a text engine it does not run — and it
+    /// guessed with a magic `+ 4.0` on top of this token.
+    pub const LINE_H: f32 = 15.0;
+
+    pub const fn font_size() -> f32 {
+        Typo::META.size
+    }
+
+    /// Full painted height of the pill. Both surfaces size from this.
+    pub const fn height() -> f32 {
+        Self::LINE_H + Self::PAD_Y * 2.0
     }
 }
 
@@ -382,6 +418,15 @@ mod tests {
             let colors = SemanticColors::new(appearance);
             assert!(colors.floating_surface().a > colors.sidebar_surface().a);
             assert_eq!(colors.floating_surface().a, 1.0);
+        }
+    }
+
+    #[test]
+    fn sidebar_stroke_is_theme_tinted_and_quieter_than_floating_chrome() {
+        for appearance in [Appearance::Light, Appearance::Dark] {
+            let colors = SemanticColors::new(appearance);
+            assert_eq!(colors.sidebar_stroke().r, colors.primary.r);
+            assert!(colors.sidebar_stroke().a < colors.floating_stroke().a);
         }
     }
 

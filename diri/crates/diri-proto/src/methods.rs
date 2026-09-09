@@ -23,6 +23,7 @@ impl Method {
     pub const SESSION_REMOVE: &'static str = "session.remove";
     pub const SESSION_RENAME: &'static str = "session.rename";
     pub const SESSION_RESUME: &'static str = "session.resume";
+    pub const SESSION_FORK: &'static str = "session.fork";
     pub const SESSION_SEND_TEXT: &'static str = "session.send_text";
     pub const SESSION_RESIZE: &'static str = "session.resize";
     pub const SESSION_READ_SCREEN: &'static str = "session.read_screen";
@@ -36,20 +37,30 @@ impl Method {
     pub const SESSION_UNARCHIVE: &'static str = "session.unarchive";
     pub const SESSION_REOPEN_LAST: &'static str = "session.reopen_last";
     pub const SESSION_MIGRATE: &'static str = "session.migrate";
+    pub const SESSION_REPARENT_WORKTREE: &'static str = "session.reparent_worktree";
     pub const HOST_SYNC_PREFS: &'static str = "host.sync_prefs";
     pub const HOST_LOCATE_REPO: &'static str = "host.locate_repo";
     pub const HOST_INITIALIZE: &'static str = "host.initialize";
     pub const HOST_LIST_DIRECTORIES: &'static str = "host.list_directories";
+    pub const HOST_LIST: &'static str = "host.list";
     pub const SESSION_HISTORY: &'static str = "session.history";
+    pub const ACTIVITY_LIST: &'static str = "activity.list";
     pub const SESSION_RESUME_FROM_HISTORY: &'static str = "session.resume_from_history";
     pub const WORKTREE_CREATE: &'static str = "worktree.create";
     pub const WORKTREE_LIST: &'static str = "worktree.list";
+    pub const WORKTREE_CLEANUP: &'static str = "worktree.cleanup";
     pub const WORKTREE_REMOVE: &'static str = "worktree.remove";
+    pub const WORKTREE_SCAN: &'static str = "worktree.scan";
     pub const WORKTREE_OVERVIEW: &'static str = "worktree.overview";
     pub const PROJECT_ADD: &'static str = "project.add";
     pub const CLIENT_SET_ACTIVE: &'static str = "client.set_active";
     pub const GOVERNOR_CONFIGURE: &'static str = "governor.configure";
     pub const AGENT_READINESS: &'static str = "agent.readiness";
+    pub const AGENT_CONFIGURE: &'static str = "agent.configure";
+    pub const ACCOUNT_PROFILES_LIST: &'static str = "account.profiles.list";
+    pub const ACCOUNT_PROFILES_SAVE: &'static str = "account.profiles.save";
+    pub const ACCOUNT_PROFILES_REMOVE: &'static str = "account.profiles.remove";
+    pub const SESSION_CONTINUE_ACCOUNT: &'static str = "session.continue_with_account";
     pub const EVENTS_SUBSCRIBE: &'static str = "events.subscribe";
     pub const EVENTS_WAIT: &'static str = "events.wait";
     pub const HOOK_REPORT: &'static str = "hook.report";
@@ -64,6 +75,7 @@ impl Method {
 pub struct EventName;
 
 impl EventName {
+    pub const SESSION_NOTIFICATION: &'static str = "session.notification";
     pub const SESSION_UPDATED: &'static str = "session.updated";
     pub const SESSION_RESOURCES: &'static str = "session.resources";
     pub const SESSION_REMOVED: &'static str = "session.removed";
@@ -86,6 +98,29 @@ pub struct SessionResourcesEvent {
 pub struct EmptyParams {}
 
 pub type EmptyResult = EmptyParams;
+pub type SessionForkParams = SessionIdParams;
+pub type SessionForkResult = SessionRecord;
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContinueAccountParams {
+    #[serde(rename = "sessionID")]
+    pub session_id: SessionId,
+    pub account_profile_id: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityListParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u16>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ActivityListResult {
+    /// Newest first.
+    pub entries: Vec<crate::model::ActivityEntry>,
+}
 
 /// Result of a best-effort desktop ownership release. The Engine remains
 /// alive whenever it still owns a live session or another control client is
@@ -158,6 +193,20 @@ pub struct AgentKeystroke {
     pub submit: bool,
 }
 
+/// Optional, display-only guidance for installing and authenticating an
+/// Agent. Clients must never execute either hint; the URL is opened only after
+/// an explicit user action and is validated by the client as HTTP(S).
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSetup {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_hint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sign_in_hint: Option<String>,
+}
+
 /// The daemon-side manifest descriptor for one agent, as much of it as the
 /// client needs. Deliberately partial and tolerant: the daemon owns the full
 /// schema (spawn args, env hygiene, injection), and unknown fields are ignored
@@ -169,6 +218,8 @@ pub struct AgentDescriptor {
     pub display_name: String,
     #[serde(default)]
     pub short_label: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
     #[serde(default)]
     pub glyph: String,
     #[serde(default)]
@@ -181,20 +232,81 @@ pub struct AgentDescriptor {
     pub approve: Option<AgentKeystroke>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deny: Option<AgentKeystroke>,
+    /// Additive setup guidance. Older clients ignore this field and older
+    /// daemons omit it, so user manifest overrides remain forwards/backwards
+    /// compatible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup: Option<AgentSetup>,
+    /// Preserve Engine-owned manifest fields that this client-facing view does
+    /// not interpret (for example injection and resume metadata). The catalog
+    /// remains additive while Settings consumes only the typed subset above.
+    #[serde(default, flatten)]
+    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct AgentReadinessItem {
+    /// This field predates open manifest-backed Agent kinds and was shipped as
+    /// a plain manifest id. Keep that compact wire shape for old clients even
+    /// though session records use AgentKind's keyed-enum encoding.
+    #[serde(
+        serialize_with = "serialize_agent_kind_id",
+        deserialize_with = "deserialize_agent_kind_id"
+    )]
     pub kind: AgentKind,
     pub binary: String,
+    /// Effective executable used for spawn: a valid manual path first, then
+    /// the account PATH result. Kept under the original field name for older
+    /// clients that only understand installed/not-installed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detected_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configured_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_source: Option<AgentPathSource>,
+    #[serde(default = "default_true")]
+    pub show_in_quick_create: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
     /// The agent's manifest descriptor. This is how the AGENT CATALOG reaches
     /// the client: `agent.readiness` doubles as "what agents exist and what can
-    /// they do". Absent when talking to a daemon that predates it — the client
-    /// then falls back to its built-in knowledge of the original four.
+    /// they do". Absent descriptors are rendered from the manifest id; clients
+    /// must not invent additional supported or installed Agents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub descriptor: Option<AgentDescriptor>,
+}
+
+fn serialize_agent_kind_id<S>(kind: &AgentKind, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(kind.id())
+}
+
+fn deserialize_agent_kind_id<'de, D>(deserializer: D) -> Result<AgentKind, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+
+    let value = serde_json::Value::deserialize(deserializer)?;
+    if let Some(id) = value.as_str() {
+        return Ok(AgentKind::new(id));
+    }
+    serde_json::from_value(value).map_err(D::Error::custom)
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentPathSource {
+    SystemPath,
+    Manual,
 }
 
 impl AgentReadinessItem {
@@ -204,7 +316,13 @@ impl AgentReadinessItem {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AgentReadinessResult {
+    /// `HostEntry.id`; absent means this Mac.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scanned_at: Option<DateMillis>,
     pub agents: Vec<AgentReadinessItem>,
 }
 
@@ -219,15 +337,47 @@ impl AgentReadinessResult {
     }
 }
 
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentReadinessParams {
+    /// `HostEntry.id`; absent means this Mac.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub force_refresh: bool,
+}
+
+/// Replaces one target/agent row atomically. `executablePath = null` means
+/// "use PATH again"; quick-create may only be enabled when the resulting
+/// executable resolves.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentConfigureParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    pub kind: AgentKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable_path: Option<String>,
+    pub show_in_quick_create: bool,
+}
+
+pub type AgentConfigureResult = AgentReadinessResult;
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionSpawnParams {
+    /// None uses the target's configured default; an empty id uses the CLI environment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_profile_id: Option<String>,
     pub kind: AgentKind,
     pub cwd: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub new_worktree: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worktree_branch: Option<String>,
+    /// Explicit starting ref for a new worktree. Absent preserves HEAD semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_base: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -291,6 +441,16 @@ pub type SessionHibernateResult = EmptyResult;
 pub type SessionWakeResult = EmptyResult;
 pub type SessionArchiveResult = EmptyResult;
 pub type SessionUnarchiveResult = EmptyResult;
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionReparentWorktreeParams {
+    #[serde(rename = "sessionID")]
+    pub session_id: SessionId,
+    pub project_root: String,
+    pub worktree_path: String,
+}
+
+pub type SessionReparentWorktreeResult = SessionRecord;
 pub type SessionReadScreenResult = ReadScreenResult;
 pub type SessionReadScrollbackResult = ReadScrollbackResult;
 pub type SessionReadScrollbackCellsResult = ReadScrollbackCellsResult;
@@ -336,8 +496,11 @@ pub struct SessionHistoryResult {
 pub type SessionHistoryParams = EmptyParams;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ResumeFromHistoryParams {
     pub entry: HistoryEntry,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_prompt: Option<String>,
 }
 
 pub type ResumeFromHistoryResult = SessionRecord;
@@ -467,7 +630,9 @@ pub type SessionReopenLastResult = SessionRecord;
 
 /// `session.migrate`: one-click handoff of a live Claude session between local
 /// and a remote host, preserving conversation context (`claude --resume`) and
-/// code state (WIP commit + push + hard-sync of the target checkout).
+/// code state — committed work by push + hard-sync of the target checkout,
+/// uncommitted work re-applied to the target tree as uncommitted state, so a
+/// session round-trips losslessly and origin only ever sees real commits.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionMigrateParams {
@@ -558,6 +723,8 @@ pub struct HostListDirectoriesParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
     pub path: String,
+    #[serde(default)]
+    pub mode: crate::remote_pty::DirectoryListMode,
 }
 
 pub type HostListDirectoriesResult = crate::remote_pty::DirectoryListResult;
@@ -618,6 +785,53 @@ pub struct WorktreeRemoveParams {
 
 pub type WorktreeRemoveResult = EmptyResult;
 
+/// Confirmed Settings cleanup. An older engine rejects the unknown method.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeCleanupParams {
+    pub repo_path: String,
+    pub worktree_path: String,
+    pub expected_head: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeHealth {
+    pub head: Option<String>,
+    pub disk_bytes: Option<u64>,
+    pub pr_number: Option<u64>,
+    pub pr_url: Option<String>,
+    /// Open, merged, closed, no recent PR, or unavailable.
+    pub pr_state: String,
+    pub protection: Option<String>,
+}
+
+/// Incremental, shared on-demand scan. Cursors belong to one generation.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeScanParams {
+    #[serde(default)]
+    pub refresh: bool,
+    #[serde(default)]
+    pub measure_disk: bool,
+    pub generation: Option<u64>,
+    #[serde(default)]
+    pub cursor: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeScanResult {
+    pub generation: u64,
+    pub cursor: usize,
+    pub entries: Vec<WorktreeOverviewEntry>,
+    pub total: usize,
+    pub checked: usize,
+    pub running: bool,
+    pub has_more: bool,
+    pub error: Option<String>,
+}
+
 pub type WorktreeOverviewParams = EmptyParams;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -635,6 +849,8 @@ pub struct WorktreeOverviewEntry {
     pub merged: bool,
     pub age_days: i64,
     pub stale_suggestion: bool,
+    #[serde(default)]
+    pub health: WorktreeHealth,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -718,7 +934,6 @@ pub struct HookReportParams {
 pub type HookReportResult = EmptyResult;
 pub type GovernorConfigureParams = GovernorSettingsParams;
 pub type GovernorConfigureResult = EmptyResult;
-pub type AgentReadinessParams = EmptyParams;
 pub type ClientSetActiveResult = EmptyResult;
 pub type DaemonPrepareShutdownParams = EmptyParams;
 pub type DaemonPrepareShutdownResult = EmptyResult;
@@ -838,4 +1053,16 @@ mod base64_bytes {
             _ => None,
         }
     }
+}
+
+/// A terminal-authored event, separate from session execution/attention state.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionNotificationEvent {
+    pub id: String,
+    pub session_id: crate::SessionId,
+    pub session_created_at: crate::DateMillis,
+    pub occurred_at: crate::DateMillis,
+    pub title: String,
+    pub body: String,
 }

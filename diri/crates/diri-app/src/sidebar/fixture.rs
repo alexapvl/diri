@@ -14,6 +14,7 @@ pub enum PreviewScenario {
     Stress,
     Empty,
     Artifacts,
+    Fleet,
 }
 
 impl PreviewScenario {
@@ -22,6 +23,7 @@ impl PreviewScenario {
             Some("stress") => Self::Stress,
             Some("empty") => Self::Empty,
             Some("artifacts") => Self::Artifacts,
+            Some("fleet") => Self::Fleet,
             _ => Self::Typical,
         }
     }
@@ -57,6 +59,37 @@ impl SidebarPreviewFixture {
             "/Users/preview/Projects/dirijor",
             "Dirijor",
         );
+        if scenario == PreviewScenario::Fleet {
+            let sessions: Vec<SessionRecord> = (0..30)
+                .map(|index| {
+                    session(
+                        &format!("preview-fleet-{index}"),
+                        [AgentKind::CODEX, AgentKind::CLAUDE_CODE, AgentKind::CURSOR][index % 3]
+                            .clone(),
+                        &dirijor,
+                        &format!("Working session {}", index + 1),
+                        SessionStatus::Working,
+                        None,
+                        now,
+                    )
+                    .into()
+                })
+                .collect();
+            return Self {
+                selected_session_id: None,
+                prefs: Prefs {
+                    sidebar_session_order: sessions
+                        .iter()
+                        .map(|session| session.id.clone())
+                        .collect(),
+                    ..Prefs::default()
+                },
+                list: SessionListResult {
+                    sessions,
+                    projects: vec![dirijor],
+                },
+            };
+        }
         let anara = project("preview-anara", "/Users/preview/Projects/anara", "Anara");
         let settings = project(
             "preview-settings-kit",
@@ -368,6 +401,7 @@ tokio::spawn(async move { clone_repository(request).await });
         }
 
         let mut prefs = Prefs {
+            sidebar_visible: true,
             sidebar_project_order: vec![dirijor.id.clone(), anara.id.clone(), settings.id.clone()],
             sidebar_session_order: sessions.iter().map(|session| session.id.clone()).collect(),
             sidebar_pinned_sessions: vec![claude.id.clone()],
@@ -407,6 +441,7 @@ fn project(id: &str, root: &str, name: &str) -> Project {
         root: root.into(),
         name: name.into(),
         pinned_order: None,
+        host: None,
     }
 }
 
@@ -488,11 +523,15 @@ fn session(
         git_branch: branch.map(str::to_owned),
         title: title.into(),
         title_source: TitleSource::AgentProvided,
+        account_profile: None,
+        originating_prompt: None,
         agent_session_id: None,
         transcript_path: None,
         status,
+        status_evidence: None,
         needs_input: None,
         resumability,
+        capabilities: None,
         parent: None,
         created_at: DateMillis(created),
         updated_at: DateMillis(created),

@@ -29,6 +29,16 @@ pub fn parse_claude_hook(
     payload: &Value,
     now: std::time::SystemTime,
 ) -> Option<(StatusSignal, HookMetadata)> {
+    // A stale hook configuration must not route a child lifecycle callback
+    // through the parent's Stop command. Payloads without the discriminator
+    // retain compatibility with older agents.
+    if payload
+        .get("hook_event_name")
+        .and_then(Value::as_str)
+        .is_some_and(|reported| reported != event)
+    {
+        return None;
+    }
     let mut meta = HookMetadata::default();
     let is_subagent = string(payload, "agent_id").is_some();
 
@@ -36,7 +46,8 @@ pub fn parse_claude_hook(
     // moves to a different project directory when an agent enters a worktree
     // mid-session, and capturing it once would leave the record pointing at the
     // pre-worktree path forever.
-    meta.agent_session_id = string(payload, "session_id");
+    meta.agent_session_id =
+        string(payload, "session_id").or_else(|| string(payload, "conversation_id"));
     meta.transcript_path = string(payload, "transcript_path");
 
     let hook = match event {
@@ -104,7 +115,14 @@ pub fn parse_claude_hook(
         _ => return None,
     };
 
-    Some((StatusSignal::ClaudeHook { hook, is_subagent }, meta))
+    Some((
+        StatusSignal::ClaudeHook {
+            hook,
+            is_subagent,
+            pending_work: diri_proto::recovery::claude_pending_work(payload),
+        },
+        meta,
+    ))
 }
 
 /// Parses a Codex notify payload. Only turn-completion is meaningful.
@@ -127,12 +145,62 @@ pub fn parse_codex_notify(payload: &Value) -> Option<(StatusSignal, HookMetadata
     Some((StatusSignal::CodexTurnComplete, meta))
 }
 
+/// Rehydrates the privacy-filtered activity written by the hook CLI while the
+/// Engine was unavailable. The seed deliberately contains too little data to
+/// recreate prompt titles or command summaries; lifecycle and conversation
+/// identity are the durable contract.
+pub fn parse_activity_seed(
+    seed: &diri_proto::recovery::HookActivitySeed,
+) -> Option<(StatusSignal, HookMetadata)> {
+    if seed.version != diri_proto::recovery::HookActivitySeed::VERSION {
+        return None;
+    }
+    let now = std::time::UNIX_EPOCH
+        .checked_add(std::time::Duration::from_millis(seed.occurred_at_ms))
+        .unwrap_or(std::time::SystemTime::now());
+    let mut payload = serde_json::Map::new();
+    if let Some(value) = &seed.agent_session_id {
+        payload.insert(
+            if seed.kind == "codex-notify" {
+                "thread-id"
+            } else {
+                "session_id"
+            }
+            .into(),
+            Value::String(value.clone()),
+        );
+    }
+    for (key, value) in [
+        ("transcript_path", seed.transcript_path.as_ref()),
+        ("notification_type", seed.notification_type.as_ref()),
+        ("tool_name", seed.tool_name.as_ref()),
+    ] {
+        if let Some(value) = value {
+            payload.insert(key.into(), Value::String(value.clone()));
+        }
+    }
+    let payload = Value::Object(payload);
+    match seed.kind.as_str() {
+        "claude-hook" => {
+            let (mut signal, metadata) = parse_claude_hook(seed.event.as_deref()?, &payload, now)?;
+            if let StatusSignal::ClaudeHook { pending_work, .. } = &mut signal {
+                *pending_work = seed.claude_pending_work;
+            }
+            Some((signal, metadata))
+        }
+        "codex-notify" => {
+            let mut payload = payload.as_object().cloned().unwrap_or_default();
+            payload.insert("type".into(), Value::String("agent-turn-complete".into()));
+            parse_codex_notify(&Value::Object(payload))
+        }
+        _ => None,
+    }
+}
+
 fn needs_input_kind(notification_type: Option<&str>) -> Option<NeedsInputKind> {
     match notification_type {
         Some("permission_prompt") => Some(NeedsInputKind::Permission),
-        Some("idle_prompt") | Some("agent_needs_input") | Some("elicitation_dialog") => {
-            Some(NeedsInputKind::Question)
-        }
+        Some("agent_needs_input") | Some("elicitation_dialog") => Some(NeedsInputKind::Question),
         _ => None,
     }
 }
@@ -217,6 +285,116 @@ mod tests {
     }
 
     #[test]
+    fn claude_background_work_suppresses_completion_until_a_drained_stop() {
+        use crate::status::{Authority, StatusReducer};
+        use diri_proto::SessionStatus;
+        use std::time::Duration;
+
+        for pending in [
+            json!({"background_tasks": [{"status": "running"}]}),
+            json!({"session_crons": [{"id": "wake-later"}]}),
+        ] {
+            let mut reducer = StatusReducer::new(Authority::HooksPrimary, now());
+            let (start, _) = parse_claude_hook("UserPromptSubmit", &json!({}), now()).unwrap();
+            reducer.reduce(start, now());
+            for (seconds, event, payload) in [
+                (1, "Stop", pending.clone()),
+                (2, "Stop", pending),
+                (
+                    3,
+                    "Notification",
+                    json!({"notification_type": "agent_completed"}),
+                ),
+                (
+                    30,
+                    "Notification",
+                    json!({"notification_type": "idle_prompt"}),
+                ),
+            ] {
+                let at = now() + Duration::from_secs(seconds);
+                let (signal, _) = parse_claude_hook(event, &payload, at).unwrap();
+                assert!(!reducer.reduce(signal, at).turn_completed);
+                assert!(!reducer.reduce(StatusSignal::Tick, at).turn_completed);
+                assert_eq!(reducer.status(), &SessionStatus::Working);
+            }
+            let at = now() + Duration::from_secs(31);
+            let (stop, _) = parse_claude_hook(
+                "Stop",
+                &json!({"background_tasks": [], "session_crons": []}),
+                at,
+            )
+            .unwrap();
+            let first = reducer.reduce(stop.clone(), at);
+            let settled = reducer.reduce(StatusSignal::Tick, at);
+            assert_eq!(
+                usize::from(first.turn_completed) + usize::from(settled.turn_completed),
+                1
+            );
+            assert!(!reducer.reduce(stop, at).turn_completed);
+        }
+    }
+
+    #[test]
+    fn claude_pending_work_keeps_permission_alerts_and_ignores_child_stops() {
+        use crate::status::{Authority, StatusReducer};
+        use diri_proto::SessionStatus;
+        let mut reducer = StatusReducer::new(Authority::HooksPrimary, now());
+        for (event, payload) in [
+            ("UserPromptSubmit", json!({})),
+            ("Stop", json!({"background_tasks": [{"status": "running"}]})),
+            (
+                "Notification",
+                json!({"notification_type": "permission_prompt", "message": "Approve this command"}),
+            ),
+        ] {
+            let (signal, _) = parse_claude_hook(event, &payload, now()).unwrap();
+            assert!(!reducer.reduce(signal, now()).turn_completed);
+        }
+        assert_eq!(
+            reducer.status(),
+            &SessionStatus::NeedsInput(NeedsInputKind::Permission)
+        );
+        for payload in [
+            json!({"agent_id": "child", "background_tasks": []}),
+            json!({"hook_event_name": "SubagentStop"}),
+        ] {
+            if let Some((signal, _)) = parse_claude_hook("Stop", &payload, now()) {
+                assert!(!reducer.reduce(signal, now()).turn_completed);
+            }
+            assert_eq!(
+                reducer.status(),
+                &SessionStatus::NeedsInput(NeedsInputKind::Permission)
+            );
+        }
+        let (reminder, _) = parse_claude_hook("Notification", &json!({"notification_type": "idle_prompt", "background_tasks": [{"status": "running"}]}), now()).unwrap();
+        reducer.reduce(reminder, now());
+        assert_eq!(
+            reducer.status(),
+            &SessionStatus::NeedsInput(NeedsInputKind::Permission)
+        );
+    }
+
+    #[test]
+    fn claude_old_and_drained_payloads_still_complete_once() {
+        use crate::status::{Authority, StatusReducer};
+        use diri_proto::SessionStatus;
+        for payload in [
+            json!({}),
+            json!({"background_tasks": [], "session_crons": []}),
+            json!({"background_tasks": [{"status": "completed"}, {"status": "failed"}, {"status": "cancelled"}]}),
+        ] {
+            let mut reducer = StatusReducer::new(Authority::HooksPrimary, now());
+            let (start, _) = parse_claude_hook("UserPromptSubmit", &json!({}), now()).unwrap();
+            reducer.reduce(start, now());
+            let (stop, _) = parse_claude_hook("Stop", &payload, now()).unwrap();
+            reducer.reduce(stop.clone(), now());
+            assert!(reducer.reduce(StatusSignal::Tick, now()).turn_completed);
+            assert!(!reducer.reduce(stop, now()).turn_completed);
+            assert_eq!(reducer.status(), &SessionStatus::Idle);
+        }
+    }
+
+    #[test]
     fn identity_is_captured_from_every_payload_not_just_session_start() {
         // The transcript moves when an agent enters a worktree mid-session;
         // reading it only at SessionStart leaves the record pointing at the old
@@ -230,6 +408,23 @@ mod tests {
         assert_eq!(
             meta.transcript_path.as_deref(),
             Some("/new/project/dir/abc-123.jsonl")
+        );
+    }
+
+    #[test]
+    fn cursor_conversation_id_is_accepted_as_session_identity() {
+        let payload = json!({
+            "conversation_id": "11111fcb-7655-4342-8b2f-88068c650200",
+            "prompt": "Fix the cursor session title",
+        });
+        let (_, meta) = parse_claude_hook("UserPromptSubmit", &payload, now()).expect("parsed");
+        assert_eq!(
+            meta.agent_session_id.as_deref(),
+            Some("11111fcb-7655-4342-8b2f-88068c650200")
+        );
+        assert_eq!(
+            meta.first_prompt_title.as_deref(),
+            Some("Fix the cursor session title")
         );
     }
 
@@ -314,7 +509,7 @@ mod tests {
     fn a_notification_asking_for_input_carries_a_detail() {
         let payload = json!({
             "session_id": "s",
-            "notification_type": "idle_prompt",
+            "notification_type": "agent_needs_input",
             "message": "Waiting for your answer",
         });
         let (_, meta) = parse_claude_hook("Notification", &payload, now()).expect("parsed");
@@ -350,5 +545,31 @@ mod tests {
     fn other_codex_notifications_are_not_turn_completions() {
         let payload = json!({ "type": "something-else", "thread-id": "t-1" });
         assert!(parse_codex_notify(&payload).is_none());
+    }
+
+    #[test]
+    fn a_durable_seed_rehydrates_lifecycle_and_safe_identity() {
+        let seed = diri_proto::recovery::HookActivitySeed {
+            claude_pending_work: None,
+            version: diri_proto::recovery::HookActivitySeed::VERSION,
+            kind: "claude-hook".into(),
+            event: Some("PermissionRequest".into()),
+            occurred_at_ms: 42,
+            agent_session_id: Some("conversation".into()),
+            transcript_path: Some("/tmp/transcript.jsonl".into()),
+            notification_type: None,
+            tool_name: Some("Bash".into()),
+        };
+        let (signal, metadata) = parse_activity_seed(&seed).expect("seed");
+        assert!(matches!(
+            signal,
+            StatusSignal::ClaudeHook {
+                hook: ClaudeHook::PermissionRequest { .. },
+                ..
+            }
+        ));
+        assert_eq!(metadata.agent_session_id.as_deref(), Some("conversation"));
+        let detail = metadata.needs_input.expect("generic permission detail");
+        assert_eq!(detail.summary, "wants to run `a command`");
     }
 }

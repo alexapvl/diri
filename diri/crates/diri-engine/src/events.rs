@@ -174,6 +174,7 @@ struct BusInner {
 #[derive(Clone)]
 pub struct EventBus {
     inner: Arc<Mutex<BusInner>>,
+    activity: Arc<Mutex<Option<crate::activity::ActivityLog>>>,
     ring_capacity: usize,
     ring_byte_capacity: usize,
     subscriber_capacity: usize,
@@ -206,6 +207,7 @@ impl EventBus {
                 subscribers: HashMap::new(),
                 next_subscriber: 0,
             })),
+            activity: Arc::new(Mutex::new(None)),
             ring_capacity,
             ring_byte_capacity,
             subscriber_capacity: subscriber_capacity
@@ -263,7 +265,44 @@ impl EventBus {
         session_id: Option<&str>,
     ) {
         if let Ok(params) = serde_json::to_value(value) {
+            if name == diri_proto::EventName::SESSION_UPDATED
+                && let Ok(record) =
+                    serde_json::from_value::<diri_proto::SessionRecord>(params.clone())
+                && let Ok(mut activity) = self.activity.lock()
+                && let Some(activity) = activity.as_mut()
+                && let Err(error) = activity.observe(&record)
+            {
+                eprintln!("diri-engine: activity log append failed: {error}");
+            }
             self.publish(name, params, session_id);
+        }
+    }
+
+    /// Enables durable history at the same publication seam used by every
+    /// live-status producer. Reconfiguration is used only during daemon/test
+    /// construction, before publishers start.
+    pub fn enable_activity_log(&self, path: impl Into<std::path::PathBuf>) -> std::io::Result<()> {
+        let log = crate::activity::ActivityLog::load(path)?;
+        *self.activity.lock().expect("activity log") = Some(log);
+        Ok(())
+    }
+
+    pub fn recent_activity(&self, limit: usize) -> Vec<diri_proto::ActivityEntry> {
+        self.activity
+            .lock()
+            .ok()
+            .and_then(|activity| activity.as_ref().map(|activity| activity.recent(limit)))
+            .unwrap_or_default()
+    }
+
+    /// Records a final snapshot before `session.remove` makes the Registry
+    /// record unavailable, while keeping the existing wire event unchanged.
+    pub fn record_removed(&self, record: &diri_proto::SessionRecord) {
+        if let Ok(mut activity) = self.activity.lock()
+            && let Some(activity) = activity.as_mut()
+            && let Err(error) = activity.observe_removed(record)
+        {
+            eprintln!("diri-engine: activity log append failed: {error}");
         }
     }
 
@@ -375,6 +414,11 @@ pub fn satisfies_wait_target(status: &diri_proto::SessionStatus, target: &str) -
 /// changes, by diffing registry views on a short cadence. The Swift daemon
 /// publishes at each mutation site inside its status engine; this engine's
 /// state changes on pump threads, so a watcher is the equivalent seam.
+fn next_notification_id() -> u64 {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    SEQUENCE.fetch_add(1, Ordering::Relaxed)
+}
+
 pub fn spawn_registry_watcher(
     registry: Arc<Mutex<crate::registry::Registry>>,
     events: EventBus,
@@ -390,18 +434,55 @@ pub fn spawn_registry_watcher(
             // every pass, all under the registry lock.
             let mut published: HashMap<String, u64> = HashMap::new();
             while !stop.load(Ordering::SeqCst) {
-                let changed = {
+                let (mut changed, cursor_requests, native_title_requests) = {
                     let Ok(mut registry) = registry.lock() else {
                         break;
                     };
-                    registry.changed_since(&mut published)
+                    (
+                        registry.changed_since(&mut published),
+                        registry.cursor_refresh_requests(),
+                        registry.native_title_refresh_requests(),
+                    )
                 };
+                let cursor_refreshes = crate::registry::scan_cursor_refreshes(cursor_requests);
+                let native_title_refreshes =
+                    crate::registry::scan_native_title_refreshes(native_title_requests);
+                if !cursor_refreshes.is_empty() || !native_title_refreshes.is_empty() {
+                    let Ok(mut registry) = registry.lock() else {
+                        break;
+                    };
+                    changed.extend(registry.apply_cursor_refreshes(cursor_refreshes));
+                    changed.extend(registry.apply_native_title_refreshes(native_title_refreshes));
+                }
                 for (id, record) in changed {
                     events.publish_encoded(
                         diri_proto::EventName::SESSION_UPDATED,
                         &record,
                         Some(&id),
                     );
+                    let notifications = registry.lock().expect("registry").take_notifications(&id);
+                    for notification in notifications {
+                        let event = diri_proto::SessionNotificationEvent {
+                            id: format!(
+                                "osc-{}-{}",
+                                std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_nanos(),
+                                next_notification_id()
+                            ),
+                            session_id: record.id.clone(),
+                            session_created_at: record.created_at,
+                            occurred_at: diri_proto::DateMillis::from(std::time::SystemTime::now()),
+                            title: notification.title,
+                            body: notification.body,
+                        };
+                        events.publish_encoded(
+                            diri_proto::EventName::SESSION_NOTIFICATION,
+                            &event,
+                            Some(&id),
+                        );
+                    }
                 }
                 std::thread::sleep(Duration::from_millis(150));
             }

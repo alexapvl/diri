@@ -24,6 +24,14 @@ const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
 const INITIAL_BACKOFF: Duration = Duration::from_millis(500);
 const MAX_BACKOFF: Duration = Duration::from_secs(8);
 const EVENT_CHANNEL_CAPACITY: usize = 4096;
+// A local catalog scan is filesystem metadata over the manifest list; nothing
+// in it blocks. A remote one crosses ssh and may bootstrap the Helper before it
+// can answer, which the Engine bounds far more generously than a user will wait
+// staring at a spinner. Timing out does not waste the scan: the Engine finishes
+// it and caches the result, so the retry this failure re-enables is usually
+// instant.
+const AGENT_CATALOG_TIMEOUT: Duration = Duration::from_secs(30);
+const REMOTE_AGENT_CATALOG_TIMEOUT: Duration = Duration::from_secs(240);
 
 /// Errors surfaced by daemon requests and the reconnecting transport.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -90,6 +98,7 @@ pub(crate) struct ClientCore {
     events_subscribed: AtomicBool,
     last_seq: AtomicU64,
     shutdown_tx: watch::Sender<bool>,
+    retry_tx: watch::Sender<u64>,
 }
 
 impl ClientCore {
@@ -109,8 +118,9 @@ impl ClientCore {
     /// IF YOU ADD AN EVENT KIND THAT DIRI NEEDS, ADD IT HERE TOO. Server-side
     /// filtering means an unlisted kind never reaches `route_message`, and the
     /// symptom is silence, not an error.
-    const EVENT_KINDS: [&'static str; 4] = [
+    const EVENT_KINDS: [&'static str; 5] = [
         EventName::SESSION_UPDATED,
+        EventName::SESSION_NOTIFICATION,
         EventName::SESSION_RESOURCES,
         EventName::SESSION_REMOVED,
         EventName::PROJECT_UPDATED,
@@ -268,7 +278,7 @@ impl Default for DaemonClient {
 }
 
 impl DaemonClient {
-    /// Uses `~/Library/Application Support/Dirijor/daemon.sock`.
+    /// Uses the platform path provider's default control socket.
     pub fn new() -> Self {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
@@ -291,6 +301,7 @@ impl DaemonClient {
         ));
         let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let (shutdown_tx, _) = watch::channel(false);
+        let (retry_tx, _) = watch::channel(0);
         Self {
             core: Arc::new(ClientCore {
                 socket_path: socket_path.into(),
@@ -305,6 +316,7 @@ impl DaemonClient {
                 events_subscribed: AtomicBool::new(false),
                 last_seq: AtomicU64::new(0),
                 shutdown_tx,
+                retry_tx,
             }),
             lifecycle: StdMutex::new(None),
         }
@@ -324,9 +336,18 @@ impl DaemonClient {
         *lifecycle = Some(tokio::spawn(async move { run_lifecycle(core).await }));
     }
 
+    /// Synchronously asks the connect/reconnect loop to close its control
+    /// connection. This is the non-waiting half of [`Self::shutdown`] for
+    /// lifecycle callbacks whose futures may be cancelled immediately.
+    ///
+    /// The signal is idempotent and never sends a daemon shutdown request.
+    pub fn begin_shutdown(&self) {
+        self.core.shutdown_tx.send_replace(true);
+    }
+
     /// Stops this client only. This never sends a shutdown request to the daemon.
     pub async fn shutdown(&self) {
-        self.core.shutdown_tx.send_replace(true);
+        self.begin_shutdown();
         let task = self
             .lifecycle
             .lock()
@@ -345,6 +366,13 @@ impl DaemonClient {
 
     pub fn connection_state(&self) -> watch::Receiver<ConnectionState> {
         self.core.state_tx.subscribe()
+    }
+
+    /// Wakes the reconnect loop out of its bounded backoff. The operation is
+    /// idempotent and never launches, kills, or replaces a daemon by itself.
+    pub fn retry_now(&self) {
+        let next = self.core.retry_tx.borrow().wrapping_add(1);
+        self.core.retry_tx.send_replace(next);
     }
 
     pub fn events(&self) -> broadcast::Receiver<EventEnvelope> {
@@ -450,6 +478,13 @@ impl DaemonClient {
         Ok(record.id)
     }
 
+    pub async fn fork(&self, session_id: &SessionId) -> Result<SessionId, ClientError> {
+        let record: SessionForkResult = self
+            .typed(Method::SESSION_FORK, &session_params(session_id))
+            .await?;
+        Ok(record.id)
+    }
+
     /// `session.migrate`: git shuttling + respawn can take a while, so this
     /// carries its own generous timeout instead of waiting forever.
     pub async fn migrate(
@@ -467,6 +502,13 @@ impl DaemonClient {
                 Some(Duration::from_secs(600)),
             )
             .await
+    }
+
+    pub async fn reparent_worktree(
+        &self,
+        params: SessionReparentWorktreeParams,
+    ) -> Result<SessionReparentWorktreeResult, ClientError> {
+        self.typed(Method::SESSION_REPARENT_WORKTREE, &params).await
     }
 
     /// `host.sync_prefs`: rsync over ssh — bounded, but slower than a local
@@ -523,7 +565,11 @@ impl DaemonClient {
         self.core
             .request_typed(
                 Method::HOST_LIST_DIRECTORIES,
-                Some(&HostListDirectoriesParams { host, path }),
+                Some(&HostListDirectoriesParams {
+                    host,
+                    path,
+                    mode: diri_proto::remote_pty::DirectoryListMode::Directories,
+                }),
                 Some(Duration::from_secs(30)),
             )
             .await
@@ -643,8 +689,30 @@ impl DaemonClient {
         self.empty(Method::GOVERNOR_CONFIGURE, &params).await
     }
 
-    pub async fn agent_readiness(&self) -> Result<AgentReadinessResult, ClientError> {
-        self.no_params(Method::AGENT_READINESS).await
+    /// `agent.readiness`: PATH metadata locally, but a remote target crosses
+    /// ssh and may install the Helper first, so the two carry very different
+    /// bounds. Both are explicit: the settings page shows a spinner for the
+    /// whole call, and an unbounded one has no way back to the user.
+    pub async fn agent_readiness(
+        &self,
+        params: diri_proto::AgentReadinessParams,
+    ) -> Result<AgentReadinessResult, ClientError> {
+        let timeout = agent_catalog_timeout(params.host.is_some());
+        self.core
+            .request_typed(Method::AGENT_READINESS, Some(&params), Some(timeout))
+            .await
+    }
+
+    /// `agent.configure`: writes the preference, then answers with the same
+    /// catalog `agent.readiness` builds — and can therefore scan.
+    pub async fn configure_agent(
+        &self,
+        params: diri_proto::AgentConfigureParams,
+    ) -> Result<diri_proto::AgentConfigureResult, ClientError> {
+        let timeout = agent_catalog_timeout(params.host.is_some());
+        self.core
+            .request_typed(Method::AGENT_CONFIGURE, Some(&params), Some(timeout))
+            .await
     }
 
     pub async fn hibernate(&self, session_id: &SessionId) -> Result<(), ClientError> {
@@ -681,8 +749,25 @@ impl DaemonClient {
         self.typed(Method::WORKTREE_LIST, &params).await
     }
 
+    pub async fn worktree_cleanup(&self, params: WorktreeCleanupParams) -> Result<(), ClientError> {
+        self.empty(Method::WORKTREE_CLEANUP, &params).await
+    }
+
     pub async fn worktree_remove(&self, params: WorktreeRemoveParams) -> Result<(), ClientError> {
         self.empty(Method::WORKTREE_REMOVE, &params).await
+    }
+
+    pub async fn worktree_scan(
+        &self,
+        params: WorktreeScanParams,
+    ) -> Result<WorktreeScanResult, ClientError> {
+        self.core
+            .request_typed(
+                Method::WORKTREE_SCAN,
+                Some(&params),
+                Some(Duration::from_secs(5)),
+            )
+            .await
     }
 
     pub async fn worktree_overview(&self) -> Result<Vec<WorktreeOverviewEntry>, ClientError> {
@@ -694,13 +779,29 @@ impl DaemonClient {
         self.no_params(Method::SESSION_HISTORY).await
     }
 
+    pub async fn activity(&self, limit: Option<u16>) -> Result<ActivityListResult, ClientError> {
+        self.typed(Method::ACTIVITY_LIST, &ActivityListParams { limit })
+            .await
+    }
+
     pub async fn resume_from_history(
         &self,
         entry: HistoryEntry,
     ) -> Result<SessionRecord, ClientError> {
+        self.resume_from_history_with_prompt(entry, None).await
+    }
+
+    pub async fn resume_from_history_with_prompt(
+        &self,
+        entry: HistoryEntry,
+        initial_prompt: Option<String>,
+    ) -> Result<SessionRecord, ClientError> {
         self.typed(
             Method::SESSION_RESUME_FROM_HISTORY,
-            &ResumeFromHistoryParams { entry },
+            &ResumeFromHistoryParams {
+                entry,
+                initial_prompt,
+            },
         )
         .await
     }
@@ -746,6 +847,45 @@ impl DaemonClient {
         self.no_params(Method::DAEMON_SHUTDOWN_IF_IDLE).await
     }
 
+    pub async fn account_profiles(&self) -> Result<diri_proto::AgentAccountCatalog, ClientError> {
+        self.no_params(Method::ACCOUNT_PROFILES_LIST).await
+    }
+
+    pub async fn continue_with_account(
+        &self,
+        session_id: &SessionId,
+        account_profile_id: String,
+    ) -> Result<SessionRecord, ClientError> {
+        self.core
+            .request_typed(
+                Method::SESSION_CONTINUE_ACCOUNT,
+                Some(&diri_proto::ContinueAccountParams {
+                    session_id: session_id.clone(),
+                    account_profile_id,
+                }),
+                Some(std::time::Duration::from_secs(120)),
+            )
+            .await
+    }
+
+    pub async fn save_account_profile(
+        &self,
+        profile: &diri_proto::AgentAccountProfile,
+    ) -> Result<diri_proto::AgentAccountCatalog, ClientError> {
+        self.typed(Method::ACCOUNT_PROFILES_SAVE, profile).await
+    }
+
+    pub async fn remove_account_profile(
+        &self,
+        id: String,
+    ) -> Result<diri_proto::AgentAccountCatalog, ClientError> {
+        self.typed(
+            Method::ACCOUNT_PROFILES_REMOVE,
+            &diri_proto::AgentAccountId { id },
+        )
+        .await
+    }
+
     async fn typed<P, R>(&self, method: &str, params: &P) -> Result<R, ClientError>
     where
         P: Serialize + ?Sized,
@@ -772,7 +912,7 @@ impl DaemonClient {
 
 impl Drop for DaemonClient {
     fn drop(&mut self) {
-        self.core.shutdown_tx.send_replace(true);
+        self.begin_shutdown();
         if let Ok(slot) = self.lifecycle.get_mut()
             && let Some(task) = slot.take()
         {
@@ -784,6 +924,14 @@ impl Drop for DaemonClient {
 impl ConnectionState {
     fn is_connected(&self) -> bool {
         matches!(self, Self::Connected(_))
+    }
+}
+
+const fn agent_catalog_timeout(remote: bool) -> Duration {
+    if remote {
+        REMOTE_AGENT_CATALOG_TIMEOUT
+    } else {
+        AGENT_CATALOG_TIMEOUT
     }
 }
 
@@ -801,6 +949,7 @@ struct AttemptOutcome {
 async fn run_lifecycle(core: Arc<ClientCore>) {
     let mut backoff = INITIAL_BACKOFF;
     let mut shutdown = core.shutdown_tx.subscribe();
+    let mut retries = core.retry_tx.subscribe();
     while !*shutdown.borrow() {
         core.set_state(ConnectionState::Connecting);
         let outcome = run_once(Arc::clone(&core), &mut shutdown).await;
@@ -816,6 +965,11 @@ async fn run_lifecycle(core: Arc<ClientCore>) {
         }
         tokio::select! {
             () = tokio::time::sleep(backoff) => {}
+            result = retries.changed() => {
+                if result.is_err() {
+                    break;
+                }
+            }
             result = shutdown.changed() => {
                 if result.is_err() || *shutdown.borrow() {
                     break;
@@ -913,6 +1067,34 @@ mod tests {
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    #[test]
+    fn begin_shutdown_publishes_without_an_async_runtime_turn() {
+        let client = DaemonClient::with_socket_path("/nonexistent/diri-test.sock");
+        let shutdown = client.core.shutdown_tx.subscribe();
+
+        client.begin_shutdown();
+
+        assert!(*shutdown.borrow());
+    }
+
+    #[tokio::test]
+    async fn retry_now_wakes_the_lifecycle_signal_without_spawning_a_daemon() {
+        let client = DaemonClient::with_socket_path("/nonexistent/diri-test.sock");
+        let mut retries = client.core.retry_tx.subscribe();
+
+        client.retry_now();
+
+        retries.changed().await.expect("retry sender remains alive");
+        assert_eq!(*retries.borrow(), 1);
+        assert!(
+            client
+                .lifecycle
+                .lock()
+                .expect("lifecycle mutex poisoned")
+                .is_none()
+        );
+    }
+
     #[tokio::test]
     async fn live_daemon_control_round_trip() -> Result<(), Box<dyn Error>> {
         if std::env::var_os("DIRI_RUN_MUTATING_DAEMON_TESTS").is_none() {
@@ -958,12 +1140,14 @@ mod tests {
                     cwd: scratch.to_string_lossy().into_owned(),
                     new_worktree: None,
                     worktree_branch: None,
+                    worktree_base: None,
                     title: Some("diri-client integration scratch".to_owned()),
                     initial_prompt: None,
                     parent: None,
                     initial_cols: Some(80),
                     initial_rows: Some(24),
                     host: None,
+                    account_profile_id: None,
                     same_repo_as: None,
                 })
                 .await?;

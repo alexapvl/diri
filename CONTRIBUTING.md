@@ -1,101 +1,105 @@
-# Contributing to diri
+# Contributing
 
-Bug reports, fixes, and new agent support are all welcome. There is no CLA —
-contributions are Apache 2.0, same as the project.
+Diri values reliable sessions, a compact interface, and clear behavior. A good
+contribution solves a specific problem and keeps those properties intact.
 
-## What you need
+## Choose a change
 
-- macOS 15 or newer, on Apple silicon or Intel
-- Xcode command-line tools (Swift 6)
-- Rust — the toolchain is pinned in `diri/rust-toolchain.toml` and rustup will
-  fetch it for you
-- Node 20 or newer, only if you touch the browser sidecar
+New here? Browse the [good first issues](https://github.com/cristicretu/diri/issues?q=is%3Aissue%20is%3Aopen%20label%3A%22good%20first%20issue%22).
+Each one includes a starting point, a bounded scope, and verification steps.
 
-The first Rust build compiles GPUI from a pinned Zed revision and takes a while.
-Later builds are incremental.
+- **Bugs:** include reproduction steps, expected behavior, and your environment
+  in a [bug report](https://github.com/cristicretu/diri/issues/new?template=bug_report.yml).
+- **Fixes and docs:** open a focused PR. An issue is useful context, not a
+  prerequisite for a small change.
+- **Agent support:** start with the [manifest guide](docs/AGENT-MANIFESTS.md).
+  Launch commands and status rules live in JSON under
+  [`diri-engine/manifests`](diri/crates/diri-engine/manifests/).
+- **Larger changes:** discuss the problem first, especially when adding a new
+  trust boundary, persistent format, dependency, or compatibility commitment.
+  Use [Discussions](https://github.com/cristicretu/diri/discussions) for early
+  ideas and a [feature request](https://github.com/cristicretu/diri/issues/new?template=feature_request.yml)
+  for a concrete proposal.
 
-## The two halves
+## Set up
 
-diri is one app made of two codebases, and which one you touch depends on what
-you are changing:
+Fork and clone the repository. Install Rust through rustup; the workspace's
+[`rust-toolchain.toml`](diri/rust-toolchain.toml) selects the compiler.
 
-- **`diri/`** — the Rust + GPUI desktop app. Window, sidebar, terminal
-  rendering, command palette, usage accounting.
-- **`Sources/`** — the Swift engine. `dirijord` owns the PTYs and child agent
-  processes so sessions outlive the app; `dirijor` is the CLI and MCP shim.
-
-They talk over a Unix socket. The app never owns a session directly — if you are
-changing what a session *does*, you are probably in `Sources/`.
-
-## Build and test
-
-The one-command contributor check runs shell/release guards, the Swift suite,
-Rust formatting, Clippy, Rust tests, and the dependency-license policy:
+On macOS, use macOS 15 or newer with the Xcode command-line tools. On Linux,
+follow the [native dependency setup](diri/LINUX.md#build-from-source).
+Node.js 20 or newer is needed for browser-sidecar work and packaging.
 
 ```sh
-./scripts/check.sh
+cd diri
+cargo build --workspace
+cargo test -p diri-engine    # choose the package you changed
 ```
 
-Pass `--browser` to also install the sidecar dependencies and run Playwright's
-browser integration tests. The default stays self-contained after toolchains and
-dependencies have been fetched once.
+The first build compiles GPUI from a pinned Zed revision. Subsequent builds
+are incremental. On macOS, run `./scripts/dev.sh` from `diri/` to try your change
+in an app bundle. The dev app shares sessions and preferences with the installed
+app; see the [development guide](diri/README.md#build-and-run).
 
-To run one half while iterating:
+## Find the code
+
+All desktop behavior lives in the Rust workspace under [`diri/`](diri/).
+Read [AGENTS.md](AGENTS.md) before changing it.
+
+| Area | Crate under `diri/crates/` |
+| :--- | :--- |
+| Desktop interface | `diri-app` |
+| Sessions, worktrees, status, and orchestration | `diri-engine` |
+| Wire types and local client | `diri-proto`, `diri-client` |
+| Terminal rendering and shared parsing | `diri-term`, `diri-terminal-state` |
+| Remote Helper | `diri-remote` |
+| Automation CLI and MCP server | `dirijor-mcp` |
+
+The Engine owns session records; Holders keep the PTYs and agent processes
+alive. Read the [remote architecture](diri/REMOTE_PORT.md) before changing
+remote sessions, SSH, Holders, terminal state, or packaging.
+
+## Verify
+
+Start with the narrowest relevant package or test. Before handing off Rust
+changes, run these from `diri/`:
 
 ```sh
-swift build && swift test          # engine
-(cd diri && cargo build && cargo test)   # app
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo build --workspace --release
 ```
 
-Before opening a pull request, run what CI runs:
+From the repository root, `./scripts/check.sh` runs formatting, Clippy, tests,
+shell/release guards, and the dependency-license policy. Add `--browser` for
+sidecar integration tests; this also installs sidecar dependencies and
+Playwright browsers. The release build above is a separate check.
 
-```sh
-swift test
-(cd diri && cargo fmt --all -- --check)
-(cd diri && cargo clippy --workspace --all-targets -- -D warnings)
-(cd diri && cargo test --workspace)
-```
+Engine tests create real PTYs, processes, and Git repositories. On a loaded
+machine, `DIRIJOR_TEST_TIMEOUT_SCALE` can extend their liveness waits. Tests
+against a real SSH host must be opt-in and document setup and cleanup.
 
-To try your change in the real app, `diri/scripts/package.sh` builds the bundle
-and `diri/scripts/install-local.sh` installs it to `~/Applications`.
+For documentation-only changes, check links and rendered output. Explain any
+checks you could not run. Never include private prompts, credentials, or raw
+session logs in fixtures or screenshots.
 
-## Notes on the test suite
+## Open a pull request
 
-The engine tests spawn real PTYs, child processes, and git repositories. A few
-consequences worth knowing:
+Keep one purpose per PR. Describe the problem, the resulting behavior, and
+how you verified it. Link an issue when one exists. Include a screenshot or
+short recording for interface changes.
 
-- They are wall-clock sensitive. `DIRIJOR_TEST_TIMEOUT_SCALE` multiplies every
-  liveness wait; CI sets it to 6. Raise it locally if your machine is loaded.
-- CI runs `swift test --no-parallel`. Tests that block a thread while holding a
-  PTY can starve the cooperative pool on a small runner.
-- Browser tests are opt-in behind `DIRIJOR_RUN_BROWSER_TESTS=1` and need
-  `npx playwright install` first.
-- Two tests are skipped on CI because they hang there (#1). They still run
-  locally. To take a stack from a runner instead of guessing, run the manual
-  `Hang repro` workflow: it sets `DIRIJOR_RUN_HANGING_TESTS=1` and runs
-  `scripts/sample-hung-tests.sh` alongside the suite, which samples the test
-  binary and everything it spawned. That script works on any stuck run —
-  `./scripts/sample-hung-tests.sh 60 1 0` while a local `swift test` is wedged
-  prints the same thing.
+If you change session lifecycle or persistence, explain what happens to running
+sessions during restart, reconnect, and upgrade. If you change a protocol or
+stored format, document compatibility. Update the relevant user guide when
+behavior or setup changes.
 
-## Adding an agent
+CI must pass before merge. Reviews weigh correctness and session continuity
+first, then performance and interface clarity. Keep new controls and
+configuration justified by the problem they solve.
 
-This is the easiest place to start and needs no Swift or Rust. Agent support is
-data: each agent is one JSON file in `Sources/DirijorCore/Resources/manifests/`
-describing how to spawn it, how to resume a session, which keystrokes approve or
-deny, and the screen predicates that decide whether it is working, waiting on
-you, or done. Copy the closest existing manifest and adjust it.
-
-Claude Code and Codex have first-class status detection and resume. Anything
-without a manifest still runs as a plain terminal.
-
-## Pull requests
-
-Keep the change focused, explain why in the description, and say how you tested
-it. If it changes behavior the daemon owns, mention whether existing sessions
-survive it — that property matters more than almost anything else here.
-
-CI must be green before merge. Maintainers may ask for a design issue first when
-a change creates a new trust boundary, persistent format, or compatibility
-commitment. See [GOVERNANCE.md](GOVERNANCE.md) for how decisions are made and
-[SECURITY.md](SECURITY.md) for private vulnerability reports.
+Contributions use [Apache 2.0](LICENSE); there is no CLA.
+[Governance](GOVERNANCE.md) covers project decisions, the
+[Code of Conduct](CODE_OF_CONDUCT.md) covers participation, and
+[Security](SECURITY.md) explains private vulnerability reporting.
