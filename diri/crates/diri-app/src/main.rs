@@ -85,7 +85,8 @@ use crate::commands::{
 use crate::store::{StoreRuntime, WindowMode, WindowPlacement};
 use crate::updates::UpdateHandle;
 use crate::usage::{
-    TranscriptInvalidation, TranscriptWatcher, UsageSnapshot, UsageStore, merge_fleet_usage,
+    TranscriptInvalidation, TranscriptWatcher, UsageSnapshot, UsageStore, merge_cursor_usage,
+    merge_fleet_usage,
 };
 
 pub mod store;
@@ -492,7 +493,7 @@ async fn publish_usage_refresh(
     invalidated: Option<Vec<PathBuf>>,
     home: &std::path::Path,
 ) -> Option<UsageStore> {
-    let (store, snapshot) = tokio::task::spawn_blocking(move || {
+    let (mut store, snapshot) = tokio::task::spawn_blocking(move || {
         let snapshot = match invalidated {
             Some(paths) => store.refresh_paths(&paths),
             None => store.refresh(),
@@ -502,6 +503,7 @@ async fn publish_usage_refresh(
     .await
     .ok()?;
     let snapshot = merge_fleet_usage(snapshot, home).await;
+    let snapshot = merge_cursor_usage(&mut store, snapshot, home).await;
     usage_tx.send_modify(|current| {
         let limits = std::mem::take(&mut current.limits);
         *current = snapshot;

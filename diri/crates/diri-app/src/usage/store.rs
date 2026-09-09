@@ -9,7 +9,9 @@ use diri_proto::paths::DirijorPaths;
 
 use super::{
     cache::{self, UsageCacheFile, UsageFileEntry},
-    model::{UsageHourAgg, UsageSnapshot, UsageTotals},
+    cursor::{CursorUsageEvent, event_aggregate, event_dedup_hash, event_hour},
+    dashboard,
+    model::{ProviderUsage, UsageHourAgg, UsageSnapshot, UsageTotals},
     parser::{parse_claude, parse_codex, tail_hash},
     timestamp::days_from_civil,
 };
@@ -158,6 +160,34 @@ impl<C: Clock> UsageStore<C> {
             .iter()
             .map(|(root, _)| root.clone())
             .collect()
+    }
+
+    pub(crate) fn cursor_fetch_start_ms(&self) -> i64 {
+        let now_ms = self.clock.read().unix_seconds.saturating_mul(1_000);
+        let last = self.ledger.cache.cursor.last_event_ms;
+        if last > 0 {
+            last.saturating_sub(super::cursor::cursor_overlap_ms())
+                .max(0)
+        } else {
+            now_ms
+                .saturating_sub(RETENTION_DAYS.saturating_mul(86_400).saturating_mul(1_000))
+                .max(0)
+        }
+    }
+
+    pub(crate) fn ingest_cursor_events(&mut self, events: &[CursorUsageEvent]) -> ProviderUsage {
+        let reading = self.clock.read();
+        let cutoff_hour = reading.unix_seconds / 3_600 - RETENTION_DAYS * 24;
+        let changed = ingest_cursor(&mut self.ledger.cache, events, cutoff_hour);
+        self.ledger.dirty |= changed;
+        if self.ledger.dirty && cache::save(&self.paths.cache_file, &self.ledger.cache).is_ok() {
+            self.ledger.dirty = false;
+        }
+        provider_from_hours(&self.ledger.cache.cursor.hours, reading)
+    }
+
+    pub(crate) fn cursor_history(&self) -> dashboard::ModelHours {
+        self.ledger.cache.cursor.details.clone()
     }
 }
 
@@ -402,6 +432,17 @@ fn scan(
     cache.seen.retain(|hour, _| *hour >= cutoff_hour);
     changed |= seen_before_retain != cache.seen.len();
 
+    let cursor_hours_before = cache.cursor.hours.len();
+    let cursor_seen_before = cache.cursor.seen.len();
+    cache.cursor.hours.retain(|hour, _| *hour >= cutoff_hour);
+    cache.cursor.seen.retain(|hour, _| *hour >= cutoff_hour);
+    cache.cursor.details.retain(|_, hours| {
+        hours.retain(|hour, _| *hour >= cutoff_hour);
+        !hours.is_empty()
+    });
+    changed |= cursor_hours_before != cache.cursor.hours.len()
+        || cursor_seen_before != cache.cursor.seen.len();
+
     let mut claude_hours = BTreeMap::new();
     let mut codex_hours = BTreeMap::new();
     for (path, entry) in &cache.files {
@@ -420,13 +461,14 @@ fn scan(
         }
     }
 
-    let mut result = snapshot(&claude_hours, &codex_hours, reading);
+    let mut result = snapshot(&claude_hours, &codex_hours, &cache.cursor.hours, reading);
     let mut history = super::dashboard::UsageHistory::default();
     for (path, entry) in &cache.files {
         if let Some(provider) = provider_for_path(Path::new(path), &paths.roots) {
             history.merge(provider, &entry.details);
         }
     }
+    history.cursor = cache.cursor.details.clone();
     result.history = std::sync::Arc::new(history);
     (result, stats, changed)
 }
@@ -551,6 +593,7 @@ fn walk(root: &Path, provider: UsageProvider, files: &mut Vec<(PathBuf, UsagePro
 fn snapshot(
     claude_hours: &BTreeMap<i64, UsageHourAgg>,
     codex_hours: &BTreeMap<i64, UsageHourAgg>,
+    cursor_hours: &BTreeMap<i64, UsageHourAgg>,
     reading: ClockReading,
 ) -> UsageSnapshot {
     let mut result = UsageSnapshot {
@@ -576,6 +619,7 @@ fn snapshot(
             result.codex.month += aggregate;
         }
     }
+    result.cursor = provider_from_hours(cursor_hours, reading);
 
     let mut block_start = None;
     let mut block_totals = UsageTotals::default();
@@ -599,6 +643,61 @@ fn snapshot(
         }
     }
     result
+}
+
+fn provider_from_hours(
+    hours: &BTreeMap<i64, UsageHourAgg>,
+    reading: ClockReading,
+) -> ProviderUsage {
+    let mut result = ProviderUsage::default();
+    let today_start_hour = reading.today_started_at / 3_600;
+    let month_start_hour = reading.month_started_at / 3_600;
+    for (&hour, &aggregate) in hours {
+        if hour >= today_start_hour {
+            result.today += aggregate;
+        }
+        if hour >= month_start_hour {
+            result.month += aggregate;
+        }
+    }
+    result
+}
+
+fn ingest_cursor(
+    cache: &mut UsageCacheFile,
+    events: &[CursorUsageEvent],
+    cutoff_hour: i64,
+) -> bool {
+    let hours_before = cache.cursor.hours.len();
+    let seen_before = cache.cursor.seen.len();
+    cache.cursor.hours.retain(|hour, _| *hour >= cutoff_hour);
+    cache.cursor.seen.retain(|hour, _| *hour >= cutoff_hour);
+    cache.cursor.details.retain(|_, hours| {
+        hours.retain(|hour, _| *hour >= cutoff_hour);
+        !hours.is_empty()
+    });
+    let mut changed =
+        hours_before != cache.cursor.hours.len() || seen_before != cache.cursor.seen.len();
+    for event in events {
+        let hour = event_hour(event);
+        if hour < cutoff_hour {
+            continue;
+        }
+        let hash = event_dedup_hash(&event.id);
+        let seen = cache.cursor.seen.entry(hour).or_default();
+        if seen.contains(&hash) {
+            continue;
+        }
+        seen.push(hash);
+        let tokens = event_aggregate(event);
+        cache.cursor.hours.entry(hour).or_default().merge(tokens);
+        dashboard::record_billed(&mut cache.cursor.details, &event.model, hour, tokens);
+        if event.timestamp_ms > cache.cursor.last_event_ms {
+            cache.cursor.last_event_ms = event.timestamp_ms;
+        }
+        changed = true;
+    }
+    changed
 }
 
 #[cfg(all(unix, target_pointer_width = "64"))]

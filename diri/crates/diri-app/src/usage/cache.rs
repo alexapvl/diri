@@ -46,6 +46,20 @@ pub(crate) struct UsageCacheFile {
     pub version: u32,
     pub files: BTreeMap<String, UsageFileEntry>,
     pub seen: BTreeMap<i64, Vec<u64>>,
+    #[serde(default)]
+    pub cursor: CursorLedger,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub(crate) struct CursorLedger {
+    #[serde(default)]
+    pub last_event_ms: i64,
+    #[serde(default)]
+    pub hours: BTreeMap<i64, UsageHourAgg>,
+    #[serde(default)]
+    pub seen: BTreeMap<i64, Vec<u64>>,
+    #[serde(default)]
+    pub details: super::dashboard::ModelHours,
 }
 
 impl Default for UsageCacheFile {
@@ -54,6 +68,7 @@ impl Default for UsageCacheFile {
             version: CACHE_VERSION,
             files: BTreeMap::new(),
             seen: BTreeMap::new(),
+            cursor: CursorLedger::default(),
         }
     }
 }
