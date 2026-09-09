@@ -4337,11 +4337,15 @@ mod tests {
         cx.simulate_click(close.center(), Modifiers::default());
         cx.run_until_parked();
         assert!(!root.read_with(cx, |root, _| root.inspector_open));
-        root.update(cx, |root, cx| {
+        root.update_in(cx, |root, window, cx| {
             root.inspector_slide = None;
             root.inspector_seam = 0.0;
+            // Closing the panel destroys its focus path. Linux GPUI tests do
+            // not always restore the workbench context before the next chord.
+            window.focus(&root.focus, cx);
             cx.notify();
         });
+        cx.executor().advance_clock(crate::seam::SEAM_SLIDE);
         cx.run_until_parked();
         cx.simulate_keystrokes(&commands::test_chords("cmd-shift-d"));
         cx.run_until_parked();
