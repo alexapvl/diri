@@ -731,7 +731,7 @@ impl ControlServer {
             None if !argv.is_empty() => {
                 let mut spec = crate::pty::PtySpec::new(argv.clone(), &cwd_path);
                 spec.env = inherited;
-                spec.env.retain(|(key, _)| key != "NO_COLOR");
+                crate::agent::apply_terminal_colour(&mut spec.env);
                 spec
             }
             None => {
@@ -939,9 +939,7 @@ impl ControlServer {
         } else {
             let mut spec = crate::pty::PtySpec::new(argv, &cwd);
             spec.env = inherited;
-            spec.env.retain(|(key, _)| key != "NO_COLOR");
-            spec.env.retain(|(key, _)| key != "TERM");
-            spec.env.push(("TERM".into(), "xterm-256color".into()));
+            crate::agent::apply_terminal_colour(&mut spec.env);
             spec
         };
         if let (Some(cols), Some(rows)) = (p.initial_cols, p.initial_rows) {

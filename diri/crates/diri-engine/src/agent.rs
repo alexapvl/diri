@@ -123,10 +123,11 @@ impl AgentDescriptor {
     /// - **Scrubbing.** Variables matching `env_scrub_prefixes` are dropped, so
     ///   a new agent does not inherit the identity of the session that spawned
     ///   it.
-    /// - **Colour is asserted, not inherited.** An inherited `NO_COLOR` (or a
-    ///   missing `TERM`) silently turns an agent's output monochrome, which
-    ///   then breaks the screen rules that look for its prompt box. `TERM` and
-    ///   `COLORTERM` are set explicitly and `NO_COLOR` is removed.
+    /// - **Colour is asserted, not inherited.** An inherited `NO_COLOR` or
+    ///   `FORCE_COLOR=0` (or a missing `TERM`) silently turns an agent's
+    ///   output monochrome, which then breaks the screen rules that look for
+    ///   its prompt box. `TERM` and `COLORTERM` are set explicitly and the
+    ///   colour-disabling overrides are removed.
     /// - **The agent's own `env` is applied last**, so a manifest can override
     ///   anything above.
     pub fn spawn_spec(
@@ -146,11 +147,7 @@ impl AgentDescriptor {
             }
             spec.env.push((key, value));
         }
-        spec.env.retain(|(key, _)| key != "NO_COLOR");
-        spec.env
-            .retain(|(key, _)| key != "TERM" && key != "COLORTERM");
-        spec.env.push(("TERM".into(), "xterm-256color".into()));
-        spec.env.push(("COLORTERM".into(), "truecolor".into()));
+        apply_terminal_colour(&mut spec.env);
         for (key, value) in &self.env {
             spec.env.retain(|(existing, _)| existing != key);
             spec.env.push((key.clone(), value.clone()));
@@ -224,10 +221,7 @@ impl AgentDescriptor {
                 spec.env.push((key, value));
             }
         }
-        spec.env
-            .retain(|(key, _)| !matches!(key.as_str(), "NO_COLOR" | "TERM" | "COLORTERM"));
-        spec.env.push(("TERM".into(), "xterm-256color".into()));
-        spec.env.push(("COLORTERM".into(), "truecolor".into()));
+        apply_terminal_colour(&mut spec.env);
         for (key, value) in &self.env {
             spec.env.retain(|(existing, _)| existing != key);
             spec.env.push((key.clone(), value.clone()));
@@ -240,6 +234,22 @@ impl AgentDescriptor {
             .iter()
             .any(|prefix| key.starts_with(prefix))
     }
+}
+
+/// Drop inherited colour overrides and pin a colour-capable TERM.
+///
+/// Cursor, chalk, and Ink treat `FORCE_COLOR=0` as "no colour" even when
+/// `COLORTERM=truecolor` is set. A daemon launched from a Cursor session
+/// inherits that, so a new agent would otherwise start monochrome.
+pub(crate) fn apply_terminal_colour(env: &mut Vec<(String, String)>) {
+    env.retain(|(key, _)| {
+        !matches!(
+            key.as_str(),
+            "NO_COLOR" | "FORCE_COLOR" | "CLICOLOR" | "CLICOLOR_FORCE" | "TERM" | "COLORTERM"
+        )
+    });
+    env.push(("TERM".into(), "xterm-256color".into()));
+    env.push(("COLORTERM".into(), "truecolor".into()));
 }
 
 fn shell_quote(value: &str) -> String {
@@ -513,26 +523,46 @@ mod tests {
 
     #[test]
     fn colour_is_asserted_rather_than_inherited() {
-        // An inherited NO_COLOR turns the agent monochrome, and the screen
-        // rules that look for its prompt box then never match.
+        // An inherited NO_COLOR or FORCE_COLOR=0 turns the agent monochrome,
+        // and the screen rules that look for its prompt box then never match.
         let claude = descriptor("claude-code");
         let inherited = [
             ("NO_COLOR".to_string(), "1".to_string()),
+            ("FORCE_COLOR".to_string(), "0".to_string()),
+            ("CLICOLOR".to_string(), "0".to_string()),
+            ("CLICOLOR_FORCE".to_string(), "0".to_string()),
             ("TERM".to_string(), "dumb".to_string()),
         ];
-        let spec = claude
-            .spawn_spec(Path::new("/tmp"), inherited, &[])
-            .expect("spec");
 
-        let get = |name: &str| {
-            spec.env
-                .iter()
-                .find(|(key, _)| key == name)
-                .map(|(_, value)| value.as_str())
+        let assert_colour = |spec: PtySpec| {
+            let get = |name: &str| {
+                spec.env
+                    .iter()
+                    .find(|(key, _)| key == name)
+                    .map(|(_, value)| value.as_str())
+            };
+            assert_eq!(get("NO_COLOR"), None, "NO_COLOR must be removed");
+            assert_eq!(get("FORCE_COLOR"), None, "FORCE_COLOR=0 must be removed");
+            assert_eq!(get("CLICOLOR"), None, "CLICOLOR=0 must be removed");
+            assert_eq!(
+                get("CLICOLOR_FORCE"),
+                None,
+                "CLICOLOR_FORCE=0 must be removed"
+            );
+            assert_eq!(get("TERM"), Some("xterm-256color"));
+            assert_eq!(get("COLORTERM"), Some("truecolor"));
         };
-        assert_eq!(get("NO_COLOR"), None, "NO_COLOR must be removed");
-        assert_eq!(get("TERM"), Some("xterm-256color"));
-        assert_eq!(get("COLORTERM"), Some("truecolor"));
+
+        assert_colour(
+            claude
+                .spawn_spec(Path::new("/tmp"), inherited.clone(), &[])
+                .expect("spec"),
+        );
+        assert_colour(
+            claude
+                .remote_spawn_spec(Path::new("/tmp"), inherited, &[])
+                .expect("spec"),
+        );
     }
 
     #[test]

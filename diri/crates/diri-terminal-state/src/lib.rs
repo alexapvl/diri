@@ -756,7 +756,9 @@ impl HeadlessScreen {
     /// Content fingerprint hashed straight off the grid cells, so
     /// `content_seq` only advances when the visible screen actually changed.
     /// Detection uses that to skip re-evaluating a frame it has already
-    /// judged.
+    /// judged. The hash covers the rendered cell (glyph, colors, style),
+    /// because agents like Cursor paint a fake caret with inverse video
+    /// without changing any characters.
     fn digest_cells(&self) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -764,7 +766,7 @@ impl HeadlessScreen {
         for row in 0..self.geometry.rows {
             let line = Line(row as i32);
             for column in 0..self.geometry.cols {
-                grid[line][Column(column)].c.hash(&mut hasher);
+                wire_cell(&grid[line][Column(column)]).hash(&mut hasher);
             }
         }
         self.title.hash(&mut hasher);
@@ -1046,6 +1048,32 @@ mod tests {
 
         screen.feed(b"world\r\n");
         assert!(screen.content_seq() > after_first);
+    }
+
+    #[test]
+    fn a_style_only_repaint_advances_content_seq() {
+        // Cursor hides the hardware cursor and paints its composer caret as
+        // inverse video. Arrows and space then restyle cells without changing
+        // glyphs; those frames must still look like new content or the attach
+        // pump suppresses them.
+        let mut screen = HeadlessScreen::new(80, 24);
+        screen.feed(b"hello");
+        let after_text = screen.content_seq();
+        let _ = screen.grid_update(true);
+
+        screen.feed(b"\r\x1b[7mh\x1b[27m");
+        assert!(
+            screen.content_seq() > after_text,
+            "a style-only caret move must look like new content"
+        );
+        assert_eq!(screen.lines(), vec!["hello"]);
+
+        let update = screen.grid_update(false);
+        let first = &update.changed_rows[0].cells[0];
+        assert!(
+            first.style.contains(TermStyle::INVERSE),
+            "the restyled cell must reach the wire"
+        );
     }
 
     #[test]
