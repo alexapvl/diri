@@ -2495,7 +2495,10 @@ impl Sidebar {
             usage = usage
                 .child(usage_row("Session", "resets in 2h 14m", "$2.31", colors))
                 .child(usage_row("Today", "1.8M tokens", "$4.82", colors))
-                .child(usage_row("This month", "", "$86.40", colors));
+                .child(usage_row("This month", "", "$86.40", colors))
+                .child(usage_row("Claude Code", "", "$40.10", colors))
+                .child(usage_row("Codex", "", "$22.00", colors))
+                .child(usage_row("Cursor", "", "$24.30", colors));
         } else if let Some(snapshot) = self.usage {
             usage = usage
                 .child(usage_row(
@@ -2526,6 +2529,30 @@ impl Sidebar {
                     &UsageFormat::money(snapshot.month().cost),
                     colors,
                 ));
+            if snapshot.claude.month.cost > 0.0 {
+                usage = usage.child(usage_row(
+                    "Claude Code",
+                    "",
+                    &UsageFormat::money(snapshot.claude.month.cost),
+                    colors,
+                ));
+            }
+            if snapshot.codex.month.cost > 0.0 {
+                usage = usage.child(usage_row(
+                    "Codex",
+                    "",
+                    &UsageFormat::money(snapshot.codex.month.cost),
+                    colors,
+                ));
+            }
+            if snapshot.cursor.month.cost > 0.0 {
+                usage = usage.child(usage_row(
+                    "Cursor",
+                    "",
+                    &UsageFormat::money(snapshot.cursor.month.cost),
+                    colors,
+                ));
+            }
         } else {
             usage = usage.child(
                 div()

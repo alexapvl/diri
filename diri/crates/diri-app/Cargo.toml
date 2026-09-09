@@ -29,6 +29,7 @@ entitlements = "../../assets/diri.entitlements"
 background-app = false
 
 [dependencies]
+base64.workspace = true
 diri-client.workspace = true
 diri-proto.workspace = true
 diri-term.workspace = true
@@ -40,6 +41,7 @@ gpui_platform.workspace = true
 image.workspace = true
 nucleo-matcher.workspace = true
 notify.workspace = true
+rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

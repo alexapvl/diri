@@ -5,6 +5,7 @@ use tempfile::TempDir;
 
 use super::{
     Clock, ClockReading, ScanPaths, UsageProvider, UsageStore,
+    cursor::CursorUsageEvent,
     parser::fnv1a,
     pricing::{match_claude, match_openai},
     timestamp::parse_timestamp,
@@ -116,6 +117,7 @@ fn aggregates_costs_dedupes_claude_and_preserves_provider_totals() {
     assert_eq!(snapshot.codex.month, snapshot.codex.today);
     assert_eq!(snapshot.codex.session.total_tokens(), 0);
 
+    assert_eq!(snapshot.cursor.today.total_tokens(), 0);
     assert_eq!(snapshot.today().total_tokens(), 3_000);
     assert_close(snapshot.today().cost, 0.011_027_5);
     assert_close(snapshot.session_cost.unwrap(), 0.007_927_5);
@@ -439,6 +441,56 @@ fn ordered_pricing_table_and_fnv_hash_match_the_swift_constants() {
         assert_eq!((pricing.input, pricing.output), (input, output));
     }
     assert_eq!(fnv1a("hello"), 0xa430_d846_80aa_bd0b);
+}
+
+#[test]
+fn ingest_cursor_events_dedupes_and_survives_refresh() {
+    let fixture = Fixture::new();
+    let mut store = fixture.store(
+        "2026-07-22T12:00:00Z",
+        "2026-07-22T00:00:00Z",
+        "2026-07-01T00:00:00Z",
+    );
+    let event = CursorUsageEvent {
+        id: "evt-1".into(),
+        timestamp_ms: timestamp("2026-07-22T10:12:00.000Z") * 1_000,
+        model: "composer-1".into(),
+        input_tokens: 100,
+        output_tokens: 20,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
+        cost: 1.5,
+    };
+    let usage = store.ingest_cursor_events(&[event.clone(), event.clone()]);
+    assert_eq!(usage.today.input_tokens, 100);
+    assert_eq!(usage.today.output_tokens, 20);
+    assert_close(usage.today.cost, 1.5);
+    assert_eq!(usage.month, usage.today);
+
+    let snapshot = store.refresh();
+    assert_eq!(snapshot.cursor.today.input_tokens, 100);
+    assert_close(snapshot.cursor.today.cost, 1.5);
+    assert_eq!(snapshot.today().total_tokens(), 120);
+    assert_close(snapshot.today().cost, 1.5);
+    assert_eq!(
+        store.cursor_fetch_start_ms(),
+        event.timestamp_ms - 5 * 60 * 1_000
+    );
+
+    let cache: Value = serde_json::from_slice(&fs::read(&fixture.cache).unwrap()).unwrap();
+    assert_eq!(cache["cursor"]["last_event_ms"], event.timestamp_ms);
+    assert_eq!(
+        cache["cursor"]["seen"]
+            .as_object()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 #[test]
