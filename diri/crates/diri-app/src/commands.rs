@@ -784,10 +784,29 @@ fn platform_keystroke(id: CommandId, key: &str) -> Option<String> {
     if id == CommandId::HideApp {
         return None;
     }
-    let key = key
-        .replace("cmd-ctrl-", "ctrl-shift-")
-        .replace("cmd-", "ctrl-");
-    Some(key)
+    Some(linux_chord(key))
+}
+
+/// Maps a macOS `cmd-` chord onto the string `simulate_keystrokes` must send
+/// on this OS. GPUI treats `cmd` as Super on Linux; shipped bindings use Ctrl.
+#[cfg(test)]
+pub(crate) fn test_chords(spec: &str) -> String {
+    spec.split_whitespace()
+        .map(|token| {
+            if cfg!(target_os = "macos") {
+                token.to_owned()
+            } else {
+                linux_chord(token)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(any(test, not(target_os = "macos")))]
+fn linux_chord(key: &str) -> String {
+    key.replace("cmd-ctrl-", "ctrl-shift-")
+        .replace("cmd-", "ctrl-")
 }
 
 #[cfg(target_os = "macos")]
@@ -1330,8 +1349,9 @@ mod tests {
     #[test]
     fn conflicts_include_alternate_bindings() {
         let overrides = ShortcutOverrides::new();
-        let conflict = shortcut_conflict(CommandId::OpenLauncher, "cmd-[", &overrides)
-            .expect("navigation alternate should be reserved");
+        let conflict =
+            shortcut_conflict(CommandId::OpenLauncher, &test_chords("cmd-["), &overrides)
+                .expect("navigation alternate should be reserved");
         assert_eq!(conflict.id, CommandId::SelectPreviousSession);
     }
 

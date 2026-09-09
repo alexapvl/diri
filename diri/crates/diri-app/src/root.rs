@@ -3893,7 +3893,7 @@ mod tests {
             });
         }
 
-        cx.simulate_keystrokes("cmd-w");
+        cx.simulate_keystrokes(&commands::test_chords("cmd-w"));
         assert!(runtime.store.read().unwrap().pending_close().is_some());
         cx.simulate_keystrokes("escape");
         {
@@ -3905,7 +3905,7 @@ mod tests {
             assert_eq!(store.selected_session_id(), Some(&selected));
         }
 
-        cx.simulate_keystrokes("cmd-w");
+        cx.simulate_keystrokes(&commands::test_chords("cmd-w"));
         assert!(runtime.store.read().unwrap().pending_close().is_some());
         cx.simulate_keystrokes("enter");
         let store = runtime.store.read().unwrap();
@@ -4056,7 +4056,7 @@ mod tests {
         });
         cx.simulate_resize(size(px(1000.0), px(700.0)));
         cx.run_until_parked();
-        cx.simulate_keystrokes("cmd-k s e t t i n g s");
+        cx.simulate_keystrokes(&commands::test_chords("cmd-k s e t t i n g s"));
         cx.run_until_parked();
         let position = cx.debug_bounds("palette-row-0").unwrap().center();
         cx.simulate_click(position, Modifiers::default());
@@ -4072,7 +4072,7 @@ mod tests {
         assert_ne!(store.store.read().unwrap().theme_id(), original_theme);
         cx.simulate_keystrokes("escape");
         assert_eq!(store.store.read().unwrap().theme_id(), original_theme);
-        cx.simulate_keystrokes("cmd-k s e t t i n g s enter");
+        cx.simulate_keystrokes(&commands::test_chords("cmd-k s e t t i n g s enter"));
         cx.run_until_parked();
         let position = cx.debug_bounds("palette-row-1").unwrap().center();
         cx.simulate_click(position, Modifiers::default());
@@ -4087,7 +4087,9 @@ mod tests {
             );
             assert!(!root.navigation.as_ref().unwrap().read(cx).is_open());
         });
-        cx.simulate_keystrokes("cmd-k s e t t i n g s enter down enter");
+        cx.simulate_keystrokes(&commands::test_chords(
+            "cmd-k s e t t i n g s enter down enter",
+        ));
         cx.run_until_parked();
         root.read_with(cx, |root, cx| {
             assert!(
@@ -4341,7 +4343,7 @@ mod tests {
             cx.notify();
         });
         cx.run_until_parked();
-        cx.simulate_keystrokes("cmd-shift-d");
+        cx.simulate_keystrokes(&commands::test_chords("cmd-shift-d"));
         cx.run_until_parked();
         assert!(
             root.read_with(cx, |root, _| root.inspector_open),
@@ -4451,9 +4453,10 @@ mod tests {
             click_count: 1,
             first_mouse: false,
         });
-        assert!(
+        assert_eq!(
             root.read_with(cx, |root, _| root.titlebar_drag_armed),
-            "unhandled titlebar chrome must still move the window"
+            cfg!(target_os = "macos"),
+            "macOS arms window move on empty chrome; Linux leaves it to the compositor"
         );
     }
 
