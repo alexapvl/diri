@@ -92,24 +92,7 @@ jobs:
       # iOS runtime installed but no devices registered, and xcodebuild then
       # fails with an empty destination list.
       - name: Prepare iPhone simulator
-        working-directory: .
-        run: |
-          set -euo pipefail
-          if xcrun simctl list devices available | grep -Fq 'iPhone 17 Pro'; then
-            exit 0
-          fi
-          echo "iPhone 17 Pro is missing; available devices and runtimes:"
-          xcrun simctl list runtimes
-          xcrun simctl list devices available
-          runtime="$(xcrun simctl list runtimes available \
-            | sed -n 's/.*(\(com\.apple\.CoreSimulator\.SimRuntime\.iOS-[^)]*\)).*/\1/p' \
-            | head -n 1)"
-          if [[ -z "${runtime}" ]]; then
-            echo "error: this runner has no iOS simulator runtime" >&2
-            exit 1
-          fi
-          echo "Creating iPhone 17 Pro with ${runtime}"
-          xcrun simctl create "iPhone 17 Pro" "iPhone 17 Pro" "${runtime}"
+        run: python3 scripts/prepare-simulator.py
       # This runner has no signing identity. Device archive below is a build
       # gate only, not proof of signing or TestFlight acceptance.
       - name: Test
@@ -167,6 +150,7 @@ jobs:
           bash scripts/verify-remote-refactor.sh
           bash scripts/test-publish-github-release.sh
           bash scripts/test-publish-homebrew-cask.sh
+          python3 ../ios/scripts/test-prepare-simulator.py
       - name: Check dependency license policy
         run: python3 ../scripts/check-licenses.py
 

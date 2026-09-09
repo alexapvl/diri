@@ -246,11 +246,6 @@ pub struct RootView {
     /// owns its own visibility; the inspector's lives here because RootView is
     /// what owns that flag.
     inspector_toggled_at: Option<Instant>,
-    /// Closing the inspector unmounts its focus path once the seam hits zero.
-    /// Linux GPUI tests (and a click that outruns the slide) drop window focus
-    /// on that unmount, so workbench shortcuts have nowhere to land until the
-    /// next click. Re-arm RootView after the panel is actually gone.
-    inspector_unmount_refocus: bool,
     /// Debounces move/resize persistence while retaining the newest placement
     /// in memory immediately (the quit hook flushes that value synchronously).
     window_bounds_save: Option<Task<()>>,
@@ -988,7 +983,6 @@ impl RootView {
             inspector_slide: None,
             inspector_seam,
             inspector_toggled_at: None,
-            inspector_unmount_refocus: false,
             inspector_resize_origin: None,
             window_bounds_save: None,
             status_banner: None,
@@ -2255,7 +2249,6 @@ impl RootView {
         }
         self.inspector_toggled_at = Some(now);
         self.inspector_open = open;
-        self.inspector_unmount_refocus = !open;
         if let Some(inspector) = &self.inspector {
             inspector.update(cx, |inspector, cx| inspector.set_visible(open, cx));
         }
@@ -3363,10 +3356,6 @@ impl Render for RootView {
         self.sidebar_seam =
             advance_seam(&mut self.sidebar_slide, occupied_sidebar_width, now, window);
         self.inspector_seam = advance_seam(&mut self.inspector_slide, inspector_width, now, window);
-        if self.inspector_unmount_refocus && self.inspector_seam <= 0.0 {
-            self.inspector_unmount_refocus = false;
-            window.focus(&self.focus, cx);
-        }
         let seam = self.sidebar_seam;
         let inspector_seam = self.inspector_seam;
         #[cfg(target_os = "macos")]
@@ -4463,6 +4452,58 @@ mod tests {
                 "layout, inset, radius and shadow must share the same curve and clock"
             );
         });
+    }
+
+    #[gpui::test]
+    fn inspector_close_preserves_new_focus(cx: &mut gpui::TestAppContext) {
+        for command in [
+            None,
+            Some(CommandId::FocusSidebar),
+            Some(CommandId::ToggleCommandPalette),
+        ] {
+            let services = test_services();
+            let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+            services.store.store.write().unwrap().hydrate(fixture.list);
+            let (root, cx) = cx.add_window_view(move |window, cx| {
+                RootView::new(services, false, PreviewScenario::Empty, window, cx)
+            });
+            cx.simulate_resize(size(px(1200.0), px(800.0)));
+            root.update(cx, |root, cx| {
+                root.preview = false;
+                root.inspector_open = true;
+                root.inspector_seam = 440.0;
+                cx.notify();
+            });
+            cx.run_until_parked();
+            // Move to another keyboard surface while the inspector closes.
+            let focused = root.update_in(cx, |root, window, cx| {
+                root.run_command(CommandId::ToggleInspector, window, cx);
+                if let Some(command) = command {
+                    root.run_command(command, window, cx);
+                } else {
+                    root.terminal
+                        .as_ref()
+                        .expect("terminal")
+                        .update(cx, |terminal, cx| {
+                            terminal.focus(window, cx);
+                        });
+                }
+                window.focused(cx).expect("new surface has focus")
+            });
+            root.update(cx, |root, cx| {
+                root.inspector_slide = None;
+                root.inspector_seam = 0.0;
+                cx.notify();
+            });
+            cx.run_until_parked();
+            root.update_in(cx, |_, window, cx| {
+                assert_eq!(
+                    window.focused(cx),
+                    Some(focused),
+                    "inspector unmount must preserve the newly focused {command:?}"
+                );
+            });
+        }
     }
 
     #[gpui::test]
