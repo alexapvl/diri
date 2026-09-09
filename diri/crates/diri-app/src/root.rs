@@ -246,6 +246,11 @@ pub struct RootView {
     /// owns its own visibility; the inspector's lives here because RootView is
     /// what owns that flag.
     inspector_toggled_at: Option<Instant>,
+    /// Closing the inspector unmounts its focus path once the seam hits zero.
+    /// Linux GPUI tests (and a click that outruns the slide) drop window focus
+    /// on that unmount, so workbench shortcuts have nowhere to land until the
+    /// next click. Re-arm RootView after the panel is actually gone.
+    inspector_unmount_refocus: bool,
     /// Debounces move/resize persistence while retaining the newest placement
     /// in memory immediately (the quit hook flushes that value synchronously).
     window_bounds_save: Option<Task<()>>,
@@ -983,6 +988,7 @@ impl RootView {
             inspector_slide: None,
             inspector_seam,
             inspector_toggled_at: None,
+            inspector_unmount_refocus: false,
             inspector_resize_origin: None,
             window_bounds_save: None,
             status_banner: None,
@@ -2249,6 +2255,7 @@ impl RootView {
         }
         self.inspector_toggled_at = Some(now);
         self.inspector_open = open;
+        self.inspector_unmount_refocus = !open;
         if let Some(inspector) = &self.inspector {
             inspector.update(cx, |inspector, cx| inspector.set_visible(open, cx));
         }
@@ -3300,6 +3307,10 @@ impl Render for RootView {
         self.sidebar_seam =
             advance_seam(&mut self.sidebar_slide, occupied_sidebar_width, now, window);
         self.inspector_seam = advance_seam(&mut self.inspector_slide, inspector_width, now, window);
+        if self.inspector_unmount_refocus && self.inspector_seam <= 0.0 {
+            self.inspector_unmount_refocus = false;
+            window.focus(&self.focus, cx);
+        }
         let seam = self.sidebar_seam;
         let inspector_seam = self.inspector_seam;
         #[cfg(target_os = "macos")]
@@ -4337,15 +4348,11 @@ mod tests {
         cx.simulate_click(close.center(), Modifiers::default());
         cx.run_until_parked();
         assert!(!root.read_with(cx, |root, _| root.inspector_open));
-        root.update_in(cx, |root, window, cx| {
+        root.update(cx, |root, cx| {
             root.inspector_slide = None;
             root.inspector_seam = 0.0;
-            // Closing the panel destroys its focus path. Linux GPUI tests do
-            // not always restore the workbench context before the next chord.
-            window.focus(&root.focus, cx);
             cx.notify();
         });
-        cx.executor().advance_clock(crate::seam::SEAM_SLIDE);
         cx.run_until_parked();
         cx.simulate_keystrokes(&commands::test_chords("cmd-shift-d"));
         cx.run_until_parked();
