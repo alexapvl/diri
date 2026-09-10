@@ -105,11 +105,11 @@ impl Pty {
                 if libc::ioctl(slave_fd, libc::TIOCSCTTY as _, 0) < 0 {
                     return Err(io::Error::last_os_error());
                 }
-
-                let maximum = libc::getdtablesize();
-                for fd in 3..maximum {
-                    libc::close(fd);
-                }
+                // stdin is already the slave; pin this session as the
+                // foreground group so a parent `TIOCGPGRP` is defined
+                // before exec. Ignore failure: TIOCSCTTY already set pgrp.
+                let _ = libc::tcsetpgrp(0, libc::getpid());
+                close_extra_fds();
                 Ok(())
             });
         }
@@ -132,7 +132,7 @@ impl Pty {
     /// before the call yields EBADF and looks like no job.
     #[must_use]
     pub fn foreground_pgid(&self) -> Option<i32> {
-        foreground_pgid(self.master.as_raw_fd())
+        foreground_pgid(self.master.as_raw_fd()).or_else(|| proc_tpgid(self.child.id()))
     }
 
     pub fn resize(&self, cols: u16, rows: u16) -> io::Result<()> {
@@ -224,10 +224,52 @@ fn exit_from(status: std::process::ExitStatus) -> Exit {
         .map_or_else(|| Exit::Code(status.code().unwrap_or(-1)), Exit::Signal)
 }
 
+fn close_extra_fds() {
+    // GitHub runners set NOFILE to ~1M. Closing that range one fd at a
+    // time delays exec by seconds and the foreground-job tests time out.
+    #[cfg(target_os = "linux")]
+    // SAFETY: called after fork in the child; fds 0-2 stay the slave.
+    unsafe {
+        libc::close_range(3, libc::c_uint::MAX, 0);
+    }
+    #[cfg(not(target_os = "linux"))]
+    unsafe {
+        // SAFETY: same child-side ownership; macOS NOFILE is small enough
+        // that walking the table is cheap.
+        let maximum = libc::getdtablesize();
+        for fd in 3..maximum {
+            libc::close(fd);
+        }
+    }
+}
+
 fn foreground_pgid(fd: RawFd) -> Option<i32> {
     // SAFETY: `tcgetpgrp` on an owned PTY master; a bad fd returns -1.
     let pgid = unsafe { libc::tcgetpgrp(fd) };
     (pgid > 0).then_some(pgid)
+}
+
+/// Linux parents often see `tcgetpgrp(master) == 0` even after the child
+/// claimed the slave. `/proc/<pid>/stat` tpgid is the child's view of the
+/// same tty and does not require the caller to own it.
+fn proc_tpgid(pid: u32) -> Option<i32> {
+    #[cfg(target_os = "linux")]
+    {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        return tpgid_from_stat(&stat);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn tpgid_from_stat(stat: &str) -> Option<i32> {
+    let after = stat.get(stat.rfind(')')? + 2..)?;
+    let tpgid: i32 = after.split_whitespace().nth(5)?.parse().ok()?;
+    (tpgid > 0).then_some(tpgid)
 }
 
 /// Independently clonable handle on the PTY master.
@@ -392,36 +434,60 @@ mod tests {
     }
 
     #[test]
+    fn tpgid_is_the_eighth_stat_field_after_a_spaced_comm() {
+        let stat = "42 (sleep 8) R 1 10 10 34816 99 0";
+        assert_eq!(tpgid_from_stat(stat), Some(99));
+        assert_eq!(tpgid_from_stat("42 (sleep 8) R 1"), None);
+        assert_eq!(tpgid_from_stat("no-paren 1 2 3 4 5 6"), None);
+    }
+
+    #[test]
     fn foreground_pgid_tracks_a_job_other_than_the_shell() {
         use std::time::{Duration, Instant};
 
-        let spec = PtySpec::new(vec!["/bin/zsh".into(), "-f".into(), "-i".into()], "/tmp")
-            .env("PATH", "/usr/bin:/bin")
-            .env("TERM", "xterm-256color")
-            .env("HOME", "/tmp")
-            .env("PS1", "> ");
+        // bash is on every CI image; zsh is not. Interactive + job control
+        // puts `sleep` in a process group other than the shell.
+        let spec = PtySpec::new(
+            vec![
+                "/bin/bash".into(),
+                "--norc".into(),
+                "--noprofile".into(),
+                "-i".into(),
+            ],
+            "/tmp",
+        )
+        .env("PATH", "/usr/bin:/bin")
+        .env("TERM", "xterm-256color")
+        .env("HOME", "/tmp")
+        .env("PS1", "$ ");
         let pty = Pty::spawn(&spec).expect("spawn shell");
         let child = pty.pid() as i32;
         let mut reader = pty.reader().expect("reader");
         reader.set_nonblocking(true).ok();
         let mut writer = pty.writer().expect("writer");
         let mut drain = [0u8; 4096];
-        let start = Instant::now();
-        while start.elapsed() < Duration::from_millis(400) {
+        let claimed = Instant::now() + Duration::from_secs(2);
+        let mut last = None;
+        while Instant::now() < claimed {
             let _ = reader.read(&mut drain);
+            last = pty.foreground_pgid();
+            if last == Some(child) {
+                break;
+            }
             std::thread::sleep(Duration::from_millis(20));
         }
+        assert_eq!(last, Some(child), "shell never claimed the tty");
         writer.write_all(b"sleep 8\n").expect("write sleep");
         writer.flush().expect("flush");
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
             let _ = reader.read(&mut drain);
-            let pgid = pty.foreground_pgid();
-            if pgid.is_some_and(|pgid| pgid > 0 && pgid != child) {
+            last = pty.foreground_pgid();
+            if last.is_some_and(|pgid| pgid > 0 && pgid != child) {
                 break;
             }
             if Instant::now() >= deadline {
-                panic!("sleep never became the foreground group; last={pgid:?} child={child}");
+                panic!("sleep never became the foreground group; last={last:?} child={child}");
             }
             std::thread::sleep(Duration::from_millis(20));
         }

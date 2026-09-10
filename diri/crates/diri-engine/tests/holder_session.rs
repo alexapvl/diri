@@ -425,11 +425,19 @@ fn a_held_shell_is_working_while_a_foreground_job_runs() {
     let holder = holder_config(&root);
     let spec = SessionSpec {
         id: "s_fgwork".into(),
-        pty: PtySpec::new(vec!["/bin/zsh".into(), "-f".into(), "-i".into()], "/tmp")
-            .env("PATH", "/usr/bin:/bin")
-            .env("TERM", "xterm-256color")
-            .env("HOME", "/tmp")
-            .env("PS1", "> "),
+        pty: PtySpec::new(
+            vec![
+                "/bin/bash".into(),
+                "--norc".into(),
+                "--noprofile".into(),
+                "-i".into(),
+            ],
+            "/tmp",
+        )
+        .env("PATH", "/usr/bin:/bin")
+        .env("TERM", "xterm-256color")
+        .env("HOME", "/tmp")
+        .env("PS1", "$ "),
         manifest_id: "shell".into(),
         authority: Authority::ProcessOnly,
         logs_dir: logs.to_path_buf(),
