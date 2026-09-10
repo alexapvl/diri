@@ -124,6 +124,17 @@ impl Pty {
         self.child.id()
     }
 
+    /// The process group currently in the foreground on this PTY, if any.
+    ///
+    /// Call this on the owner, not on the live read stream: `tcgetpgrp` on
+    /// the same fd the pump is reading can lose canonical-mode input. Do not
+    /// extract a raw fd from a temporary clone either; closing that clone
+    /// before the call yields EBADF and looks like no job.
+    #[must_use]
+    pub fn foreground_pgid(&self) -> Option<i32> {
+        foreground_pgid(self.master.as_raw_fd())
+    }
+
     pub fn resize(&self, cols: u16, rows: u16) -> io::Result<()> {
         if cols == 0 || rows == 0 {
             return Err(io::Error::new(
@@ -211,6 +222,12 @@ fn exit_from(status: std::process::ExitStatus) -> Exit {
     status
         .signal()
         .map_or_else(|| Exit::Code(status.code().unwrap_or(-1)), Exit::Signal)
+}
+
+fn foreground_pgid(fd: RawFd) -> Option<i32> {
+    // SAFETY: `tcgetpgrp` on an owned PTY master; a bad fd returns -1.
+    let pgid = unsafe { libc::tcgetpgrp(fd) };
+    (pgid > 0).then_some(pgid)
 }
 
 /// Independently clonable handle on the PTY master.
@@ -372,6 +389,42 @@ mod tests {
         reader.read_to_end(&mut output).expect("read output");
         assert_eq!(pty.wait().expect("wait"), Exit::Code(0));
         assert!(String::from_utf8_lossy(&output).contains("exact value:1"));
+    }
+
+    #[test]
+    fn foreground_pgid_tracks_a_job_other_than_the_shell() {
+        use std::time::{Duration, Instant};
+
+        let spec = PtySpec::new(vec!["/bin/zsh".into(), "-f".into(), "-i".into()], "/tmp")
+            .env("PATH", "/usr/bin:/bin")
+            .env("TERM", "xterm-256color")
+            .env("HOME", "/tmp")
+            .env("PS1", "> ");
+        let pty = Pty::spawn(&spec).expect("spawn shell");
+        let child = pty.pid() as i32;
+        let mut reader = pty.reader().expect("reader");
+        reader.set_nonblocking(true).ok();
+        let mut writer = pty.writer().expect("writer");
+        let mut drain = [0u8; 4096];
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_millis(400) {
+            let _ = reader.read(&mut drain);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        writer.write_all(b"sleep 8\n").expect("write sleep");
+        writer.flush().expect("flush");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let _ = reader.read(&mut drain);
+            let pgid = pty.foreground_pgid();
+            if pgid.is_some_and(|pgid| pgid > 0 && pgid != child) {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!("sleep never became the foreground group; last={pgid:?} child={child}");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     #[test]

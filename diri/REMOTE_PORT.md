@@ -558,7 +558,10 @@ declares terminal, session management, environment capture, directory listing,
 batched executable discovery, persistence probing, and atomic activation as
 required capabilities. Protocol 1.4 additively preserves granular mouse
 tracking/encoding bits and the raw mouse-input frame while retaining the old
-any-mouse compatibility bit.
+any-mouse compatibility bit. Protocol 1.5 additively reports the PTY foreground
+process group (`HelloAck.foregroundPid` and `ForegroundProcess`) so a shell can
+show work only while a foreground job is running. Older Helpers omit the
+field; older Engines ignore the extra JSON and never see the new frame.
 
 The protocol includes:
 
@@ -577,6 +580,7 @@ Resize
 Ping
 Pong
 ProcessExit
+ForegroundProcess
 Signal
 AcquireControl
 ControlGranted

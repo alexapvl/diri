@@ -207,6 +207,7 @@ fn message_kinds(messages: &[RemoteMessage]) -> String {
             RemoteMessage::ScrollbackRequest(_) => "ScrollbackRequest",
             RemoteMessage::ScrollbackResponse(_) => "ScrollbackResponse",
             RemoteMessage::Error(_) => "Error",
+            RemoteMessage::ForegroundProcess(_) => "ForegroundProcess",
         })
         .collect::<Vec<_>>()
         .join(",")
