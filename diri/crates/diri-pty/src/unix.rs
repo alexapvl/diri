@@ -228,9 +228,10 @@ fn close_extra_fds() {
     // GitHub runners set NOFILE to ~1M. Closing that range one fd at a
     // time delays exec by seconds and the foreground-job tests time out.
     #[cfg(target_os = "linux")]
-    // SAFETY: called after fork in the child; fds 0-2 stay the slave.
     unsafe {
-        libc::close_range(3, libc::c_uint::MAX, 0);
+        // SAFETY: after fork in the child; fds 0-2 stay the slave. musl has
+        // no close_range wrapper, so the syscall is used on gnu and musl.
+        libc::syscall(libc::SYS_close_range, 3, libc::c_uint::MAX, 0);
     }
     #[cfg(not(target_os = "linux"))]
     unsafe {
@@ -256,7 +257,7 @@ fn proc_tpgid(pid: u32) -> Option<i32> {
     #[cfg(target_os = "linux")]
     {
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-        return tpgid_from_stat(&stat);
+        tpgid_from_stat(&stat)
     }
     #[cfg(not(target_os = "linux"))]
     {
