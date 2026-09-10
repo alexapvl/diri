@@ -8,8 +8,8 @@ use std::{
 use diri_proto::paths::DirijorPaths;
 
 use super::{
-    cache::{self, UsageCacheFile, UsageFileEntry},
-    cursor::{CursorUsageEvent, event_aggregate, event_dedup_hash, event_hour},
+    cache::{self, CursorFetchWindow, UsageCacheFile, UsageFileEntry},
+    cursor::{CursorBatch, CursorUsageEvent, event_aggregate, event_dedup_hash, event_hour},
     dashboard,
     model::{ProviderUsage, UsageHourAgg, UsageSnapshot, UsageTotals},
     parser::{parse_claude, parse_codex, tail_hash},
@@ -162,24 +162,43 @@ impl<C: Clock> UsageStore<C> {
             .collect()
     }
 
-    pub(crate) fn cursor_fetch_start_ms(&self) -> i64 {
+    pub(crate) fn cursor_fetch_window(&self) -> CursorFetchWindow {
+        if let Some(pending) = self.ledger.cache.cursor.pending {
+            return pending;
+        }
         let now_ms = self.clock.read().unix_seconds.saturating_mul(1_000);
         let last = self.ledger.cache.cursor.last_event_ms;
-        if last > 0 {
+        let start_ms = if last > 0 {
             last.saturating_sub(super::cursor::cursor_overlap_ms())
                 .max(0)
         } else {
-            now_ms
-                .saturating_sub(RETENTION_DAYS.saturating_mul(86_400).saturating_mul(1_000))
-                .max(0)
+            now_ms.saturating_sub(RETENTION_DAYS * 86_400_000).max(0)
+        };
+        CursorFetchWindow {
+            start_ms,
+            end_ms: now_ms,
+            next_page: 1,
+            newest_event_ms: last,
         }
     }
 
-    pub(crate) fn ingest_cursor_events(&mut self, events: &[CursorUsageEvent]) -> ProviderUsage {
+    pub(crate) fn ingest_cursor_batch(&mut self, batch: CursorBatch) -> ProviderUsage {
         let reading = self.clock.read();
         let cutoff_hour = reading.unix_seconds / 3_600 - RETENTION_DAYS * 24;
-        let changed = ingest_cursor(&mut self.ledger.cache, events, cutoff_hour);
-        self.ledger.dirty |= changed;
+        let changed = ingest_cursor(&mut self.ledger.cache, &batch.events, cutoff_hour);
+        let cursor = &mut self.ledger.cache.cursor;
+        let pending = (!batch.complete).then_some(batch.window);
+        let last_event_ms = if batch.complete {
+            batch.window.newest_event_ms
+        } else {
+            cursor.last_event_ms
+        };
+        self.ledger.dirty |=
+            changed || cursor.pending != pending || cursor.last_event_ms != last_event_ms;
+        cursor.pending = pending;
+        cursor.last_event_ms = last_event_ms;
+        // Save aggregates and progress together. A failed write is retried by the
+        // normal ledger refresh; replay after a crash is deduplicated.
         if self.ledger.dirty && cache::save(&self.paths.cache_file, &self.ledger.cache).is_ok() {
             self.ledger.dirty = false;
         }
@@ -692,9 +711,6 @@ fn ingest_cursor(
         let tokens = event_aggregate(event);
         cache.cursor.hours.entry(hour).or_default().merge(tokens);
         dashboard::record_billed(&mut cache.cursor.details, &event.model, hour, tokens);
-        if event.timestamp_ms > cache.cursor.last_event_ms {
-            cache.cursor.last_event_ms = event.timestamp_ms;
-        }
         changed = true;
     }
     changed

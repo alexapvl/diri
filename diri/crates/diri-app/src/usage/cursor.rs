@@ -7,7 +7,6 @@
 use std::{
     path::{Path, PathBuf},
     process::Stdio,
-    sync::Arc,
     time::Duration,
 };
 
@@ -15,12 +14,7 @@ use serde_json::Value;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
-use super::{
-    UsageSnapshot,
-    model::UsageHourAgg,
-    parser::fnv1a,
-    store::{Clock, UsageStore},
-};
+use super::{cache::CursorFetchWindow, model::UsageHourAgg, parser::fnv1a};
 
 const DASHBOARD_URL: &str = "https://cursor.com/api/dashboard/get-filtered-usage-events";
 const OAUTH_TOKEN_URL: &str = "https://api2.cursor.sh/oauth/token";
@@ -175,26 +169,56 @@ struct CursorAuth {
     machine_id: Option<String>,
 }
 
-pub async fn merge_cursor_usage<C: Clock>(
-    store: &mut UsageStore<C>,
-    mut snapshot: UsageSnapshot,
-    home: &Path,
-) -> UsageSnapshot {
-    let Some(mut auth) = load_cursor_auth(home) else {
-        return snapshot;
-    };
-    let start_ms = store.cursor_fetch_start_ms();
-    match fetch_cursor_events(&mut auth, start_ms).await {
-        Ok(events) if !events.is_empty() => {
-            snapshot.cursor = store.ingest_cursor_events(&events);
-            let mut history = snapshot.history.as_ref().clone();
-            history.cursor = store.cursor_history();
-            snapshot.history = Arc::new(history);
+/// A bounded page batch; only a complete walk may advance the committed watermark.
+pub(crate) struct CursorBatch {
+    pub events: Vec<CursorUsageEvent>,
+    pub window: CursorFetchWindow,
+    pub complete: bool,
+}
+
+/// One independent fetch at a time. Transcript updates never wait on this task.
+#[derive(Default)]
+pub(crate) struct CursorRefresh {
+    task: Option<tokio::task::JoinHandle<Result<CursorBatch, ()>>>,
+}
+
+impl CursorRefresh {
+    pub(crate) fn start(&mut self, home: &Path, window: CursorFetchWindow) {
+        if self.task.is_some() {
+            return;
         }
-        Ok(_) => {}
-        Err(_) => {}
+        let home = home.to_owned();
+        self.task = Some(tokio::spawn(async move {
+            // SQLite and Keychain access must not block a Tokio worker.
+            let mut auth = tokio::task::spawn_blocking(move || load_cursor_auth(&home))
+                .await
+                .map_err(|_| ())?
+                .ok_or(())?;
+            fetch_cursor_events(&CurlHttp, &mut auth, window).await
+        }));
     }
-    snapshot
+
+    pub(crate) async fn next(&mut self) -> Result<CursorBatch, ()> {
+        let Some(task) = self.task.as_mut() else {
+            return std::future::pending().await;
+        };
+        let result = task.await.map_err(|_| ()).and_then(|result| result);
+        self.task = None;
+        result
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_task(task: tokio::task::JoinHandle<Result<CursorBatch, ()>>) -> Self {
+        Self { task: Some(task) }
+    }
+}
+
+impl Drop for CursorRefresh {
+    fn drop(&mut self) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
 }
 
 fn load_cursor_auth(home: &Path) -> Option<CursorAuth> {
@@ -317,51 +341,66 @@ fn keychain_password(service: &str) -> Option<String> {
 }
 
 async fn fetch_cursor_events(
+    http: &impl CursorHttp,
     auth: &mut CursorAuth,
-    start_ms: i64,
-) -> Result<Vec<CursorUsageEvent>, ()> {
+    mut window: CursorFetchWindow,
+) -> Result<CursorBatch, ()> {
     let mut events = Vec::new();
-    for page in 1..=MAX_PAGES {
+    let mut complete = false;
+    for _ in 0..MAX_PAGES {
         let body = serde_json::json!({
-            "page": page,
+            "page": window.next_page,
             "pageSize": PAGE_SIZE,
-            "startDate": start_ms.max(0),
+            "startDate": window.start_ms.max(0),
+            "endDate": window.end_ms,
         });
-        let (status, payload) = dashboard_post(auth, &body).await?;
+        let (mut status, mut payload) = dashboard_post(http, auth, &body).await?;
         if status == 401 || status == 403 {
-            refresh_session(auth).await?;
-            let (status, payload) = dashboard_post(auth, &body).await?;
-            if status != 200 {
-                return Err(());
-            }
-            let has_next = payload
-                .pointer("/pagination/hasNextPage")
-                .and_then(Value::as_bool);
-            let page_events = events_from_dashboard_body(&payload);
-            let count = page_events.len();
-            events.extend(page_events);
-            if has_next == Some(false) || (has_next != Some(true) && count < PAGE_SIZE as usize) {
-                break;
-            }
-            continue;
+            refresh_session(http, auth).await?;
+            (status, payload) = dashboard_post(http, auth, &body).await?;
         }
         if status != 200 {
             return Err(());
         }
+        // Invalid responses must not masquerade as the end of a successful walk.
+        let raw_events = payload
+            .get("usageEvents")
+            .or_else(|| payload.get("usageEventsDisplay"))
+            .and_then(Value::as_array)
+            .ok_or(())?;
+        let count = raw_events.len();
+        let page_events = events_from_dashboard_body(&payload);
+        if page_events.len() != count {
+            return Err(());
+        }
+        for event in &page_events {
+            window.newest_event_ms = window.newest_event_ms.max(event.timestamp_ms);
+        }
+        events.extend(page_events);
         let has_next = payload
             .pointer("/pagination/hasNextPage")
             .and_then(Value::as_bool);
-        let page_events = events_from_dashboard_body(&payload);
-        let count = page_events.len();
-        events.extend(page_events);
+        window.next_page = window.next_page.checked_add(1).ok_or(())?;
         if has_next == Some(false) || (has_next != Some(true) && count < PAGE_SIZE as usize) {
+            complete = true;
             break;
         }
+        if count == 0 {
+            return Err(());
+        }
     }
-    Ok(events)
+    Ok(CursorBatch {
+        events,
+        window,
+        complete,
+    })
 }
 
-async fn dashboard_post(auth: &CursorAuth, body: &Value) -> Result<(u16, Value), ()> {
+async fn dashboard_post(
+    http: &impl CursorHttp,
+    auth: &CursorAuth,
+    body: &Value,
+) -> Result<(u16, Value), ()> {
     let mut headers = vec![
         ("Content-Type".into(), "application/json".into()),
         (
@@ -373,17 +412,23 @@ async fn dashboard_post(auth: &CursorAuth, body: &Value) -> Result<(u16, Value),
     if let Some(machine_id) = &auth.machine_id {
         headers.push(("x-cursor-client-id".into(), machine_id.clone()));
     }
-    http_json("POST", DASHBOARD_URL, &headers, Some(body)).await
+    http.post(DASHBOARD_URL, &headers, body).await
 }
 
-async fn refresh_session(auth: &mut CursorAuth) -> Result<(), ()> {
+async fn refresh_session(http: &impl CursorHttp, auth: &mut CursorAuth) -> Result<(), ()> {
     let refresh = auth.refresh_token.as_deref().ok_or(())?;
     let body = serde_json::json!({
         "grant_type": "refresh_token",
         "client_id": OAUTH_CLIENT_ID,
         "refresh_token": refresh,
     });
-    let (status, payload) = http_json("POST", OAUTH_TOKEN_URL, &[], Some(&body)).await?;
+    let (status, payload) = http
+        .post(
+            OAUTH_TOKEN_URL,
+            &[("Content-Type".into(), "application/json".into())],
+            &body,
+        )
+        .await?;
     if status != 200 || payload.get("shouldLogout").and_then(Value::as_bool) == Some(true) {
         return Err(());
     }
@@ -395,6 +440,28 @@ async fn refresh_session(auth: &mut CursorAuth) -> Result<(), ()> {
         .ok_or(())?;
     auth.session_token = workos_session_token(access).ok_or(())?;
     Ok(())
+}
+
+trait CursorHttp {
+    async fn post(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+        body: &Value,
+    ) -> Result<(u16, Value), ()>;
+}
+
+struct CurlHttp;
+
+impl CursorHttp for CurlHttp {
+    async fn post(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+        body: &Value,
+    ) -> Result<(u16, Value), ()> {
+        http_json("POST", url, headers, Some(body)).await
+    }
 }
 
 async fn http_json(
@@ -579,5 +646,187 @@ mod tests {
         }));
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].model, "composer-1");
+    }
+    struct RefreshHttp;
+
+    impl CursorHttp for RefreshHttp {
+        async fn post(
+            &self,
+            url: &str,
+            headers: &[(String, String)],
+            body: &Value,
+        ) -> Result<(u16, Value), ()> {
+            assert_eq!(url, OAUTH_TOKEN_URL);
+            assert!(
+                headers
+                    .iter()
+                    .any(|(name, value)| name == "Content-Type" && value == "application/json"),
+                "JSON refresh requests must declare their content type"
+            );
+            assert_eq!(body["grant_type"], "refresh_token");
+            Ok((200, json!({"access_token": "user::refreshed"})))
+        }
+    }
+
+    #[tokio::test]
+    async fn cursor_regression_refresh_declares_json() {
+        let mut auth = CursorAuth {
+            session_token: "user::expired".into(),
+            refresh_token: Some("fixture-refresh".into()),
+            machine_id: None,
+        };
+        refresh_session(&RefreshHttp, &mut auth).await.unwrap();
+        assert_eq!(auth.session_token, "user::refreshed");
+    }
+
+    struct PagesHttp;
+
+    impl CursorHttp for PagesHttp {
+        async fn post(
+            &self,
+            url: &str,
+            _: &[(String, String)],
+            body: &Value,
+        ) -> Result<(u16, Value), ()> {
+            assert_eq!(url, DASHBOARD_URL);
+            let page = body["page"].as_u64().unwrap();
+            let events: Vec<_> = ((page - 1) * 100..(page * 100).min(1001))
+                .map(|index| {
+                    json!({
+                        "id": format!("event-{index}"),
+                        "timestamp": 1_784_717_999_000_i64 - index as i64 * 60_000,
+                        "totalCents": 100,
+                    })
+                })
+                .collect();
+            Ok((
+                200,
+                json!({
+                    "usageEvents": events,
+                    "pagination": {"hasNextPage": page < 11},
+                }),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn cursor_regression_fetch_keeps_older_pages() {
+        let mut auth = CursorAuth {
+            session_token: "user::fixture".into(),
+            refresh_token: None,
+            machine_id: None,
+        };
+        let window = CursorFetchWindow {
+            start_ms: 0,
+            end_ms: 1_784_718_000_000,
+            next_page: 1,
+            newest_event_ms: 0,
+        };
+        let first = fetch_cursor_events(&PagesHttp, &mut auth, window)
+            .await
+            .unwrap();
+        assert!(!first.complete);
+        assert_eq!(first.window.next_page, 11);
+        assert_eq!(first.window.start_ms, window.start_ms);
+        assert_eq!(first.window.end_ms, window.end_ms);
+        let second = fetch_cursor_events(&PagesHttp, &mut auth, first.window)
+            .await
+            .unwrap();
+        assert!(second.complete);
+        assert_eq!(
+            first.events.len() + second.events.len(),
+            1001,
+            "older usage must remain reachable after the page cap"
+        );
+    }
+    struct ScriptHttp {
+        responses: std::cell::RefCell<std::collections::VecDeque<Result<(u16, Value), ()>>>,
+        requests: std::cell::RefCell<Vec<(String, Value)>>,
+    }
+
+    impl CursorHttp for ScriptHttp {
+        async fn post(
+            &self,
+            url: &str,
+            headers: &[(String, String)],
+            body: &Value,
+        ) -> Result<(u16, Value), ()> {
+            assert!(
+                headers
+                    .iter()
+                    .any(|(name, value)| name == "Content-Type" && value == "application/json")
+            );
+            self.requests.borrow_mut().push((url.into(), body.clone()));
+            self.responses
+                .borrow_mut()
+                .pop_front()
+                .expect("unexpected extra request")
+        }
+    }
+
+    #[tokio::test]
+    async fn cursor_regression_expired_auth_retries_the_same_page() {
+        let http = ScriptHttp {
+            responses: std::cell::RefCell::new(
+                [
+                    Ok((401, Value::Null)),
+                    Ok((200, json!({"access_token": "user::refreshed"}))),
+                    Ok((
+                        200,
+                        json!({"usageEvents": [], "pagination": {"hasNextPage": false}}),
+                    )),
+                ]
+                .into(),
+            ),
+            requests: Default::default(),
+        };
+        let mut auth = CursorAuth {
+            session_token: "user::expired".into(),
+            refresh_token: Some("fixture".into()),
+            machine_id: None,
+        };
+        let window = CursorFetchWindow {
+            start_ms: 1000,
+            end_ms: 2000,
+            next_page: 11,
+            newest_event_ms: 1500,
+        };
+        let batch = fetch_cursor_events(&http, &mut auth, window).await.unwrap();
+        assert!(batch.complete);
+        let requests = http.requests.borrow();
+        assert_eq!(requests[0], requests[2]);
+        assert_eq!(requests[1].0, OAUTH_TOKEN_URL);
+        assert_eq!(auth.session_token, "user::refreshed");
+    }
+
+    #[tokio::test]
+    async fn cursor_regression_failed_pages_do_not_complete_a_walk() {
+        for response in [
+            Err(()),
+            Ok((500, Value::Null)),
+            Ok((200, Value::Null)),
+            Ok((200, json!({"usageEvents": [{"timestamp": "invalid"}]}))),
+        ] {
+            let http = ScriptHttp {
+                responses: std::cell::RefCell::new([
+                    Ok((200, json!({"usageEvents": [{"timestamp": 1500}], "pagination": {"hasNextPage": true}}))),
+                    response,
+                ].into()),
+                requests: Default::default(),
+            };
+            let mut auth = CursorAuth {
+                session_token: "user::fixture".into(),
+                refresh_token: None,
+                machine_id: None,
+            };
+            let window = CursorFetchWindow {
+                start_ms: 1000,
+                end_ms: 2000,
+                next_page: 11,
+                newest_event_ms: 1500,
+            };
+            assert!(fetch_cursor_events(&http, &mut auth, window).await.is_err());
+            assert_eq!(http.requests.borrow().len(), 2);
+        }
     }
 }

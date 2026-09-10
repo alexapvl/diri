@@ -50,10 +50,21 @@ pub(crate) struct UsageCacheFile {
     pub cursor: CursorLedger,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+pub(crate) struct CursorFetchWindow {
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub next_page: u32,
+    pub newest_event_ms: i64,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub(crate) struct CursorLedger {
     #[serde(default)]
     pub last_event_ms: i64,
+    /// An unfinished newest-first walk. Its time bounds stay fixed across retries.
+    #[serde(default)]
+    pub pending: Option<CursorFetchWindow>,
     #[serde(default)]
     pub hours: BTreeMap<i64, UsageHourAgg>,
     #[serde(default)]

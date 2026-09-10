@@ -17,7 +17,7 @@ mod store;
 mod timestamp;
 mod watcher;
 
-pub(crate) use cursor::merge_cursor_usage;
+pub(crate) use cursor::{CursorBatch, CursorRefresh};
 pub(crate) use fleet::merge_fleet_usage;
 pub use model::{ProviderUsage, UsageHourAgg, UsageSnapshot, UsageTotals};
 pub use pricing::PRICING_ENTRY_COUNT;
