@@ -12,6 +12,7 @@ use gpui::{
     point, px, relative, size,
 };
 
+use crate::blocks::BlockGlyph;
 use crate::buffer::{ApplySummary, ChangedRenderRow, GridBuffer};
 use crate::find::{
     FindSnapshot, FindSpan, NavigationTarget, SearchJob, SearchRequest, SearchResult,
@@ -350,6 +351,7 @@ struct CursorPaint {
     col: u16,
     quad: PaintQuad,
     glyph: Option<ShapedLine>,
+    block: Option<BlockGlyph>,
 }
 
 impl TerminalElement {
@@ -652,7 +654,6 @@ impl TerminalElement {
     }
 
     /// The web URL whose text spans the given window cell, if any.
-    /// Wrapped multi-row URLs are out of scope: the scan is per logical row.
     #[must_use]
     pub fn link_at(&self, col: usize, window_row: usize) -> Option<String> {
         match self.reference_at(col, window_row) {
@@ -665,7 +666,8 @@ impl TerminalElement {
     ///
     /// The full whitespace-delimited row run is inspected, so clicking a line
     /// number or punctuation wrapper resolves the same reference as clicking
-    /// the path itself. Multi-row references are deliberately out of scope.
+    /// the path itself. URLs can continue across terminal rows or within an
+    /// indented/table column; file references remain confined to one row.
     #[must_use]
     pub fn reference_at(&self, col: usize, window_row: usize) -> Option<TerminalReference> {
         let viewport = mutex_lock(&self.shared.viewport);
@@ -676,7 +678,6 @@ impl TerminalElement {
             .iter()
             .map(|cell| crate::selection::cell_char(*cell))
             .collect();
-        drop(buffer);
         if col >= chars.len() {
             return None;
         }
@@ -684,6 +685,12 @@ impl TerminalElement {
         if !is_reference_char(chars[col]) {
             return None;
         }
+        if let Some(url) = wrapped_url_at(col, absolute_row, |row| {
+            viewport.row_at_absolute(&buffer, row)
+        }) {
+            return Some(TerminalReference::Url(url));
+        }
+        drop(buffer);
         let mut start = col;
         while start > 0 && is_reference_char(chars[start - 1]) {
             start -= 1;
@@ -1176,6 +1183,12 @@ impl Element for TerminalElement {
                     self.theme.cursor,
                 ),
                 glyph: self.shape_cursor_glyph(cell, metrics, window),
+                block: self
+                    .theme
+                    .resolve_cell(cell)
+                    .visible
+                    .then(|| BlockGlyph::from_scalar(cell.scalar))
+                    .flatten(),
             })
         } else {
             None
@@ -1330,6 +1343,16 @@ impl Element for TerminalElement {
 
             if let Some(cursor) = prepaint.cursor.take() {
                 window.paint_quad(cursor.quad);
+                if let Some(block) = cursor.block {
+                    for rect in block.rectangles(
+                        bounds.origin,
+                        metrics,
+                        usize::from(cursor.col),
+                        cursor.row,
+                    ) {
+                        window.paint_quad(fill(rect, self.theme.cursor_text));
+                    }
+                }
                 if let Some(glyph) = cursor.glyph {
                     let origin = point(
                         bounds.left() + metrics.x_for_col(cursor.col),
@@ -1425,11 +1448,26 @@ fn append_row_quads(
             && !cell
                 .style
                 .contains(diri_proto::grid::TermStyle::CROSSED_OUT)
+            && BlockGlyph::from_scalar(cell.scalar).is_none()
     });
     if is_plain {
         return;
     }
     append_background_quads(row, row_index, origin, metrics, theme, background_quads);
+    // Keep blocks in the foreground layer, above selection/search backgrounds
+    // and below the cursor. The same path serves cached live rows and history.
+    for (col, cell) in row.iter().enumerate() {
+        if let Some(block) = BlockGlyph::from_scalar(cell.scalar) {
+            let style = theme.resolve_cell(*cell);
+            if style.visible {
+                decoration_quads.extend(
+                    block
+                        .rectangles(origin, metrics, col, row_index)
+                        .map(|bounds| fill(bounds, style.foreground)),
+                );
+            }
+        }
+    }
     append_decoration_quads(row, row_index, origin, metrics, theme, decoration_quads);
 }
 
@@ -1571,7 +1609,7 @@ fn styled_font(base: &Font, style: ResolvedCellStyle) -> Font {
 }
 
 fn render_char(cell: GridCell, visible: bool) -> char {
-    if !visible || cell.scalar == 0 {
+    if !visible || cell.scalar == 0 || BlockGlyph::from_scalar(cell.scalar).is_some() {
         return ' ';
     }
     char::from_u32(cell.scalar)
@@ -1590,6 +1628,127 @@ fn url_from_run(run: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Grid cells do not carry soft-wrap or OSC 8 targets. Reconstruct visible URLs
+/// conservatively: bare links continue only at the terminal's right edge;
+/// prose/table links need an opening wrapper and its matching closing wrapper.
+/// Read through the viewport so cached history and held reading views agree
+/// with what the user actually clicked. Both lookbehind and URL size are bounded.
+fn wrapped_url_at(
+    col: usize,
+    clicked_row: i64,
+    row_at: impl Fn(i64) -> Vec<GridCell>,
+) -> Option<String> {
+    const MAX_ROWS: usize = 16;
+    const MAX_URL_BYTES: usize = 4096;
+    let read_row = |row| {
+        row_at(row)
+            .into_iter()
+            .map(crate::selection::cell_char)
+            .collect::<Vec<_>>()
+    };
+    for behind in 0..MAX_ROWS {
+        let start_row = clicked_row.checked_sub(behind as i64)?;
+        let chars = read_row(start_row);
+        let mut start = 0;
+        while start < chars.len() {
+            if chars[start].is_whitespace() {
+                start += 1;
+                continue;
+            }
+            let end = reference_run_end(&chars, start);
+            let mut candidate: String = chars[start..end].iter().collect();
+            let closer = match chars[start] {
+                '(' => Some(')'),
+                '[' => Some(']'),
+                '{' => Some('}'),
+                '<' => Some('>'),
+                '\'' => Some('\''),
+                '"' => Some('"'),
+                _ => None,
+            };
+            let already_closed = closer.is_some_and(|close| candidate[1..].contains(close));
+            if url_from_run(&candidate).is_some()
+                && !already_closed
+                && (closer.is_some() || end == chars.len())
+                && candidate.len() <= MAX_URL_BYTES
+            {
+                // A double-space gutter (or a drawn table border) separates
+                // columns. Single spaces belong to the label before the URL.
+                let mut lane_start = (0..start)
+                    .rev()
+                    .find(|&i| {
+                        matches!(chars[i], '|' | '│')
+                            || (chars[i].is_whitespace()
+                                && (i == 0 || chars[i - 1].is_whitespace()))
+                    })
+                    .map_or(0, |i| i + 1);
+                while lane_start < start && chars[lane_start].is_whitespace() {
+                    lane_start += 1;
+                }
+                let mut hit = behind == 0 && (start..end).contains(&col);
+                let mut at_edge = end == chars.len();
+                for ahead in 1..MAX_ROWS {
+                    let row_number = start_row.checked_add(ahead as i64)?;
+                    let next = read_row(row_number);
+                    let mut next_start = if at_edge { 0 } else { lane_start };
+                    if closer.is_some() {
+                        while next_start < next.len() && next[next_start].is_whitespace() {
+                            next_start += 1;
+                        }
+                    }
+                    if next_start >= next.len() || next[next_start].is_whitespace() {
+                        if closer.is_none() && ahead > 1 && hit {
+                            return url_from_run(&candidate);
+                        }
+                        break;
+                    }
+                    // Do not jump to another table column across an empty cell.
+                    if !at_edge && next_start != lane_start {
+                        break;
+                    }
+                    let next_end = reference_run_end(&next, next_start);
+                    let fragment: String = next[next_start..next_end].iter().collect();
+                    if url_from_run(&fragment).is_some() || fragment.contains(['|', '│', '─', '━'])
+                    {
+                        if closer.is_none() && ahead > 1 && hit {
+                            return url_from_run(&candidate);
+                        }
+                        break;
+                    }
+                    if candidate.len() + fragment.len() > MAX_URL_BYTES {
+                        break;
+                    }
+                    candidate.push_str(&fragment);
+                    hit |= row_number == clicked_row && (next_start..next_end).contains(&col);
+                    at_edge = next_end == next.len();
+                    let complete = closer.map_or(!at_edge, |close| fragment.contains(close));
+                    if complete {
+                        if hit {
+                            return url_from_run(&candidate);
+                        }
+                        break;
+                    }
+                    if !at_edge
+                        && (closer.is_none()
+                            || next.get(next_end + 1).is_some_and(|ch| !ch.is_whitespace()))
+                    {
+                        break;
+                    }
+                }
+            }
+            start = end;
+        }
+    }
+    None
+}
+
+fn reference_run_end(chars: &[char], start: usize) -> usize {
+    chars[start..]
+        .iter()
+        .position(|ch| ch.is_whitespace())
+        .map_or(chars.len(), |length| start + length)
 }
 
 fn trim_reference_run(run: &str) -> &str {
@@ -1706,6 +1865,101 @@ fn write_lock<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
 }
 
 #[cfg(test)]
+mod block_tests {
+    use super::*;
+    use diri_proto::grid::{TermColor, TermStyle};
+
+    #[test]
+    fn anara_blocks_fill_their_cell_and_keep_adjacent_text_in_place() {
+        let metrics =
+            CellMetrics::from_measurements(px(8.5), px(12.0), px(5.0), px(0.0), FontId(0));
+        for (ch, top, height) in [('█', 0.0, 17.0), ('▀', 0.0, 8.5), ('▄', 8.5, 8.5)] {
+            let cell = GridCell::new(
+                ch as u32,
+                TermColor::Default,
+                TermColor::DefaultInverted,
+                TermStyle::empty(),
+            );
+            let mut backgrounds = Vec::new();
+            let mut foregrounds = Vec::new();
+            append_row_quads(
+                &[cell],
+                1,
+                point(px(2.0), px(3.0)),
+                metrics,
+                TermTheme::default(),
+                &mut backgrounds,
+                &mut foregrounds,
+            );
+            assert_eq!(
+                foregrounds.len(),
+                1,
+                "{ch} must use cell geometry, not font ink bounds"
+            );
+            assert_eq!(
+                foregrounds[0].bounds,
+                Bounds::new(point(px(2.0), px(20.0 + top)), size(px(8.5), px(height)))
+            );
+            let terminal = TerminalElement::with_buffer(GridBuffer::default());
+            let (text, _) = terminal.row_text_and_runs(&[
+                cell,
+                GridCell::new('A' as u32, cell.fg, cell.bg, cell.style),
+            ]);
+            assert_eq!(
+                text, " A",
+                "the block must reserve one text column without painting a second glyph"
+            );
+        }
+    }
+
+    #[test]
+    fn blocks_preserve_terminal_colors_styles_and_source_text() {
+        let metrics =
+            CellMetrics::from_measurements(px(8.0), px(12.0), px(4.0), px(0.0), FontId(0));
+        for theme in [TermTheme::DIRIJOR_DARK, TermTheme::DIRIJOR_LIGHT] {
+            for style in [
+                TermStyle::empty(),
+                TermStyle::DIM,
+                TermStyle::INVERSE,
+                TermStyle::BOLD | TermStyle::ITALIC,
+                TermStyle::INVISIBLE,
+            ] {
+                let cell = GridCell::new(
+                    '█' as u32,
+                    TermColor::Rgb(120, 150, 180),
+                    TermColor::Rgb(20, 30, 40),
+                    style,
+                );
+                let mut backgrounds = Vec::new();
+                let mut foregrounds = Vec::new();
+                append_row_quads(
+                    &[cell],
+                    0,
+                    Point::default(),
+                    metrics,
+                    theme,
+                    &mut backgrounds,
+                    &mut foregrounds,
+                );
+                assert_eq!(backgrounds.len(), 1);
+                if style.contains(TermStyle::INVISIBLE) {
+                    assert!(foregrounds.is_empty());
+                } else {
+                    assert_eq!(foregrounds.len(), 1);
+                    assert_eq!(
+                        foregrounds[0].background,
+                        fill(foregrounds[0].bounds, theme.resolve_cell(cell).foreground).background
+                    );
+                }
+                let mut buffer = GridBuffer::new(1, 1);
+                buffer.cells[0] = cell;
+                assert_eq!(buffer.row_text_with_columns(0).unwrap().0, "█");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod link_tests {
     use std::sync::{Arc, Mutex};
 
@@ -1715,6 +1969,164 @@ mod link_tests {
         TerminalImeState, TerminalInputHandler, TerminalReference, file_reference_from_run,
         mutex_lock, reference_from_run, url_from_run,
     };
+
+    fn terminal_with_rows(rows: &[&str]) -> super::TerminalElement {
+        let cols = rows.iter().map(|row| row.chars().count()).max().unwrap();
+        let mut buffer = crate::buffer::GridBuffer::new(cols as u16, rows.len() as u16);
+        for (row, text) in rows.iter().enumerate() {
+            for (col, ch) in text.chars().enumerate() {
+                buffer.cells[row * cols + col].scalar = u32::from(ch);
+            }
+        }
+        super::TerminalElement::new(Arc::new(std::sync::RwLock::new(buffer)))
+    }
+
+    #[test]
+    fn wrapped_url_in_table_opens_full_pr_from_either_row() {
+        let terminal = terminal_with_rows(&[
+            "  #6396 — Safari banner (https://github.com/anaralabs/anara/   Updates the existing PR",
+            "  pull/6396)                                                 routing.",
+        ]);
+        for (row, start, end) in [(0, 24, 56), (1, 2, 12)] {
+            for col in start..end {
+                assert_eq!(
+                    terminal.link_at(col, row).as_deref(),
+                    Some("https://github.com/anaralabs/anara/pull/6396"),
+                    "click at row {row}, col {col}"
+                );
+            }
+        }
+        assert_eq!(terminal.link_at(60, 0), None);
+        assert_eq!(terminal.link_at(60, 1), None);
+        assert_eq!(terminal.link_at(1, 1), None);
+    }
+
+    #[test]
+    fn wrapped_url_spans_three_indented_rows_and_keeps_query_and_fragment() {
+        let terminal = terminal_with_rows(&[
+            "  See (https://github.com/anaralabs/",
+            "  anara/pull/6396?diff=split&",
+            "  view=1#discussion).",
+            "                                        ",
+        ]);
+        for (col, row) in [(8, 0), (4, 1), (5, 2)] {
+            assert_eq!(
+                terminal.link_at(col, row).as_deref(),
+                Some("https://github.com/anaralabs/anara/pull/6396?diff=split&view=1#discussion")
+            );
+        }
+    }
+
+    #[test]
+    fn wrapped_url_at_terminal_edge_works_from_each_fragment() {
+        let terminal =
+            terminal_with_rows(&["https://github.com/anaralabs/", "anara/pull/6396 next"]);
+        for (col, row) in [(12, 0), (5, 1)] {
+            assert_eq!(
+                terminal.link_at(col, row).as_deref(),
+                Some("https://github.com/anaralabs/anara/pull/6396")
+            );
+        }
+        assert_eq!(terminal.link_at(16, 1), None);
+    }
+
+    #[test]
+    fn wrapped_url_can_end_exactly_at_terminal_edge() {
+        let terminal = terminal_with_rows(&["https://example.com/", "12345678901234567890"]);
+        for row in 0..2 {
+            assert_eq!(
+                terminal.link_at(5, row).as_deref(),
+                Some("https://example.com/12345678901234567890")
+            );
+        }
+    }
+
+    #[test]
+    fn wrapped_url_in_second_table_column_stays_in_its_column() {
+        let terminal = terminal_with_rows(&[
+            "  PR  See (https://github.com/anaralabs/   Details",
+            "  42  anara/pull/6396)                   More",
+        ]);
+        assert_eq!(
+            terminal.link_at(7, 1).as_deref(),
+            Some("https://github.com/anaralabs/anara/pull/6396")
+        );
+        assert_eq!(terminal.link_at(2, 1), None);
+        assert_eq!(terminal.link_at(42, 1), None);
+        let bordered = terminal_with_rows(&[
+            "│ (https://github.com/anaralabs/ │ Details │",
+            "│ anara/pull/6396)              │ More    │",
+        ]);
+        assert_eq!(
+            bordered.link_at(3, 1).as_deref(),
+            Some("https://github.com/anaralabs/anara/pull/6396")
+        );
+    }
+
+    #[test]
+    fn wrapped_url_does_not_join_unrelated_rows_or_table_cells() {
+        for rows in [
+            vec![
+                "  (https://example.com)",
+                "  unrelated/path)",
+                "                              ",
+            ],
+            vec![
+                "  (https://example.com/",
+                "  ────────────────────",
+                "  pull/6396)",
+            ],
+            vec![
+                "  (https://example.com/   Text",
+                "                         unrelated/path)",
+            ],
+            vec![
+                "  (https://example.com/",
+                "  unrelated prose)",
+                "                              ",
+            ],
+            vec![
+                "  https://example.com/",
+                "  unrelated/path)",
+                "                              ",
+            ],
+            vec!["https://example.com/", "https://example.org/"],
+        ] {
+            let terminal = terminal_with_rows(&rows);
+            assert_eq!(
+                terminal.link_at(3, 0).as_deref(),
+                Some(
+                    rows[0]
+                        .split_whitespace()
+                        .next()
+                        .unwrap()
+                        .trim_matches(['(', ')'])
+                ),
+                "{rows:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn wrapped_url_resolves_across_cached_history_and_live_grid() {
+        let terminal = terminal_with_rows(&[
+            "  pull/6396)",
+            "                                                                ",
+        ]);
+        let history = terminal_with_rows(&["  PR (https://github.com/anaralabs/anara/"]);
+        let cells = super::read_lock(&history.buffer).cells.clone();
+        {
+            let mut viewport = mutex_lock(&terminal.shared.viewport);
+            viewport.apply_rows(vec![cells], 0, 1, 3, 1, 2);
+            viewport.set_view_offset(1, 2);
+        }
+        for (col, row) in [(8, 0), (5, 1)] {
+            assert_eq!(
+                terminal.link_at(col, row).as_deref(),
+                Some("https://github.com/anaralabs/anara/pull/6396")
+            );
+        }
+    }
 
     #[test]
     fn terminal_renderer_never_creates_autonomous_frame_tasks() {
