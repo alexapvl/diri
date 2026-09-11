@@ -231,12 +231,14 @@ fn close_extra_fds() {
     unsafe {
         // SAFETY: after fork in the child; fds 0-2 stay the slave. musl has
         // no close_range wrapper, so the syscall is used on gnu and musl.
-        libc::syscall(libc::SYS_close_range, 3, libc::c_uint::MAX, 0);
+        if libc::syscall(libc::SYS_close_range, 3, libc::c_uint::MAX, 0) == 0 {
+            return;
+        }
     }
-    #[cfg(not(target_os = "linux"))]
     unsafe {
-        // SAFETY: same child-side ownership; macOS NOFILE is small enough
-        // that walking the table is cheap.
+        // SAFETY: same child-side ownership. Linux before close_range (or a
+        // seccomp policy denying it) still needs every inherited fd closed.
+        // macOS uses this path directly.
         let maximum = libc::getdtablesize();
         for fd in 3..maximum {
             libc::close(fd);
@@ -410,6 +412,112 @@ fn platform_exit_watcher(pid: u32) -> io::Result<OwnedFd> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pty_child_does_not_inherit_extra_descriptors() {
+        #[cfg(target_os = "linux")]
+        if let Ok(error) = std::env::var("DIRI_TEST_CLOSE_RANGE_ERRNO") {
+            block_close_range(error.parse().expect("errno"));
+        }
+
+        let file = File::open("/dev/null").expect("open sentinel");
+        // Deliberately inherit an fd without CLOEXEC, well above the stdio
+        // and shell startup descriptors, without replacing an existing fd.
+        // SAFETY: file is live; F_DUPFD returns a fresh descriptor on success.
+        let fd = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD, 200) };
+        assert!(fd >= 200);
+        // SAFETY: fcntl returned a new descriptor owned by this test.
+        let sentinel = unsafe { OwnedFd::from_raw_fd(fd) };
+        let spec = PtySpec::new(
+            vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "if [ -e \"/dev/fd/$1\" ]; then exit 42; fi; printf clean".into(),
+                "fd-test".into(),
+                sentinel.as_raw_fd().to_string(),
+            ],
+            "/",
+        );
+        let mut pty = Pty::spawn(&spec).expect("spawn");
+        let mut output = Vec::new();
+        pty.reader()
+            .expect("reader")
+            .read_to_end(&mut output)
+            .expect("output");
+        assert_eq!(
+            pty.wait().expect("wait"),
+            Exit::Code(0),
+            "inherited sentinel fd"
+        );
+        assert_eq!(output, b"clean");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pty_closes_descriptors_when_close_range_is_unavailable_or_denied() {
+        for error in [libc::ENOSYS, libc::EPERM] {
+            let output = Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "unix::tests::pty_child_does_not_inherit_extra_descriptors",
+                    "--nocapture",
+                ])
+                .env("DIRI_TEST_CLOSE_RANGE_ERRNO", error.to_string())
+                .output()
+                .expect("run isolated seccomp test");
+            assert!(
+                output.status.success(),
+                "close_range errno {error}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn block_close_range(error: u32) {
+        // Only this disposable test process and its children receive the
+        // filter. No privileges or host configuration are required.
+        let mut instructions = [
+            libc::sock_filter {
+                code: (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
+                jt: 0,
+                jf: 0,
+                k: 0,
+            },
+            libc::sock_filter {
+                code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+                jt: 0,
+                jf: 1,
+                k: libc::SYS_close_range as u32,
+            },
+            libc::sock_filter {
+                code: (libc::BPF_RET | libc::BPF_K) as u16,
+                jt: 0,
+                jf: 0,
+                k: libc::SECCOMP_RET_ERRNO | error,
+            },
+            libc::sock_filter {
+                code: (libc::BPF_RET | libc::BPF_K) as u16,
+                jt: 0,
+                jf: 0,
+                k: libc::SECCOMP_RET_ALLOW,
+            },
+        ];
+        let filter = libc::sock_fprog {
+            len: instructions.len() as u16,
+            filter: instructions.as_mut_ptr(),
+        };
+        // SAFETY: no_new_privs only restricts this process; the filter points
+        // to initialized BPF instructions for the duration of prctl.
+        unsafe {
+            assert_eq!(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), 0);
+            assert_eq!(
+                libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &filter),
+                0
+            );
+        }
+    }
 
     #[test]
     fn structured_argv_environment_and_size_reach_the_child() {

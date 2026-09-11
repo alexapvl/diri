@@ -559,9 +559,13 @@ batched executable discovery, persistence probing, and atomic activation as
 required capabilities. Protocol 1.4 additively preserves granular mouse
 tracking/encoding bits and the raw mouse-input frame while retaining the old
 any-mouse compatibility bit. Protocol 1.5 additively reports the PTY foreground
-process group (`HelloAck.foregroundPid` and `ForegroundProcess`) so a shell can
-show work only while a foreground job is running. Older Helpers omit the
-field; older Engines ignore the extra JSON and never see the new frame.
+process group (`HelloAck.foregroundPid` and `ForegroundProcess`) so the Engine
+can distinguish an idle shell from a foreground job. Plain-shell sidebar
+indicators remain hidden; foreground Agent indicators follow normal attention
+rules. Older Helpers omit the field; older Engines ignore the extra JSON and
+never see the new frame. Foreground probes are armed only for an attached
+compatible controller and are cleared when it disconnects, so a detached
+Holder sleeps between PTY, lifecycle, and attach events.
 
 The protocol includes:
 

@@ -1081,6 +1081,9 @@ impl Holder {
             .as_ref()
             .is_none_or(|connection| connection.epoch.is_none())
         {
+            // No controller consumes these samples. An expired deadline must
+            // not keep poll(0) spinning after EOF, release, or a failed write.
+            self.foreground_probe_deadline = None;
             return Ok(());
         }
         let pid = self.pty.foreground_pgid();
