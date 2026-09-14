@@ -1,14 +1,14 @@
 //! One contextual home for session links. Status is always attached by URL.
 use super::*;
-use crate::palette_chrome::{PaletteTooltip, keycap, scroll_fades};
+use crate::palette_chrome::{PaletteTooltip, scroll_fades};
 use diri_proto::{ArtifactKind, PrCheck, PullRequestStatus, SessionArtifact};
 use diri_ui::{Icon, IconName};
 use gpui::{
-    Anchor, Animation, AnimationExt, ClickEvent, Pixels, Point, ScrollStrategy,
-    UniformListScrollHandle, anchored, canvas, deferred, ease_out_quint, point, uniform_list,
+    Anchor, Animation, AnimationExt, ClickEvent, FontWeight, Pixels, Point, ScrollStrategy,
+    UniformListScrollHandle, anchored, canvas, deferred, ease_out_quint, point, rgba, uniform_list,
 };
 use std::{cell::Cell, rc::Rc};
-const ROW_HEIGHT: f32 = 48.0;
+const ROW_HEIGHT: f32 = 44.0;
 pub(super) struct SessionLinks {
     open: bool,
     pull_request: Option<String>,
@@ -49,6 +49,7 @@ struct LinkRow {
     icon: IconName,
     status: Option<(String, gpui::Rgba)>,
     action: LinkAction,
+    details: Option<String>,
 }
 fn pr_state(pr: &PullRequestStatus) -> &'static str {
     match pr.state.as_str() {
@@ -58,6 +59,23 @@ fn pr_state(pr: &PullRequestStatus) -> &'static str {
         _ => "Open",
     }
 }
+fn pr_summary(pr: &PullRequestStatus) -> (String, gpui::Rgba) {
+    match pr.state.as_str() {
+        "MERGED" => ("Merged".into(), rgba(0xaf7cf7ff)),
+        "CLOSED" => ("Closed".into(), Ink::DANGER),
+        _ => check_summary(pr).unwrap_or_else(|| {
+            (
+                pr_state(pr).into(),
+                if pr.is_draft {
+                    Ink::GENERIC_WORKING
+                } else {
+                    Ink::FRESH
+                },
+            )
+        }),
+    }
+}
+
 fn check_summary(pr: &PullRequestStatus) -> Option<(String, gpui::Rgba)> {
     if pr.checks_failed > 0 {
         Some((
@@ -131,19 +149,15 @@ fn pr_row(pr: &PullRequestStatus) -> LinkRow {
             .clone()
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| format!("Pull request #{}", pr.number)),
-        subtitle: format!(
-            "#{} · {} · {}",
-            pr.number,
-            pr_state(pr),
-            repository_name(&pr.url)
-        ),
+        subtitle: format!("#{} · {}", pr.number, repository_name(&pr.url)),
         icon: if pr.state == "MERGED" {
             IconName::Merge
         } else {
             IconName::PullRequest
         },
-        status: check_summary(pr),
-        action: LinkAction::PullRequest(pr.url.clone()),
+        status: Some(pr_summary(pr)),
+        action: LinkAction::Open(pr.url.clone()),
+        details: Some(pr.url.clone()),
     }
 }
 fn artifact_row(artifact: &SessionArtifact) -> LinkRow {
@@ -183,6 +197,7 @@ fn artifact_row(artifact: &SessionArtifact) -> LinkRow {
         icon,
         status: None,
         action: LinkAction::Open(artifact.url.clone()),
+        details: None,
     }
 }
 // The closed toolbar counts borrowed URLs; it does not clone titles, checks,
@@ -240,6 +255,7 @@ fn session_rows(session: &SessionRecord) -> Vec<LinkRow> {
                 icon: IconName::Monitor,
                 status: None,
                 action: LinkAction::Open(url),
+                details: None,
             });
         }
     }
@@ -258,6 +274,7 @@ fn detail_rows(pr: &PullRequestStatus) -> Vec<LinkRow> {
         icon: IconName::ExternalLink,
         status: None,
         action: LinkAction::Open(pr.url.clone()),
+        details: None,
     }];
     for check in sorted_checks(pr) {
         let (label, icon, tone) = match check.result.as_str() {
@@ -271,6 +288,7 @@ fn detail_rows(pr: &PullRequestStatus) -> Vec<LinkRow> {
             subtitle: check.detail.filter(|s| !s.is_empty()).unwrap_or_default(),
             icon,
             status: Some((label.into(), tone)),
+            details: None,
             action: LinkAction::Open(
                 check
                     .url
@@ -285,6 +303,7 @@ fn detail_rows(pr: &PullRequestStatus) -> Vec<LinkRow> {
                 .map_or_else(|| "No checks reported".into(), |(label, _)| label),
             icon: IconName::CheckCircle,
             status: None,
+            details: None,
             action: LinkAction::Open(format!("{}/checks", pr.url.trim_end_matches('/'))),
         });
     }
@@ -294,6 +313,7 @@ fn detail_rows(pr: &PullRequestStatus) -> Vec<LinkRow> {
             subtitle: comments_help(pr),
             icon: IconName::Comment,
             status: None,
+            details: None,
             action: LinkAction::Open(format!(
                 "{}#discussion_bucket",
                 pr.url.trim_end_matches('/')
@@ -385,7 +405,15 @@ impl TerminalPane {
                     (self.session_links.selected + 1).min(action_count.saturating_sub(1))
             }
             "up" => self.session_links.selected = self.session_links.selected.saturating_sub(1),
-            "enter" | "right" => {
+            "right"
+                if rows
+                    .get(self.session_links.selected)
+                    .is_some_and(|row| row.details.is_some()) =>
+            {
+                let url = rows[self.session_links.selected].details.as_ref().unwrap();
+                self.activate_link(&LinkAction::PullRequest(url.clone()), false, window, cx);
+            }
+            "enter" => {
                 if let Some(row) = rows.get(self.session_links.selected) {
                     self.activate_link(&row.action, event.keystroke.modifiers.alt, window, cx);
                 } else if has_account {
@@ -458,6 +486,13 @@ impl TerminalPane {
                     this.close_session_links(window, cx);
                 } else {
                     this.session_links.open = true;
+                    if let Some(session) = this.selected_session() {
+                        this.runtime
+                            .store
+                            .read()
+                            .unwrap()
+                            .refresh_session_links(session.id.clone());
+                    }
                     this.session_links.selected = 0;
                     this.session_links
                         .scroll
@@ -480,40 +515,49 @@ impl TerminalPane {
         let action = row.action.clone();
         let help = match &action {
             LinkAction::Open(url) | LinkAction::PullRequest(url) => {
-                format!("{}\n{}\n{}", row.title, row.subtitle, url)
+                format!("Open link\n{}\n{}\n{}", row.title, row.subtitle, url)
             }
             LinkAction::Account => row.subtitle.clone(),
         };
-        let icon_color = row
-            .status
-            .as_ref()
-            .map_or(colors.secondary, |(_, tone)| *tone);
         let selected = index == self.session_links.selected;
+        let metadata = div()
+            .h(px(14.0))
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .text_size(px(Typo::META.size))
+            .line_height(px(14.0))
+            .text_color(colors.secondary)
+            .when(!row.subtitle.is_empty(), |el| {
+                el.child(div().min_w(px(0.0)).truncate().child(row.subtitle.clone()))
+            })
+            .when_some(row.status.clone(), |el, (label, tone)| {
+                el.when(!row.subtitle.is_empty(), |el| {
+                    el.child(div().flex_none().text_color(colors.tertiary).child("·"))
+                })
+                .child(div().flex_none().text_color(tone).child(label))
+            });
         div()
             .id(("session-link", index))
             .debug_selector(move || format!("session-link-{index}"))
             .h(px(row_height))
             .px(px(6.0))
-            .py(px(2.0))
             .child(
                 div()
                     .h_full()
                     .rounded(px(Radius::ROW))
-                    .px(px(10.0))
+                    .px(px(8.0))
                     .flex()
                     .items_center()
-                    .gap(px(6.0))
-                    .when(selected, |el| el.bg(Fill::selected(colors, true)))
-                    .hover(move |el| el.bg(Fill::subtle(colors)))
+                    .gap(px(8.0))
+                    .when(selected, |el| el.bg(Fill::subtle(colors)))
+                    .hover(move |el| el.bg(Fill::selected(colors, true)))
                     .cursor_pointer()
-                    .child(
-                        div()
-                            .w(px(28.0))
-                            .flex_none()
-                            .flex()
-                            .justify_center()
-                            .child(Icon::new(row.icon, 16.0, icon_color)),
-                    )
+                    .child(div().w(px(16.0)).flex_none().child(Icon::new(
+                        row.icon,
+                        16.0,
+                        colors.secondary,
+                    )))
                     .child(
                         div()
                             .min_w(px(0.0))
@@ -524,38 +568,64 @@ impl TerminalPane {
                             .child(
                                 div()
                                     .truncate()
-                                    .text_size(px(13.0))
+                                    .text_size(px(Typo::ROW.size))
+                                    .line_height(px(16.0))
                                     .text_color(colors.primary)
                                     .child(row.title.clone()),
                             )
-                            .when(!row.subtitle.is_empty(), |el| {
-                                el.child(
-                                    div()
-                                        .truncate()
-                                        .text_size(px(11.0))
-                                        .text_color(colors.secondary)
-                                        .child(row.subtitle.clone()),
-                                )
+                            .when(!row.subtitle.is_empty() || row.status.is_some(), |el| {
+                                el.child(metadata)
                             }),
                     )
-                    .when_some(row.status.clone(), |el, (label, tone)| {
-                        el.child(
-                            div()
-                                .flex_none()
-                                .text_size(px(11.0))
-                                .text_color(tone)
-                                .child(label),
-                        )
-                    })
-                    .child(Icon::new(
-                        if matches!(action, LinkAction::PullRequest(_)) {
-                            IconName::ChevronRight
-                        } else {
-                            IconName::ExternalLink
-                        },
-                        14.0,
-                        colors.tertiary,
-                    )),
+                    .child(
+                        div()
+                            .w(px(24.0))
+                            .flex_none()
+                            .flex()
+                            .justify_center()
+                            .when_some(row.details.clone(), |el, url| {
+                                el.child(
+                                    div()
+                                        .id(("session-link-details", index))
+                                        .debug_selector(move || {
+                                            format!("session-link-details-{index}")
+                                        })
+                                        .size(px(24.0))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded(px(Radius::CHIP))
+                                        .hover(move |el| el.bg(Fill::selected(colors, true)))
+                                        .child(Icon::new(
+                                            IconName::ChevronRight,
+                                            12.0,
+                                            colors.secondary,
+                                        ))
+                                        .tooltip(move |_, cx| {
+                                            cx.new(|_| {
+                                                PaletteTooltip(
+                                                    "Checks and discussion · →".into(),
+                                                    colors,
+                                                )
+                                            })
+                                            .into()
+                                        })
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.session_links.selected = index;
+                                            this.activate_link(
+                                                &LinkAction::PullRequest(url.clone()),
+                                                false,
+                                                window,
+                                                cx,
+                                            );
+                                            cx.stop_propagation();
+                                        })),
+                                )
+                            })
+                            .when(row.details.is_none(), |el| {
+                                el.child(Icon::new(IconName::ExternalLink, 12.0, colors.tertiary))
+                            }),
+                    ),
             )
             .tooltip(move |_, cx| cx.new(|_| PaletteTooltip(help.clone(), colors)).into())
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
@@ -609,62 +679,72 @@ impl TerminalPane {
             || "Links".into(),
             |pr| format!("Pull request #{}", pr.number),
         );
-        let header =
-            div()
-                .h(px(48.0))
-                .px(px(16.0))
-                .flex()
-                .items_center()
-                .gap(px(6.0))
-                .child(div().w(px(28.0)).flex_none().flex().justify_center().child(
-                    if pr.is_some() {
-                        div()
-                            .id("session-links-back")
-                            .debug_selector(|| "session-links-back".into())
-                            .size(px(28.0))
-                            .rounded(px(Radius::ROW))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .cursor_pointer()
-                            .hover(move |el| el.bg(Fill::subtle(colors)))
-                            .child(Icon::new(IconName::ChevronLeft, 16.0, colors.secondary))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.links_back(cx);
-                                cx.stop_propagation();
-                            }))
-                            .into_any_element()
-                    } else {
-                        Icon::new(IconName::ExternalLink, 16.0, colors.secondary).into_any_element()
-                    },
-                ))
-                .child(
+        let header = div()
+            .h(px(34.0))
+            .pl(px(14.0))
+            .pr(px(14.0))
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .when(pr.is_some(), |el| {
+                el.child(
                     div()
-                        .min_w(px(0.0))
-                        .flex_1()
-                        .truncate()
-                        .text_size(px(13.0))
-                        .text_color(colors.primary)
-                        .child(title),
-                )
-                .child(
-                    keycap(colors)
-                        .id("session-links-close")
+                        .id("session-links-back")
+                        .debug_selector(|| "session-links-back".into())
+                        .size(px(20.0))
+                        .rounded(px(Radius::CHIP))
+                        .flex()
+                        .items_center()
+                        .justify_center()
                         .cursor_pointer()
-                        .child("esc")
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.close_session_links(window, cx);
+                        .hover(move |el| el.bg(Fill::subtle(colors)))
+                        .child(Icon::new(IconName::ChevronLeft, 12.0, colors.secondary))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.links_back(cx);
                             cx.stop_propagation();
                         })),
-                );
-        let row_height = if pr.is_some() { 40.0 } else { ROW_HEIGHT };
+                )
+            })
+            .child(
+                div()
+                    .min_w(px(0.0))
+                    .flex_1()
+                    .truncate()
+                    .text_size(px(Typo::META.size))
+                    .line_height(px(14.0))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(colors.secondary)
+                    .child(title),
+            )
+            .child(
+                div()
+                    .id("session-links-close")
+                    .size(px(24.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(Radius::CHIP))
+                    .cursor_pointer()
+                    .hover(move |el| el.bg(Fill::subtle(colors)))
+                    .child(Icon::new(IconName::Close, 12.0, colors.tertiary))
+                    .tooltip(move |_, cx| {
+                        cx.new(|_| PaletteTooltip("Close · Esc".into(), colors))
+                            .into()
+                    })
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.close_session_links(window, cx);
+                        cx.stop_propagation();
+                    })),
+            );
+        let row_height = ROW_HEIGHT;
         let list_height = (row_count as f32 * row_height)
             .min(364.0)
             .min((f32::from(window.viewport_size().height) - 230.0).max(ROW_HEIGHT));
         let body = if rows.is_empty() {
             div()
-                .px(px(20.0))
-                .pb(px(18.0))
+                .px(px(14.0))
+                .pt(px(6.0))
+                .pb(px(14.0))
                 .text_size(px(13.0))
                 .text_color(colors.secondary)
                 .child("Links shared in this chat appear here.")
@@ -716,6 +796,8 @@ impl TerminalPane {
             .into_any_element()
         };
         let mut content = div()
+            .font_weight(FontWeight::NORMAL)
+            .line_height(px(16.0))
             .flex()
             .flex_col()
             .child(header)
@@ -727,14 +809,13 @@ impl TerminalPane {
                 .map(|host| self.runtime.store.read().unwrap().host_display_name(host));
             if session.git_branch.is_some() || host.is_some() || session.account_profile.is_some() {
                 let mut context = div()
-                    .mx(px(16.0))
-                    .pt(px(8.0))
-                    .pb(px(10.0))
+                    .mx(px(14.0))
+                    .py(px(10.0))
                     .border_t_1()
                     .border_color(colors.floating_stroke())
                     .flex()
                     .flex_col()
-                    .gap(px(8.0));
+                    .gap(px(6.0));
                 for (context_index, (icon, label, value)) in [
                     (IconName::Branch, "Branch", session.git_branch.clone()),
                     (IconName::Server, "Running on", host),
@@ -748,28 +829,29 @@ impl TerminalPane {
                                 .id(("session-links-context", context_index))
                                 .flex()
                                 .items_center()
-                                .gap(px(6.0))
+                                .gap(px(8.0))
                                 .text_size(px(11.0))
+                                .line_height(px(14.0))
                                 .text_color(colors.secondary)
                                 .child(
                                     div()
-                                        .w(px(28.0))
+                                        .w(px(16.0))
                                         .flex_none()
                                         .flex()
                                         .justify_center()
                                         .child(Icon::new(icon, 14.0, colors.tertiary)),
                                 )
-                                .child(label)
                                 .child(
                                     div()
                                         .min_w(px(0.0))
                                         .flex_1()
                                         .truncate()
-                                        .text_color(colors.primary)
+                                        .text_color(colors.secondary)
                                         .child(value.clone()),
                                 )
                                 .tooltip(move |_, cx| {
-                                    cx.new(|_| PaletteTooltip(value.clone(), colors)).into()
+                                    cx.new(|_| PaletteTooltip(format!("{label} · {value}"), colors))
+                                        .into()
                                 }),
                         );
                     }
@@ -786,16 +868,16 @@ impl TerminalPane {
                             .hover(move |el| el.bg(Fill::subtle(colors)))
                             .flex()
                             .items_center()
-                            .gap(px(6.0))
+                            .gap(px(8.0))
                             .text_size(px(11.0))
+                            .line_height(px(14.0))
                             .text_color(colors.secondary)
                             .cursor_pointer()
-                            .child(div().w(px(28.0)).flex().justify_center().child(Icon::new(
+                            .child(div().w(px(16.0)).flex().justify_center().child(Icon::new(
                                 IconName::Account,
                                 14.0,
                                 colors.tertiary,
                             )))
-                            .child("Account")
                             .child(
                                 div()
                                     .flex_1()
@@ -836,7 +918,7 @@ impl TerminalPane {
                             div()
                                 .id("session-links-panel")
                                 .debug_selector(|| "session-links-panel".into())
-                                .w(px(400.0))
+                                .w(px(380.0))
                                 .max_w(window.viewport_size().width - px(24.0))
                                 .occlude()
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -993,11 +1075,11 @@ mod tests {
         assert_eq!(rows[1].status.as_ref().unwrap().0, "Checks passed");
         assert_eq!(
             rows[0].action,
-            LinkAction::PullRequest("https://github.com/diri/app/pull/181".into())
+            LinkAction::Open("https://github.com/diri/app/pull/181".into())
         );
         assert_eq!(
             rows[1].action,
-            LinkAction::PullRequest("https://github.com/diri/app/pull/180".into())
+            LinkAction::Open("https://github.com/diri/app/pull/180".into())
         );
         assert_eq!(rows[2].title, "Notion page");
         let details = detail_rows(&session.pull_requests.as_ref().unwrap()[0]);
@@ -1008,6 +1090,14 @@ mod tests {
         );
     }
     #[test]
+    fn merged_state_takes_priority_over_old_checks() {
+        let mut session = fixture();
+        session.pull_requests.as_mut().unwrap()[1].state = "MERGED".into();
+        let rows = session_rows(&session);
+        assert_eq!(rows[0].status.as_ref().unwrap().0, "Merged");
+    }
+
+    #[test]
     fn status_upgrades_a_generic_artifact_by_url() {
         let mut session = fixture();
         for kind in [ArtifactKind::Link, ArtifactKind::Unknown] {
@@ -1017,7 +1107,7 @@ mod tests {
             assert_eq!(rows[0].status.as_ref().unwrap().0, "1 check failed");
             assert_eq!(
                 rows[0].action,
-                LinkAction::PullRequest("https://github.com/diri/app/pull/181".into())
+                LinkAction::Open("https://github.com/diri/app/pull/181".into())
             );
         }
     }
@@ -1032,11 +1122,11 @@ mod tests {
         assert_eq!(rows.len(), 4);
         assert_eq!(
             rows.last().unwrap().action,
-            LinkAction::PullRequest("https://github.com/diri/app/pull/180".into())
+            LinkAction::Open("https://github.com/diri/app/pull/180".into())
         );
     }
     #[gpui::test]
-    fn mouse_and_keyboard_keep_detail_navigation_inside_the_menu(cx: &mut TestAppContext) {
+    fn mouse_and_keyboard_keep_explicit_detail_navigation_inside_the_menu(cx: &mut TestAppContext) {
         cx.update(|cx| cx.set_reduce_motion(true));
         let (runtime, tokio) = runtime(fixture());
         let (pane, cx) =
@@ -1047,7 +1137,7 @@ mod tests {
         cx.simulate_click(trigger.center(), Modifiers::default());
         cx.run_until_parked();
         assert!(pane.read_with(cx, |pane, _| pane.session_links.open));
-        let second = cx.debug_bounds("session-link-1").unwrap();
+        let second = cx.debug_bounds("session-link-details-1").unwrap();
         cx.simulate_click(second.center(), Modifiers::default());
         cx.run_until_parked();
         assert_eq!(
@@ -1060,7 +1150,7 @@ mod tests {
         cx.run_until_parked();
         assert!(pane.read_with(cx, |pane, _| pane.session_links.open
             && pane.session_links.pull_request.is_none()));
-        cx.simulate_keystrokes("up enter");
+        cx.simulate_keystrokes("up right");
         cx.run_until_parked();
         assert_eq!(
             pane.read_with(cx, |pane, _| pane.session_links.pull_request.clone())
@@ -1074,6 +1164,35 @@ mod tests {
         cx.simulate_click(point(px(10.0), px(300.0)), Modifiers::default());
         assert!(!pane.read_with(cx, |pane, _| pane.session_links.open));
     }
+    #[gpui::test]
+    fn menu_rows_open_github_directly_without_a_toolbar_pr(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (runtime, tokio) = runtime(fixture());
+        let (pane, cx) =
+            cx.add_window_view(move |window, cx| TerminalPane::new(runtime, tokio, window, cx));
+        cx.simulate_resize(size(px(900.0), px(700.0)));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("session-primary-pr").is_none());
+        let trigger = cx.debug_bounds("session-links-trigger").unwrap().center();
+        cx.simulate_click(trigger, Modifiers::default());
+        cx.run_until_parked();
+        let position = cx.debug_bounds("session-link-0").unwrap().center();
+        cx.simulate_click(position, Modifiers::default());
+        assert_eq!(
+            cx.opened_url().as_deref(),
+            Some("https://github.com/diri/app/pull/181")
+        );
+        assert!(!pane.read_with(cx, |p, _| p.session_links.open));
+        cx.simulate_click(trigger, Modifiers::default());
+        cx.run_until_parked();
+        cx.simulate_keystrokes("down enter");
+        assert_eq!(
+            cx.opened_url().as_deref(),
+            Some("https://github.com/diri/app/pull/180")
+        );
+        assert!(!pane.read_with(cx, |p, _| p.session_links.open));
+    }
+
     #[test]
     fn closed_toolbar_only_flags_active_pull_requests() {
         let mut session = fixture();
@@ -1191,6 +1310,9 @@ mod tests {
             session.git_branch = None;
             session.title = "Plan the autumn launch".into();
         }
+        if std::env::var_os("DIRI_VISUAL_MERGED").is_some() {
+            session.pull_requests.as_mut().unwrap()[0].state = "MERGED".into();
+        }
         let (runtime, tokio) = runtime(session);
         if std::env::var_os("DIRI_VISUAL_LIGHT").is_some() {
             runtime
@@ -1200,8 +1322,13 @@ mod tests {
                 .update_preferences(|prefs| prefs.terminal_theme = "dirijor-light".into())
                 .unwrap();
         }
+        let width = if std::env::var_os("DIRI_VISUAL_NARROW").is_some() {
+            340.0
+        } else {
+            900.0
+        };
         let window = cx
-            .open_window(size(px(900.0), px(560.0)), move |window, cx| {
+            .open_window(size(px(width), px(560.0)), move |window, cx| {
                 cx.new(|cx| {
                     let mut pane = TerminalPane::new(runtime, tokio, window, cx);
                     pane.session_links.open = true;
