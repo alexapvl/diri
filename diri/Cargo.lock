@@ -1649,6 +1649,7 @@ dependencies = [
  "diri-pty",
  "diri-terminal-state",
  "diri-usage",
+ "dirijor-mcp",
  "getrandom 0.4.3",
  "libc",
  "serde",
