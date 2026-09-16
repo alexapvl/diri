@@ -1675,8 +1675,7 @@ fn continuous_output_keeps_controller_responsive() {
         _ => false,
     });
     let elapsed = started.elapsed();
-    drop(attach);
-    let _ = run_output(
+    let _: SessionInspection = run_json(
         "kill",
         &state_dir,
         Some(&SessionSelector {
