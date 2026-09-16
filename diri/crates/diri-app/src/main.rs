@@ -1,5 +1,6 @@
 mod agent_catalog;
 mod app_theme;
+mod application_notifications;
 mod clipboard_transfer;
 mod code_intelligence;
 mod code_viewer;
@@ -15,6 +16,8 @@ mod empty_workbench;
 mod external_drop;
 pub mod fonts;
 pub mod fuzzy;
+#[cfg(any(target_os = "macos", test))]
+mod gesture_delivery;
 mod git_review;
 pub mod history;
 mod icons;
@@ -30,6 +33,7 @@ mod notification_feed;
 pub mod notifications;
 pub mod palette;
 mod palette_chrome;
+mod palette_workspace;
 mod peek_settle;
 mod phone_access;
 mod platform;
@@ -58,6 +62,14 @@ pub mod transcript;
 pub mod updates;
 pub mod usage;
 mod workbench;
+#[cfg(all(test, target_os = "macos"))]
+mod workspace_fixture;
+#[cfg_attr(not(test), allow(dead_code))]
+mod workspace_geometry;
+#[cfg_attr(not(test), allow(dead_code))]
+mod workspace_preview;
+mod workspace_preview_source;
+mod workspace_workbench;
 pub mod worktrees;
 
 #[cfg(target_os = "macos")]
@@ -134,7 +146,10 @@ pub(crate) fn refresh_app_menus(cx: &mut App) {
             MenuItem::separator(),
             MenuItem::action("Quit diri", Quit),
         ]),
-        Menu::new("File").items([MenuItem::action("New Session", OpenLauncher)]),
+        Menu::new("File").items([
+            MenuItem::action("New Session", OpenLauncher),
+            MenuItem::action("New Window", commands::NewWindow),
+        ]),
         Menu::new("Edit").items([
             MenuItem::os_action("Copy", CopySelection, OsAction::Copy),
             MenuItem::os_action("Paste", Paste, OsAction::Paste),
@@ -149,6 +164,7 @@ pub(crate) fn refresh_app_menus(cx: &mut App) {
     cx.set_menus([
         Menu::new("File").items([
             MenuItem::action("New Session", OpenLauncher),
+            MenuItem::action("New Window", commands::NewWindow),
             MenuItem::separator(),
             MenuItem::action("Quit diri", Quit),
         ]),
@@ -179,6 +195,13 @@ pub(crate) struct AppServices {
 }
 
 fn main() {
+    if cfg!(test) {
+        #[cfg(all(test, target_os = "macos"))]
+        if std::env::var_os("DIRI_TEST_NATIVE_FIND").is_some() {
+            terminal_pane::find_workflow_tests::run_native();
+        }
+        return;
+    }
     #[cfg(all(target_os = "macos", debug_assertions))]
     if std::env::var_os("DIRI_NATIVE_MENU_SMOKE").is_some() {
         macos::menu_bar::smoke_test();
@@ -375,6 +398,20 @@ fn main() {
             .clone();
         commands::bind_keys(cx, &shortcut_overrides);
         install_app_menus(cx);
+        let window_services = services.clone();
+        cx.on_action(move |_: &commands::NewWindow, cx| {
+            let context = cx.active_window().and_then(|handle| {
+                handle
+                    .update(cx, |root, window, cx| {
+                        root.downcast::<RootView>()
+                            .ok()
+                            .map(|root| root.read(cx).native_window_context(window, cx))
+                    })
+                    .ok()
+                    .flatten()
+            });
+            open_main_window_with_context(cx, window_services.clone(), preview, scenario, context);
+        });
         let quit_services = Arc::clone(&services);
         let quit_updates = services.updates.clone();
         let release_owned_daemon =
@@ -580,12 +617,28 @@ async fn publish_usage_refresh(
     Some(store)
 }
 
+struct NativeWindowContext {
+    workspace: Option<diri_proto::workspace::WorkspaceId>,
+    selected: Option<diri_proto::SessionId>,
+    placement: WindowPlacement,
+}
+
 fn open_main_window(
     cx: &mut App,
     services: Arc<AppServices>,
     preview: bool,
     scenario: PreviewScenario,
-) {
+) -> gpui::WindowHandle<RootView> {
+    open_main_window_with_context(cx, services, preview, scenario, None)
+}
+
+fn open_main_window_with_context(
+    cx: &mut App,
+    services: Arc<AppServices>,
+    preview: bool,
+    scenario: PreviewScenario,
+    context: Option<NativeWindowContext>,
+) -> gpui::WindowHandle<RootView> {
     let perf_large_window = std::env::var_os("DIRI_PERF_LARGE_WINDOW").is_some();
     let initial_size = if perf_large_window {
         size(px(1800.0), px(1100.0))
@@ -604,6 +657,12 @@ fn open_main_window(
                 .clone()
         })
         .flatten();
+    let saved_placement = context
+        .as_ref()
+        .map(|context| context.placement.clone())
+        .or(saved_placement);
+    let selected_override = context.as_ref().map(|context| context.selected.clone());
+    let workspace_override = context.map(|context| context.workspace);
     let (window_bounds, display_id) = saved_placement
         .map(|placement| restore_window_bounds(placement, cx))
         .unwrap_or_else(|| {
@@ -644,9 +703,25 @@ fn open_main_window(
             }),
             ..Default::default()
         },
-        move |window, cx| cx.new(|cx| RootView::new(services, preview, scenario, window, cx)),
+        move |window, cx| {
+            cx.new(|cx| {
+                if workspace_override.is_some() {
+                    RootView::new_with_selection(
+                        services,
+                        preview,
+                        scenario,
+                        workspace_override,
+                        selected_override,
+                        window,
+                        cx,
+                    )
+                } else {
+                    RootView::new(services, preview, scenario, window, cx)
+                }
+            })
+        },
     )
-    .expect("failed to open the diri window");
+    .expect("failed to open the diri window")
 }
 
 /// Convert GPUI's runtime window state into the JSON-friendly preference

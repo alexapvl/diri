@@ -141,9 +141,17 @@ impl TerminalDamageObserver {
     }
 }
 
-#[derive(Default)]
 struct TerminalImeState {
     marked_text: String,
+    enabled: bool,
+}
+impl Default for TerminalImeState {
+    fn default() -> Self {
+        Self {
+            marked_text: String::new(),
+            enabled: true,
+        }
+    }
 }
 
 impl TerminalImeState {
@@ -161,12 +169,20 @@ struct TerminalInputHandler {
 
 impl TerminalInputHandler {
     fn commit_text(&self, text: &str) {
-        mutex_lock(&self.ime_state).marked_text.clear();
-        (self.text_input)(text);
+        let mut state = mutex_lock(&self.ime_state);
+        state.marked_text.clear();
+        let enabled = state.enabled;
+        drop(state);
+        if enabled {
+            (self.text_input)(text);
+        }
     }
 
     fn mark_text(&self, text: &str) {
-        text.clone_into(&mut mutex_lock(&self.ime_state).marked_text);
+        let mut state = mutex_lock(&self.ime_state);
+        if state.enabled {
+            text.clone_into(&mut state.marked_text);
+        }
     }
 }
 
@@ -275,6 +291,11 @@ struct ElementSharedState {
 
 #[derive(Default)]
 struct FindHighlights {
+    retained: Option<(
+        Arc<crate::find::RetainedFindSnapshot>,
+        Vec<crate::find::FindMatch>,
+        usize,
+    )>,
     spans: Vec<FindSpan>,
     current_bounds: Option<Bounds<Pixels>>,
 }
@@ -525,6 +546,14 @@ impl TerminalElement {
         self.focus_handle = Some(focus_handle);
         self.focus_override = None;
         self
+    }
+
+    /// Temporarily hands text ownership to an overlay. Existing native handlers
+    /// observe the same gate, including callbacks delivered before the next paint.
+    pub fn set_text_input_enabled(&self, enabled: bool) {
+        let mut state = mutex_lock(&self.ime_state);
+        state.enabled = enabled;
+        state.marked_text.clear();
     }
 
     /// Receives committed platform text, including multi-stage IME input.
@@ -836,6 +865,7 @@ impl TerminalElement {
     pub fn set_find_highlights(&self, spans: Vec<FindSpan>) {
         *mutex_lock(&self.shared.find_highlights) = FindHighlights {
             spans,
+            retained: None,
             current_bounds: None,
         };
     }
@@ -866,16 +896,44 @@ impl TerminalElement {
     }
 
     pub fn find_next(&self, model: &mut TerminalFindModel) -> Option<NavigationTarget> {
-        model.next(&mut mutex_lock(&self.shared.viewport))
+        model.navigate_with_live(
+            false,
+            &mut mutex_lock(&self.shared.viewport),
+            &read_lock(&self.buffer),
+        )
     }
 
     pub fn find_previous(&self, model: &mut TerminalFindModel) -> Option<NavigationTarget> {
-        model.previous(&mut mutex_lock(&self.shared.viewport))
+        model.navigate_with_live(
+            true,
+            &mut mutex_lock(&self.shared.viewport),
+            &read_lock(&self.buffer),
+        )
     }
 
     pub fn sync_find_highlights(&self, model: &TerminalFindModel) {
-        let viewport = mutex_lock(&self.shared.viewport);
-        self.set_find_highlights(model.visible_spans(&viewport));
+        if let Some((source, matches, current)) = model.retained_highlights() {
+            let mut highlights = mutex_lock(&self.shared.find_highlights);
+            if !highlights
+                .retained
+                .as_ref()
+                .is_some_and(|(old, old_matches, index)| {
+                    old == source && old_matches == matches && *index == current
+                })
+            {
+                highlights.retained = Some((Arc::clone(source), matches.to_vec(), current));
+                highlights.current_bounds = None;
+            }
+        } else {
+            let viewport = mutex_lock(&self.shared.viewport);
+            self.set_find_highlights(
+                model.visible_spans_with_live(&viewport, &read_lock(&self.buffer)),
+            );
+        }
+    }
+
+    pub fn clear_find_source(&self) {
+        mutex_lock(&self.shared.viewport).clear_find_source();
     }
 
     fn is_focused(&self, window: &Window) -> bool {
@@ -1326,7 +1384,36 @@ impl Element for TerminalElement {
                 ));
             }
         }
+        let buffer = read_lock(&self.buffer);
         let mut highlights = mutex_lock(&self.shared.find_highlights);
+        if let Some((source, matches, current)) = &highlights.retained {
+            let pinned = viewport.has_find_source(source);
+            let top = if pinned {
+                viewport.absolute_row(0)
+            } else {
+                source.live_start_row
+            };
+            highlights.spans = matches
+                .iter()
+                .enumerate()
+                .filter_map(|(index, item)| {
+                    if !pinned
+                        && (!source.matches_live_row(item.absolute_row, &buffer)
+                            || viewport.is_reading())
+                    {
+                        return None;
+                    }
+                    let row = usize::try_from(item.absolute_row.checked_sub(top)?).ok()?;
+                    (row < visible_rows).then_some(FindSpan {
+                        row,
+                        start_col: item.start_col,
+                        end_col_exclusive: item.end_col_exclusive,
+                        is_current: index == *current,
+                    })
+                })
+                .collect();
+        }
+        drop(buffer);
         highlights.current_bounds = highlights.spans.iter().find_map(|span| {
             if !span.is_current || span.row >= visible_rows {
                 return None;
@@ -2397,6 +2484,28 @@ mod link_tests {
 
         assert!(mutex_lock(&state).marked_range().is_none());
         assert_eq!(&*mutex_lock(&committed), &["你"]);
+    }
+
+    #[test]
+    fn overlay_gate_rejects_existing_native_handler_until_terminal_restored() {
+        let terminal = terminal_with_rows(&["test"]);
+        let committed = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = Arc::clone(&committed);
+        let handler = TerminalInputHandler {
+            text_input: Arc::new(move |text| mutex_lock(&sink).push(text.to_owned())),
+            ime_state: Arc::clone(&terminal.ime_state),
+            cursor_bounds: Bounds::new(point(px(0.0), px(0.0)), size(px(8.0), px(16.0))),
+            cell_width: px(8.0),
+        };
+        handler.mark_text("old");
+        terminal.set_text_input_enabled(false);
+        handler.mark_text("ni");
+        handler.commit_text("你");
+        assert!(mutex_lock(&terminal.ime_state).marked_range().is_none());
+        assert!(mutex_lock(&committed).is_empty());
+        terminal.set_text_input_enabled(true);
+        handler.commit_text("terminal");
+        assert_eq!(&*mutex_lock(&committed), &["terminal"]);
     }
 
     #[test]

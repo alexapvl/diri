@@ -118,12 +118,13 @@ impl ClientCore {
     /// IF YOU ADD AN EVENT KIND THAT DIRI NEEDS, ADD IT HERE TOO. Server-side
     /// filtering means an unlisted kind never reaches `route_message`, and the
     /// symptom is silence, not an error.
-    const EVENT_KINDS: [&'static str; 5] = [
+    const EVENT_KINDS: [&'static str; 6] = [
         EventName::SESSION_UPDATED,
         EventName::SESSION_NOTIFICATION,
         EventName::SESSION_RESOURCES,
         EventName::SESSION_REMOVED,
         EventName::PROJECT_UPDATED,
+        EventName::WORKSPACE_UPDATED,
     ];
 
     async fn request<P: Serialize + ?Sized>(
@@ -676,6 +677,16 @@ impl DaemonClient {
         session_id: &SessionId,
     ) -> Result<ReadScreenResult, ClientError> {
         self.typed(Method::SESSION_READ_SCREEN, &session_params(session_id))
+            .await
+    }
+
+    /// Captures bounded styled rows from a local Engine session atomically.
+    /// Remote sessions return an explicit unsupported-capability error.
+    pub async fn capture_find(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<diri_proto::CaptureFindResult, ClientError> {
+        self.typed(Method::SESSION_CAPTURE_FIND, &session_params(session_id))
             .await
     }
 

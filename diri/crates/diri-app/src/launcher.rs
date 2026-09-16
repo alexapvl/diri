@@ -124,6 +124,9 @@ pub(crate) enum LauncherEvent {
 }
 
 pub(crate) struct LauncherOverlay {
+    workspace_spawn_target: Option<crate::store::WorkspaceSpawnTarget>,
+    window_store: Option<crate::store::WindowStore>,
+    workspace_submission: Option<(u64, u64, LauncherTarget)>,
     accounts: diri_proto::AgentAccountCatalog,
     accounts_loading: bool,
     accounts_error: Option<String>,
@@ -315,6 +318,10 @@ enum ProjectCommit {
 impl EventEmitter<LauncherEvent> for LauncherOverlay {}
 
 impl LauncherOverlay {
+    pub(crate) fn set_window_store(&mut self, store: crate::store::WindowStore) {
+        self.window_store = Some(store);
+    }
+
     pub(crate) fn new(services: Arc<AppServices>, preview: bool, cx: &mut Context<Self>) -> Self {
         let focus = cx.focus_handle();
         let (selected_harness, selected_root, selected_host) = initial_target(&services);
@@ -325,6 +332,7 @@ impl LauncherOverlay {
                     Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         if this
                             .update(cx, |this, cx| {
+                                this.finish_workspace_submission(cx);
                                 this.resume_pending_recipe_activation(cx);
                                 if this.open
                                     && !this.delivery.is_sending()
@@ -347,6 +355,9 @@ impl LauncherOverlay {
         });
 
         Self {
+            workspace_spawn_target: None,
+            window_store: None,
+            workspace_submission: None,
             accounts: diri_proto::AgentAccountCatalog::default(),
             accounts_loading: false,
             accounts_error: None,
@@ -387,6 +398,44 @@ impl LauncherOverlay {
         self.open
     }
 
+    pub(crate) fn set_workspace_spawn_target(
+        &mut self,
+        target: Option<crate::store::WorkspaceSpawnTarget>,
+    ) {
+        self.workspace_spawn_target = target;
+    }
+
+    fn finish_workspace_submission(&mut self, cx: &mut Context<Self>) {
+        let Some((receipt_id, ticket, target)) = self.workspace_submission.clone() else {
+            return;
+        };
+        let state = self
+            .services
+            .store
+            .store
+            .read()
+            .expect("store")
+            .workspace_spawn_receipts()
+            .find(|r| r.id == receipt_id)
+            .map(|r| r.state.clone());
+        let result = match state {
+            Some(
+                crate::store::WorkspaceSpawnState::Placed { .. }
+                | crate::store::WorkspaceSpawnState::Created { .. }
+                | crate::store::WorkspaceSpawnState::Unplaced { .. },
+            ) => Ok(None),
+            Some(crate::store::WorkspaceSpawnState::Unconfirmed(error)) => Err(error),
+            // A placed receipt can be evicted only after 32 newer requests.
+            None => Err(
+                "Launch receipt is no longer available. Check All sessions before sending again."
+                    .into(),
+            ),
+            _ => return,
+        };
+        self.workspace_submission = None;
+        self.finish_submission(ticket, target, result, cx);
+    }
+
     pub(crate) fn open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.delivery.is_sending() {
             self.open = true;
@@ -403,7 +452,13 @@ impl LauncherOverlay {
         // cleared on submit, and only there.
         if self.prompt.is_empty() {
             self.selected_account = None;
-            let (harness, root, host) = initial_target(&self.services);
+            let (harness, root, host) = initial_target_in_window(
+                &self.services,
+                self.workspace_spawn_target.as_ref(),
+                self.window_store
+                    .as_ref()
+                    .map(|store| store.read().expect("store").selected_session_id().cloned()),
+            );
             self.selected_harness = harness;
             self.selected_root = root;
             self.selected_host = host;
@@ -1515,6 +1570,38 @@ impl LauncherOverlay {
         let Some(ticket) = self.delivery.begin() else {
             return false;
         };
+        let destination = self
+            .workspace_spawn_target
+            .clone()
+            .map(crate::store::SpawnDestination::Workspace)
+            .or_else(|| {
+                self.window_store.as_ref().map(|store| {
+                    crate::store::SpawnDestination::Window(
+                        store.write().expect("store").spawn_target(),
+                    )
+                })
+            });
+        if let (Some(params), Some(workspace_target)) = (spawn.as_ref(), destination) {
+            let receipt = self
+                .services
+                .store
+                .store
+                .write()
+                .expect("store")
+                .request_workspace_spawn(workspace_target, params.clone());
+            if let Some(receipt) = receipt {
+                self.workspace_submission = Some((receipt, ticket, target));
+                self.fallback_notice = None;
+                self.picker = None;
+                cx.notify();
+                return true;
+            }
+            self.delivery.settle(ticket);
+            self.fallback_notice =
+                Some("Launch was not requested. Review pending launches and try again.".into());
+            cx.notify();
+            return false;
+        }
         self.services
             .store
             .store
@@ -3964,13 +4051,40 @@ impl Render for LauncherOverlay {
 }
 
 fn initial_target(services: &AppServices) -> (AgentKind, String, Option<String>) {
+    initial_target_for_workspace(services, None)
+}
+
+fn initial_target_for_workspace(
+    services: &AppServices,
+    target: Option<&crate::store::WorkspaceSpawnTarget>,
+) -> (AgentKind, String, Option<String>) {
+    initial_target_in_window(services, target, None)
+}
+
+fn initial_target_in_window(
+    services: &AppServices,
+    target: Option<&crate::store::WorkspaceSpawnTarget>,
+    selected_override: Option<Option<SessionId>>,
+) -> (AgentKind, String, Option<String>) {
     let store = services
         .store
         .store
         .read()
         .expect("session store lock poisoned");
-    let selected = store
-        .selected_session()
+    let selected = target
+        .map_or_else(
+            || {
+                selected_override.as_ref().map_or_else(
+                    || store.selected_session(),
+                    |id| {
+                        id.as_ref()
+                            .and_then(|id| store.sessions().get(id))
+                            .map(Arc::as_ref)
+                    },
+                )
+            },
+            |target| store.workspace_spawn_source(target),
+        )
         .and_then(|session| {
             store
                 .projects()

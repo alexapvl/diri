@@ -3,6 +3,9 @@
 mod prefs;
 mod projection;
 mod residency;
+mod window_navigation;
+mod workspace_spawn;
+mod workspaces;
 
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -36,6 +39,12 @@ pub use prefs::{
 };
 pub use projection::{SidebarProject, SidebarProjection, SidebarRow};
 pub use residency::{ResidencyUpdate, TerminalResidency};
+pub(crate) use window_navigation::{WindowAction, WindowStore, WindowWrite};
+pub use workspace_spawn::{
+    SpawnDestination, SpawnOwner, WindowSpawnTarget, WorkspaceSpawnReceipt, WorkspaceSpawnState,
+    WorkspaceSpawnTarget,
+};
+pub use workspaces::{WorkspaceCatalog, WorkspaceCatalogStatus};
 
 pub const AUXILIARY_TERMINAL_TITLE: &str = "Terminal";
 
@@ -98,6 +107,13 @@ pub enum DaemonState {
 pub enum StoreEffect {
     /// Repaint subscribers after a purely local navigation change.
     UiChanged,
+    RefreshWorkspaces {
+        generation: u64,
+    },
+    MutateWorkspace {
+        generation: u64,
+        params: diri_proto::workspace::WorkspaceMutationParams,
+    },
     /// Push one fresh snapshot to watch subscribers. The menu-bar panel skips
     /// rebuilds while hidden, so opening it asks for a current snapshot.
     PublishSnapshot,
@@ -114,6 +130,10 @@ pub enum StoreEffect {
         title: String,
     },
     Spawn(SessionSpawnParams),
+    WorkspaceSpawn {
+        id: u64,
+        params: Option<SessionSpawnParams>,
+    },
     /// A shell owned by a workbench pane. Unlike a top-level spawn, its
     /// response must not replace the selected sidebar session.
     SpawnAuxiliary {
@@ -138,6 +158,7 @@ pub enum StoreEffect {
     /// `host.locate_repo` — resolve the reference session's repo on a host;
     /// the answer lands back in the store as a `RepoTarget`.
     LocateRepo {
+        owner: Option<(SpawnOwner, u64)>,
         key: String,
         host: Option<String>,
         session_id: SessionId,
@@ -145,6 +166,7 @@ pub enum StoreEffect {
     /// One bounded level for the New Agent folder picker. Results are keyed by
     /// generation so a slow host cannot overwrite a newer navigation click.
     ListDirectories {
+        owner: Option<SpawnOwner>,
         request_id: u64,
         host: Option<String>,
         path: String,
@@ -242,6 +264,8 @@ pub struct WorktreeSpawn {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SpawnOptions {
+    pub workspace_target: Option<WorkspaceSpawnTarget>,
+    pub window_target: Option<WindowSpawnTarget>,
     pub account_profile_id: Option<String>,
     pub cwd: Option<String>,
     pub worktree: Option<WorktreeSpawn>,
@@ -296,6 +320,8 @@ fn repo_target_key(host: Option<&str>) -> String {
 
 /// Pure application model. Side effects are emitted onto a channel for the daemon adapter.
 pub struct SessionStore {
+    workspaces: WorkspaceCatalog,
+    workspace_spawns: workspace_spawn::WorkspaceSpawns,
     daemon_state: DaemonState,
     session_list_hydrated: bool,
     daemon_identity: Option<HelloResult>,
@@ -319,6 +345,7 @@ pub struct SessionStore {
     syncing_prefs: HashSet<String>,
     /// Popover repo resolution: host key → state (see `RepoTarget`).
     repo_targets: HashMap<String, RepoTarget>,
+    window_targets: HashMap<SpawnOwner, window_navigation::WindowTargets>,
     /// The session whose repo the popover preserves (selected at open time).
     repo_target_session: Option<SessionId>,
     directory_request_seq: u64,
@@ -327,6 +354,9 @@ pub struct SessionStore {
     theme_preview: Option<String>,
     terminal_residency: TerminalResidency,
     app_is_active: bool,
+    focused_window: Option<SpawnOwner>,
+    window_navigation_enabled: bool,
+    focused_window_session: Option<SessionId>,
     notification_surface_visible: bool,
     last_action_failure: Option<ActionFailure>,
     sidebar_selection_anchor: Option<SessionId>,
@@ -401,6 +431,8 @@ impl SessionStore {
             .unwrap_or_default();
         (
             Self {
+                workspaces: WorkspaceCatalog::default(),
+                workspace_spawns: workspace_spawn::WorkspaceSpawns::default(),
                 daemon_state: DaemonState::Connecting,
                 session_list_hydrated: false,
                 daemon_identity: None,
@@ -416,6 +448,7 @@ impl SessionStore {
                 migrating: HashSet::new(),
                 syncing_prefs: HashSet::new(),
                 repo_targets: HashMap::new(),
+                window_targets: HashMap::new(),
                 repo_target_session: None,
                 directory_request_seq: 0,
                 directory_listing: None,
@@ -423,6 +456,9 @@ impl SessionStore {
                 theme_preview: None,
                 terminal_residency: TerminalResidency::default(),
                 app_is_active: true,
+                focused_window: None,
+                window_navigation_enabled: false,
+                focused_window_session: None,
                 notification_surface_visible: true,
                 last_action_failure: None,
                 sidebar_selection_anchor: None,
@@ -563,7 +599,7 @@ impl SessionStore {
         self.notification_surface_visible = visible;
         if visible
             && self.app_is_active
-            && let Some(id) = self.selected_session_id.clone()
+            && let Some(id) = self.notification_selected_session().cloned()
         {
             self.mark_notifications_read(&id);
             self.emit(StoreEffect::MarkSeen(id));
@@ -573,7 +609,15 @@ impl SessionStore {
     fn notification_is_focused(&self, id: &SessionId) -> bool {
         self.app_is_active
             && self.notification_surface_visible
-            && self.selected_session_id.as_ref() == Some(id)
+            && self.notification_selected_session() == Some(id)
+    }
+
+    fn notification_selected_session(&self) -> Option<&SessionId> {
+        if self.window_navigation_enabled {
+            self.focused_window_session.as_ref()
+        } else {
+            self.selected_session_id.as_ref()
+        }
     }
 
     pub fn next_unread_notification(&self) -> Option<SessionId> {
@@ -925,6 +969,7 @@ impl SessionStore {
         }
         self.repo_targets.insert(key.clone(), RepoTarget::Pending);
         self.emit(StoreEffect::LocateRepo {
+            owner: None,
             key,
             host,
             session_id,
@@ -945,6 +990,7 @@ impl SessionStore {
             state: DirectoryListingState::Loading,
         });
         self.emit(StoreEffect::ListDirectories {
+            owner: None,
             request_id,
             host,
             path,
@@ -1406,6 +1452,7 @@ impl SessionStore {
         // A restored selection did not travel through `focus_session`, so it
         // still needs terminal residency before the pane can attach.
         if let Some(id) = self.selected_session_id.clone()
+            && !self.window_navigation_enabled
             && self
                 .sessions
                 .get(&id)
@@ -1445,7 +1492,7 @@ impl SessionStore {
         }
         if self.app_is_active
             && self.notification_surface_visible
-            && let Some(id) = self.selected_session_id.clone()
+            && let Some(id) = self.notification_selected_session().cloned()
         {
             self.mark_notifications_read(&id);
         }
@@ -1462,6 +1509,17 @@ impl SessionStore {
 
     fn handle_event_change(&mut self, event: EventEnvelope) -> StoreEventChange {
         match event.name.as_str() {
+            EventName::WORKSPACE_UPDATED => {
+                if let Some(revision) = event
+                    .params
+                    .get("revision")
+                    .and_then(|value| value.as_u64())
+                {
+                    self.workspace_announced(revision);
+                } else {
+                    self.refresh_workspaces();
+                }
+            }
             EventName::SESSION_NOTIFICATION => {
                 if let Ok(mut event) =
                     serde_json::from_value::<diri_proto::SessionNotificationEvent>(event.params)
@@ -1631,6 +1689,7 @@ impl SessionStore {
         // only focus_session grants terminal residency -- without this, a
         // session created from the UI stays "Preparing terminal" forever.
         if is_new
+            && !self.window_navigation_enabled
             && self.selected_session_id.as_ref() == Some(&id)
             && !arriving_archived
             && !self.terminal_residency.contains(&id)
@@ -2012,7 +2071,7 @@ impl SessionStore {
         StoreSnapshot {
             sessions,
             projects,
-            selected_session_id: self.selected_session_id.clone(),
+            selected_session_id: self.notification_selected_session().cloned(),
             global_attention: self.global_attention(),
         }
     }
@@ -2118,6 +2177,12 @@ impl SessionStore {
     }
 
     pub fn revive_sessions(&mut self, ids: Vec<SessionId>) {
+        if let Some(first) = self.revive_records(ids).first().cloned() {
+            self.select(first);
+        }
+    }
+
+    fn revive_records(&mut self, ids: Vec<SessionId>) -> Vec<SessionId> {
         let mut revived = Vec::new();
         for id in ids {
             let Some(session) = self.sessions.get_mut(&id) else {
@@ -2140,21 +2205,24 @@ impl SessionStore {
             });
         }
         self.invalidate_projection();
-        if let Some(first) = revived.first().cloned() {
-            self.select(first);
-        }
+        revived
     }
 
     pub fn auto_resume_if_needed(&mut self, id: &SessionId) -> bool {
-        let eligible = self.selected_session_id.as_ref() == Some(id)
-            && self.sessions.get(id).is_some_and(|session| {
-                !session.is_archived()
-                    && session.can_resume()
-                    && matches!(
-                        &session.status,
-                        SessionStatus::Exited(info) if info.reason == ExitReason::DaemonRestart
-                    )
-            });
+        !self.window_navigation_enabled
+            && self.selected_session_id.as_ref() == Some(id)
+            && self.auto_resume_referenced(id)
+    }
+
+    fn auto_resume_referenced(&mut self, id: &SessionId) -> bool {
+        let eligible = self.sessions.get(id).is_some_and(|session| {
+            !session.is_archived()
+                && session.can_resume()
+                && matches!(
+                    &session.status,
+                    SessionStatus::Exited(info) if info.reason == ExitReason::DaemonRestart
+                )
+        });
         if !eligible || !self.auto_resume_attempted.insert(id.clone()) {
             return false;
         }
@@ -2315,7 +2383,17 @@ impl SessionStore {
     }
 
     pub fn spawn_kind(&mut self, kind: AgentKind, options: SpawnOptions) {
-        self.emit(StoreEffect::Spawn(self.spawn_params(kind, options)));
+        let target = options
+            .workspace_target
+            .clone()
+            .map(SpawnDestination::Workspace)
+            .or_else(|| options.window_target.clone().map(SpawnDestination::Window));
+        let params = self.spawn_params(kind, options);
+        if let Some(target) = target {
+            self.request_workspace_spawn(target, params);
+        } else {
+            self.emit(StoreEffect::Spawn(params));
+        }
     }
 
     /// Shared launch resolution for queued actions and acknowledged composers.
@@ -2324,6 +2402,25 @@ impl SessionStore {
         kind: AgentKind,
         options: SpawnOptions,
     ) -> SessionSpawnParams {
+        let local_context = options
+            .workspace_target
+            .as_ref()
+            .and_then(|target| self.workspace_spawn_source(target))
+            .or_else(|| {
+                options
+                    .window_target
+                    .as_ref()
+                    .and_then(|target| target.selected_session.as_ref())
+                    .and_then(|id| self.sessions.get(id))
+                    .map(Arc::as_ref)
+            })
+            .map(|session| {
+                if session.host.is_none() {
+                    session.cwd.clone()
+                } else {
+                    self.local_fallback_directory_for(Some(session))
+                }
+            });
         let host = options.host;
         let cwd = if let Some(host_id) = &host {
             // Remote spawn: local directories are meaningless — use the
@@ -2333,7 +2430,10 @@ impl SessionStore {
                 .or_else(|| self.host(host_id).and_then(|host| host.default_cwd.clone()))
                 .unwrap_or_else(|| "~".to_owned())
         } else {
-            options.cwd.unwrap_or_else(|| self.active_directory())
+            options
+                .cwd
+                .or(local_context)
+                .unwrap_or_else(|| self.active_directory())
         };
         // Worktrees are a local-git feature; drop them for remote spawns (the
         // daemon rejects the combination outright).
@@ -2370,11 +2470,12 @@ impl SessionStore {
     /// its remote cwd is useless as a local path, so prefer the first project
     /// root that exists on this machine, then home.
     pub fn local_fallback_directory(&self) -> String {
-        if self
-            .selected_session()
-            .is_none_or(|session| session.host.is_none())
-        {
-            return self.default_new_agent_directory();
+        self.local_fallback_directory_for(self.selected_session())
+    }
+
+    fn local_fallback_directory_for(&self, selected: Option<&SessionRecord>) -> String {
+        if selected.is_none_or(|session| session.host.is_none()) {
+            return self.default_new_agent_directory_for(selected);
         }
         let mut roots: Vec<_> = self
             .projects
@@ -2394,16 +2495,24 @@ impl SessionStore {
     /// the repo root of the active project, never the selected session's
     /// worktree cwd (⌘T should default to the main checkout).
     pub fn default_new_agent_directory(&self) -> String {
-        if let Some(session) = self.selected_session()
+        self.default_new_agent_directory_for(self.selected_session())
+    }
+
+    fn default_new_agent_directory_for(&self, selected: Option<&SessionRecord>) -> String {
+        if let Some(session) = selected
             && let Some(project) = self.projects.get(&session.project_id)
         {
             return project.root.clone();
         }
-        self.active_directory()
+        self.active_directory_for(selected)
     }
 
     pub fn active_directory(&self) -> String {
-        if let Some(session) = self.selected_session() {
+        self.active_directory_for(self.selected_session())
+    }
+
+    fn active_directory_for(&self, selected: Option<&SessionRecord>) -> String {
+        if let Some(session) = selected {
             return session.cwd.clone();
         }
         let projection = projection::build_projection(
@@ -2440,7 +2549,7 @@ impl SessionStore {
         self.app_is_active = active;
         if active
             && self.notification_surface_visible
-            && let Some(id) = self.selected_session_id.clone()
+            && let Some(id) = self.notification_selected_session().cloned()
         {
             self.mark_notifications_read(&id);
             self.emit(StoreEffect::MarkSeen(id));
@@ -2451,6 +2560,10 @@ impl SessionStore {
     fn focus_session(&mut self, id: SessionId) {
         let selection_changed = self.selected_session_id.as_ref() != Some(&id);
         self.selected_session_id = Some(id.clone());
+        if self.window_navigation_enabled {
+            self.invalidate_projection();
+            return;
+        }
         if self.notification_is_focused(&id) {
             self.mark_notifications_read(&id);
         }
@@ -2839,7 +2952,12 @@ impl StoreRuntime {
                             let _ = event_publish_tx.try_send(changed);
                         }
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        event_store
+                            .write()
+                            .expect("session store lock poisoned")
+                            .refresh_workspaces();
+                    }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
@@ -2868,15 +2986,15 @@ impl StoreRuntime {
                 waiting_for_deferred_start = false;
                 match state {
                     ConnectionState::Connecting => {
-                        state_store
-                            .write()
-                            .expect("session store lock poisoned")
-                            .daemon_state = DaemonState::Connecting;
+                        let mut store = state_store.write().expect("session store lock poisoned");
+                        store.daemon_state = DaemonState::Connecting;
+                        store.workspace_connection_changed(false);
                     }
                     ConnectionState::Disconnected(error) => {
                         let mut store = state_store.write().expect("session store lock poisoned");
                         store.daemon_state = DaemonState::Unreachable(error);
                         store.daemon_identity = None;
+                        store.workspace_connection_changed(false);
                     }
                     ConnectionState::Connected(identity) => {
                         {
@@ -2885,6 +3003,7 @@ impl StoreRuntime {
                             store.daemon_state = DaemonState::Connected;
                             store.daemon_identity = Some(identity);
                             store.last_action_failure = None;
+                            store.workspace_connection_changed(true);
                         }
                         // The agent catalog first: `hydrate` runs the notification
                         // policy for every arriving session, and that policy reads
@@ -3102,7 +3221,15 @@ async fn run_effects(
     snapshot_tx: tokio::sync::watch::Sender<StoreSnapshot>,
     status_tx: broadcast::Sender<StatusTransition>,
 ) {
-    while let Some(effect) = effects.recv().await {
+    let mut workspace_tasks = tokio::task::JoinSet::new();
+    loop {
+        // Reap completed handles before admitting another effect, so a burst
+        // of fast launches cannot retain an unbounded completed task set.
+        while workspace_tasks.try_join_next().is_some() {}
+        let effect = tokio::select! {
+            effect = effects.recv() => match effect { Some(effect) => effect, None => break },
+            _ = workspace_tasks.join_next(), if !workspace_tasks.is_empty() => continue,
+        };
         let action_context = action_context(&effect);
         let force_snapshot = matches!(
             &effect,
@@ -3110,6 +3237,36 @@ async fn run_effects(
         );
         let result: Result<(), ClientError> = match effect {
             StoreEffect::UiChanged | StoreEffect::PublishSnapshot => Ok(()),
+            StoreEffect::RefreshWorkspaces { generation } => {
+                if !store
+                    .read()
+                    .expect("store")
+                    .workspace_request_is_current(generation)
+                {
+                    continue;
+                }
+                let result = client.workspaces().await;
+                store
+                    .write()
+                    .expect("store")
+                    .finish_workspace_request(generation, false, result);
+                Ok(())
+            }
+            StoreEffect::MutateWorkspace { generation, params } => {
+                if !store
+                    .read()
+                    .expect("store")
+                    .workspace_request_is_current(generation)
+                {
+                    continue;
+                }
+                let result = client.mutate_workspace(&params).await;
+                store
+                    .write()
+                    .expect("store")
+                    .finish_workspace_request(generation, true, result);
+                Ok(())
+            }
             StoreEffect::MarkSeen(id) => client.mark_seen(&id).await,
             StoreEffect::Remove(id) => client.remove(&id).await,
             StoreEffect::Resume { id, automatic } => {
@@ -3125,6 +3282,16 @@ async fn run_effects(
             StoreEffect::Archive(id) => client.archive(&id).await,
             StoreEffect::Unarchive(id) => client.unarchive(&id).await,
             StoreEffect::Rename { id, title } => client.rename(&id, title).await,
+            StoreEffect::WorkspaceSpawn { id, params } => {
+                workspace_tasks.spawn(workspace_spawn::run(
+                    id,
+                    params,
+                    client.clone(),
+                    store.clone(),
+                    change_tx.clone(),
+                ));
+                Ok(())
+            }
             StoreEffect::Spawn(params) => match client.spawn(params).await {
                 Ok(id) => {
                     // The authoritative record still arrives through session.updated.
@@ -3206,6 +3373,7 @@ async fn run_effects(
                 result.map(|_| ())
             }
             StoreEffect::LocateRepo {
+                owner,
                 key,
                 host,
                 session_id,
@@ -3227,13 +3395,16 @@ async fn run_effects(
                     // default directory instead of surfacing an error.
                     Err(_) => RepoTarget::NoOrigin,
                 };
-                store
-                    .write()
-                    .expect("session store lock poisoned")
-                    .set_repo_target(key, target);
+                let mut store = store.write().expect("session store lock poisoned");
+                if let Some((owner, generation)) = owner {
+                    store.finish_window_repo_target(owner, generation, key, target);
+                } else {
+                    store.set_repo_target(key, target);
+                }
                 Ok(())
             }
             StoreEffect::ListDirectories {
+                owner,
                 request_id,
                 host,
                 path,
@@ -3246,10 +3417,13 @@ async fn run_effects(
                         .list_directories(host, path)
                         .await
                         .map_err(|error| error.to_string());
-                    store
-                        .write()
-                        .expect("session store lock poisoned")
-                        .finish_directory_listing(request_id, result);
+                    let mut store = store.write().expect("session store lock poisoned");
+                    if let Some(owner) = owner {
+                        store.finish_window_directory_listing(owner, request_id, result);
+                    } else {
+                        store.finish_directory_listing(request_id, result);
+                    }
+                    drop(store);
                     let _ = change_tx.send(());
                 });
                 Ok(())
@@ -3390,6 +3564,9 @@ fn action_context(effect: &StoreEffect) -> Option<ActionContext> {
         ),
         StoreEffect::ReopenLast => ("Reopen session failed", None),
         StoreEffect::UiChanged
+        | StoreEffect::WorkspaceSpawn { .. }
+        | StoreEffect::RefreshWorkspaces { .. }
+        | StoreEffect::MutateWorkspace { .. }
         | StoreEffect::PublishSnapshot
         | StoreEffect::MarkSeen(_)
         | StoreEffect::RetryConnection

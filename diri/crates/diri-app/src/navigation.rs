@@ -7,7 +7,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::commands::{
@@ -80,7 +80,7 @@ enum Overlay {
     Themes,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 enum CommandSelection {
     Action(PaletteCommand),
     Session(SessionId),
@@ -93,10 +93,14 @@ struct PageState {
     scroll: UniformListScrollHandle,
 }
 
+impl gpui::EventEmitter<crate::palette_workspace::WorkspaceCommand> for NavigationOverlay {}
+
 pub struct NavigationOverlay {
+    active_workspace: Option<diri_proto::workspace::WorkspaceId>,
+    workspace_spawn_target: Option<crate::store::WorkspaceSpawnTarget>,
     focus_handle: FocusHandle,
     previous_focus_handle: Option<FocusHandle>,
-    store: Arc<RwLock<SessionStore>>,
+    store: crate::store::WindowStore,
     _runtime: Arc<StoreRuntime>,
     overlay: Option<Overlay>,
     query: QueryEditor,
@@ -109,10 +113,9 @@ pub struct NavigationOverlay {
     directory_index: DirectoryIndex,
     quick_snapshot: QuickOpenSnapshot,
     ranked_items: Vec<RankedFolder>,
-    /// Identity of the readiness facts `ranked_actions` was built from, so a
-    /// store change that cannot have altered the Agent rows does not rebuild
-    /// them. See `agent_actions_fingerprint`.
-    agent_actions_fingerprint: u64,
+    /// Readiness and displayed preference identity. Terminal output does not
+    /// rebuild ranked rows; orientation and shortcut changes do.
+    palette_context_fingerprint: u64,
     list_scroll: UniformListScrollHandle,
     tokio: Arc<tokio::runtime::Runtime>,
     history: Vec<diri_proto::HistoryEntry>,
@@ -142,6 +145,61 @@ pub struct NavigationOverlay {
 }
 
 impl NavigationOverlay {
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn workspace_palette_for_test(
+        &mut self,
+        query: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<PaletteAction> {
+        self.open_overlay(Overlay::CommandPalette, window, cx);
+        self.query.clear();
+        self.query.insert(query);
+        self.refresh_command_items();
+        cx.notify();
+        self.ranked_actions
+            .iter()
+            .map(|row| row.item.clone())
+            .collect()
+    }
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn invoke_workspace_palette_for_test(
+        &mut self,
+        command: PaletteCommand,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.run_palette_command(command, window, cx);
+    }
+
+    pub(crate) fn set_window_store(&mut self, store: crate::store::WindowStore) {
+        self.store = store;
+    }
+
+    pub(crate) fn set_workspace_palette_context(
+        &mut self,
+        active: Option<diri_proto::workspace::WorkspaceId>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active_workspace == active {
+            return;
+        }
+        self.active_workspace = active;
+        if self.overlay == Some(Overlay::CommandPalette) {
+            let highlighted = self.highlighted_command();
+            self.refresh_command_items();
+            self.restore_highlight(highlighted.as_ref());
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn set_workspace_spawn_target(
+        &mut self,
+        target: Option<crate::store::WorkspaceSpawnTarget>,
+    ) {
+        self.workspace_spawn_target = target;
+    }
+
     pub fn new(
         runtime: Arc<StoreRuntime>,
         tokio: Arc<tokio::runtime::Runtime>,
@@ -169,9 +227,11 @@ impl NavigationOverlay {
             }
         });
         let mut overlay = Self {
+            active_workspace: None,
+            workspace_spawn_target: None,
             focus_handle,
             previous_focus_handle: None,
-            store: Arc::clone(&runtime.store),
+            store: crate::store::WindowStore::from_canonical(Arc::clone(&runtime.store)),
             _runtime: runtime,
             overlay: None,
             query: QueryEditor::default(),
@@ -182,7 +242,7 @@ impl NavigationOverlay {
             directory_index: DirectoryIndex::default(),
             quick_snapshot: QuickOpenSnapshot::default(),
             ranked_items: Vec::new(),
-            agent_actions_fingerprint: 0,
+            palette_context_fingerprint: 0,
             list_scroll: UniformListScrollHandle::new(),
             tokio,
             history: Vec::new(),
@@ -222,9 +282,11 @@ impl NavigationOverlay {
                 .unwrap(),
         );
         Self {
+            active_workspace: None,
+            workspace_spawn_target: None,
             focus_handle: cx.focus_handle(),
             previous_focus_handle: None,
-            store: Arc::clone(&runtime.store),
+            store: crate::store::WindowStore::from_canonical(Arc::clone(&runtime.store)),
             _runtime: runtime,
             overlay: Some(Overlay::CommandPalette),
             query: QueryEditor::default(),
@@ -235,7 +297,7 @@ impl NavigationOverlay {
             directory_index: DirectoryIndex::default(),
             quick_snapshot: QuickOpenSnapshot::default(),
             ranked_items: Vec::new(),
-            agent_actions_fingerprint: 0,
+            palette_context_fingerprint: 0,
             list_scroll: UniformListScrollHandle::new(),
             tokio,
             history: Vec::new(),
@@ -268,8 +330,8 @@ impl NavigationOverlay {
     /// one of these several times a second while any session is producing
     /// output. Rebuilding on each would take a write lock, clone every project
     /// and session record, and re-rank the whole list — reordering rows under a
-    /// highlight index that is not re-anchored. Only readiness can change the
-    /// Agent rows this handler exists for, so gate on exactly that.
+    /// highlight index that is not re-anchored. Rebuild only when readiness or
+    /// displayed preference values change, retaining the highlighted command.
     fn handle_store_change(&mut self, cx: &mut Context<Self>) {
         let mut changed = {
             let store = self.store.read().expect("session store lock poisoned");
@@ -283,9 +345,13 @@ impl NavigationOverlay {
         if self.overlay == Some(Overlay::CommandPalette) {
             let fingerprint = {
                 let store = self.store.read().expect("session store lock poisoned");
-                agent_actions_fingerprint(&store)
+                palette_context_fingerprint(
+                    &store,
+                    self.active_workspace.as_ref(),
+                    store.selected_session(),
+                )
             };
-            if fingerprint != self.agent_actions_fingerprint {
+            if fingerprint != self.palette_context_fingerprint {
                 let highlighted = self.highlighted_command();
                 self.refresh_command_items();
                 self.restore_highlight(highlighted.as_ref());
@@ -678,6 +744,7 @@ impl NavigationOverlay {
                     let launched = {
                         let mut store = self.store.write().expect("session store lock poisoned");
                         let options = SpawnOptions {
+                            workspace_target: self.workspace_spawn_target.clone(),
                             cwd: Some(cwd),
                             ..SpawnOptions::default()
                         };
@@ -744,6 +811,10 @@ impl NavigationOverlay {
         cx: &mut Context<Self>,
     ) {
         match command {
+            PaletteCommand::Workspace(command) => {
+                self.close_overlay(window, cx);
+                cx.emit(command);
+            }
             PaletteCommand::Themes => self.push_page(Overlay::Themes, window, cx),
             PaletteCommand::Action(CommandId::ToggleQuickOpen) => {
                 self.push_page(Overlay::QuickOpen, window, cx)
@@ -762,6 +833,7 @@ impl NavigationOverlay {
                 {
                     let mut store = self.store.write().expect("session store lock poisoned");
                     let mut options = SpawnOptions {
+                        workspace_target: self.workspace_spawn_target.clone(),
                         cwd: cwd.map(|path| path.to_string_lossy().into_owned()),
                         host: host.clone(),
                         ..SpawnOptions::default()
@@ -770,7 +842,10 @@ impl NavigationOverlay {
                     // chosen and the spawn targets a remote host (or the
                     // active session lives on one), keep the active REPO —
                     // the daemon resolves its checkout on the target host.
-                    let selected = store.selected_session();
+                    let selected = self.workspace_spawn_target.as_ref().map_or_else(
+                        || store.selected_session(),
+                        |target| store.workspace_spawn_source(target),
+                    );
                     let active_host = selected.and_then(|session| session.host.clone());
                     if options.cwd.is_none() && (host.is_some() || active_host.is_some()) {
                         options.same_repo_as = selected.map(|session| session.id.clone());
@@ -829,6 +904,13 @@ impl NavigationOverlay {
                 default_host.as_deref(),
                 store.agent_catalogs(),
             );
+            actions.extend(crate::palette_workspace::actions(
+                store.workspace_catalog().snapshot(),
+                self.active_workspace.as_ref(),
+                selected.as_ref(),
+                store.sessions(),
+                store.workspace_catalog().can_edit(),
+            ));
             let orientation = store.preferences().tab_orientation;
             for action in &mut actions {
                 if let PaletteCommand::Action(command) = action.command {
@@ -853,10 +935,14 @@ impl NavigationOverlay {
                     }
                 }
             }
-            let fingerprint = agent_actions_fingerprint(&store);
+            let fingerprint = palette_context_fingerprint(
+                &store,
+                self.active_workspace.as_ref(),
+                store.selected_session(),
+            );
             (actions, store.ordered_sessions(), fingerprint)
         };
-        self.agent_actions_fingerprint = fingerprint;
+        self.palette_context_fingerprint = fingerprint;
         let query = FuzzyQuery::new(self.query.text());
         let searching = !self.query.text().trim().is_empty();
         let mut ranked_actions = palette::rank_actions(actions, &query, &mut self.matcher);
@@ -1459,13 +1545,23 @@ impl NavigationOverlay {
                     CommandId::ToggleQuickOpen | CommandId::ToggleHistory | CommandId::OpenSettings
                 )
         );
-        let trailing = action
-            .detail
-            .clone()
-            .map(SharedString::from)
-            .or_else(|| action.shortcut.map(SharedString::from))
-            .into_iter()
-            .collect();
+        let trailing = if matches!(command, PaletteCommand::Workspace(_)) {
+            action
+                .detail
+                .clone()
+                .into_iter()
+                .chain(action.shortcut)
+                .map(SharedString::from)
+                .collect()
+        } else {
+            action
+                .detail
+                .clone()
+                .or(action.shortcut)
+                .into_iter()
+                .map(SharedString::from)
+                .collect()
+        };
         palette_row(
             highlighted_label(action.title, &ranked.title_matches),
             sf_symbol(action.system_image, 12.5, colors.secondary),
@@ -1790,6 +1886,9 @@ fn palette_row(
 
 fn shortcut_hint(text: impl Into<gpui::SharedString>, colors: SemanticColors) -> AnyElement {
     div()
+        .max_w(px(160.0))
+        .overflow_hidden()
+        .text_ellipsis()
         .px(px(5.0))
         .py(px(2.0))
         .text_size(px(11.0))
@@ -1798,8 +1897,24 @@ fn shortcut_hint(text: impl Into<gpui::SharedString>, colors: SemanticColors) ->
         .into_any_element()
 }
 
-fn agent_actions_fingerprint(store: &SessionStore) -> u64 {
+fn palette_context_fingerprint(
+    store: &SessionStore,
+    workspace: Option<&diri_proto::workspace::WorkspaceId>,
+    selected: Option<&SessionRecord>,
+) -> u64 {
     let mut hasher = DefaultHasher::new();
+    workspace.hash(&mut hasher);
+    selected
+        .map(|session| (&session.id, &session.title))
+        .hash(&mut hasher);
+    store
+        .workspace_catalog()
+        .snapshot()
+        .map(|snapshot| snapshot.revision)
+        .hash(&mut hasher);
+    store.workspace_catalog().can_edit().hash(&mut hasher);
+    std::mem::discriminant(&store.preferences().tab_orientation).hash(&mut hasher);
+    store.preferences().shortcut_overrides.hash(&mut hasher);
     store.preferences().default_agent.id().hash(&mut hasher);
     store.default_spawn_host().hash(&mut hasher);
     let mut targets: Vec<_> = store.agent_catalogs().iter().collect();
@@ -1906,6 +2021,81 @@ mod tests {
             assert!(layout.top_inset + px(SEARCH_HEIGHT + 13.0) + layout.list_height <= px(height));
             assert!(layout.list_height <= px(LIST_HEIGHT));
         }
+    }
+
+    #[gpui::test]
+    fn open_palette_refreshes_orientation_and_shortcuts_without_moving_highlight(
+        cx: &mut TestAppContext,
+    ) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let for_view = runtime.clone();
+        let (overlay, cx) = cx.add_window_view(move |_, cx| {
+            let mut view = NavigationOverlay::opened_for_test(for_view, cx);
+            view.query.insert("tabs");
+            view.refresh_command_items();
+            view.highlight = view
+                .ranked_actions
+                .iter()
+                .position(|r| r.item.command == PaletteCommand::Action(CommandId::HorizontalTabs))
+                .unwrap();
+            view
+        });
+        let highlighted = overlay.read_with(cx, |view, _| view.highlighted_command());
+        assert!(
+            overlay.read_with(cx, |view, _| view.ranked_actions.iter().any(|r| r
+                .item
+                .command
+                == PaletteCommand::Action(CommandId::VerticalTabs)
+                && r.item.detail.as_deref() == Some("Current")))
+        );
+        runtime
+            .store
+            .write()
+            .unwrap()
+            .update_preferences(|prefs| {
+                prefs.tab_orientation = crate::store::TabOrientation::Horizontal
+            })
+            .unwrap();
+        overlay.update(cx, |view, cx| view.handle_store_change(cx));
+        assert_eq!(
+            overlay.read_with(cx, |view, _| view.highlighted_command()),
+            highlighted
+        );
+        assert!(
+            overlay.read_with(cx, |view, _| view.ranked_actions.iter().any(|r| r
+                .item
+                .command
+                == PaletteCommand::Action(CommandId::HorizontalTabs)
+                && r.item.detail.as_deref() == Some("Current")))
+        );
+        assert!(
+            !overlay.read_with(cx, |view, _| view.ranked_actions.iter().any(|r| r
+                .item
+                .command
+                == PaletteCommand::Action(CommandId::VerticalTabs)
+                && r.item.detail.as_deref() == Some("Current")))
+        );
+        let before = overlay.read_with(cx, |view, _| view.palette_context_fingerprint);
+        runtime
+            .store
+            .write()
+            .unwrap()
+            .update_preferences(|prefs| {
+                prefs.shortcut_overrides.insert(
+                    "toggle-tab-orientation".into(),
+                    Some(crate::commands::test_chords("cmd-alt-shift-t")),
+                );
+            })
+            .unwrap();
+        overlay.update(cx, |view, cx| view.handle_store_change(cx));
+        assert_ne!(
+            overlay.read_with(cx, |view, _| view.palette_context_fingerprint),
+            before
+        );
+        assert_eq!(
+            overlay.read_with(cx, |view, _| view.highlighted_command()),
+            highlighted
+        );
     }
 
     #[gpui::test]
@@ -2031,6 +2221,16 @@ mod tests {
                             })
                             .unwrap();
                     }
+                    if std::env::var_os("DIRI_VISUAL_HORIZONTAL").is_some() {
+                        overlay
+                            .store
+                            .write()
+                            .unwrap()
+                            .update_preferences(|prefs| {
+                                prefs.tab_orientation = crate::store::TabOrientation::Horizontal
+                            })
+                            .unwrap();
+                    }
                     overlay.refresh_command_items();
                     match std::env::var("DIRI_VISUAL_PAGE").as_deref() {
                         Ok("history") => super::page_tests::seed_history(&mut overlay),
@@ -2135,14 +2335,14 @@ mod tests {
         // A store change that cannot have moved readiness must not rebuild the
         // list: these arrive on the UI tick, and re-ranking under a fixed
         // highlight index moves rows out from under the user's selection.
-        let before = overlay.read_with(cx, |overlay, _| overlay.agent_actions_fingerprint);
+        let before = overlay.read_with(cx, |overlay, _| overlay.palette_context_fingerprint);
         overlay.update(cx, |overlay, cx| {
             overlay.highlight = 1;
             overlay.handle_store_change(cx);
         });
         assert_eq!(
             overlay.read_with(cx, |overlay, _| (
-                overlay.agent_actions_fingerprint,
+                overlay.palette_context_fingerprint,
                 overlay.highlight
             )),
             (before, 1)

@@ -450,6 +450,29 @@ impl Render for ActionHarness {
             NewTerminal,
             ToggleOverview,
             ToggleTabPeek,
+            ReviewLaunches,
+            NewWindow,
+            CloseWindow,
+            FocusPaneLeft,
+            FocusPaneRight,
+            FocusPaneUp,
+            FocusPaneDown,
+            SplitPaneRight,
+            SplitPaneBelow,
+            TogglePaneZoom,
+            RemoveFocusedPane,
+            PaneGrowWidth,
+            PaneShrinkWidth,
+            PaneGrowHeight,
+            PaneShrinkHeight,
+            SwapPaneLeft,
+            SwapPaneRight,
+            SwapPaneUp,
+            SwapPaneDown,
+            MovePaneLeft,
+            MovePaneRight,
+            MovePaneUp,
+            MovePaneDown,
             OpenWorktrees,
             ToggleSidebar,
             HorizontalTabs,
@@ -494,7 +517,7 @@ fn every_static_palette_action_dispatches_once_by_mouse_and_keyboard(cx: &mut Te
     };
     assert_eq!(
         actions.len(),
-        10,
+        33,
         "new static actions need a dispatch probe"
     );
     for action in actions {
@@ -653,7 +676,13 @@ fn dynamic_palette_commands_preserve_their_targets(cx: &mut TestAppContext) {
                 cx,
             );
         });
-        let StoreEffect::Spawn(params) = effects.try_recv().unwrap() else {
+        let StoreEffect::WorkspaceSpawn {
+            params: Some(params),
+            ..
+        } = std::iter::from_fn(|| effects.try_recv().ok())
+            .find(|effect| matches!(effect, StoreEffect::WorkspaceSpawn { .. }))
+            .unwrap()
+        else {
             panic!("spawn effect")
         };
         assert_eq!(params.kind, AgentKind::CODEX);
@@ -683,7 +712,9 @@ fn dynamic_palette_commands_preserve_their_targets(cx: &mut TestAppContext) {
         );
     });
     assert_eq!(
-        effects.try_recv().unwrap(),
+        std::iter::from_fn(|| effects.try_recv().ok())
+            .find(|effect| matches!(effect, StoreEffect::Migrate { .. }))
+            .unwrap(),
         StoreEffect::Migrate {
             id: selected,
             target_host: Some("forge".into())
@@ -751,7 +782,13 @@ fn project_open_keeps_its_context_until_an_agent_can_launch(cx: &mut TestAppCont
     });
     // Cmd+Enter remains an explicit Terminal escape hatch while readiness is pending.
     cx.simulate_keystrokes("cmd-enter");
-    let StoreEffect::Spawn(terminal) = effects.try_recv().unwrap() else {
+    let StoreEffect::WorkspaceSpawn {
+        params: Some(terminal),
+        ..
+    } = std::iter::from_fn(|| effects.try_recv().ok())
+        .find(|effect| matches!(effect, StoreEffect::WorkspaceSpawn { .. }))
+        .unwrap()
+    else {
         panic!("terminal spawn")
     };
     assert_eq!(terminal.kind, AgentKind::SHELL);
@@ -774,7 +811,10 @@ fn project_open_keeps_its_context_until_an_agent_can_launch(cx: &mut TestAppCont
     cx.run_until_parked();
     let spawned = std::iter::from_fn(|| effects.try_recv().ok())
         .find_map(|effect| match effect {
-            StoreEffect::Spawn(params) => Some(params),
+            StoreEffect::WorkspaceSpawn {
+                params: Some(params),
+                ..
+            } => Some(params),
             _ => None,
         })
         .unwrap();

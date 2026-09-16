@@ -5,8 +5,12 @@
 
 mod controller;
 use controller::{AttachmentControl, ControllerLease};
+mod find_input;
 mod find_overlay;
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) mod find_workflow_tests;
 mod qol;
+mod reconnect;
 use qol::QolState;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -56,7 +60,7 @@ use crate::commands::{
 };
 use crate::external_drop::{TerminalDropAction, plan_terminal_drop, terminal_drop_text};
 use crate::icons::{SymbolWeight, sf_symbol, sf_symbol_weighted};
-use crate::navigation::{NavigationOverlay, query_label};
+use crate::navigation::NavigationOverlay;
 use crate::query_editor::{self, ClipboardEdit, Edit, QueryEditor};
 use crate::quote::{Quote, QuoteSource};
 use crate::session_surfaces::switcher_key;
@@ -506,6 +510,7 @@ struct ResidentTerminal {
     /// The editable text behind `find`'s query, so ⌘F gets the same caret,
     /// selection, and readline keys as the other query fields.
     find_query: QueryEditor,
+    find_composition: find_input::Composition,
     last_size: (u16, u16),
     pointer_owner: Option<(MouseButton, PointerOwner)>,
     mouse_motion: MouseMotionLimiter,
@@ -558,7 +563,9 @@ pub struct TerminalViewport {
 
 pub struct TerminalPane {
     qol: QolState,
+    reconnect: reconnect::ReconnectUi,
     runtime: Arc<StoreRuntime>,
+    window_store: Option<crate::store::WindowStore>,
     _tokio_owner: Arc<tokio::runtime::Runtime>,
     tokio: Handle,
     residents: HashMap<SessionId, ResidentTerminal>,
@@ -602,6 +609,8 @@ pub struct TerminalPane {
     utility_surfaces: Option<Entity<UtilitySurfaces>>,
     local_clipboard_images: Vec<StagedClipboardImage>,
     _focus_owner: gpui::Subscription,
+    _find_blur: gpui::Subscription,
+    _find_focus_change: gpui::Subscription,
     _window_owner: gpui::Subscription,
     _pane_events: Task<()>,
     _store_changes: Task<()>,
@@ -620,6 +629,24 @@ impl TerminalPane {
             runtime,
             tokio_owner,
             SessionSource::FollowSelection,
+            None,
+            window,
+            cx,
+        )
+    }
+
+    pub(crate) fn new_for_window(
+        runtime: Arc<StoreRuntime>,
+        tokio_owner: Arc<tokio::runtime::Runtime>,
+        store: crate::store::WindowStore,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::new_with_source(
+            runtime,
+            tokio_owner,
+            SessionSource::FollowSelection,
+            Some(store),
             window,
             cx,
         )
@@ -636,15 +663,21 @@ impl TerminalPane {
             runtime,
             tokio_owner,
             SessionSource::Fixed(session_id),
+            None,
             window,
             cx,
         )
+    }
+
+    pub(crate) fn set_window_store(&mut self, store: crate::store::WindowStore) {
+        self.window_store = Some(store);
     }
 
     fn new_with_source(
         runtime: Arc<StoreRuntime>,
         tokio_owner: Arc<tokio::runtime::Runtime>,
         session_source: SessionSource,
+        window_store: Option<crate::store::WindowStore>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -657,6 +690,19 @@ impl TerminalPane {
                 this.claim_selected_control();
             }
             cx.notify();
+        });
+        let find_blur = cx.on_blur(&focus, window, |this, window, cx| {
+            this.cancel_find_composition(window, cx);
+        });
+        let find_focus_change = cx.observe_pending_input(window, |this, window, cx| {
+            if !this.focus.is_focused(window)
+                && this
+                    .residents
+                    .values()
+                    .any(|resident| resident.find_composition.is_composing())
+            {
+                this.cancel_find_composition(window, cx);
+            }
         });
         let window_owner = cx.observe_window_activation(window, |this, window, cx| {
             if window.is_window_active() && this.focus.is_focused(window) {
@@ -703,15 +749,21 @@ impl TerminalPane {
         let tokio = tokio_owner.handle().clone();
         let observed_selected_id = matches!(session_source, SessionSource::FollowSelection)
             .then(|| {
-                runtime
-                    .store
-                    .read()
-                    .expect("session store lock poisoned")
-                    .selected_session_id()
-                    .cloned()
+                window_store.as_ref().map_or_else(
+                    || {
+                        runtime
+                            .store
+                            .read()
+                            .expect("store")
+                            .selected_session_id()
+                            .cloned()
+                    },
+                    |store| store.read().expect("store").selected_session_id().cloned(),
+                )
             })
             .flatten();
         let mut pane = Self {
+            window_store,
             runtime,
             _tokio_owner: tokio_owner,
             tokio,
@@ -723,6 +775,7 @@ impl TerminalPane {
             glyphs: HashMap::new(),
             session_links: SessionLinks::new(cx),
             qol: QolState::default(),
+            reconnect: Default::default(),
             pending_resizes: HashMap::new(),
             resize_flush: None,
             resize_flush_armed: false,
@@ -740,6 +793,8 @@ impl TerminalPane {
             utility_surfaces: None,
             local_clipboard_images: Vec::new(),
             _focus_owner: focus_owner,
+            _find_blur: find_blur,
+            _find_focus_change: find_focus_change,
             _window_owner: window_owner,
             _pane_events: pane_events,
             _store_changes: store_changes,
@@ -750,6 +805,10 @@ impl TerminalPane {
     }
 
     fn reconcile_residency(&mut self, cx: &mut Context<Self>) {
+        let window_selected = self
+            .window_store
+            .as_ref()
+            .map(|window| window.read().expect("store").selected_session_id().cloned());
         let store = self
             .runtime
             .store
@@ -757,7 +816,19 @@ impl TerminalPane {
             .expect("session store lock poisoned");
         let resident_ids: HashSet<_> = match &self.session_source {
             SessionSource::FollowSelection => {
-                store.terminal_residency().resident().cloned().collect()
+                if let Some(selected) = window_selected {
+                    selected
+                        .filter(|id| {
+                            store
+                                .sessions()
+                                .get(id)
+                                .is_some_and(|session| !session.is_archived())
+                        })
+                        .into_iter()
+                        .collect()
+                } else {
+                    store.terminal_residency().resident().cloned().collect()
+                }
             }
             SessionSource::Fixed(id) if store.sessions().contains_key(id) => {
                 HashSet::from([id.clone()])
@@ -833,6 +904,7 @@ impl TerminalPane {
                     find: None,
                     find_scheduler: FindSearchScheduler::default(),
                     find_query: QueryEditor::default(),
+                    find_composition: find_input::Composition::default(),
                     last_size: (0, 0),
                     pointer_owner: None,
                     mouse_motion: MouseMotionLimiter::default(),
@@ -843,17 +915,11 @@ impl TerminalPane {
 
     fn reconcile_store_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let selected_id = matches!(self.session_source, SessionSource::FollowSelection)
-            .then(|| {
-                self.runtime
-                    .store
-                    .read()
-                    .expect("session store lock poisoned")
-                    .selected_session_id()
-                    .cloned()
-            })
+            .then(|| self.selected_id())
             .flatten();
         let selection_changed = selected_id != self.observed_selected_id;
         if selection_changed {
+            self.cancel_find_composition(window, cx);
             if let Some(previous) = &self.observed_selected_id
                 && let Some(resident) = self.residents.get(previous)
             {
@@ -912,11 +978,51 @@ impl TerminalPane {
         self.utility_surfaces = Some(utility_surfaces);
     }
 
-    pub fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.session_source, SessionSource::FollowSelection)
+            && self.selected_id() != self.observed_selected_id
+        {
+            self.reconcile_store_change(window, cx);
+            return;
+        }
         if window.is_window_active() {
             self.claim_selected_control();
         }
         window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
+    /// A split workbench explicitly assigns one visible owner per SessionId.
+    /// Unfocused sessions still need geometry; duplicate passive views do not.
+    pub(crate) fn claim_layout_control(&self, window: &Window) {
+        if window.is_window_active() {
+            self.claim_selected_control();
+        }
+    }
+
+    pub(crate) fn release_layout_control(&self) {
+        if let Some(id) = self.selected_id()
+            && let Some(resident) = self.residents.get(&id)
+        {
+            resident.attachment.release();
+        }
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn send_owned_fixture_input(&self) -> Option<(SessionId, u16, u16)> {
+        let id = self.selected_id()?;
+        let resident = self.residents.get(&id)?;
+        if !resident.attachment.is_controller() || resident.last_size == (0, 0) {
+            return None;
+        }
+        resident.attachment.input(b"show\n".to_vec());
+        Some((id, resident.last_size.0, resident.last_size.1))
+    }
+    #[cfg(test)]
+    pub(crate) fn layout_owner_for_test(&self) -> bool {
+        self.selected_id()
+            .and_then(|id| self.residents.get(&id))
+            .is_some_and(|resident| resident.attachment.is_controller())
     }
 
     fn claim_selected_control(&self) {
@@ -944,6 +1050,7 @@ impl TerminalPane {
             *resident.element.buffer().write().unwrap() = grid;
             resident.attachment_state = AttachmentState::Live;
             resident.controller.seed_live_for_test();
+            self.seed_reconnect_fixture(&id);
         }
     }
 
@@ -1065,13 +1172,16 @@ impl TerminalPane {
                     return;
                 }
                 let now = self.started_at.elapsed();
-                let schedule = self
-                    .residents
-                    .get_mut(&id)
-                    .and_then(|resident| resident.find.as_mut())
-                    .is_some_and(|find| find.on_output(now));
+                let schedule = self.residents.get_mut(&id).is_some_and(|resident| {
+                    let Some(find) = resident.find.as_mut() else {
+                        return false;
+                    };
+                    let scheduled = find.on_output(now);
+                    resident.element.sync_find_highlights(find);
+                    scheduled
+                });
                 if schedule {
-                    self.schedule_find(id.clone(), Duration::from_millis(100), window, cx);
+                    self.schedule_find(id.clone(), self.find_rescan_delay(&id), window, cx);
                 }
                 if terminal_damage_should_repaint(self.selected_id().as_ref(), &id, changed) {
                     self.request_terminal_repaint(window, cx);
@@ -1393,6 +1503,7 @@ impl TerminalPane {
             }
             if applied && let Some(find) = resident.find.as_mut() {
                 schedule_find = find.on_output(now);
+                resident.element.sync_find_highlights(find);
             }
         }
         if !applied {
@@ -1403,7 +1514,8 @@ impl TerminalPane {
         // gating on it freezes a still-visible window on another monitor.
         let repaint = terminal_damage_should_repaint(selected.as_ref(), &id, changed);
         if schedule_find {
-            self.schedule_find(id, Duration::from_millis(100), window, cx);
+            let delay = self.find_rescan_delay(&id);
+            self.schedule_find(id, delay, window, cx);
         }
         if repaint {
             self.request_terminal_repaint(window, cx);
@@ -1457,28 +1569,109 @@ impl TerminalPane {
     }
 
     fn launch_find_read(
-        &self,
+        &mut self,
         id: SessionId,
         generation: AttachmentGeneration,
         request: SearchRequest,
     ) {
+        let capture = self
+            .residents
+            .get_mut(&id)
+            .and_then(|resident| resident.find.as_mut())
+            .map(|find| {
+                (
+                    find.uses_retained_capture(),
+                    find.paused_source(),
+                    if find.uses_retained_capture() {
+                        find.reservation()
+                    } else {
+                        None
+                    },
+                )
+            });
         let client = Arc::clone(self.runtime.client());
         let pane_tx = self.pane_tx.clone();
         self.tokio.spawn(async move {
-            let snapshot = client.read_scrollback(&id).await.ok().map(Into::into);
+            let snapshot = match capture {
+                Some((true, Some(source), _)) => Some(FindSnapshot::from(source)),
+                Some((true, None, Some(reservation))) => {
+                    // Only active searches wait here. A single admission gate
+                    // bounds transient RPC/decode allocations across windows.
+                    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+                    let permit = loop {
+                        if let Some(permit) = diri_term::find::FindCapturePermit::acquire() {
+                            break Some(permit);
+                        }
+                        if tokio::time::Instant::now() >= deadline {
+                            break None;
+                        }
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                    };
+                    if let Some(permit) = permit {
+                        match client.capture_find(&id).await {
+                            Ok(result) if result.session_id == id => Some(
+                                tokio::task::spawn_blocking(move || {
+                                    let _permit = permit;
+                                    match diri_term::find::RetainedFindSnapshot::decode(
+                                        result,
+                                        reservation,
+                                    ) {
+                                        Ok(source) => FindSnapshot::from(source),
+                                        Err(error) => FindSnapshot::failure(error),
+                                    }
+                                })
+                                .await
+                                .unwrap_or_else(|_| FindSnapshot::failure("Search interrupted")),
+                            ),
+                            Ok(_) => Some(FindSnapshot::failure("Search session changed")),
+                            Err(_) => Some(FindSnapshot::failure(
+                                "Search unavailable. Refresh results to retry",
+                            )),
+                        }
+                    } else {
+                        Some(FindSnapshot::failure(
+                            "Search busy. Refresh results to retry",
+                        ))
+                    }
+                }
+                Some((true, None, None)) => Some(FindSnapshot::failure(
+                    "Close another Find view to search here",
+                )),
+                Some((false, _, _)) => client.read_scrollback(&id).await.ok().map(Into::into),
+                None => None,
+            };
             let _ = pane_tx.send(PaneEvent::FindSnapshot(id, generation, request, snapshot));
         });
     }
 
+    fn find_rescan_delay(&self, id: &SessionId) -> Duration {
+        self.residents
+            .get(id)
+            .and_then(|resident| resident.find.as_ref())
+            .map_or(
+                Duration::from_millis(100),
+                TerminalFindModel::output_rescan_delay,
+            )
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn session_id_for_test(&self) -> Option<SessionId> {
+        self.selected_id()
+    }
+
     fn selected_id(&self) -> Option<SessionId> {
         match &self.session_source {
-            SessionSource::FollowSelection => self
-                .runtime
-                .store
-                .read()
-                .expect("session store lock poisoned")
-                .selected_session_id()
-                .cloned(),
+            SessionSource::FollowSelection => self.window_store.as_ref().map_or_else(
+                || {
+                    self.runtime
+                        .store
+                        .read()
+                        .expect("store")
+                        .selected_session_id()
+                        .cloned()
+                },
+                |store| store.read().expect("store").selected_session_id().cloned(),
+            ),
             SessionSource::Fixed(id) => Some(id.clone()),
         }
     }
@@ -1507,22 +1700,38 @@ impl TerminalPane {
         let Some(id) = self.selected_id() else {
             return;
         };
+        let local = self
+            .selected_session()
+            .is_some_and(|session| session.host.is_none());
         let Some(resident) = self.residents.get_mut(&id) else {
             return;
         };
         if resident.find.is_none() {
-            resident.find = Some(TerminalFindModel::default());
+            resident.find_composition.cancel(&mut resident.find_query);
+            resident.element.set_text_input_enabled(false);
+            let mut find = if local {
+                TerminalFindModel::retained()
+            } else {
+                TerminalFindModel::default()
+            };
+            find.set_query(
+                resident.find_query.text().to_owned(),
+                self.started_at.elapsed(),
+            );
+            resident.find = Some(find);
             // Reopening keeps the last query but selects it, so ⌘F then typing
             // starts a new search while ⌘F then ⏎ repeats the old one.
             resident.find_query.select_all();
         }
+        self.schedule_find(id, Duration::from_millis(200), window, cx);
         window.focus(&self.focus, cx);
         cx.stop_propagation();
         cx.notify();
     }
 
-    fn close_find(&mut self, _: &CloseFind, _window: &mut Window, cx: &mut Context<Self>) {
+    fn close_find(&mut self, _: &CloseFind, window: &mut Window, cx: &mut Context<Self>) {
         if self.close_find_for_selected() {
+            find_input::discard_native(window, cx);
             cx.stop_propagation();
             cx.notify();
         } else {
@@ -1540,9 +1749,40 @@ impl TerminalPane {
         if resident.find.take().is_none() {
             return false;
         }
+        resident.find_composition.cancel(&mut resident.find_query);
+        resident.element.clear_find_source();
+        resident.element.set_text_input_enabled(true);
         resident.find_scheduler.cancel();
         resident.element.set_find_highlights(Vec::new());
         true
+    }
+
+    fn cancel_find_composition(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mut changed = Vec::new();
+        let mut owns_input = false;
+        for (id, resident) in &mut self.residents {
+            if resident.find.is_none() {
+                continue;
+            }
+            owns_input = true;
+            resident.find_composition.cancel(&mut resident.find_query);
+            if let Some(find) = resident.find.as_mut()
+                && find.set_query(
+                    resident.find_query.text().to_owned(),
+                    self.started_at.elapsed(),
+                )
+            {
+                resident.element.set_find_highlights(Vec::new());
+                changed.push(id.clone());
+            }
+        }
+        for id in changed {
+            self.schedule_find(id, Duration::from_millis(200), window, cx);
+        }
+        if owns_input {
+            find_input::discard_native(window, cx);
+            cx.notify();
+        }
     }
 
     fn find_next(&mut self, _: &FindNext, _window: &mut Window, cx: &mut Context<Self>) {
@@ -1551,6 +1791,36 @@ impl TerminalPane {
 
     fn find_previous(&mut self, _: &FindPrevious, _window: &mut Window, cx: &mut Context<Self>) {
         self.navigate_find(true, cx);
+    }
+
+    fn refresh_find(&mut self, cx: &mut Context<Self>) {
+        if let Some(id) = self.selected_id() {
+            if let Some(resident) = self.residents.get_mut(&id)
+                && let Some(find) = resident.find.as_mut()
+            {
+                resident
+                    .element
+                    .scroll_to_live(usize::from(resident.last_size.1));
+                find.refresh(self.started_at.elapsed());
+            }
+            self.start_due_find(&id);
+            cx.notify();
+        }
+    }
+
+    fn return_to_live(&mut self, id: &SessionId, cx: &mut Context<Self>) {
+        if let Some(resident) = self.residents.get_mut(id) {
+            resident
+                .element
+                .scroll_to_live(usize::from(resident.last_size.1));
+            if let Some(find) = resident.find.as_mut()
+                && find.is_paused()
+            {
+                find.refresh(self.started_at.elapsed());
+            }
+            self.start_due_find(id);
+            cx.notify();
+        }
     }
 
     fn navigate_find(&mut self, backwards: bool, cx: &mut Context<Self>) {
@@ -2035,7 +2305,8 @@ impl TerminalPane {
                     .read()
                     .expect("session store lock poisoned");
                 store
-                    .selected_session()
+                    .sessions()
+                    .get(&id)
                     .and_then(|session| session.host.as_deref())
                     .and_then(|host_id| store.host(host_id))
                     .map(|host| host.ssh.clone())
@@ -2083,7 +2354,10 @@ impl TerminalPane {
             return;
         };
         if let Some(find) = resident.find.as_mut() {
-            resident.find_query.insert(&text);
+            resident
+                .find_composition
+                .commit(&mut resident.find_query, &text);
+            find_input::discard_native(window, cx);
             let query = resident.find_query.text().to_owned();
             if find.set_query(query, now) {
                 resident.element.set_find_highlights(Vec::new());
@@ -2130,7 +2404,23 @@ impl TerminalPane {
         self.qol.hover = None;
         self.qol.hit = None;
         let switcher_key = switcher_key(event);
-        let switcher_handled = {
+        let switcher_handled = if let Some(window_store) = &self.window_store {
+            let mut store = window_store.write().expect("session store lock poisoned");
+            let was_visible = store.switcher_state().is_visible();
+            let handled = if was_visible
+                || matches!(
+                    switcher_key,
+                    crate::switcher::SwitcherKey::Tab { control: true, .. }
+                ) {
+                store.handle_switcher_key(switcher_key)
+            } else {
+                false
+            };
+            if handled && !was_visible && store.switcher_state().is_visible() {
+                store.dismiss_overview();
+            }
+            handled
+        } else {
             let mut store = self
                 .runtime
                 .store
@@ -2169,6 +2459,10 @@ impl TerminalPane {
             match event.keystroke.key.as_str() {
                 "escape" => {
                     resident.find = None;
+                    resident.element.clear_find_source();
+                    resident.find_composition.cancel(&mut resident.find_query);
+                    resident.element.set_text_input_enabled(true);
+                    find_input::discard_native(window, cx);
                     resident.find_scheduler.cancel();
                     resident.element.set_find_highlights(Vec::new());
                     cx.notify();
@@ -2190,12 +2484,16 @@ impl TerminalPane {
                         return;
                     };
                     let changed = match edit {
-                        Edit::Local(local) => resident.find_query.apply(local),
+                        Edit::Local(local) => {
+                            resident.find_composition.finish();
+                            resident.find_query.apply(local)
+                        }
                         Edit::Clipboard(ClipboardEdit::Copy) => {
                             query_editor::copy_selection(&resident.find_query, cx);
                             false
                         }
                         Edit::Clipboard(ClipboardEdit::Cut) => {
+                            resident.find_composition.finish();
                             query_editor::cut_selection(&mut resident.find_query, cx)
                         }
                         // ⌘V is already an action (it also handles image
@@ -2258,13 +2556,28 @@ impl TerminalPane {
         }
     }
 
-    fn handle_key_up(&mut self, event: &KeyUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        if matches!(event.keystroke.key.as_str(), "control" | "ctrl") {
-            self.runtime
+    fn finish_switcher_modifiers(&self, control: bool) -> bool {
+        if let Some(window_store) = &self.window_store {
+            let mut store = window_store.write().expect("session store lock poisoned");
+            let was_visible = store.switcher_state().is_visible();
+            store.handle_switcher_modifiers_changed(control);
+            was_visible != store.switcher_state().is_visible()
+        } else {
+            let mut store = self
+                .runtime
                 .store
                 .write()
-                .expect("session store lock poisoned")
-                .handle_switcher_modifiers_changed(false);
+                .expect("session store lock poisoned");
+            let was_visible = store.switcher_state().is_visible();
+            store.handle_switcher_modifiers_changed(control);
+            was_visible != store.switcher_state().is_visible()
+        }
+    }
+
+    fn handle_key_up(&mut self, event: &KeyUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(event.keystroke.key.as_str(), "control" | "ctrl")
+            && self.finish_switcher_modifiers(false)
+        {
             cx.notify();
         }
     }
@@ -2275,14 +2588,7 @@ impl TerminalPane {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let mut store = self
-            .runtime
-            .store
-            .write()
-            .expect("session store lock poisoned");
-        let was_visible = store.switcher_state().is_visible();
-        store.handle_switcher_modifiers_changed(event.modifiers.control);
-        if was_visible != store.switcher_state().is_visible() {
+        if self.finish_switcher_modifiers(event.modifiers.control) {
             cx.notify();
         }
     }
@@ -2509,6 +2815,9 @@ impl TerminalPane {
         let sidebar_reveal = show_sidebar.then(|| self.render_sidebar_reveal_control(colors, cx));
         let inspector_open = self.inspector_open;
         let header_trailing_inset = self.header_trailing_inset;
+        let header_width = self
+            .viewport
+            .map_or(f32::INFINITY, |viewport| viewport.width);
         let unread = self
             .runtime
             .store
@@ -2538,8 +2847,7 @@ impl TerminalPane {
                         div()
                             .min_w(px(0.0))
                             .flex_1()
-                            .overflow_hidden()
-                            .whitespace_nowrap()
+                            .text_ellipsis()
                             .text_size(px(Typo::TITLE.size))
                             .font_weight(Typo::TITLE.weight)
                             .text_color(colors.primary)
@@ -2550,7 +2858,11 @@ impl TerminalPane {
             .child(
                 div()
                     .flex_none()
-                    .pl(px(Metrics::TOOLBAR_EDGE_INSET))
+                    .pl(px(if header_width < 420.0 {
+                        4.0
+                    } else {
+                        Metrics::TOOLBAR_EDGE_INSET
+                    }))
                     .flex()
                     .items_center()
                     .gap(px(Metrics::TOOLBAR_ITEM_GAP))
@@ -2560,13 +2872,18 @@ impl TerminalPane {
                             .flex()
                             .items_center()
                             .gap(px(Metrics::TOOLBAR_COMPACT_GAP))
-                            .when_some(glyph, |identity, glyph| identity.child(glyph))
-                            .child(
-                                div()
-                                    .text_size(px(Typo::META.size))
-                                    .text_color(colors.tertiary)
-                                    .child(kind.label()),
-                            ),
+                            .when_some(
+                                glyph.filter(|_| header_width >= 280.0),
+                                |identity, glyph| identity.child(glyph),
+                            )
+                            .when(header_width >= 420.0, |identity| {
+                                identity.child(
+                                    div()
+                                        .text_size(px(Typo::META.size))
+                                        .text_color(colors.tertiary)
+                                        .child(kind.label()),
+                                )
+                            }),
                     )
                     .when(shell_controls, |trailing| {
                         trailing.child(
@@ -2733,11 +3050,15 @@ impl TerminalPane {
                 cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
                     this.focus(window, cx);
                     if follows_selection {
-                        this.runtime
-                            .store
-                            .write()
-                            .expect("session store lock poisoned")
-                            .select(id_for_focus.clone());
+                        if let Some(store) = &this.window_store {
+                            store.write().expect("store").select(id_for_focus.clone());
+                        } else {
+                            this.runtime
+                                .store
+                                .write()
+                                .expect("store")
+                                .select(id_for_focus.clone());
+                        }
                     }
                     this.handle_pointer_down(event, window, cx);
                 }),
@@ -2801,12 +3122,7 @@ impl TerminalPane {
                     .child(sf_symbol("arrow.down", 11.5, colors.secondary))
                     .child(format!("{view_offset} lines · Return to live"))
                     .on_click(cx.listener(move |this, _, _window, cx| {
-                        if let Some(resident) = this.residents.get_mut(&return_id) {
-                            resident
-                                .element
-                                .scroll_to_live(usize::from(resident.last_size.1));
-                            cx.notify();
-                        }
+                        this.return_to_live(&return_id, cx);
                     })),
             );
         }
@@ -2835,6 +3151,9 @@ impl TerminalPane {
         }
         if exited {
             body = body.child(self.render_exit_pill(session, colors, cx));
+        }
+        if let Some(status) = self.render_remote_connection(session, colors, cx) {
+            body = body.child(status);
         }
         body.child(self.render_qol(colors, cx)).into_any_element()
     }
@@ -2920,12 +3239,26 @@ impl TerminalPane {
         } else {
             format!("{}/{}", find.current_index() + 1, find.matches().len())
         };
-        let query = if resident.find_query.is_empty() {
-            div().child("Find").into_any_element()
-        } else {
-            query_label(&resident.find_query)
-        };
+        let query = find_input::render(self, &session.id, colors, cx);
         let alt_screen = find.is_alt_screen();
+        let search_status = find.error().map(str::to_owned).or_else(|| {
+            if find.is_paused() {
+                Some(
+                    match (find.is_partial(), find.has_newer_output()) {
+                        (true, true) => "Paused · Recent output · New output",
+                        (true, false) => "Paused · Recent output",
+                        (false, true) => "Paused · New output available",
+                        (false, false) => "Paused",
+                    }
+                    .to_owned(),
+                )
+            } else if find.is_partial() {
+                Some("Searching recent output".to_owned())
+            } else {
+                None
+            }
+        });
+        let retained_search = find.uses_retained_capture();
         Some(find_overlay::render(
             resident.element.clone(),
             div()
@@ -2984,6 +3317,20 @@ impl TerminalPane {
                                         this.navigate_find(false, cx);
                                     },
                                 ))
+                                .when(retained_search, |row| {
+                                    row.child(find_icon_button(
+                                        FindButtonSpec {
+                                            id: "find-refresh",
+                                            system_image: "arrow.clockwise.circle",
+                                            label: "Refresh results",
+                                            shortcut: "",
+                                        },
+                                        colors,
+                                        true,
+                                        cx,
+                                        |this, _window, cx| this.refresh_find(cx),
+                                    ))
+                                })
                                 .child(find_icon_button(
                                     FindButtonSpec {
                                         id: "find-close",
@@ -2994,12 +3341,22 @@ impl TerminalPane {
                                     colors,
                                     true,
                                     cx,
-                                    |this, _w, cx| {
+                                    |this, window, cx| {
                                         this.close_find_for_selected();
+                                        find_input::discard_native(window, cx);
                                         cx.notify();
                                     },
                                 )),
                         )
+                        .when_some(search_status, |bar, status| {
+                            bar.child(
+                                div()
+                                    .pl(px(20.0))
+                                    .text_size(px(Typo::META.size))
+                                    .text_color(colors.secondary)
+                                    .child(status),
+                            )
+                        })
                         .when(alt_screen, |bar| {
                             bar.child(
                                 div()
@@ -3403,6 +3760,7 @@ fn find_icon_button(
 ) -> AnyElement {
     div()
         .id(spec.id)
+        .debug_selector(move || spec.id.into())
         .size(px(28.0))
         .rounded(px(Radius::CHIP))
         .flex()
@@ -3731,6 +4089,8 @@ mod tests {
 
     fn find_snapshot(content_seq: u64) -> FindSnapshot {
         FindSnapshot {
+            error: None,
+            retained: None,
             text_cells: Default::default(),
             lines: Vec::new(),
             first_row: 0,
@@ -4667,6 +5027,135 @@ mod tests {
     }
 
     #[gpui::test]
+    fn split_terminal_switcher_events_keep_the_originating_window(cx: &mut TestAppContext) {
+        use crate::store::WindowStore;
+        use crate::workspace_workbench::WorkspaceWorkbench;
+        use diri_proto::workspace::{LayoutAxis, LayoutNode, PaneId, SplitId, TabId, WorkspaceTab};
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let first = fixture_session();
+        let first_id = first.id.clone();
+        let mut second = first.clone();
+        second.id = SessionId::new("switcher-second");
+        let second_id = second.id.clone();
+        {
+            let mut store = runtime.store.write().unwrap();
+            store.upsert_session(first);
+            store.upsert_session(second);
+            store.select(first_id.clone());
+        }
+        let origin = WindowStore::new(runtime.store.clone(), Some(first_id.clone()));
+        let other = WindowStore::new(runtime.store.clone(), Some(second_id.clone()));
+        let tab = WorkspaceTab {
+            id: TabId::new("saved-tab"),
+            title: Some("Saved split".into()),
+            focused_pane: PaneId::new("first"),
+            zoomed_pane: None,
+            layout: LayoutNode::Split {
+                id: SplitId::new("divider"),
+                axis: LayoutAxis::Horizontal,
+                fraction: 0.5,
+                first: Box::new(LayoutNode::Pane {
+                    id: PaneId::new("first"),
+                    session_id: first_id.clone(),
+                }),
+                second: Box::new(LayoutNode::Pane {
+                    id: PaneId::new("second"),
+                    session_id: second_id.clone(),
+                }),
+            },
+        };
+        let workbench = cx.add_window(|window, cx| {
+            let mut workbench = WorkspaceWorkbench::new(runtime.clone(), tokio.clone(), window, cx);
+            workbench.set_window_store(origin.clone(), cx);
+            workbench.set_tab(
+                tab,
+                TerminalViewport {
+                    width: 900.0,
+                    height: 600.0,
+                    ..Default::default()
+                },
+                window,
+                cx,
+            );
+            workbench
+        });
+        let other_window = cx.add_window(|window, cx| {
+            TerminalPane::new_for_window(runtime.clone(), tokio.clone(), other.clone(), window, cx)
+        });
+        // Another window is focused after mounting; the fixed split must still
+        // route terminal-local events to the window that owns that saved tab.
+        other.write().unwrap().set_active(true);
+        for release_with_key_up in [true, false] {
+            origin.write().unwrap().select(first_id.clone());
+            other.write().unwrap().select(second_id.clone());
+            workbench
+                .update(cx, |workbench, window, cx| {
+                    let terminal = workbench.focused_terminal().unwrap();
+                    terminal.update(cx, |pane, cx| {
+                        assert_eq!(pane.window_store.as_ref().unwrap().owner(), origin.owner());
+                        pane.handle_key_down(
+                            &KeyDownEvent {
+                                keystroke: Keystroke::parse("ctrl-tab").unwrap(),
+                                is_held: false,
+                                prefer_character_input: false,
+                            },
+                            window,
+                            cx,
+                        );
+                        assert!(origin.read().unwrap().switcher_state().is_visible());
+                        assert!(!other.read().unwrap().switcher_state().is_visible());
+                        assert!(!runtime.store.read().unwrap().switcher_state().is_visible());
+                        assert_eq!(
+                            origin.read().unwrap().switcher_state().highlighted(),
+                            Some(&second_id)
+                        );
+                        if release_with_key_up {
+                            pane.handle_key_up(
+                                &KeyUpEvent {
+                                    keystroke: Keystroke::parse("control").unwrap(),
+                                },
+                                window,
+                                cx,
+                            );
+                        } else {
+                            pane.handle_modifiers_changed(
+                                &ModifiersChangedEvent::default(),
+                                window,
+                                cx,
+                            );
+                        }
+                    });
+                })
+                .unwrap();
+            assert_eq!(
+                origin.read().unwrap().selected_session_id(),
+                Some(&second_id)
+            );
+            assert_eq!(
+                other.read().unwrap().selected_session_id(),
+                Some(&second_id)
+            );
+            assert_eq!(
+                runtime.store.read().unwrap().selected_session_id(),
+                Some(&first_id)
+            );
+            assert!(!origin.read().unwrap().switcher_state().is_visible());
+        }
+        other_window
+            .update(cx, |_, window, _| window.remove_window())
+            .unwrap();
+        workbench
+            .update(cx, |_, window, _| window.remove_window())
+            .unwrap();
+    }
+
+    #[gpui::test]
     fn two_windows_transfer_control_without_replacing_grid_or_passive_resize(
         cx: &mut TestAppContext,
     ) {
@@ -5059,7 +5548,36 @@ mod tests {
             anchor,
             "bar returns when result moves clear"
         );
-        let close = gpui::point(anchor.right() - px(22.0), anchor.center().y);
+        pane.update_in(cx, |pane, _, cx| {
+            pane.residents[&id]
+                .element
+                .set_find_highlights(vec![span(0)]);
+            cx.notify();
+        });
+        let relocated = cx.debug_bounds("find-bar").unwrap();
+        assert_eq!(relocated, moved);
+        pane.update_in(cx, |pane, _, cx| {
+            pane.residents[&id]
+                .element
+                .set_view_offset(3, usize::from(original_size.1));
+            cx.notify();
+        });
+        let refresh = cx
+            .debug_bounds("find-refresh")
+            .expect("reachable refresh control")
+            .center();
+        cx.simulate_mouse_down(refresh, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_up(refresh, MouseButton::Left, Modifiers::default());
+        pane.read_with(cx, |pane, _| {
+            assert!(
+                pane.residents[&id].find.is_some(),
+                "Refresh must not close Find"
+            );
+            assert_eq!(pane.residents[&id].element.view_offset(), 0);
+            assert_eq!(pane.residents[&id].last_size, original_size);
+        });
+        let relocated = cx.debug_bounds("find-bar").unwrap();
+        let close = gpui::point(relocated.right() - px(22.0), relocated.center().y);
         cx.simulate_mouse_down(close, MouseButton::Left, Modifiers::default());
         cx.simulate_mouse_up(close, MouseButton::Left, Modifiers::default());
         assert!(cx.debug_bounds("find-bar").is_none());
@@ -5330,6 +5848,8 @@ mod tests {
             .take_due_search(Duration::from_millis(200))
             .expect("find request");
         let snapshot = FindSnapshot {
+            error: None,
+            retained: None,
             text_cells: Default::default(),
             lines: Vec::new(),
             first_row: 0,

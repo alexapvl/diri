@@ -160,6 +160,8 @@ pub struct Prefs {
     pub sidebar_width: f32,
     pub sidebar_grouping: SidebarGrouping,
     pub tab_orientation: TabOrientation,
+    /// Initial workspace for new windows; each open window keeps its own selection.
+    pub active_workspace: Option<diri_proto::workspace::WorkspaceId>,
     pub sidebar_ordering: SidebarOrdering,
     /// The projectless recency view has one shared archive disclosure rather
     /// than one disclosure per hidden project header.
@@ -180,6 +182,8 @@ pub struct Prefs {
     pub sidebar_pinned_projects: Vec<ProjectId>,
     pub sidebar_pinned_sessions: Vec<SessionId>,
     pub sidebar_collapsed_projects: Vec<ProjectId>,
+    /// Presentation-only disclosure state for named workspace headings.
+    pub sidebar_collapsed_workspaces: Vec<diri_proto::workspace::WorkspaceId>,
     /// Sessions whose spawned children are folded away.
     pub sidebar_collapsed_sessions: Vec<SessionId>,
     pub sidebar_expanded_archives: Vec<ProjectId>,
@@ -222,6 +226,7 @@ impl Default for Prefs {
             sidebar_width: 248.0,
             sidebar_grouping: SidebarGrouping::Project,
             tab_orientation: TabOrientation::Vertical,
+            active_workspace: None,
             sidebar_ordering: SidebarOrdering::Custom,
             sidebar_recency_archives_expanded: false,
             inspector_open: false,
@@ -234,6 +239,7 @@ impl Default for Prefs {
             sidebar_pinned_projects: Vec::new(),
             sidebar_pinned_sessions: Vec::new(),
             sidebar_collapsed_projects: Vec::new(),
+            sidebar_collapsed_workspaces: Vec::new(),
             sidebar_collapsed_sessions: Vec::new(),
             sidebar_expanded_archives: Vec::new(),
             launch_recipes: LaunchRecipeBook::default(),

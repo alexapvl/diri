@@ -152,8 +152,7 @@ fn validate(state: &WorkspaceSnapshot) -> Result<(), ControlError> {
             if let Some(title) = &tab.title {
                 name(title)?;
             }
-            let mut sessions = HashSet::new();
-            validate_node(&tab.layout, 0, &mut seen, &mut sessions)?;
+            validate_node(&tab.layout, 0, &mut seen)?;
             let ids = tree::panes(&tab.layout);
             if ids.len() > MAX_TAB_PANES
                 || tab
@@ -173,7 +172,6 @@ fn validate_node(
     node: &LayoutNode,
     depth: usize,
     seen: &mut HashSet<String>,
-    sessions: &mut HashSet<SessionId>,
 ) -> Result<(), ControlError> {
     if depth >= MAX_LAYOUT_DEPTH {
         return Err(invalid("layout tree is too deep"));
@@ -181,11 +179,10 @@ fn validate_node(
     match node {
         LayoutNode::Pane { id, session_id } => {
             identity(&id.0, seen)?;
-            if session_id.0.is_empty()
-                || session_id.0.len() > 128
-                || !sessions.insert(session_id.clone())
-            {
-                return Err(invalid("a session may appear only once within a tab"));
+            // Pane identity is unique; a saved pane is a reference to a session.
+            // Repeated references share one controller and do not spawn another PTY.
+            if session_id.0.is_empty() || session_id.0.len() > 128 {
+                return Err(invalid("invalid session reference"));
             }
         }
         LayoutNode::Split {
@@ -199,8 +196,8 @@ fn validate_node(
             if !fraction.is_finite() || !(0.1..=0.9).contains(fraction) {
                 return Err(invalid("split fraction must be between 0.1 and 0.9"));
             }
-            validate_node(first, depth + 1, seen, sessions)?;
-            validate_node(second, depth + 1, seen, sessions)?;
+            validate_node(first, depth + 1, seen)?;
+            validate_node(second, depth + 1, seen)?;
         }
     }
     Ok(())
@@ -311,6 +308,7 @@ fn mutate(
             state.workspaces.insert(index, record);
         }
         CreateTab {
+            select,
             workspace_id,
             session_id,
             title,
@@ -329,7 +327,9 @@ fn mutate(
                 focused_pane: pane_id,
                 zoomed_pane: None,
             });
-            workspace.selected_tab = Some(tab_id);
+            if select || workspace.selected_tab.is_none() {
+                workspace.selected_tab = Some(tab_id);
+            }
         }
         RenameTab { tab_id, title } => {
             tab(state, &tab_id)?.title = title;
@@ -528,6 +528,7 @@ mod tests {
         }
         fn create_tab(&mut self, workspace_id: WorkspaceId, session: usize) -> (TabId, PaneId) {
             self.apply(CreateTab {
+                select: true,
                 workspace_id: workspace_id.clone(),
                 session_id: SessionId::new(format!("session_{session}")),
                 title: None,
@@ -666,19 +667,23 @@ mod tests {
     }
 
     #[test]
-    fn invalid_moves_and_duplicate_sessions_are_atomic() {
+    fn repeated_session_references_keep_unique_panes_and_invalid_moves_are_atomic() {
         let mut f = Fixture::new();
         let workspace = f.create_workspace("Work");
         let (tab, pane) = f.create_tab(workspace, 0);
-        f.reject(
-            SplitPane {
-                tab_id: tab.clone(),
-                target: pane.clone(),
-                session_id: SessionId::new("session_0"),
-                edge: DockEdge::Right,
-            },
-            "invalid_workspace",
-        );
+        f.apply(SplitPane {
+            tab_id: tab.clone(),
+            target: pane.clone(),
+            session_id: SessionId::new("session_0"),
+            edge: DockEdge::Right,
+        });
+        let saved = &f.snapshot.workspaces[0].tabs[0];
+        let panes = tree::panes(&saved.layout);
+        assert_eq!(panes.len(), 2);
+        assert_ne!(panes[0], panes[1]);
+        assert_eq!(f.store.snapshot().unwrap(), f.snapshot);
+        assert_eq!(f.sessions.len(), 12);
+
         f.reject(
             MoveNode {
                 source_tab: tab.clone(),
@@ -790,6 +795,30 @@ mod tests {
     }
 
     #[test]
+    fn background_tab_creation_preserves_selection_and_old_wire_defaults_to_select() {
+        let mut f = Fixture::new();
+        let workspace = f.create_workspace("Work");
+        let (original, _) = f.create_tab(workspace.clone(), 0);
+        f.apply(CreateTab {
+            select: false,
+            workspace_id: workspace.clone(),
+            session_id: SessionId::new("session_1"),
+            title: None,
+        });
+        assert_eq!(f.snapshot.workspaces[0].selected_tab, Some(original));
+        assert_eq!(f.snapshot.workspaces[0].tabs.len(), 2);
+        assert_eq!(f.store.snapshot().unwrap(), f.snapshot);
+        let old_wire = serde_json::json!({"type":"createTab", "workspaceId":workspace, "sessionId":"session_2", "title":null});
+        let mutation = serde_json::from_value(old_wire).unwrap();
+        assert!(matches!(mutation, CreateTab { select: true, .. }));
+        f.apply(mutation);
+        assert_eq!(
+            f.snapshot.workspaces[0].selected_tab.as_ref(),
+            Some(&f.snapshot.workspaces[0].tabs[2].id)
+        );
+    }
+
+    #[test]
     fn removal_race_keeps_unavailable_reference_and_never_recreates_session() {
         let mut f = Fixture::new();
         let workspace = f.create_workspace("Work");
@@ -802,6 +831,7 @@ mod tests {
                 WorkspaceMutationParams {
                     expected_revision: f.snapshot.revision,
                     mutation: CreateTab {
+                        select: true,
                         workspace_id: workspace.clone(),
                         session_id: SessionId::new("session_0"),
                         title: None,
@@ -817,6 +847,7 @@ mod tests {
         });
         f.reject(
             CreateTab {
+                select: true,
                 workspace_id: workspace,
                 session_id: SessionId::new("session_0"),
                 title: None,
