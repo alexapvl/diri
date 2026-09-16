@@ -4002,8 +4002,14 @@ impl RootView {
     ) {
         let allowed = window.is_window_active()
             && !self.launcher.read(cx).is_open()
-            && !self.navigation.as_ref().is_some_and(|v| v.read(cx).is_open())
-            && !self.utility_surfaces.as_ref().is_some_and(|v| v.read(cx).is_open())
+            && !self
+                .navigation
+                .as_ref()
+                .is_some_and(|v| v.read(cx).is_open())
+            && !self
+                .utility_surfaces
+                .as_ref()
+                .is_some_and(|v| v.read(cx).is_open())
             && !self.notification_panel_open
             && self.sidebar.read(cx).pending_close_copy().is_none()
             && self.quote_target_picker.is_none()
@@ -4018,7 +4024,9 @@ impl RootView {
             return;
         }
         let position = surfaces.read(cx).tab_peek_position();
-        let frame = self.tab_pinch.sample(event, position, cx.background_executor().now());
+        let frame = self
+            .tab_pinch
+            .sample(event, position, cx.background_executor().now());
         if self.tab_pinch.take_feedback() {
             #[cfg(target_os = "macos")]
             crate::macos::pinch_feedback();
@@ -6247,8 +6255,8 @@ mod tests {
             root.run_command(CommandId::HorizontalTabs, window, cx)
         });
         cx.run_until_parked();
-        assert!(cx.debug_bounds("workspace-tab-build").is_some());
-        assert!(cx.debug_bounds("workspace-tab-review").is_some());
+        assert!(cx.debug_bounds("horizontal-tab-preview-claude").is_some());
+        assert!(cx.debug_bounds("horizontal-tab-preview-codex").is_some());
         assert_eq!(
             root.read_with(cx, |root, cx| root.active_terminal(cx).unwrap()),
             terminal
@@ -6258,7 +6266,7 @@ mod tests {
         });
         cx.run_until_parked();
         assert!(cx.debug_bounds("SESSION_preview-codex").is_some());
-        assert!(cx.debug_bounds("workspace-tab-build").is_none());
+        assert!(cx.debug_bounds("horizontal-tab-preview-claude").is_none());
         assert_eq!(
             root.read_with(cx, |root, cx| root.active_terminal(cx).unwrap()),
             terminal
