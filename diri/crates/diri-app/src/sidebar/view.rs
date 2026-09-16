@@ -290,6 +290,8 @@ pub struct Sidebar {
     hover_task: Option<Task<()>>,
     hover_keystrokes: Option<gpui::Subscription>,
     usage: Option<UsageSnapshot>,
+    number_flows: crate::number_flow::Bank,
+    number_tick: Option<Task<()>>,
     account_context: Option<crate::transcript::ContextUsage>,
     account_context_session: Option<SessionId>,
     account_context_task: Option<Task<()>>,
@@ -444,6 +446,8 @@ impl Sidebar {
             hover_task: None,
             hover_keystrokes: None,
             usage: None,
+            number_flows: crate::number_flow::Bank::default(),
+            number_tick: None,
             account_context: None,
             account_context_session: None,
             account_context_task: None,
@@ -3667,6 +3671,29 @@ impl Sidebar {
         Some(pill.into_any_element())
     }
 
+    fn ensure_number_flow_tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.number_tick.is_some() {
+            return;
+        }
+        self.number_tick = Some(cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(16))
+                    .await;
+                let done = this
+                    .update_in(cx, |this, _, cx| {
+                        cx.notify();
+                        !this.number_flows.running()
+                    })
+                    .unwrap_or(true);
+                if done {
+                    let _ = this.update_in(cx, |this, _, _| this.number_tick = None);
+                    break;
+                }
+            }
+        }));
+    }
+
     fn account_footer(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
         let hovered = self.ui.hovered_control == Some("account");
         let account_label = local_account_label(self.preview);
@@ -3727,13 +3754,15 @@ impl Sidebar {
                             .child(account_label),
                     )
                     .when_some(cost, |row, cost| {
-                        row.child(
-                            div()
-                                .font_family(crate::fonts::mono_family())
-                                .text_size(px(Typo::META_MONO.size))
-                                .text_color(colors.tertiary)
-                                .child(UsageFormat::money(cost)),
-                        )
+                        row.child(self.number_flows.show_font(
+                            "sidebar-today",
+                            cost,
+                            UsageFormat::money(cost),
+                            Typo::META_MONO.size,
+                            colors.tertiary,
+                            FontWeight::NORMAL,
+                            Some(SharedString::from(crate::fonts::mono_family())),
+                        ))
                     })
                     .child(div().text_size(px(9.0)).text_color(colors.tertiary).child(
                         sf_symbol_weighted(
@@ -7086,6 +7115,9 @@ impl Render for Sidebar {
             root = root.child(self.filter_control(colors, window, cx));
         }
         root = root.child(self.account_footer(colors, cx));
+        if self.number_flows.running() {
+            self.ensure_number_flow_tick(window, cx);
+        }
         // Paint the edge without reducing the shared sidebar content width.
         root = root.when(!self.surface_in_parent, |root| {
             root.child(

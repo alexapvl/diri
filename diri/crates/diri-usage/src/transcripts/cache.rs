@@ -12,7 +12,8 @@ use super::model::UsageHourAgg;
 
 // Costs and priced-token coverage are persisted: adding Astra's bundled rate
 // requires reparsing existing transcripts, even when their bytes are unchanged.
-pub(crate) const CACHE_VERSION: u32 = 5;
+// 181-day retention also needs a reparse so hours previously GC'd at 91 return.
+pub(crate) const CACHE_VERSION: u32 = 6;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct UsageFileEntry {
