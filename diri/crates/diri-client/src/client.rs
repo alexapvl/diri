@@ -484,6 +484,14 @@ impl DaemonClient {
         .await
     }
 
+    pub async fn process_info(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<diri_proto::process_facts::SessionProcessInfo, ClientError> {
+        self.typed(Method::SESSION_PROCESS_INFO, &session_params(session_id))
+            .await
+    }
+
     pub async fn reconnect(
         &self,
         session_id: &SessionId,
@@ -620,6 +628,13 @@ impl DaemonClient {
                 Some(Duration::from_secs(60)),
             )
             .await
+    }
+
+    pub async fn send_key(
+        &self,
+        params: &diri_proto::SendKeyParams,
+    ) -> Result<diri_proto::SendKeyResult, ClientError> {
+        self.typed(Method::SESSION_SEND_KEY, params).await
     }
 
     pub async fn send_text(

@@ -1554,6 +1554,7 @@ dependencies = [
  "diri-usage",
  "diri-web",
  "gpui",
+ "gpui_macos",
  "gpui_platform",
  "image",
  "libc",
@@ -1643,6 +1644,7 @@ dependencies = [
 name = "diri-pty"
 version = "0.1.0"
 dependencies = [
+ "diri-proto",
  "libc",
 ]
 
