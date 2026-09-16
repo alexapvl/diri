@@ -552,6 +552,10 @@ impl Sidebar {
         colors: SemanticColors,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        if horizontal {
+            return self.render_project_tab_rows(self.workspace_nav.available_width, cx);
+        }
+
         let groups = {
             let store = self.store.read().expect("store");
             let Some(snapshot) = store.workspace_catalog().snapshot() else {
