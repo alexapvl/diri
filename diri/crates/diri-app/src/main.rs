@@ -31,6 +31,7 @@ mod menu_inbox;
 pub mod navigation;
 mod notification_feed;
 pub mod notifications;
+mod number_flow;
 pub mod palette;
 mod palette_chrome;
 mod palette_workspace;

@@ -1,3 +1,5 @@
+#[path = "usage_chart.rs"]
+mod usage_chart;
 #[path = "usage_page.rs"]
 mod usage_page;
 mod worktree_settings;
@@ -278,7 +280,13 @@ pub struct UtilitySurfaces {
     usage_days: usize,
     usage_host: Option<String>,
     usage_tokens: bool,
-    usage_by_day: bool,
+    usage_chart_split: Option<[bool; 3]>,
+    usage_series_hover: u8,
+    usage_series_menu_close: Option<Task<()>>,
+    usage_chart_window: usage_chart::ChartWindow,
+    usage_scrub: Option<(f32, f32, f32)>,
+    usage_chart_tick: Option<Task<()>>,
+    usage_numbers: crate::number_flow::Bank,
     release_notes: ReleaseNotesState,
     settings_scroll: ScrollHandle,
     settings_search: QueryEditor,
@@ -442,7 +450,13 @@ impl UtilitySurfaces {
             usage_days: 30,
             usage_host: None,
             usage_tokens: false,
-            usage_by_day: false,
+            usage_chart_split: None,
+            usage_series_hover: 0,
+            usage_series_menu_close: None,
+            usage_chart_window: usage_chart::ChartWindow::new(30.0),
+            usage_scrub: None,
+            usage_chart_tick: None,
+            usage_numbers: crate::number_flow::Bank::default(),
             release_notes: ReleaseNotesState::default(),
             settings_scroll: ScrollHandle::new(),
             settings_search: QueryEditor::default(),
@@ -4668,7 +4682,7 @@ impl Focusable for UtilitySurfaces {
 }
 
 impl Render for UtilitySurfaces {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Worktree delegation starts in the sidebar, so that one surface
         // deliberately leaves the visible sidebar interactive. The shaded
         // workspace and sheet remain modal once the pointer crosses the seam.
@@ -4681,6 +4695,9 @@ impl Render for UtilitySurfaces {
             Surface::Settings => Some(self.render_settings(cx).into_any_element()),
             Surface::Diagnostics => Some(self.render_diagnostics(cx).into_any_element()),
         };
+        if self.usage_numbers.running() {
+            self.ensure_chart_tick(window, cx);
+        }
         let root = div()
             .id("utility-surfaces")
             .track_focus(&self.focus)
@@ -6387,31 +6404,20 @@ mod tests {
             }];
         });
         cx.run_until_parked();
-        for selector in [
-            "usage-range-7",
-            "usage-tokens",
-            "usage-source-forge",
-            "usage-by-day",
-        ] {
-            if selector == "usage-by-day" {
-                surfaces.update(cx, |surfaces, cx| {
-                    surfaces
-                        .settings_scroll
-                        .set_offset(point(px(0.0), px(-300.0)));
-                    cx.notify();
-                });
-                cx.run_until_parked();
-            }
+        for selector in ["usage-tokens", "usage-source-forge", "usage-range-1"] {
             let bounds = cx.debug_bounds(selector).expect("visible usage control");
             cx.simulate_click(bounds.center(), Modifiers::default());
             cx.run_until_parked();
         }
         surfaces.read_with(cx, |surfaces, _| {
-            assert_eq!(surfaces.usage_days, 7);
+            assert_eq!(surfaces.usage_days, 1);
             assert!(surfaces.usage_tokens);
-            assert!(surfaces.usage_by_day);
             assert_eq!(surfaces.usage_host.as_deref(), Some("forge"));
         });
+        assert!(
+            cx.debug_bounds("usage-by-day").is_none(),
+            "day grouping control is gone"
+        );
         assert!(settings_tab_matches(SettingsTab::Usage, "cache savings"));
         assert!(settings_tab_matches(SettingsTab::Usage, "cost"));
     }
@@ -6447,7 +6453,8 @@ mod tests {
                         let mut history = crate::usage::dashboard::UsageHistory::default();
                         let mut models = crate::usage::dashboard::ModelHours::default();
                         let now = 1_788_523_200;
-                        for day in 0..30 {
+                        let today = now / 86_400;
+                        for day in 0..60 {
                             if day % 5 == 0 {
                                 continue;
                             }
@@ -6459,7 +6466,7 @@ mod tests {
                                 crate::usage::dashboard::record(
                                     &mut models,
                                     model,
-                                    now / 3600 - day as i64 * 24,
+                                    (today - day as i64) * 24,
                                     crate::usage::UsageHourAgg {
                                         i: volume * 1000,
                                         o: volume * 10_000,
@@ -6474,12 +6481,12 @@ mod tests {
                         }
                         history.merge(crate::usage::UsageProvider::Claude, &models);
                         models.clear();
-                        for day in 0..30 {
+                        for day in 0..60 {
                             let volume = (day * 3) % 13 + 1;
                             crate::usage::dashboard::record(
                                 &mut models,
                                 "gpt-5.4",
-                                now / 3600 - day * 24,
+                                (today - day) * 24,
                                 crate::usage::UsageHourAgg {
                                     i: volume * 2000,
                                     o: volume * 8000,

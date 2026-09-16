@@ -16,7 +16,7 @@ use super::{
     timestamp::days_from_civil,
 };
 
-const RETENTION_DAYS: i64 = 91;
+pub(crate) const RETENTION_DAYS: i64 = 181;
 const BLOCK_HOURS: i64 = 5;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

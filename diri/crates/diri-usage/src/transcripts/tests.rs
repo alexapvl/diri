@@ -758,7 +758,12 @@ fn dashboard_ranges_zero_fill_and_rebuild_old_caches_for_ninety_days() {
     let first = store.refresh();
     for (days, tokens, active) in [(7, 30, 1), (30, 50, 2), (90, 60, 3)] {
         let report = first.history.report(first.updated_at, days);
-        assert_eq!(report.days.len(), days);
+        let end_hour = first.updated_at.div_euclid(3_600);
+        let start_hour = end_hour - days as i64 * 24 + 1;
+        assert_eq!(
+            report.days.len(),
+            (end_hour.div_euclid(24) - start_hour.div_euclid(24) + 1) as usize
+        );
         assert_eq!(report.total.totals().total_tokens(), tokens);
         assert_eq!(report.active_days, active);
         assert_eq!(
@@ -782,6 +787,76 @@ fn dashboard_ranges_zero_fill_and_rebuild_old_caches_for_ninety_days() {
     assert_eq!(
         super::dashboard::date_label(timestamp("2024-02-29T00:00:00Z") / 86400),
         "2024-02-29"
+    );
+}
+
+#[test]
+fn retention_keeps_one_hundred_eighty_one_days_and_drops_older_hours() {
+    let fixture = Fixture::new();
+    write_lines(
+        &fixture.claude.join("history.jsonl"),
+        &[
+            claude_line(
+                "2026-01-20T00:00:00Z",
+                "claude-sonnet",
+                "too-old",
+                "too-old",
+                7,
+                0,
+                0,
+                0,
+                None,
+            ),
+            claude_line(
+                "2026-01-23T13:00:00Z",
+                "claude-sonnet",
+                "kept",
+                "kept",
+                11,
+                0,
+                0,
+                0,
+                None,
+            ),
+            claude_line(
+                "2026-07-20T12:00:00Z",
+                "claude-sonnet",
+                "recent",
+                "recent",
+                13,
+                0,
+                0,
+                0,
+                None,
+            ),
+        ],
+    );
+    let snapshot = fixture
+        .store(
+            "2026-07-22T12:00:00Z",
+            "2026-07-22T00:00:00Z",
+            "2026-07-01T00:00:00Z",
+        )
+        .refresh();
+    let now = snapshot.updated_at;
+    assert_eq!(
+        snapshot.history.report(now, 90).total.totals().input_tokens,
+        13
+    );
+    let compare = snapshot.history.compare(now, 90);
+    assert!(compare.comparable());
+    assert_eq!(compare.previous.total.totals().input_tokens, 11);
+    assert_eq!(compare.current.total.totals().input_tokens, 13);
+    assert_eq!(
+        snapshot
+            .history
+            .report(now.saturating_sub(200 * 86_400), 1)
+            .total
+            .totals()
+            .input_tokens,
+        0,
+        "hours older than {retention} days are dropped",
+        retention = super::store::RETENTION_DAYS
     );
 }
 
