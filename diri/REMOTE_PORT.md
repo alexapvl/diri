@@ -649,6 +649,60 @@ source and workspace dependency configuration participate in the default
 Helper Build ID. This adds no parser implementation or runtime dependency.
 See `vendor/vte/DIRI-PATCH.md` and the 2026-09-06 measurements in `PERF.md`.
 
+The vendored terminal parser allocates its pristine alternate grid on first
+screen entry, at the current dimensions. It retains that grid for subsequent
+switches and applies the existing cursor, erase, resize, reset and history rules.
+For a new 80×24 core this removes 46,848 requested heap bytes; first alternate
+entry pays that allocation instead. Snapshot format is unchanged; retained
+history follows the stored-representation policy below. This parser source already participates in Helper Build
+IDs; existing Holders retain their original allocations until they exit.
+
+Spare parser history rows are allocated in batches sized by row bytes, capped at
+1,000 rows and approximately 64 KiB of new cell/row storage (at least one row).
+Required visible/history rows are always allocated. This bounds the eager reserve
+at first scroll in the dense comparison configuration without changing its
+history allowance or serialized grid representation. Existing vector capacity and reflow-retained rows
+remain separate from this reserve target. Smaller batches trade more occasional
+growth operations for lower memory; the resource and throughput harnesses verify
+that tradeoff. Parser source participates in the Helper Build ID as above.
+
+### Lossless compact history
+
+The Engine and Remote Helper enable process-local compressed row blocks in the
+existing parser. Editable recent rows remain directly accessible; cold history
+uses typed Cell style palettes, UTF-8 scalars and style runs followed by DEFLATE.
+Row occupancy, flags, colors, links and combining marks survive exact round trips.
+There is one parser and no background compression task or terminal lock.
+
+Retain up to 10,000 physical history rows under a 4 MiB stored-history allowance:
+compressed payload, allocated block/row indexes, and editable history cells.
+Discard only oldest history when either limit is reached. Visible cells,
+cell-extra heap allocations, temporary codec/read/reflow work and caller-owned
+response buffers are separate from this allowance. Reflow can alter physical row
+count and therefore evict oldest rows at the same cap. History capacity no longer
+shrinks merely because the terminal becomes wider.
+
+History reads decode bounded row blocks and release caches at exclusive borrow
+boundaries. Resizing untouched hard lines retains compressed payloads and pads
+only rows requested by a reader. Wrapped lines and edits retain the existing
+parser reflow algorithm. Shared index ranges split for wide reads and coalesce
+where possible when narrowing; this does not change terminal semantics.
+
+This is not a parking/checkpoint format and does not change a wire codec or
+on-disk state. `flate2`, already present in the lockfile, supplies compression
+instead of a new compressor implementation; serde/serde_json supply the typed
+internal layout. The dense feature configuration remains for differential tests
+and benchmark comparison only. Shipping Engine and Helper builds use the default
+compact configuration. Parser and dependency changes participate in Helper Build
+IDs; live Holders keep their original code and allocations until they exit.
+
+Acceptance covers actual-parser scrolling, partial regions, editing, both screens,
+reset and resize/reflow differentials; bounded history reads; checkpoint/adoption
+and Helper Scroll; high-entropy storage-budget eviction; and paired CPU, latency
+and requested-heap measurements. See `docs/verification/compact-history` for raw
+results and metric boundaries. Existing Helper/UDS latency gates remain unchanged.
+No transport or controller-lease migration is implied.
+
 ### Local Holder input compatibility
 
 The durable local Holder is outside the remote Helper wire protocol, but it
@@ -1015,13 +1069,44 @@ attach/preview fields and unsupported versions before normal attach dispatch.
 A matching versioned acknowledgement precedes the existing binary full grid,
 modes, and pushed diff frames. There is no fallback to a normal attachment.
 
-At most 16 preview connections are admitted per Engine. They share the bounded
+At most 16 preview subscriptions are admitted per Engine, shared between single-session and multiplexed connections. They share the bounded
 publisher above and do not count as governor visibility. Opening a preview does
 not wake, mark seen, persist, trigger the PR monitor, or refresh activity clocks.
 Input, mouse, resize, and scroll frames close the preview before session lookup;
 only Ping/Pong is accepted. Observing a remote mirror never opens another Helper
 channel or changes its controller lease. The deferred multiple-observer feature
 of the Remote Helper protocol remains deferred.
+
+A second strict, versioned local handshake,
+`{"preview_set":true,"version":1}`, carries a changing bounded membership on one
+receive-only connection. Each member has a session ID and generation; remove and
+re-add requires a fresh generation and full seed. The client coalesces desired
+membership through a latest-value channel, filters stale generations, and keeps
+its decoded event queue at capacity one. A missing or admission-limited member
+gets an individual unavailable event. Connection loss requires reseeding every
+remaining member. The maximum request contains 64 unique IDs; it does not raise
+the shared Engine admission limit.
+
+The existing per-session AttachHub publisher remains the only diff owner. Its
+encoded frame allocations are shared with multiplexed sinks; the multiplexed
+connection has one membership reader and one socket writer, with no additional
+parser, polling publisher, remote channel, or controller. Its queue retains at
+most 8 MiB and 512 frame/header references, plus a separate bounded control
+reserve. One protocol-valid oversized full seed may occupy the empty queue;
+its full allocation stays counted through partial writes. Overflow or a stalled
+writer closes the connection instead of splicing or discarding terminal patches.
+These queue sizes are subject to the same capacity measurements as the admission
+limit.
+
+Seed capture, queue admission, and publisher registration share the Registry
+sequencing boundary. When queue capacity is unavailable, admission releases
+Registry and retries with a newly captured seed; no old snapshot survives the
+wait. Admission has a two-second bound for a complete membership update, and
+connection closure cancels it. Socket I/O takes place outside Registry and queue
+locks. Empty writers sleep until a publication or cancellation, with no idle
+timer. Tests cover fresh seeds after capacity waits, retained partial-frame
+allocation, continuous large-grid progress, stale-generation rejection, and
+closing a backpressured receiver.
 
 The Rust client exposes `SessionPreview` with decoded receive-only chunks, a
 capacity-one queue, and cancellation on close/drop. Previews create no idle
@@ -1060,8 +1145,29 @@ reducer. Only an actual ProcessExit can establish Agent exit, including code126.
 Explicit kill still uses the existing management RPC; automatic replay or a
 second Holder controller is never introduced. A failed resident `session.resume`
 returns the structured error instead of falsely succeeding as a live no-op.
-Explicit Engine re-adoption remains the recovery boundary; a session-scoped
-reconnect command is a separate follow-up.
+`session.reconnect` is the explicit recovery boundary for a failed resident
+remote transport. It reserves the session identity against concurrent lifecycle
+operations and inspects the same Holder outside Registry, with a 15-second
+deadline. The inspection must match the session ID, incarnation, Helper build,
+and last known Agent PID. An actual exited inspection records that exit without
+reattaching or inventing a replacement Agent.
+
+For a running Agent, recovery retains the existing Session, mirror, process ID,
+output offsets, and incarnation. A replacement pump joins the failed pump outside
+Registry, discards all previous pending/uncertain input and resize operations,
+and requests the existing single-controller attachment. HelloAck must again
+match build/incarnation/PID and advance the previous controller epoch; only a
+validated FullSnapshot restores Connected. A race where the Agent exits between
+inspection and attachment records the genuine exit. Input after exit is rejected
+instead of accumulating in a disconnected transport queue.
+
+The result includes the latest SessionRecord, whether recovery started, and
+whether previous input delivery was uncertain and discarded. That flag never
+means the input was confirmed. Connected or already reconnecting sessions return
+their current state without creating another attachment. Missing Engine owners
+return `remote_owner_unavailable`; reconnect does not silently invoke Agent
+resume/relaunch or replace a persisted session. The Rust client and CLI expose
+the same operation (`dirijor session reconnect ID [--json]`).
 
 Deterministic fake-SSH fixtures preserve one live child across bridge loss and
 validated reconnect, reject a fatal protocol frame without declaring that child

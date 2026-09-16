@@ -298,7 +298,8 @@ pub struct Term<T> {
     ///
     /// Opposite of the active grid. While the alternate screen buffer is active, this will be the
     /// primary grid. Otherwise it is the alternate screen buffer.
-    inactive_grid: Grid<Cell>,
+    /// None is the pristine alternate screen, allocated on first entry.
+    inactive_grid: Option<Grid<Cell>>,
 
     /// Index into `charsets`, pointing to what ASCII is currently being mapped to.
     active_charset: CharsetIndex,
@@ -403,6 +404,18 @@ pub enum Osc52 {
 }
 
 impl<T> Term<T> {
+    #[cfg(feature = "compact-history")]
+    pub fn bound_primary_history_storage(&mut self, budget: usize) {
+        if self.mode.contains(TermMode::ALT_SCREEN) {
+            self.inactive_grid
+                .as_mut()
+                .expect("primary grid")
+                .bound_history_storage(budget);
+        } else {
+            self.grid.bound_history_storage(budget);
+        }
+    }
+
     #[inline]
     pub fn scroll_display(&mut self, scroll: Scroll)
     where
@@ -431,7 +444,7 @@ impl<T> Term<T> {
 
         let history_size = config.scrolling_history;
         let grid = Grid::new(num_lines, num_cols, history_size);
-        let inactive_grid = Grid::new(num_lines, num_cols, 0);
+        let inactive_grid = None;
 
         let tabs = TabStops::new(grid.columns());
 
@@ -529,6 +542,8 @@ impl<T> Term<T> {
 
         if self.mode.contains(TermMode::ALT_SCREEN) {
             self.inactive_grid
+                .as_mut()
+                .expect("alternate screen retains the primary grid")
                 .update_history(self.config.scrolling_history);
         } else {
             self.grid.update_history(self.config.scrolling_history);
@@ -720,7 +735,9 @@ impl<T> Term<T> {
 
         let is_alt = self.mode.contains(TermMode::ALT_SCREEN);
         self.grid.resize(!is_alt, num_lines, num_cols);
-        self.inactive_grid.resize(is_alt, num_lines, num_cols);
+        if let Some(inactive_grid) = self.inactive_grid.as_mut() {
+            inactive_grid.resize(is_alt, num_lines, num_cols);
+        }
 
         // Invalidate selection and tabs only when necessary.
         if old_cols != num_cols {
@@ -757,15 +774,20 @@ impl<T> Term<T> {
 
     /// Swap primary and alternate screen buffer.
     pub fn swap_alt(&mut self) {
+        let num_lines = self.grid.screen_lines();
+        let num_cols = self.grid.columns();
+        let inactive_grid = self
+            .inactive_grid
+            .get_or_insert_with(|| Grid::new(num_lines, num_cols, 0));
         if !self.mode.contains(TermMode::ALT_SCREEN) {
             // Set alt screen cursor to the current primary screen cursor.
-            self.inactive_grid.cursor = self.grid.cursor.clone();
+            inactive_grid.cursor = self.grid.cursor.clone();
 
             // Drop information about the primary screens saved cursor.
             self.grid.saved_cursor = self.grid.cursor.clone();
 
             // Reset alternate screen contents.
-            self.inactive_grid.reset_region(..);
+            inactive_grid.reset_region(..);
         }
 
         mem::swap(
@@ -780,7 +802,12 @@ impl<T> Term<T> {
             .into();
         self.set_keyboard_mode(keyboard_mode, KeyboardModesApplyBehavior::Replace);
 
-        mem::swap(&mut self.grid, &mut self.inactive_grid);
+        mem::swap(
+            &mut self.grid,
+            self.inactive_grid
+                .as_mut()
+                .expect("alternate screen initialized before swap"),
+        );
         self.mode ^= TermMode::ALT_SCREEN;
         self.selection = None;
         self.mark_fully_damaged();
@@ -1400,7 +1427,7 @@ impl<T: EventListener> Handler for Term<T> {
         trace!("Pushing `{mode:?}` keyboard mode into the stack");
 
         if self.keyboard_mode_stack.len() >= KEYBOARD_MODE_STACK_MAX_DEPTH {
-            let removed = self.title_stack.remove(0);
+            let removed = self.keyboard_mode_stack.remove(0);
             trace!(
                 "Removing '{removed:?}' from bottom of keyboard mode stack that exceeds its \
                  maximum depth"
@@ -1963,12 +1990,19 @@ impl<T: EventListener> Handler for Term<T> {
     #[inline]
     fn reset_state(&mut self) {
         if self.mode.contains(TermMode::ALT_SCREEN) {
-            mem::swap(&mut self.grid, &mut self.inactive_grid);
+            mem::swap(
+                &mut self.grid,
+                self.inactive_grid
+                    .as_mut()
+                    .expect("alternate screen initialized before swap"),
+            );
         }
         self.active_charset = Default::default();
         self.cursor_style = None;
         self.grid.reset();
-        self.inactive_grid.reset();
+        if let Some(inactive_grid) = self.inactive_grid.as_mut() {
+            inactive_grid.reset();
+        }
         self.scroll_region = Line(0)..Line(self.screen_lines() as i32);
         self.tabs = TabStops::new(self.columns());
         self.title_stack = Vec::new();
@@ -3716,6 +3750,45 @@ mod tests {
         term.title = Some("Test".into());
         term.set_title(None);
         assert_eq!(term.title, None);
+    }
+
+    #[test]
+    fn keyboard_stack_overflow_preserves_titles_and_evicts_only_oldest_modes() {
+        let size = TermSize::new(7, 17);
+        let mut term = Term::new(
+            Config {
+                kitty_keyboard: true,
+                ..Config::default()
+            },
+            &size,
+            VoidListener,
+        );
+        term.push_keyboard_mode(KeyboardModes::DISAMBIGUATE_ESC_CODES);
+        // An empty title stack must not make the 4,097th keyboard push panic.
+        for _ in 0..KEYBOARD_MODE_STACK_MAX_DEPTH {
+            term.push_keyboard_mode(KeyboardModes::REPORT_EVENT_TYPES);
+        }
+        assert_eq!(
+            term.keyboard_mode_stack.len(),
+            KEYBOARD_MODE_STACK_MAX_DEPTH
+        );
+        assert!(term.title_stack.is_empty());
+        assert!(
+            term.keyboard_mode_stack
+                .iter()
+                .all(|mode| *mode == KeyboardModes::REPORT_EVENT_TYPES)
+        );
+        term.set_title(Some("saved window title".into()));
+        term.push_title();
+        term.push_keyboard_mode(KeyboardModes::REPORT_ALL_KEYS_AS_ESC);
+        assert_eq!(term.title_stack, vec![Some("saved window title".into())]);
+        assert_eq!(
+            term.keyboard_mode_stack.len(),
+            KEYBOARD_MODE_STACK_MAX_DEPTH
+        );
+        term.pop_keyboard_modes(1);
+        assert!(term.mode.contains(TermMode::REPORT_EVENT_TYPES));
+        assert!(!term.mode.contains(TermMode::REPORT_ALL_KEYS_AS_ESC));
     }
 
     #[test]

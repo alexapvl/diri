@@ -441,6 +441,19 @@ impl DaemonClient {
         self.core.hello(HEARTBEAT_TIMEOUT.into()).await
     }
 
+    pub async fn workspaces(
+        &self,
+    ) -> Result<diri_proto::workspace::WorkspaceSnapshot, ClientError> {
+        self.no_params(Method::WORKSPACE_SNAPSHOT).await
+    }
+
+    pub async fn mutate_workspace(
+        &self,
+        params: &diri_proto::workspace::WorkspaceMutationParams,
+    ) -> Result<diri_proto::workspace::WorkspaceSnapshot, ClientError> {
+        self.typed(Method::WORKSPACE_MUTATE, params).await
+    }
+
     pub async fn sessions(&self) -> Result<SessionListResult, ClientError> {
         self.no_params(Method::SESSION_LIST).await
     }
@@ -469,6 +482,14 @@ impl DaemonClient {
             },
         )
         .await
+    }
+
+    pub async fn reconnect(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<diri_proto::SessionReconnectResult, ClientError> {
+        self.typed(Method::SESSION_RECONNECT, &session_params(session_id))
+            .await
     }
 
     pub async fn resume(&self, session_id: &SessionId) -> Result<SessionId, ClientError> {

@@ -28,6 +28,7 @@ mod account_handoff;
 mod message_delivery;
 mod operations;
 mod tasks;
+mod workspaces;
 
 /// Identifies this engine in the handshake, so a client can tell which
 /// implementation it reached.
@@ -64,6 +65,7 @@ pub struct ControlServer {
     active_connections: Arc<AtomicUsize>,
     background_requests: Arc<AtomicUsize>,
     worktree_scan: crate::worktree_scan::ScanStore,
+    workspaces: crate::workspace::WorkspaceStore,
     agent_catalog: Arc<Mutex<crate::agent_catalog::AgentCatalogStore>>,
     accounts: Mutex<crate::accounts::AccountStore>,
     session_operations: Mutex<std::collections::HashSet<String>>,
@@ -116,6 +118,8 @@ impl ControlServer {
         // updater can replace the bundle path underneath the live daemon.
         let _ = process_executable_hash();
         let socket_path = socket_path.into();
+        let workspaces =
+            crate::workspace::WorkspaceStore::new(registry.lock().expect("registry").state_file());
         let logs_dir = socket_path
             .parent()
             .map(|parent| parent.join("logs"))
@@ -159,6 +163,7 @@ impl ControlServer {
             active_connections: Arc::new(AtomicUsize::new(0)),
             background_requests: Arc::new(AtomicUsize::new(0)),
             worktree_scan: Default::default(),
+            workspaces,
             agent_catalog: Arc::new(Mutex::new(agent_catalog)),
             accounts,
             session_operations: Mutex::new(std::collections::HashSet::new()),
@@ -444,6 +449,23 @@ impl ControlServer {
             }
             if first {
                 first = false;
+                if serde_json::from_slice::<serde_json::Value>(&line)
+                    .is_ok_and(|value| value.get("preview_set").is_some())
+                {
+                    if let Ok(request) =
+                        serde_json::from_slice::<diri_proto::preview_set::PreviewSetRequest>(&line)
+                        && request.preview_set
+                        && request.version == diri_proto::preview_set::PREVIEW_SET_VERSION
+                    {
+                        let buffered = reader.buffer().to_vec();
+                        return self.attach.serve_preview_set(
+                            &self.registry,
+                            reader.into_inner(),
+                            buffered,
+                        );
+                    }
+                    return Ok(());
+                }
                 // Route by the distinct key before normal attach decoding. Mixed
                 // or unsupported requests fail closed without visibility effects.
                 if serde_json::from_slice::<serde_json::Value>(&line)
@@ -544,6 +566,7 @@ impl ControlServer {
                         | Method::SESSION_REMOVE
                         | Method::SESSION_ARCHIVE
                         | Method::SESSION_RESUME
+                        | Method::SESSION_RECONNECT
                         | Method::SESSION_FORK
                         | Method::SESSION_MIGRATE
                         | Method::WORKTREE_OVERVIEW
@@ -731,6 +754,8 @@ impl ControlServer {
                 let params: diri_proto::AgentAccountId = decode(params)?;
                 encode(&self.accounts.lock().map_err(poisoned)?.remove(&params.id)?)
             }
+            Method::WORKSPACE_SNAPSHOT => encode(&self.workspaces.snapshot()?),
+            Method::WORKSPACE_MUTATE => self.workspace_mutate(params),
             Method::HELLO => self.hello(params),
             Method::SESSION_SPAWN => self.session_spawn(params),
             Method::SESSION_SPAWN_TRACKED => self.session_spawn_tracked(params),
@@ -776,6 +801,7 @@ impl ControlServer {
             Method::HOST_LOCATE_REPO => self.host_locate_repo(params),
             Method::HOOK_REPORT => self.hook_report(params),
             Method::SESSION_RESUME => self.session_resume(params),
+            Method::SESSION_RECONNECT => self.session_reconnect(params),
             Method::SESSION_FORK => self.session_fork(params),
             Method::SESSION_RESUME_FROM_HISTORY => self.session_resume_from_history(params),
             Method::SESSION_REOPEN_LAST => self.session_reopen_last(),
@@ -2189,6 +2215,65 @@ impl ControlServer {
     }
 
     /// Revives an exited session's conversation under the SAME record id.
+    fn session_reconnect(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        let p: diri_proto::SessionReconnectParams = decode(params)?;
+        let owner = {
+            let registry = self.registry.lock().map_err(poisoned)?;
+            let record = registry
+                .record(&p.session_id.0)
+                .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?;
+            if record.host.is_none() {
+                return Err(ControlError::bad_request(
+                    "Reconnect requires a remote session",
+                ));
+            }
+            if !matches!(record.status, diri_proto::SessionStatus::Exited(_))
+                && registry.get(&p.session_id.0).is_none()
+            {
+                return Err(ControlError::new(
+                    "remote_owner_unavailable",
+                    "The remote session has no live Engine binding to reconnect",
+                ));
+            }
+            if !record.remote_connection.is_some_and(|connection| {
+                connection.state == diri_proto::RemoteConnectionState::Failed
+            }) {
+                return encode(&diri_proto::SessionReconnectResult {
+                    session: record,
+                    started: false,
+                    uncertain_input_discarded: false,
+                });
+            }
+            registry
+                .get(&p.session_id.0)
+                .and_then(|session| session.remote_reconnect_handle())
+                .ok_or_else(|| {
+                    ControlError::new(
+                        "remote_owner_unavailable",
+                        "The remote session has no live Engine binding to reconnect",
+                    )
+                })?
+        };
+        // Inspect can wait on SSH. The lifecycle reservation pins this identity,
+        // while Registry remains available to unrelated sessions and UI reads.
+        let inspection = owner
+            .inspect()
+            .map_err(|error| ControlError::new("remote_reconnect_failed", error.to_string()))?;
+        let mut registry = self.registry.lock().map_err(poisoned)?;
+        let (started, uncertain_input_discarded) = registry
+            .reconnect_remote(&p.session_id.0, &owner, inspection.process_state)
+            .map_err(io_control_error)?;
+        self.publish_updated(&registry, &p.session_id.0);
+        let session = registry
+            .record(&p.session_id.0)
+            .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?;
+        encode(&diri_proto::SessionReconnectResult {
+            session,
+            started,
+            uncertain_input_discarded,
+        })
+    }
+
     fn session_resume(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
         let p: diri_proto::SessionIdParams = decode(params)?;
         let record = {
@@ -3935,6 +4020,33 @@ const MAX_PROBE_CHARS: usize = 20;
 mod tests {
     use super::*;
 
+    mod reconnect_tests;
+
+    #[test]
+    fn explicit_launch_argv_is_literal_and_never_silently_repaired() {
+        assert!(decode_launch_argv(&json!({})).unwrap().is_empty());
+        let arguments = vec!["/bin/echo", "", "a b", "$(touch nope)", "--host", "界"];
+        assert_eq!(
+            decode_launch_argv(&json!({"argv": arguments})).unwrap(),
+            arguments
+        );
+        for argv in [
+            json!(null),
+            json!("echo"),
+            json!([]),
+            json!([""]),
+            json!(["echo", 3]),
+            json!(["echo", "x\0y"]),
+            json!(vec!["x"; diri_proto::remote_pty::MAX_ARGUMENTS + 1]),
+            json!(["x".repeat(diri_proto::remote_pty::MAX_LAUNCH_BYTES + 1)]),
+        ] {
+            assert_eq!(
+                decode_launch_argv(&json!({"argv": argv})).unwrap_err().code,
+                "bad_request"
+            );
+        }
+    }
+
     #[test]
     fn failed_remote_state_times_out_exit_wait_and_returns_a_structured_resume_error() {
         let temp = tempfile::tempdir().unwrap();
@@ -3964,31 +4076,6 @@ mod tests {
             crate::remote::client::RemoteTransportFailed,
         ));
         assert_eq!(error.code, "remote_transport_failed");
-    }
-
-    #[test]
-    fn explicit_launch_argv_is_literal_and_never_silently_repaired() {
-        assert!(decode_launch_argv(&json!({})).unwrap().is_empty());
-        let arguments = vec!["/bin/echo", "", "a b", "$(touch nope)", "--host", "界"];
-        assert_eq!(
-            decode_launch_argv(&json!({"argv": arguments})).unwrap(),
-            arguments
-        );
-        for argv in [
-            json!(null),
-            json!("echo"),
-            json!([]),
-            json!([""]),
-            json!(["echo", 3]),
-            json!(["echo", "x\0y"]),
-            json!(vec!["x"; diri_proto::remote_pty::MAX_ARGUMENTS + 1]),
-            json!(["x".repeat(diri_proto::remote_pty::MAX_LAUNCH_BYTES + 1)]),
-        ] {
-            assert_eq!(
-                decode_launch_argv(&json!({"argv": argv})).unwrap_err().code,
-                "bad_request"
-            );
-        }
     }
 
     #[test]

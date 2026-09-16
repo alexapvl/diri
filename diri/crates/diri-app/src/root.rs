@@ -1,3 +1,7 @@
+#[cfg(all(test, target_os = "macos"))]
+#[path = "root/peek_profile.rs"]
+mod peek_profile;
+
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -714,9 +718,7 @@ impl RootView {
                     bridge.cancel();
                 }
                 if let Some(surfaces) = &this.session_surfaces {
-                    surfaces.update(cx, |s, cx| {
-                        s.tab_gesture(crate::tab_peek::GestureFrame::Cancelled, cx)
-                    });
+                    surfaces.update(cx, |s, cx| s.cancel_tab_peek_immediately(cx));
                 }
             }
             activation_services
@@ -843,7 +845,7 @@ impl RootView {
                                 Ok(())
                                 | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                                     let buffers = terminal
-                                        .update(cx, |terminal, _| terminal.resident_buffers());
+                                        .update(cx, |terminal, cx| terminal.resident_buffers(cx));
                                     surfaces.update(cx, |surfaces, _| {
                                         surfaces.sync_resident_buffers(buffers);
                                     });
@@ -981,6 +983,10 @@ impl RootView {
             cx.observe(surfaces, move |_this, surfaces, cx| {
                 let visible = surfaces.read(cx).tab_peek_visible();
                 let offset = surfaces.read(cx).tab_peek_offset(cx);
+                #[cfg(target_os = "macos")]
+                if let Some(bridge) = &_this._tab_gesture {
+                    bridge.set_revealed(visible);
+                }
                 if was_visible && !visible {
                     #[cfg(target_os = "macos")]
                     if let Some(bridge) = &_this._tab_gesture {
@@ -4541,12 +4547,22 @@ mod tests {
         }
         cx.simulate_keystrokes("escape");
         cx.run_until_parked();
+        assert_eq!(cx.debug_bounds("horizontal-tabs").unwrap(), heading);
+        assert!(cx.debug_bounds("terminal-card-body").unwrap().top() > body.top());
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(250));
+        root.update_in(cx, |_, window, cx| window.simulate_next_frame(cx));
+        cx.run_until_parked();
         assert_eq!(cx.debug_bounds("terminal-card-body").unwrap(), body);
         let trigger = cx.debug_bounds("horizontal-peek-tabs").unwrap();
         cx.simulate_click(trigger.center(), Modifiers::default());
         cx.run_until_parked();
         assert!(cx.debug_bounds("TAB_PEEK").is_some());
         cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(250));
+        root.update_in(cx, |_, window, cx| window.simulate_next_frame(cx));
         cx.run_until_parked();
         assert!(cx.debug_bounds("TAB_PEEK").is_none());
         assert_eq!(
@@ -4575,6 +4591,8 @@ mod tests {
         let (root, cx) = cx.add_window_view(move |window, cx| {
             RootView::new(services, false, PreviewScenario::Empty, window, cx)
         });
+        root.update_in(cx, |_, window, _| window.activate_window());
+        cx.run_until_parked();
         let windowed = size(px(1000.0), px(700.0));
         cx.simulate_resize(windowed);
         cx.run_until_parked();
@@ -4645,6 +4663,8 @@ mod tests {
         let (root, cx) = cx.add_window_view(move |window, cx| {
             RootView::new(services, false, PreviewScenario::Empty, window, cx)
         });
+        root.update_in(cx, |_, window, _| window.activate_window());
+        cx.run_until_parked();
         let mut input = root.update(cx, |root, cx| {
             root.terminal
                 .as_ref()
@@ -4994,6 +5014,24 @@ mod tests {
             .project_id
             .clone();
         fixture.list.sessions.retain(|s| s.project_id == project);
+        if std::env::var_os("DIRI_PEEK_REMOTE_STATES").is_some() {
+            use diri_proto::{DateMillis, RemoteConnection, RemoteConnectionState};
+            let states = [
+                RemoteConnectionState::Connected,
+                RemoteConnectionState::Connecting,
+                RemoteConnectionState::Reconnecting,
+                RemoteConnectionState::Failed,
+                RemoteConnectionState::Unknown,
+                RemoteConnectionState::Exited,
+            ];
+            for (index, session) in fixture.list.sessions.iter_mut().enumerate() {
+                session.host = Some("fixture-host".into());
+                session.remote_connection = Some(RemoteConnection {
+                    state: states[index % states.len()],
+                    since: DateMillis(1.0),
+                });
+            }
+        }
         {
             let mut store = services.store.store.write().unwrap();
             store.hydrate(fixture.list);
@@ -5031,7 +5069,7 @@ mod tests {
                 }
                 let terminal = root.terminal.as_ref().unwrap();
                 terminal.update(cx, |terminal, cx| {
-                    terminal.seed_preview_grid_for_test(grid);
+                    terminal.seed_preview_grid_for_test(grid, cx);
                     cx.notify();
                 });
                 let buffers = terminal.read(cx).resident_preview_buffers();
@@ -5061,6 +5099,9 @@ mod tests {
                 .unwrap();
             source.settle(states);
             cx.run_until_parked();
+        }
+        if let Some(profile) = std::env::var_os("DIRI_PEEK_PROFILE") {
+            super::peek_profile::run(&mut cx, window, std::path::Path::new(&profile));
         }
         cx.capture_screenshot(window.into())
             .unwrap()

@@ -1,11 +1,68 @@
 use super::*;
-use crate::tab_peek::{GestureFrame, card_rect, terminal_offset, visible_card_indices};
+use crate::tab_peek::{
+    GestureFrame, card_rect, preview_reveal_offset, terminal_offset, visible_card_indices,
+};
 use gpui::App;
 
+/// A local preview connection is not proof that the remote Holder is reachable.
+fn preview_caption(
+    session: &SessionRecord,
+    source: Option<crate::tab_preview::PreviewState>,
+) -> Option<&'static str> {
+    use crate::tab_preview::PreviewState;
+    use diri_proto::{RemoteConnectionState, SessionStatus};
+    let remote = session
+        .host
+        .as_ref()
+        .and(session.remote_connection.as_ref())
+        .map(|connection| connection.state);
+    if matches!(session.status, SessionStatus::Exited(_))
+        || remote == Some(RemoteConnectionState::Exited)
+    {
+        return Some("Exited");
+    }
+    if session.hibernation.is_some() {
+        return Some("Paused");
+    }
+    if source == Some(PreviewState::Disconnected) {
+        return Some("Disconnected");
+    }
+    session.host.as_ref()?;
+    Some(match remote {
+        Some(RemoteConnectionState::Connecting) => "Connecting",
+        Some(RemoteConnectionState::Connected) => "Connected",
+        Some(RemoteConnectionState::Reconnecting) => "Reconnecting",
+        Some(RemoteConnectionState::Failed) => "Connection failed",
+        Some(RemoteConnectionState::Exited) => "Exited",
+        Some(RemoteConnectionState::Unknown) | None => "Last received",
+    })
+}
+
 impl SessionSurfaces {
-    pub(super) fn dismiss_tab_peek(&mut self) {
+    pub(super) fn dismiss_tab_peek(&mut self, cx: &mut Context<Self>) {
+        if self.peek.is_closing() {
+            return;
+        }
+        self.closing_previews = self
+            .peek
+            .sessions
+            .iter()
+            .filter_map(|id| {
+                self.live_previews
+                    .get(id)
+                    .map(|preview| (id.clone(), preview.element.clone()))
+            })
+            .collect();
+        self.live_previews.clear();
+        self.peek
+            .animate_to(0.0, cx.background_executor().now(), cx.reduce_motion());
+    }
+
+    pub(crate) fn cancel_tab_peek_immediately(&mut self, cx: &mut Context<Self>) {
         self.peek.dismiss();
         self.live_previews.clear();
+        self.closing_previews.clear();
+        cx.notify();
     }
 
     pub(crate) fn sync_tab_peek_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -45,7 +102,7 @@ impl SessionSurfaces {
     }
     pub(crate) fn tab_gesture(&mut self, frame: GestureFrame, cx: &mut Context<Self>) {
         if matches!(frame, GestureFrame::Cancelled) {
-            self.dismiss_tab_peek();
+            self.dismiss_tab_peek(cx);
             cx.notify();
             return;
         }
@@ -63,7 +120,11 @@ impl SessionSurfaces {
             self.peek.begin(sessions, selected.as_ref());
             self.peek_scroll.set_offset(point(px(0.0), px(0.0)));
         }
-        self.peek.update(frame);
+        if matches!(frame, GestureFrame::Tracking(_)) {
+            self.closing_previews.clear();
+        }
+        self.peek
+            .update_animated(frame, cx.background_executor().now(), cx.reduce_motion());
         if !self.peek.visible() {
             self.live_previews.clear();
         }
@@ -71,20 +132,26 @@ impl SessionSurfaces {
     }
     pub(crate) fn toggle_tab_peek(&mut self, cx: &mut Context<Self>) {
         if self.peek.visible() {
-            self.dismiss_tab_peek();
+            self.dismiss_tab_peek(cx);
             cx.notify();
         } else {
-            self.tab_gesture(GestureFrame::Released(140.0), cx);
+            self.tab_gesture(GestureFrame::Tracking(0.0), cx);
+            self.peek
+                .animate_to(140.0, cx.background_executor().now(), cx.reduce_motion());
+            cx.notify();
         }
     }
     fn commit_tab_peek(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        if !self.peek.visible() {
+            return;
+        }
         let mut store = self.store.write().unwrap();
         let activate = store.sessions().get(&id).is_some();
         if activate {
             store.select(id);
         }
         drop(store);
-        self.dismiss_tab_peek();
+        self.dismiss_tab_peek(cx);
         if activate {
             cx.emit(TabPeekActivated);
         }
@@ -103,14 +170,14 @@ impl SessionSurfaces {
             crate::commands::CommandId::ToggleTabPeek,
             &event.keystroke,
         ) {
-            self.dismiss_tab_peek();
+            self.dismiss_tab_peek(cx);
             self.sync_tab_peek_focus(window, cx);
             cx.notify();
             cx.stop_propagation();
             return true;
         }
         match event.keystroke.key.as_str() {
-            "escape" => self.dismiss_tab_peek(),
+            "escape" => self.dismiss_tab_peek(cx),
             "left" => self.peek.advance(-1),
             "right" | "tab" => self.peek.advance(if event.keystroke.modifiers.shift {
                 -1
@@ -210,7 +277,8 @@ impl SessionSurfaces {
             .iter()
             .filter_map(|index| sessions.get(*index))
             .filter(|session| {
-                !self.resident_previews.contains_key(&session.id)
+                self.peek.visible()
+                    && !self.resident_previews.contains_key(&session.id)
                     && !matches!(session.status, diri_proto::SessionStatus::Exited(_))
             })
             .map(|session| session.id.clone())
@@ -236,10 +304,12 @@ impl SessionSurfaces {
             let live = self.live_previews.get(&id);
             let state = live.map(|preview| *preview.state.borrow());
             let resident = self.resident_previews.get(&id);
-            let grid = resident.or_else(|| {
-                live.filter(|preview| preview.element.grid_cols() > 0)
-                    .map(|preview| &preview.element)
-            });
+            let grid = resident
+                .or_else(|| self.closing_previews.get(&id))
+                .or_else(|| {
+                    live.filter(|preview| preview.element.grid_cols() > 0)
+                        .map(|preview| &preview.element)
+                });
             let preview = if let Some(preview) = grid {
                 let font_size = ((bounds.width - 12.0)
                     / (f32::from(preview.grid_cols().max(1)) * 0.65))
@@ -280,19 +350,7 @@ impl SessionSurfaces {
                     .into_any_element()
             };
             let title = display_title(session);
-            let status = if matches!(session.status, diri_proto::SessionStatus::Exited(_)) {
-                Some("Exited")
-            } else if session.hibernation.is_some() {
-                Some("Paused")
-            } else if state == Some(crate::tab_preview::PreviewState::Disconnected) {
-                Some("Disconnected")
-            } else if session.host.is_some() {
-                // The Engine's remote mirror can outlive its SSH channel. A
-                // preview socket confirms local delivery, not host reachability.
-                Some("Last received")
-            } else {
-                None
-            };
+            let status = preview_caption(session, state);
             body = body.child(
                 div()
                     .id(SharedString::from(format!("tab-peek-{}", id.0)))
@@ -336,10 +394,12 @@ impl SessionSurfaces {
                             .text_color(colors.primary)
                             .overflow_hidden()
                             .whitespace_nowrap()
-                            .child(title)
+                            .child(div().flex_1().min_w(px(0.0)).truncate().child(title))
                             .when_some(status, |row, status| {
-                                row.child(div().flex_1()).child(
+                                row.child(
                                     div()
+                                        .flex_shrink_0()
+                                        .debug_selector(move || format!("TAB_PEEK_STATUS_{index}"))
                                         .ml(px(6.0))
                                         .text_size(px(9.0))
                                         .text_color(colors.secondary)
@@ -347,14 +407,23 @@ impl SessionSurfaces {
                                 )
                             }),
                     )
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .when(self.peek.visible(), |element| {
+                        element.on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    })
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.commit_tab_peek(id.clone(), cx);
-                        cx.stop_propagation();
+                        if this.peek.visible() {
+                            this.commit_tab_peek(id.clone(), cx);
+                            cx.stop_propagation();
+                        }
                     })),
             );
         }
-        body = body.h(px(content_height));
+        body = body
+            .h(px(content_height))
+            .when(self.peek.is_closing(), |body| {
+                // Preserve the last scrolled pose after scroll interaction is disabled.
+                body.top(self.peek_scroll.offset().y)
+            });
         div()
             .id("tab-peek")
             .debug_selector(|| "TAB_PEEK".into())
@@ -363,35 +432,41 @@ impl SessionSurfaces {
             .top(px(self.peek_top))
             .w(px(width))
             .h(px(height))
-            .occlude()
+            .when(self.peek.visible(), |surface| surface.occlude())
+            .opacity(self.peek.reveal())
             .overflow_hidden()
             .bg(colors
                 .background
                 .alpha(if reduced { 1.0 } else { blend * 0.98 }))
-            .on_scroll_wheel(cx.listener(|_, _, _, cx| {
-                cx.notify();
-                cx.stop_propagation();
+            .on_scroll_wheel(cx.listener(|this, _, _, cx| {
+                if this.peek.visible() {
+                    cx.notify();
+                    cx.stop_propagation();
+                }
             }))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
-                    this.dismiss_tab_peek();
-                    cx.notify();
-                    cx.stop_propagation();
+                    if this.peek.visible() {
+                        this.dismiss_tab_peek(cx);
+                        cx.notify();
+                        cx.stop_propagation();
+                    }
                 }),
             )
             .child(
                 div()
                     .id("tab-peek-scroll")
                     .size_full()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.peek_scroll)
+                    .when(self.peek.visible(), |element| {
+                        element.overflow_y_scroll().track_scroll(&self.peek_scroll)
+                    })
                     .child(body),
             )
             .child(
                 div()
                     .absolute()
-                    .top(px(12.0))
+                    .top(px(12.0 + preview_reveal_offset(&self.peek, reduced)))
                     .right(px(16.0))
                     .h(px(28.0))
                     .flex()
@@ -409,13 +484,20 @@ impl SessionSurfaces {
                             .id("tab-peek-expand")
                             .cursor_pointer()
                             .child(if blend > 0.5 { "Collapse" } else { "Show all" })
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .when(self.peek.visible(), |element| {
+                                element.on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                    cx.stop_propagation()
+                                })
+                            })
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.peek.update(GestureFrame::Released(if blend > 0.5 {
-                                    140.0
-                                } else {
-                                    380.0
-                                }));
+                                if !this.peek.visible() {
+                                    return;
+                                }
+                                this.peek.animate_to(
+                                    if blend > 0.5 { 140.0 } else { 380.0 },
+                                    cx.background_executor().now(),
+                                    cx.reduce_motion(),
+                                );
                                 cx.notify();
                                 cx.stop_propagation();
                             })),
@@ -425,14 +507,155 @@ impl SessionSurfaces {
                             .id("tab-peek-close")
                             .cursor_pointer()
                             .child("Esc  ×")
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .when(self.peek.visible(), |element| {
+                                element.on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                    cx.stop_propagation()
+                                })
+                            })
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.dismiss_tab_peek();
-                                cx.notify();
-                                cx.stop_propagation();
+                                if this.peek.visible() {
+                                    this.dismiss_tab_peek(cx);
+                                    cx.notify();
+                                    cx.stop_propagation();
+                                }
                             })),
                     ),
             )
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        sidebar::{PreviewScenario, SidebarPreviewFixture},
+        tab_preview::PreviewState,
+    };
+    use diri_proto::{
+        DateMillis, ExitInfo, ExitReason, HibernationInfo, HibernationReason, RemoteConnection,
+        RemoteConnectionState, SessionStatus,
+    };
+
+    fn remote_session() -> SessionRecord {
+        let mut session = SidebarPreviewFixture::make(PreviewScenario::Typical)
+            .list
+            .sessions
+            .remove(0);
+        session.host = Some("fixture-host".into());
+        session.status = SessionStatus::Working;
+        session.hibernation = None;
+        session.remote_connection = None;
+        session
+    }
+
+    #[test]
+    fn local_preview_delivery_never_invents_remote_connectivity() {
+        let mut session = remote_session();
+        assert_eq!(
+            preview_caption(&session, Some(PreviewState::Live)),
+            Some("Last received")
+        );
+        for (state, expected) in [
+            (RemoteConnectionState::Unknown, "Last received"),
+            (RemoteConnectionState::Connecting, "Connecting"),
+            (RemoteConnectionState::Connected, "Connected"),
+            (RemoteConnectionState::Reconnecting, "Reconnecting"),
+            (RemoteConnectionState::Failed, "Connection failed"),
+            (RemoteConnectionState::Exited, "Exited"),
+        ] {
+            session.remote_connection = Some(RemoteConnection {
+                state,
+                since: DateMillis(1.0),
+            });
+            assert_eq!(
+                preview_caption(&session, Some(PreviewState::Live)),
+                Some(expected)
+            );
+            // Transition time is not terminal output age and does not change the label.
+            session.remote_connection.as_mut().unwrap().since = DateMillis(9_999_999.0);
+            assert_eq!(
+                preview_caption(&session, Some(PreviewState::Live)),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn authoritative_exit_pause_and_local_delivery_loss_have_explicit_precedence() {
+        let mut session = remote_session();
+        session.remote_connection = Some(RemoteConnection {
+            state: RemoteConnectionState::Connected,
+            since: DateMillis(1.0),
+        });
+        assert_eq!(
+            preview_caption(&session, Some(PreviewState::Disconnected)),
+            Some("Disconnected")
+        );
+        session.hibernation = Some(HibernationInfo {
+            since: DateMillis(2.0),
+            reason: HibernationReason::Manual,
+            tree_pids: vec![],
+            tree_start_times: None,
+        });
+        assert_eq!(
+            preview_caption(&session, Some(PreviewState::Disconnected)),
+            Some("Paused")
+        );
+        session.status = SessionStatus::Exited(ExitInfo {
+            reason: ExitReason::Exited,
+            code: Some(0),
+            signal: None,
+        });
+        assert_eq!(
+            preview_caption(&session, Some(PreviewState::Disconnected)),
+            Some("Exited")
+        );
+        session.status = SessionStatus::Working;
+        session.hibernation = None;
+        session.host = None;
+        assert_eq!(preview_caption(&session, Some(PreviewState::Live)), None);
+    }
+    struct CaptionHarness(Entity<SessionSurfaces>);
+    impl Render for CaptionHarness {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().relative().child(self.0.clone())
+        }
+    }
+
+    #[gpui::test]
+    fn remote_caption_stays_inside_a_narrow_card_with_a_long_title(cx: &mut gpui::TestAppContext) {
+        let mut session = remote_session();
+        session.title = "A long task title that must leave the transport caption readable".into();
+        session.remote_connection = Some(RemoteConnection {
+            state: RemoteConnectionState::Failed,
+            since: DateMillis(1.0),
+        });
+        let id = session.id.clone();
+        let runtime = Arc::new(StoreRuntime::inert());
+        runtime
+            .store
+            .write()
+            .unwrap()
+            .hydrate(diri_proto::SessionListResult {
+                sessions: vec![session],
+                projects: vec![],
+            });
+        runtime.store.write().unwrap().select(id);
+        let (_, cx) = cx.add_window_view(move |_, cx| {
+            CaptionHarness(cx.new(|cx| {
+                let mut surface = SessionSurfaces::new(runtime, None, cx);
+                surface.tab_gesture(GestureFrame::Tracking(140.0), cx);
+                surface.tab_gesture(GestureFrame::Released(140.0), cx);
+                surface
+            }))
+        });
+        cx.simulate_resize(gpui::size(px(250.0), px(700.0)));
+        let card = cx.debug_bounds("TAB_PEEK_CARD_0").unwrap();
+        let status = cx.debug_bounds("TAB_PEEK_STATUS_0").unwrap();
+        assert!(status.left() >= card.left());
+        assert!(status.right() <= card.right());
+        assert!(status.bottom() <= card.bottom());
+        assert!(status.size.width > px(40.0));
     }
 }
