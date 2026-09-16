@@ -1162,7 +1162,7 @@ impl TerminalPane {
             .store
             .read()
             .expect("session store lock poisoned");
-        crate::app_theme::colors(store.theme_id())
+        crate::app_theme::colors_for(store.preferences())
     }
 
     fn handle_pane_event(&mut self, event: PaneEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -2870,7 +2870,7 @@ impl TerminalPane {
             .flex()
             .items_center()
             .justify_between()
-            .bg(colors.background)
+            .bg(colors.work_surface_nested())
             .child(
                 div()
                     .min_w(px(0.0))
@@ -3041,6 +3041,12 @@ impl TerminalPane {
             .element
             .clone()
             .theme(theme)
+            // The surface around the grid paints the work-surface tint, so
+            // the grid only adds its own fill on an opaque window.
+            .background_opacity(match colors.material() {
+                diri_ui::Material::Opaque => 1.0,
+                diri_ui::Material::Glass => 0.0,
+            })
             .font_size(px(font_size))
             .focus_handle(self.focus.clone())
             .hovered_reference(self.qol.hit.clone());
@@ -3067,7 +3073,6 @@ impl TerminalPane {
             .pt(px(2.0))
             .pb(px(10.0))
             .px(px(12.0))
-            .bg(theme.background)
             .cursor(if self.qol.hit.is_some() {
                 gpui::CursorStyle::PointingHand
             } else {
@@ -3555,12 +3560,12 @@ impl Render for TerminalPane {
                 .store
                 .read()
                 .expect("session store lock poisoned");
-            let theme_id = store.theme_id();
+            let prefs = store.preferences();
             (
-                crate::app_theme::terminal_theme(theme_id),
-                crate::app_theme::colors(theme_id),
-                crate::app_theme::sidebar_colors(theme_id),
-                store.preferences().terminal_font_size,
+                crate::app_theme::terminal_theme(&prefs.terminal_theme),
+                crate::app_theme::colors_for(prefs),
+                crate::app_theme::sidebar_colors_for(prefs),
+                prefs.terminal_font_size,
             )
         };
         self.sync_status_glyphs(colors, window, cx);
@@ -3578,7 +3583,7 @@ impl Render for TerminalPane {
                 .overflow_hidden()
                 .border_l_1()
                 .border_color(sidebar_colors.primary.alpha(0.08))
-                .bg(theme.background)
+                .bg(colors.work_surface())
                 .child(self.render_header(&session, sidebar_colors, cx));
             let mut terminal_surface = div()
                 .relative()
@@ -3589,7 +3594,7 @@ impl Render for TerminalPane {
                 .rounded_tl(px(Radius::CARD))
                 .rounded_tr(px(Radius::CARD))
                 .overflow_hidden()
-                .bg(theme.background)
+                .bg(colors.work_surface_nested())
                 .child(
                     self.render_grid_and_overlays(&session, theme, colors, font_size, window, cx),
                 );
@@ -3610,7 +3615,7 @@ impl Render for TerminalPane {
                 .h_full()
                 .flex()
                 .flex_col()
-                .bg(theme.background)
+                .bg(colors.work_surface())
                 .when_some(sidebar_reveal, |pane, control| {
                     pane.child(
                         div()
@@ -3619,7 +3624,7 @@ impl Render for TerminalPane {
                             .px(px(Metrics::TOOLBAR_EDGE_INSET))
                             .flex()
                             .items_center()
-                            .bg(theme.background)
+                            .bg(colors.work_surface_nested())
                             .child(control),
                     )
                 })

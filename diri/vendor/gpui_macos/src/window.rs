@@ -12,7 +12,7 @@ use cocoa::{
         NSAppKitVersionNumber, NSAppKitVersionNumber12_0, NSApplication, NSBackingStoreBuffered,
         NSColor, NSEvent, NSEventModifierFlags, NSFilenamesPboardType, NSPasteboard,
         NSRequestUserAttentionType, NSScreen, NSView, NSViewHeightSizable, NSViewWidthSizable,
-        NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView, NSWindow,
+        NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView, NSWindow,
         NSWindowCollectionBehavior, NSWindowOcclusionState, NSWindowOrderingMode,
         NSWindowStyleMask, NSWindowTitleVisibility,
     },
@@ -1556,7 +1556,6 @@ impl PlatformWindow for MacWindow {
 
         let opaque = background_appearance == WindowBackgroundAppearance::Opaque;
         this.renderer.update_transparency(!opaque);
-
         unsafe {
             this.native_window.setOpaque_(opaque as BOOL);
             let background_color = if opaque {
@@ -3110,9 +3109,14 @@ fn display_id_for_screen(screen: id) -> Option<CGDirectDisplayID> {
 extern "C" fn blurred_view_init_with_frame(this: &Object, _: Sel, frame: NSRect) -> id {
     unsafe {
         let view = msg_send![super(this, class!(NSVisualEffectView)), initWithFrame: frame];
-        // Use a colorless semantic material. The default value `AppearanceBased`, though not
-        // manually set, is deprecated.
-        NSVisualEffectView::setMaterial_(view, NSVisualEffectMaterial::Selection);
+        // diri: on macOS 26+ the colorless `Selection` material no longer owns a
+        // `CABackdropLayer`, so after the tint stripping below nothing blurs at all.
+        // Window-background materials still carry the backdrop (sdrNormalize,
+        // gaussianBlur, colorSaturate); stripping their tint leaves the plain blur.
+        NSVisualEffectView::setMaterial_(view, NSVisualEffectMaterial::UnderWindowBackground);
+        // Behind-window blending samples the desktop rather than the window's
+        // own content. It is the default, but this view exists only for that.
+        NSVisualEffectView::setBlendingMode_(view, NSVisualEffectBlendingMode::BehindWindow);
         NSVisualEffectView::setState_(view, NSVisualEffectState::Active);
         view
     }
@@ -3124,6 +3128,14 @@ extern "C" fn blurred_view_update_layer(this: &Object, _: Sel) {
         let layer: id = msg_send![this, layer];
         if !layer.is_null() {
             remove_layer_background(layer);
+            // Fallback base behind the backdrop sublayer: Mission Control and
+            // the Spaces switcher render window snapshots without backdrop
+            // layers, and with every background stripped the window read as
+            // clear glass over the raw desktop there. Live compositing covers
+            // this with the blur.
+            let black: id = msg_send![class!(NSColor), blackColor];
+            let black_cg: id = msg_send![black, CGColor];
+            let _: () = msg_send![layer, setBackgroundColor: black_cg];
         }
     }
 }

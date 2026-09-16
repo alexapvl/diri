@@ -685,7 +685,7 @@ impl Render for WorkspaceWorkbench {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = {
             let store = self.runtime.store.read().expect("store");
-            crate::app_theme::colors(store.theme_id())
+            crate::app_theme::colors_in(&store)
         };
         let mut root = div()
             .id("workspace-workbench")
@@ -694,7 +694,7 @@ impl Render for WorkspaceWorkbench {
             .relative()
             .size_full()
             .overflow_hidden()
-            .bg(colors.background)
+            .bg(colors.work_surface_nested())
             .on_drag_move(cx.listener(
                 |this, event: &DragMoveEvent<DraggedWorkspaceDivider>, _, cx| {
                     this.drag_resize(
