@@ -38,6 +38,7 @@ impl Bank {
         self.show_font(id, value, text, size, color, weight, None)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn show_font(
         &self,
         id: impl Into<String>,
@@ -206,14 +207,8 @@ fn int_digit(digits: &str, width: usize, i: usize) -> Option<u8> {
     }
 }
 
-fn frac_digit(digits: &str, width: usize, i: usize) -> Option<u8> {
-    if i < digits.len() {
-        Some(digits.as_bytes()[i] - b'0')
-    } else if i < width {
-        None
-    } else {
-        None
-    }
+fn frac_digit(digits: &str, _width: usize, i: usize) -> Option<u8> {
+    (i < digits.len()).then(|| digits.as_bytes()[i] - b'0')
 }
 
 fn snapshot_digit(from: Option<u8>, to: Option<u8>, dir: i8, t: f32) -> Option<char> {

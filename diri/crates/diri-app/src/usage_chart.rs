@@ -175,13 +175,13 @@ fn smooth_cumulative(points: &mut [ChartSample], radius: f32) {
         let mut value_sum = 0.0;
         let lo = index.saturating_sub(reach);
         let hi = (index + reach).min(values.len() - 1);
-        for other in lo..=hi {
+        for (other, &value) in values.iter().enumerate().take(hi + 1).skip(lo) {
             let weight = (radius + 1.0 - (other as f32 - index as f32).abs()).max(0.0);
             if weight == 0.0 {
                 continue;
             }
             weight_sum += f64::from(weight);
-            value_sum += values[other] * f64::from(weight);
+            value_sum += value * f64::from(weight);
         }
         if weight_sum > 0.0 {
             point.value = value_sum / weight_sum;
@@ -275,6 +275,7 @@ pub(crate) fn interpolate_at(samples: &[ChartSample], time: f32) -> Option<(i64,
     Some((a.time, a.value + (b.value - a.value) * f64::from(t)))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn paint(
     window: &mut Window,
     bounds: Bounds<Pixels>,
