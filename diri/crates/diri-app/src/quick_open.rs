@@ -55,6 +55,7 @@ pub struct DirectoryIndex {
     is_scanning: bool,
     scanned_at: Option<Instant>,
     scanned_includes: Option<String>,
+    scanned_roots: Option<Vec<PathBuf>>,
 }
 
 impl DirectoryIndex {
@@ -75,11 +76,12 @@ impl DirectoryIndex {
     }
 
     /// A scan is worth running when nothing is indexed yet, the include file
-    /// changed, or the last walk has aged out. Opening Quick Open five times
-    /// in a minute should walk the filesystem once, not five times.
-    pub fn needs_scan(&self, now: Instant, includes: &str) -> bool {
+    /// or search roots changed, or the last walk has aged out. Opening Quick
+    /// Open five times in a minute should walk the filesystem once, not five.
+    pub fn needs_scan(&self, now: Instant, includes: &str, roots: &[PathBuf]) -> bool {
         !self.is_scanning
             && (self.scanned_includes.as_deref() != Some(includes)
+                || self.scanned_roots.as_deref() != Some(roots)
                 || self
                     .scanned_at
                     .is_none_or(|at| now.duration_since(at) >= RESCAN_AFTER))
@@ -93,11 +95,18 @@ impl DirectoryIndex {
         }
     }
 
-    pub fn finish_scan(&mut self, entries: Vec<DirectoryEntry>, now: Instant, includes: String) {
+    pub fn finish_scan(
+        &mut self,
+        entries: Vec<DirectoryEntry>,
+        now: Instant,
+        includes: String,
+        roots: Vec<PathBuf>,
+    ) {
         self.entries = entries;
         self.is_scanning = false;
         self.scanned_at = Some(now);
         self.scanned_includes = Some(includes);
+        self.scanned_roots = Some(roots);
     }
 }
 
@@ -186,6 +195,75 @@ pub fn resolve_roots(roots_setting: &str, fallback: &[PathBuf], home: &Path) -> 
         }
     }
     result
+}
+
+/// Prefer `~/…` when the path is inside `home`, so Settings matches Swift.
+pub fn collapse_home(path: &Path, home: &Path) -> String {
+    let path = lexical_standardize(path);
+    if path == home {
+        return "~".into();
+    }
+    path.strip_prefix(home)
+        .map(|rest| format!("~/{}", rest.display()))
+        .unwrap_or_else(|_| path.to_string_lossy().into_owned())
+}
+
+/// Append a unique root, collapsing `home` to `~`. Trailing slashes match.
+pub fn add_root(setting: &str, path: &Path, home: &Path) -> String {
+    let line = collapse_home(path, home);
+    let standardized = lexical_standardize(&expand_tilde(Path::new(&line), home));
+    let mut lines: Vec<String> = setting
+        .split(['\n', ','])
+        .map(str::trim)
+        .filter(|root| !root.is_empty())
+        .map(str::to_owned)
+        .collect();
+    if lines.iter().any(|existing| {
+        lexical_standardize(&expand_tilde(Path::new(existing), home)) == standardized
+    }) {
+        return lines.join("\n");
+    }
+    lines.push(line);
+    lines.join("\n")
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RootAdd {
+    Fresh,
+    Duplicate,
+    Nested { parent: String },
+}
+
+pub fn classify_root(setting: &str, path: &Path, home: &Path) -> RootAdd {
+    let child = lexical_standardize(&expand_tilde(path, home));
+    for existing in setting
+        .split(['\n', ','])
+        .map(str::trim)
+        .filter(|root| !root.is_empty())
+    {
+        let parent = lexical_standardize(&expand_tilde(Path::new(existing), home));
+        if parent == child {
+            return RootAdd::Duplicate;
+        }
+        if child.starts_with(&parent) {
+            return RootAdd::Nested {
+                parent: existing.to_owned(),
+            };
+        }
+    }
+    RootAdd::Fresh
+}
+
+pub fn remove_root_line(setting: &str, line: &str, home: &Path) -> String {
+    let target = lexical_standardize(&expand_tilde(Path::new(line), home));
+    setting
+        .split(['\n', ','])
+        .map(str::trim)
+        .filter(|existing| !existing.is_empty())
+        .filter(|existing| lexical_standardize(&expand_tilde(Path::new(existing), home)) != target)
+        .map(str::to_owned)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Gitignore-style extra paths that Quick Open should enter even when the
@@ -856,18 +934,31 @@ mod tests {
     fn scans_are_throttled_and_a_cache_never_overwrites_a_fresh_scan() {
         let mut index = DirectoryIndex::default();
         let now = Instant::now();
-        assert!(index.needs_scan(now, ""), "an empty index must scan");
+        let roots: &[PathBuf] = &[];
+        assert!(index.needs_scan(now, "", roots), "an empty index must scan");
 
         assert!(index.begin_scan());
         assert!(!index.begin_scan(), "no concurrent scans");
-        assert!(!index.needs_scan(now, ""), "a scan is already in flight");
-
-        index.finish_scan(vec![fixture_entry("scanned")], now, String::new());
-        assert!(!index.needs_scan(now, ""), "just scanned");
-        assert!(index.needs_scan(now + RESCAN_AFTER, ""), "aged out");
         assert!(
-            index.needs_scan(now, "**/.worktrees/\n"),
+            !index.needs_scan(now, "", roots),
+            "a scan is already in flight"
+        );
+
+        index.finish_scan(
+            vec![fixture_entry("scanned")],
+            now,
+            String::new(),
+            Vec::new(),
+        );
+        assert!(!index.needs_scan(now, "", roots), "just scanned");
+        assert!(index.needs_scan(now + RESCAN_AFTER, "", roots), "aged out");
+        assert!(
+            index.needs_scan(now, "**/.worktrees/\n", roots),
             "a changed include file must rescan immediately"
+        );
+        assert!(
+            index.needs_scan(now, "", &[PathBuf::from("/other")]),
+            "changed search roots must rescan immediately"
         );
 
         // The disk cache lands asynchronously; if the scan won the race it
@@ -887,6 +978,38 @@ mod tests {
             resolve_roots("  ", &fallback, home),
             [home.join("fallback")]
         );
+    }
+
+    #[test]
+    fn add_root_collapses_home_and_skips_duplicates() {
+        let home = Path::new("/Users/tester");
+        assert_eq!(add_root("", &home.join("fun"), home), "~/fun");
+        assert_eq!(add_root("~/fun/", &home.join("fun"), home), "~/fun/");
+        assert_eq!(add_root("~/fun", &home.join("src"), home), "~/fun\n~/src");
+        assert_eq!(
+            add_root("", Path::new("/tmp/projects"), home),
+            "/tmp/projects"
+        );
+    }
+
+    #[test]
+    fn classify_root_detects_nested_and_duplicate_folders() {
+        let home = Path::new("/Users/tester");
+        assert_eq!(
+            classify_root("~/src", &home.join("src"), home),
+            RootAdd::Duplicate
+        );
+        assert_eq!(
+            classify_root("~/src", &home.join("src/nested"), home),
+            RootAdd::Nested {
+                parent: "~/src".into()
+            }
+        );
+        assert_eq!(
+            classify_root("~/src", &home.join("other"), home),
+            RootAdd::Fresh
+        );
+        assert_eq!(remove_root_line("~/src\n~/other", "~/src", home), "~/other");
     }
 
     #[test]

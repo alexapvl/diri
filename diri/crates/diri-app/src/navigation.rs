@@ -477,7 +477,7 @@ impl NavigationOverlay {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/nonexistent"));
         let projects = self.project_roots();
-        let mut fallback = vec![PathBuf::from("~/fun")];
+        let mut fallback = vec![PathBuf::from("~")];
         fallback.extend(
             projects
                 .iter()
@@ -525,7 +525,9 @@ impl NavigationOverlay {
     fn refresh_directory_index(&mut self, cx: &mut Context<Self>) {
         let (roots, standalone, cache, include_path) = self.index_roots();
         let includes = quick_open::load_include(&include_path);
-        if !self.directory_index.needs_scan(Instant::now(), &includes)
+        if !self
+            .directory_index
+            .needs_scan(Instant::now(), &includes, &roots)
             || !self.directory_index.begin_scan()
         {
             return;
@@ -536,18 +538,18 @@ impl NavigationOverlay {
             // Scan, persist, and prepare 20 000 ranking candidates all on the
             // background executor: preparing them on the main thread cost ~13 ms,
             // which is a dropped frame on any display and most of two at 120 Hz.
-            let (entries, snapshot, includes) = cx
+            let (entries, snapshot, includes, roots) = cx
                 .background_spawn(async move {
                     let include = quick_open::IncludeRules::parse(&includes);
                     let entries = quick_open::scan_with(&roots, &standalone, &include);
                     quick_open::store_cache(&cache, &roots, &includes, &entries);
                     let snapshot = quick_open::build_snapshot(&entries, &projects, &cwds);
-                    (entries, snapshot, includes)
+                    (entries, snapshot, includes, roots)
                 })
                 .await;
             this.update(cx, |this, cx| {
                 this.directory_index
-                    .finish_scan(entries, Instant::now(), includes);
+                    .finish_scan(entries, Instant::now(), includes, roots);
                 this.quick_snapshot = snapshot;
                 if this.overlay == Some(Overlay::QuickOpen) && !this.query.text().trim().is_empty()
                 {
