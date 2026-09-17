@@ -495,20 +495,20 @@ mod macos {
             palette.secondary,
             card_h,
         );
-        let mark_x = CARD_W - PAD - mark_w;
-        let brand_x = mark_x - 8.0 - brand_size.0;
+        let brand_x = CARD_W - PAD - brand_size.0;
+        let mark_x = brand_x - 8.0 - mark_w;
+        draw_mark(
+            mark_x,
+            PAD + (header_h - MARK_H) * 0.5,
+            MARK_H,
+            palette.primary,
+            card_h,
+        );
         draw_text(
             BRAND,
             brand_x,
             PAD + (header_h - brand_size.1) * 0.5,
             &brand_font,
-            palette.primary,
-            card_h,
-        );
-        draw_mark(
-            mark_x,
-            PAD + (header_h - MARK_H) * 0.5,
-            MARK_H,
             palette.primary,
             card_h,
         );
@@ -736,13 +736,13 @@ mod macos {
 
     fn brand_font_matching(height: f32) -> objc2::rc::Retained<NSFont> {
         let mut size = height;
-        for _ in 0..6 {
+        for _ in 0..8 {
             let font = medium_font(px(size));
-            let measured = measure(BRAND, &font).1;
-            if (measured - height).abs() < 0.5 {
+            let cap = font.capHeight() as f32 / SCALE;
+            if (cap - height).abs() < 0.35 {
                 return font;
             }
-            size *= height / measured.max(1.0);
+            size *= height / cap.max(1.0);
         }
         medium_font(px(size))
     }
