@@ -126,18 +126,11 @@ pub fn include_file(home: &Path) -> PathBuf {
 }
 
 pub fn load_include(path: &Path) -> String {
-    fs::read_to_string(path).unwrap_or_default()
+    diri_proto::include::load(path)
 }
 
 pub fn store_include(path: &Path, text: &str) {
-    if text.trim().is_empty() {
-        let _ = fs::remove_file(path);
-        return;
-    }
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let _ = fs::write(path, text);
+    let _ = diri_proto::include::store(path, text);
 }
 
 pub fn load_cache(path: &Path, roots: &[PathBuf], includes: &str) -> Option<Vec<DirectoryEntry>> {

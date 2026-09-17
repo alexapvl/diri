@@ -7,6 +7,7 @@ pub mod control;
 pub mod frames;
 pub mod grid;
 pub mod hosts;
+pub mod include;
 pub mod methods;
 pub mod model;
 pub mod net;

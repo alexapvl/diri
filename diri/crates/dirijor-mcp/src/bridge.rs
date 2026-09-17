@@ -1,10 +1,10 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use diri_proto::{
     AgentKind, AgentReadinessResult, Method, ReadScreenResult, SessionId, SessionListResult,
-    SessionRecord, SessionSpawnParams, SessionStatus,
+    SessionRecord, SessionSpawnParams, SessionStatus, paths::DirijorPaths,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
@@ -114,6 +114,9 @@ impl Bridge {
             "release_agent" => self.release_agent(arguments),
             "test_run" => self.test_run(arguments),
             "browser" => self.browser(arguments),
+            "get_quick_open_include" => self.get_quick_open_include(),
+            "add_quick_open_include" => self.add_quick_open_include(arguments),
+            "set_quick_open_include" => self.set_quick_open_include(arguments),
             "whoami" => self.whoami(),
             "list_children" => self.list_children(arguments),
             "wait_for_children" => self.wait_for_children(arguments),
@@ -527,6 +530,62 @@ impl Bridge {
         self.request("test.run", arguments.clone(), Duration::from_secs(180))
     }
 
+    fn get_quick_open_include(&self) -> Result<Value, String> {
+        let path = include_file_path()?;
+        Ok(include_payload(
+            &path,
+            diri_proto::include::load(&path),
+            None,
+        ))
+    }
+
+    fn add_quick_open_include(&self, arguments: &Value) -> Result<Value, String> {
+        self.authorize_quick_open_include()?;
+        let patterns = required_strings(arguments, "patterns")?;
+        if patterns.len() > 64 {
+            return Err("too many patterns".into());
+        }
+        for pattern in &patterns {
+            if pattern.contains('\n') || pattern.contains('\r') {
+                return Err("patterns must be single lines".into());
+            }
+        }
+        let path = include_file_path()?;
+        let mutation = diri_proto::include::add_patterns(&path, &patterns)
+            .map_err(|error| error.to_string())?;
+        Ok(include_payload(
+            &mutation.path,
+            mutation.text,
+            Some(mutation.added),
+        ))
+    }
+
+    fn set_quick_open_include(&self, arguments: &Value) -> Result<Value, String> {
+        self.authorize_quick_open_include()?;
+        let text = arguments
+            .get("text")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "missing required argument: text".to_owned())?;
+        let path = include_file_path()?;
+        diri_proto::include::store(&path, text).map_err(|error| error.to_string())?;
+        Ok(include_payload(
+            &path,
+            diri_proto::include::load(&path),
+            None,
+        ))
+    }
+
+    fn authorize_quick_open_include(&self) -> Result<(), String> {
+        let snapshot = self.snapshot()?;
+        McpPolicy::new(
+            &snapshot.sessions,
+            &snapshot.projects,
+            self.caller.as_deref(),
+        )?
+        .authorize(WriteAction::QuickOpenInclude)?;
+        Ok(())
+    }
+
     fn whoami(&self) -> Result<Value, String> {
         let sessions = self.sessions()?;
         let lineage = Lineage::new(&sessions, self.caller.as_deref());
@@ -823,6 +882,35 @@ fn optional_bool(arguments: &Value, key: &str) -> Option<bool> {
 
 fn optional_number(arguments: &Value, key: &str) -> Option<f64> {
     arguments.get(key).and_then(Value::as_f64)
+}
+
+fn required_strings(arguments: &Value, key: &str) -> Result<Vec<String>, String> {
+    if arguments.get(key).is_none() {
+        return Err(format!("missing required argument: {key}"));
+    }
+    let values = optional_strings(arguments, key);
+    if values.is_empty() {
+        return Err(format!("missing required argument: {key}"));
+    }
+    Ok(values)
+}
+
+fn include_file_path() -> Result<PathBuf, String> {
+    let home = std::env::var_os("HOME").ok_or_else(|| "HOME is not set".to_owned())?;
+    Ok(DirijorPaths::diri_include_file(home))
+}
+
+fn include_payload(path: &Path, text: String, added: Option<Vec<String>>) -> Value {
+    let patterns = diri_proto::include::pattern_lines(&text);
+    let mut value = json!({
+        "path": path.to_string_lossy(),
+        "text": text,
+        "patterns": patterns,
+    });
+    if let Some(added) = added {
+        value["added"] = json!(added);
+    }
+    value
 }
 
 fn optional_strings(arguments: &Value, key: &str) -> Vec<String> {
