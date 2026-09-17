@@ -12,7 +12,7 @@ place. Built with Rust and GPUI for macOS, with Linux in beta.
 [Documentation](docs/README.md) ·
 [Contributing](CONTRIBUTING.md)
 
-![Diri with agent sessions in the sidebar, a terminal in the center, and a code diff alongside it](docs/images/diri.png)
+<img width="1907" height="1042" alt="image" src="https://github.com/user-attachments/assets/9d7aa97d-b51e-4ed0-aaab-6d1d1ddfdaa6" />
 
 ## Install
 
