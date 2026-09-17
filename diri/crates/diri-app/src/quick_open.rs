@@ -23,7 +23,7 @@ pub const RESULT_LIMIT: usize = 50;
 pub const RANK_DEBOUNCE: Duration = Duration::from_millis(25);
 /// Bump when `DirectoryEntry`'s shape or the traversal's meaning changes, so a
 /// new build never ranks against an index built under different rules.
-pub const INDEX_CACHE_VERSION: u32 = 1;
+pub const INDEX_CACHE_VERSION: u32 = 2;
 /// How long a scan stays fresh enough to skip re-walking the filesystem.
 pub const RESCAN_AFTER: Duration = Duration::from_secs(30);
 
@@ -54,6 +54,7 @@ pub struct DirectoryIndex {
     entries: Vec<DirectoryEntry>,
     is_scanning: bool,
     scanned_at: Option<Instant>,
+    scanned_includes: Option<String>,
 }
 
 impl DirectoryIndex {
@@ -73,14 +74,15 @@ impl DirectoryIndex {
         true
     }
 
-    /// A scan is worth running when nothing is indexed yet or the last one has
-    /// aged out. Opening Quick Open five times in a minute should walk the
-    /// filesystem once, not five times.
-    pub fn needs_scan(&self, now: Instant) -> bool {
+    /// A scan is worth running when nothing is indexed yet, the include file
+    /// changed, or the last walk has aged out. Opening Quick Open five times
+    /// in a minute should walk the filesystem once, not five times.
+    pub fn needs_scan(&self, now: Instant, includes: &str) -> bool {
         !self.is_scanning
-            && self
-                .scanned_at
-                .is_none_or(|at| now.duration_since(at) >= RESCAN_AFTER)
+            && (self.scanned_includes.as_deref() != Some(includes)
+                || self
+                    .scanned_at
+                    .is_none_or(|at| now.duration_since(at) >= RESCAN_AFTER))
     }
 
     /// Adopt a disk-cached index without claiming it is freshly scanned, so the
@@ -91,10 +93,11 @@ impl DirectoryIndex {
         }
     }
 
-    pub fn finish_scan(&mut self, entries: Vec<DirectoryEntry>, now: Instant) {
+    pub fn finish_scan(&mut self, entries: Vec<DirectoryEntry>, now: Instant, includes: String) {
         self.entries = entries;
         self.is_scanning = false;
         self.scanned_at = Some(now);
+        self.scanned_includes = Some(includes);
     }
 }
 
@@ -107,6 +110,10 @@ pub struct IndexCache {
     /// The roots this index was built from. Different roots, different index —
     /// a stale cache from an old `quick_open_roots` setting is worse than none.
     pub roots: Vec<PathBuf>,
+    /// Exact `.diri-include` text used for the walk. A changed include list is
+    /// a different index even when the roots are the same.
+    #[serde(default)]
+    pub includes: String,
     pub entries: Vec<DirectoryEntry>,
 }
 
@@ -114,16 +121,37 @@ pub fn cache_file(home: &Path) -> PathBuf {
     DirijorPaths::quick_open_cache_file(home)
 }
 
-pub fn load_cache(path: &Path, roots: &[PathBuf]) -> Option<Vec<DirectoryEntry>> {
-    let bytes = fs::read(path).ok()?;
-    let cache: IndexCache = serde_json::from_slice(&bytes).ok()?;
-    (cache.version == INDEX_CACHE_VERSION && cache.roots == roots).then_some(cache.entries)
+pub fn include_file(home: &Path) -> PathBuf {
+    DirijorPaths::diri_include_file(home)
 }
 
-pub fn store_cache(path: &Path, roots: &[PathBuf], entries: &[DirectoryEntry]) {
+pub fn load_include(path: &Path) -> String {
+    fs::read_to_string(path).unwrap_or_default()
+}
+
+pub fn store_include(path: &Path, text: &str) {
+    if text.trim().is_empty() {
+        let _ = fs::remove_file(path);
+        return;
+    }
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(path, text);
+}
+
+pub fn load_cache(path: &Path, roots: &[PathBuf], includes: &str) -> Option<Vec<DirectoryEntry>> {
+    let bytes = fs::read(path).ok()?;
+    let cache: IndexCache = serde_json::from_slice(&bytes).ok()?;
+    (cache.version == INDEX_CACHE_VERSION && cache.roots == roots && cache.includes == includes)
+        .then_some(cache.entries)
+}
+
+pub fn store_cache(path: &Path, roots: &[PathBuf], includes: &str, entries: &[DirectoryEntry]) {
     let cache = IndexCache {
         version: INDEX_CACHE_VERSION,
         roots: roots.to_vec(),
+        includes: includes.to_owned(),
         entries: entries.to_vec(),
     };
     let Ok(bytes) = serde_json::to_vec(&cache) else {
@@ -167,6 +195,118 @@ pub fn resolve_roots(roots_setting: &str, fallback: &[PathBuf], home: &Path) -> 
     result
 }
 
+/// Gitignore-style extra paths that Quick Open should enter even when the
+/// directory would otherwise be skipped (dotfolders, `node_modules`, `target`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IncludeRules {
+    patterns: Vec<IncludePattern>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct IncludePattern {
+    glob: String,
+    rooted: bool,
+}
+
+impl IncludeRules {
+    pub fn parse(text: &str) -> Self {
+        let patterns = text
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    return None;
+                }
+                let trimmed = line.trim_end_matches('/');
+                let rooted = trimmed.starts_with('/') || trimmed.contains('/');
+                let glob = trimmed.trim_start_matches('/').to_owned();
+                (!glob.is_empty()).then_some(IncludePattern { glob, rooted })
+            })
+            .collect();
+        Self { patterns }
+    }
+
+    pub fn allows(&self, relative: &Path) -> bool {
+        if self.patterns.is_empty() {
+            return false;
+        }
+        let path = unix_relative(relative);
+        if path.is_empty() {
+            return false;
+        }
+        self.patterns
+            .iter()
+            .any(|pattern| pattern_matches(pattern, &path))
+    }
+}
+
+fn unix_relative(path: &Path) -> String {
+    path.components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(name) => Some(name.to_string_lossy()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn pattern_matches(pattern: &IncludePattern, path: &str) -> bool {
+    if pattern.rooted {
+        return glob_path(&pattern.glob, path);
+    }
+    let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    (0..parts.len()).any(|index| glob_path(&pattern.glob, &parts[index..].join("/")))
+}
+
+fn glob_path(pattern: &str, path: &str) -> bool {
+    let pattern: Vec<&str> = pattern.split('/').filter(|part| !part.is_empty()).collect();
+    let path: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    match_segments(&pattern, &path)
+}
+
+fn match_segments(pattern: &[&str], path: &[&str]) -> bool {
+    match pattern.split_first() {
+        None => path.is_empty(),
+        Some((&"**", rest)) => {
+            rest.is_empty()
+                || match_segments(rest, path)
+                || path
+                    .split_first()
+                    .is_some_and(|(_, tail)| match_segments(pattern, tail))
+        }
+        Some((segment, rest)) => path.split_first().is_some_and(|(name, tail)| {
+            match_component(segment, name) && match_segments(rest, tail)
+        }),
+    }
+}
+
+fn match_component(pattern: &str, text: &str) -> bool {
+    match_component_bytes(pattern.as_bytes(), text.as_bytes())
+}
+
+fn match_component_bytes(pattern: &[u8], text: &[u8]) -> bool {
+    match pattern.split_first() {
+        None => text.is_empty(),
+        Some((b'*', rest)) => {
+            match_component_bytes(rest, text)
+                || text
+                    .split_first()
+                    .is_some_and(|(_, tail)| match_component_bytes(pattern, tail))
+        }
+        Some((b'?', rest)) => text
+            .split_first()
+            .is_some_and(|(_, tail)| match_component_bytes(rest, tail)),
+        Some((byte, rest)) => text
+            .split_first()
+            .is_some_and(|(next, tail)| next == byte && match_component_bytes(rest, tail)),
+    }
+}
+
+struct WalkItem {
+    path: PathBuf,
+    root: PathBuf,
+}
+
 /// Blocking scan intended to be dispatched to GPUI's background executor.
 ///
 /// Traversal is breadth-first *by design*. A depth-first walk spends the whole
@@ -177,6 +317,14 @@ pub fn resolve_roots(roots_setting: &str, fallback: &[PathBuf], home: &Path) -> 
 /// truncates the deepest, least useful level instead of the second half of the
 /// alphabet.
 pub fn scan(roots: &[PathBuf], standalone_roots: &[PathBuf]) -> Vec<DirectoryEntry> {
+    scan_with(roots, standalone_roots, &IncludeRules::default())
+}
+
+pub fn scan_with(
+    roots: &[PathBuf],
+    standalone_roots: &[PathBuf],
+    include: &IncludeRules,
+) -> Vec<DirectoryEntry> {
     let mut result = Vec::new();
     let mut seen = HashSet::new();
 
@@ -190,21 +338,28 @@ pub fn scan(roots: &[PathBuf], standalone_roots: &[PathBuf]) -> Vec<DirectoryEnt
         result.push(entry(root, 0));
     }
 
-    let mut frontier: Vec<PathBuf> = roots.iter().filter(|root| root.is_dir()).cloned().collect();
+    let mut frontier: Vec<WalkItem> = roots
+        .iter()
+        .filter(|root| root.is_dir())
+        .map(|root| WalkItem {
+            path: root.clone(),
+            root: root.clone(),
+        })
+        .collect();
     for depth in 0..=MAX_DEPTH {
         if frontier.is_empty() || result.len() >= INDEX_CAP {
             break;
         }
         let mut next = Vec::new();
-        for path in frontier {
+        for item in frontier {
             if result.len() >= INDEX_CAP {
                 break;
             }
-            if seen.insert(path.clone()) {
-                result.push(entry(&path, depth));
+            if seen.insert(item.path.clone()) {
+                result.push(entry(&item.path, depth));
             }
             if depth < MAX_DEPTH {
-                children(&path, &mut next);
+                children(&item.path, &item.root, include, &mut next);
             }
         }
         frontier = next;
@@ -214,24 +369,37 @@ pub fn scan(roots: &[PathBuf], standalone_roots: &[PathBuf]) -> Vec<DirectoryEnt
 
 /// Append the indexable subdirectories of `path`, skipping hidden entries, the
 /// build/dependency noise in `SKIP_NAMES`, and symlinks (which would otherwise
-/// let a loop re-enter the tree).
-fn children(path: &Path, out: &mut Vec<PathBuf>) {
+/// let a loop re-enter the tree). `.diri-include` patterns can opt those
+/// skipped names back in.
+fn children(path: &Path, root: &Path, include: &IncludeRules, out: &mut Vec<WalkItem>) {
     let Ok(entries) = fs::read_dir(path) else {
         return;
     };
     for child in entries.flatten() {
         let name = child.file_name();
         let name = name.to_string_lossy();
-        if name.starts_with('.') || SKIP_NAMES.contains(&name.as_ref()) {
+        let relative = match path.strip_prefix(root) {
+            Ok(prefix) if prefix.as_os_str().is_empty() => PathBuf::from(name.as_ref()),
+            Ok(prefix) => prefix.join(name.as_ref()),
+            Err(_) => PathBuf::from(name.as_ref()),
+        };
+        if skipped_name(&name) && !include.allows(&relative) {
             continue;
         }
         let Ok(file_type) = child.file_type() else {
             continue;
         };
         if file_type.is_dir() && !file_type.is_symlink() {
-            out.push(child.path());
+            out.push(WalkItem {
+                path: child.path(),
+                root: root.to_path_buf(),
+            });
         }
     }
+}
+
+fn skipped_name(name: &str) -> bool {
+    name.starts_with('.') || SKIP_NAMES.contains(&name)
 }
 
 fn entry(path: &Path, depth: usize) -> DirectoryEntry {
@@ -670,39 +838,44 @@ mod tests {
         let roots = vec![PathBuf::from("/work")];
         let entries = vec![fixture_entry("diri"), fixture_entry("anara")];
 
-        store_cache(&path, &roots, &entries);
-        assert_eq!(load_cache(&path, &roots), Some(entries.clone()));
+        store_cache(&path, &roots, "", &entries);
+        assert_eq!(load_cache(&path, &roots, ""), Some(entries.clone()));
 
         // A different roots setting indexed a different world.
-        assert!(load_cache(&path, &[PathBuf::from("/elsewhere")]).is_none());
+        assert!(load_cache(&path, &[PathBuf::from("/elsewhere")], "").is_none());
+        assert!(load_cache(&path, &roots, "**/.worktrees/\n").is_none());
 
         // A newer build's traversal rules invalidate the old index.
         let stale = format!(
-            r#"{{"version":{},"roots":["/work"],"entries":[]}}"#,
+            r#"{{"version":{},"roots":["/work"],"includes":"","entries":[]}}"#,
             INDEX_CACHE_VERSION + 1
         );
         fs::write(&path, stale).unwrap();
-        assert!(load_cache(&path, &roots).is_none());
+        assert!(load_cache(&path, &roots, "").is_none());
 
         // Truncated JSON reads as "no cache", never as a panic.
         fs::write(&path, "{\"version\":1,\"roo").unwrap();
-        assert!(load_cache(&path, &roots).is_none());
-        assert!(load_cache(&temp.path().join("missing.json"), &roots).is_none());
+        assert!(load_cache(&path, &roots, "").is_none());
+        assert!(load_cache(&temp.path().join("missing.json"), &roots, "").is_none());
     }
 
     #[test]
     fn scans_are_throttled_and_a_cache_never_overwrites_a_fresh_scan() {
         let mut index = DirectoryIndex::default();
         let now = Instant::now();
-        assert!(index.needs_scan(now), "an empty index must scan");
+        assert!(index.needs_scan(now, ""), "an empty index must scan");
 
         assert!(index.begin_scan());
         assert!(!index.begin_scan(), "no concurrent scans");
-        assert!(!index.needs_scan(now), "a scan is already in flight");
+        assert!(!index.needs_scan(now, ""), "a scan is already in flight");
 
-        index.finish_scan(vec![fixture_entry("scanned")], now);
-        assert!(!index.needs_scan(now), "just scanned");
-        assert!(index.needs_scan(now + RESCAN_AFTER), "aged out");
+        index.finish_scan(vec![fixture_entry("scanned")], now, String::new());
+        assert!(!index.needs_scan(now, ""), "just scanned");
+        assert!(index.needs_scan(now + RESCAN_AFTER, ""), "aged out");
+        assert!(
+            index.needs_scan(now, "**/.worktrees/\n"),
+            "a changed include file must rescan immediately"
+        );
 
         // The disk cache lands asynchronously; if the scan won the race it
         // holds the truth and the cache must not roll it back.
@@ -746,5 +919,64 @@ mod tests {
         assert_eq!(snapshot.folders[0].path, git_folder);
         assert_eq!(snapshot.folders[1].path, plain_folder);
         assert_eq!(snapshot.pool.len(), 4);
+    }
+
+    #[test]
+    fn include_patterns_follow_gitignore_wildcards() {
+        let rules = IncludeRules::parse(
+            "# worktrees under any repo\n*/.worktrees/\n**/.hidden/\n.cursor/\n",
+        );
+        assert!(rules.allows(Path::new("diri/.worktrees")));
+        assert!(!rules.allows(Path::new(".worktrees")));
+        assert!(!rules.allows(Path::new("a/b/.worktrees")));
+        assert!(rules.allows(Path::new(".hidden")));
+        assert!(rules.allows(Path::new("src/.hidden")));
+        assert!(rules.allows(Path::new("src/deep/.hidden")));
+        assert!(rules.allows(Path::new("app/.cursor")));
+        assert!(!rules.allows(Path::new("node_modules")));
+        assert!(!IncludeRules::default().allows(Path::new("diri/.worktrees")));
+    }
+
+    #[test]
+    fn scan_enters_included_dotfolders_and_indexes_their_children() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("GitHub");
+        fs::create_dir_all(root.join("diri/.worktrees/diri-include/.git")).unwrap();
+        fs::create_dir_all(root.join("diri/.hidden/skip")).unwrap();
+
+        let skipped = scan(std::slice::from_ref(&root), &[]);
+        assert!(
+            skipped
+                .iter()
+                .all(|entry| entry.name != "diri-include" && entry.name != ".worktrees")
+        );
+
+        let included = scan_with(
+            std::slice::from_ref(&root),
+            &[],
+            &IncludeRules::parse("*/.worktrees/\n"),
+        );
+        let names: HashSet<_> = included.iter().map(|entry| entry.name.as_str()).collect();
+        assert!(names.contains(".worktrees"));
+        assert!(names.contains("diri-include"));
+        assert!(
+            included
+                .iter()
+                .any(|entry| entry.name == "diri-include" && entry.is_git_repo)
+        );
+        assert!(!names.contains(".hidden"));
+    }
+
+    #[test]
+    fn include_file_round_trips_and_deletes_when_empty() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join(".diri-include");
+        store_include(&path, "  \n");
+        assert!(!path.exists());
+        store_include(&path, "**/.worktrees/\n");
+        assert_eq!(load_include(&path), "**/.worktrees/\n");
+        store_include(&path, "");
+        assert!(!path.exists());
+        assert_eq!(load_include(&path), "");
     }
 }

@@ -14,7 +14,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::delegation::worktree_move_proposal;
 use crate::icons::{SymbolWeight, sf_symbol, sf_symbol_weighted};
 use crate::navigation::query_label;
-use crate::query_editor::{self, ClipboardEdit, Edit, QueryEditor};
+use crate::query_editor::{self, ClipboardEdit, Edit, LocalEdit, QueryEditor};
+use crate::quick_open;
 use crate::settings::{HostDraft, SettingsNav, SettingsTab, theme};
 mod account_settings;
 use crate::sidebar::DraggedSidebarItem;
@@ -294,6 +295,9 @@ pub struct UtilitySurfaces {
     shortcut_search: QueryEditor,
     shortcut_search_active: bool,
     shortcut_editor: Option<ShortcutEditor>,
+    include_path: PathBuf,
+    include_editor: QueryEditor,
+    include_editor_active: bool,
     settings_transition_generation: u64,
     settings_menu: Option<SettingsMenu>,
     agents_host: Option<String>,
@@ -341,6 +345,9 @@ impl UtilitySurfaces {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/nonexistent"));
         let hosts_path = diri_proto::paths::DirijorPaths::hosts_config_file(&home);
+        let include_path = diri_proto::paths::DirijorPaths::diri_include_file(&home);
+        let mut include_editor = QueryEditor::default();
+        include_editor.insert_multiline(&quick_open::load_include(&include_path));
         let (prefs, hosts, agents_host) = {
             let store = store_runtime
                 .store
@@ -464,6 +471,9 @@ impl UtilitySurfaces {
             shortcut_search: QueryEditor::default(),
             shortcut_search_active: false,
             shortcut_editor: None,
+            include_path,
+            include_editor,
+            include_editor_active: false,
             settings_transition_generation: 0,
             settings_menu: None,
             agents_host,
@@ -688,6 +698,17 @@ impl UtilitySurfaces {
             self.activity = "Settings saved for diri".to_owned();
             true
         }
+    }
+
+    fn persist_include(&mut self) {
+        quick_open::store_include(&self.include_path, self.include_editor.text());
+    }
+
+    fn reload_include_editor(&mut self) {
+        self.include_editor = QueryEditor::default();
+        self.include_editor
+            .insert_multiline(&quick_open::load_include(&self.include_path));
+        self.include_editor_active = false;
     }
 
     fn reload_hosts(&mut self) {
@@ -1088,6 +1109,61 @@ impl UtilitySurfaces {
         true
     }
 
+    fn handle_include_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        if self.surface != Surface::Settings
+            || self.settings_tab != SettingsTab::General
+            || !self.include_editor_active
+        {
+            return false;
+        }
+        let key = &event.keystroke;
+        match key.key.as_str() {
+            "escape" => {
+                self.include_editor_active = false;
+                cx.notify();
+            }
+            "enter" => {
+                self.include_editor.insert_multiline("\n");
+                self.persist_include();
+                cx.notify();
+            }
+            _ => {
+                let Some(edit) = query_editor::edit_for(key) else {
+                    return false;
+                };
+                match edit {
+                    Edit::Local(LocalEdit::Insert(text)) => {
+                        if self.include_editor.insert_multiline(&text) {
+                            self.persist_include();
+                        }
+                    }
+                    Edit::Local(local) => {
+                        if self.include_editor.apply(local) {
+                            self.persist_include();
+                        }
+                    }
+                    Edit::Clipboard(ClipboardEdit::Copy) => {
+                        query_editor::copy_selection(&self.include_editor, cx);
+                    }
+                    Edit::Clipboard(ClipboardEdit::Cut) => {
+                        if query_editor::cut_selection(&mut self.include_editor, cx) {
+                            self.persist_include();
+                        }
+                    }
+                    Edit::Clipboard(ClipboardEdit::Paste) => {
+                        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text())
+                            && self.include_editor.insert_multiline(&text)
+                        {
+                            self.persist_include();
+                        }
+                    }
+                }
+                cx.notify();
+            }
+        }
+        true
+    }
+
     fn close_surface(&mut self, cx: &mut Context<Self>) {
         if self.worktrees.pending_cleanup.is_some() {
             self.worktrees.cancel_cleanup();
@@ -1099,6 +1175,7 @@ impl UtilitySurfaces {
             self.settings_menu = None;
             self.host_editor = None;
             self.agent_path_editor = None;
+            self.include_editor_active = false;
         }
         cx.notify();
     }
@@ -1131,6 +1208,7 @@ impl UtilitySurfaces {
         self.shortcut_search.clear();
         self.shortcut_search_active = false;
         self.shortcut_editor = None;
+        self.reload_include_editor();
         if self.settings_tab == SettingsTab::Skills {
             self.refresh_skills(cx);
         }
@@ -1187,6 +1265,7 @@ impl UtilitySurfaces {
             return;
         }
         self.settings_search_active = true;
+        self.include_editor_active = false;
         self.focus.focus(window, cx);
         cx.notify();
     }
@@ -1197,6 +1276,7 @@ impl UtilitySurfaces {
         }
         self.settings_search.clear();
         self.settings_search_active = true;
+        self.include_editor_active = false;
         self.focus.focus(window, cx);
         cx.notify();
     }
@@ -1225,6 +1305,7 @@ impl UtilitySurfaces {
         self.settings_menu = None;
         self.host_editor = None;
         self.agent_path_editor = None;
+        self.include_editor_active = false;
         self.shortcut_search_active = false;
         self.shortcut_editor = None;
         if tab == SettingsTab::Remote {
@@ -1535,6 +1616,7 @@ impl UtilitySurfaces {
             return;
         }
         if self.handle_account_key(event, cx)
+            || self.handle_include_key(event, cx)
             || self.handle_agent_path_key(event, cx)
             || self.handle_host_editor_key(event, cx)
         {
@@ -2414,6 +2496,72 @@ impl UtilitySurfaces {
                                         "One folder per line, scanned four levels deep."
                                     }
                                     .into(),
+                                )),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(13.0))
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(".diri-include"),
+                        )
+                        .child(
+                            div()
+                                .id("quick-open-include")
+                                .debug_selector(|| "quick-open-include".into())
+                                .min_w(px(0.0))
+                                .w_full()
+                                .min_h(px(88.0))
+                                .whitespace_normal()
+                                .p(px(10.0))
+                                .rounded(px(Radius::BADGE))
+                                .bg(colors.primary.alpha(0.055))
+                                .border_1()
+                                .border_color(colors.primary.alpha(
+                                    if self.include_editor_active { 0.22 } else { 0.0 },
+                                ))
+                                .font_family(crate::fonts::mono_family())
+                                .text_size(px(11.0))
+                                .line_height(px(17.0))
+                                .text_color(if self.include_editor.is_empty()
+                                    && !self.include_editor_active
+                                {
+                                    colors.tertiary
+                                } else {
+                                    colors.secondary
+                                })
+                                .cursor_text()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, window, cx| {
+                                        this.include_editor_active = true;
+                                        this.settings_search_active = false;
+                                        this.focus.focus(window, cx);
+                                        cx.stop_propagation();
+                                        cx.notify();
+                                    }),
+                                )
+                                .child(if self.include_editor_active {
+                                    query_label(&self.include_editor)
+                                } else if self.include_editor.is_empty() {
+                                    div()
+                                        .child("# gitignore-style paths to index")
+                                        .into_any_element()
+                                } else {
+                                    div()
+                                        .child(self.include_editor.text().to_owned())
+                                        .into_any_element()
+                                }),
+                        )
+                        .child(
+                            div()
+                                .min_w(px(0.0))
+                                .w_full()
+                                .whitespace_normal()
+                                .text_size(px(11.0))
+                                .line_height(px(16.0))
+                                .text_color(colors.tertiary)
+                                .child(wrappable_setting_copy(
+                                    "One pattern per line, saved to ~/.diri-include. Hidden folders stay skipped unless they match. Use **/.worktrees/ to index git worktrees.".into(),
                                 )),
                         ),
                     colors,
@@ -5394,7 +5542,7 @@ fn settings_tab_matches(tab: SettingsTab, query: &str) -> bool {
     }
     let searchable = match tab {
         SettingsTab::General => {
-            "general default startup login sessions close confirmation sounds chimes support diagnostics quick open search roots updates"
+            "general default startup login sessions close confirmation sounds chimes support diagnostics quick open search roots updates diri-include include gitignore worktrees hidden folders"
         }
         SettingsTab::WhatsNew => {
             "what's new whats new release notes latest version changes features improvements"
@@ -7417,9 +7565,24 @@ mod tests {
         assert!(settings_tab_matches(SettingsTab::Remote, "ssh"));
         assert!(settings_tab_matches(SettingsTab::Resources, "memory"));
         assert!(settings_tab_matches(SettingsTab::General, "login"));
+        assert!(settings_tab_matches(SettingsTab::General, "diri-include"));
         assert!(settings_tab_matches(SettingsTab::Shortcuts, "keyboard"));
         assert!(settings_tab_matches(SettingsTab::Terminal, "appearance"));
         assert!(!settings_tab_matches(SettingsTab::Terminal, "ssh"));
+    }
+
+    #[gpui::test]
+    fn general_settings_shows_the_diri_include_editor(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces.open_settings_tab(SettingsTab::General, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("quick-open-include").is_some(),
+            "General settings must expose the .diri-include editor"
+        );
     }
 
     #[test]

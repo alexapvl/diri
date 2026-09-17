@@ -169,7 +169,7 @@ fn shortcuts_switch_pages_without_stacking_overlays(cx: &mut TestAppContext) {
         seed_history(overlay);
         overlay
             .directory_index
-            .finish_scan(Vec::new(), Instant::now());
+            .finish_scan(Vec::new(), Instant::now(), String::new());
         overlay.overlay = None;
         overlay.toggle_history(&ToggleHistory, window, cx);
         assert_eq!(overlay.overlay, Some(Overlay::History));
@@ -252,7 +252,7 @@ fn registered_shortcuts_route_to_the_focused_palette(cx: &mut TestAppContext) {
             seed_history(&mut overlay);
             overlay
                 .directory_index
-                .finish_scan(Vec::new(), Instant::now());
+                .finish_scan(Vec::new(), Instant::now(), String::new());
             overlay.focus_handle.focus(window, cx);
             overlay
         });
@@ -288,7 +288,7 @@ fn pending_project_search_cannot_change_a_new_page(cx: &mut TestAppContext) {
         seed_history(&mut overlay);
         overlay
             .directory_index
-            .finish_scan(Vec::new(), Instant::now());
+            .finish_scan(Vec::new(), Instant::now(), String::new());
         overlay
     });
     overlay.update_in(cx, |overlay, window, cx| {
@@ -590,7 +590,7 @@ fn searchable_pages_open_by_mouse_and_keyboard(cx: &mut TestAppContext) {
             seed_history(&mut overlay);
             overlay
                 .directory_index
-                .finish_scan(Vec::new(), Instant::now());
+                .finish_scan(Vec::new(), Instant::now(), String::new());
             overlay.focus_handle.focus(window, cx);
             overlay
         });

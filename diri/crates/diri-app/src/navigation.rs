@@ -472,7 +472,7 @@ impl NavigationOverlay {
     }
 
     /// The roots to index, and where their cached index lives.
-    fn index_roots(&mut self) -> (Vec<PathBuf>, Vec<PathBuf>, PathBuf) {
+    fn index_roots(&mut self) -> (Vec<PathBuf>, Vec<PathBuf>, PathBuf, PathBuf) {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/nonexistent"));
@@ -492,18 +492,20 @@ impl NavigationOverlay {
             .clone();
         let roots = quick_open::resolve_roots(&quick_open_roots, &fallback, &home);
         let cache = quick_open::cache_file(&home);
-        (roots, vec![home], cache)
+        let include = quick_open::include_file(&home);
+        (roots, vec![home], cache, include)
     }
 
     /// Populate the index from the previous run's scan. Costs one file read, so
     /// the first ⌘P of a launch has results to show instead of "Scanning…".
     fn load_cached_index(&mut self, cx: &mut Context<Self>) {
-        let (roots, _, cache) = self.index_roots();
+        let (roots, _, cache, include_path) = self.index_roots();
         let (projects, cwds) = self.snapshot_inputs();
         self.cache_task = Some(cx.spawn(async move |this, cx| {
             let built = cx
                 .background_spawn(async move {
-                    let entries = quick_open::load_cache(&cache, &roots)?;
+                    let includes = quick_open::load_include(&include_path);
+                    let entries = quick_open::load_cache(&cache, &roots, &includes)?;
                     let snapshot = quick_open::build_snapshot(&entries, &projects, &cwds);
                     Some((entries, snapshot))
                 })
@@ -521,26 +523,31 @@ impl NavigationOverlay {
     }
 
     fn refresh_directory_index(&mut self, cx: &mut Context<Self>) {
-        if !self.directory_index.needs_scan(Instant::now()) || !self.directory_index.begin_scan() {
+        let (roots, standalone, cache, include_path) = self.index_roots();
+        let includes = quick_open::load_include(&include_path);
+        if !self.directory_index.needs_scan(Instant::now(), &includes)
+            || !self.directory_index.begin_scan()
+        {
             return;
         }
-        let (roots, standalone, cache) = self.index_roots();
         let (projects, cwds) = self.snapshot_inputs();
 
         self.scan_task = Some(cx.spawn(async move |this, cx| {
             // Scan, persist, and prepare 20 000 ranking candidates all on the
             // background executor: preparing them on the main thread cost ~13 ms,
             // which is a dropped frame on any display and most of two at 120 Hz.
-            let (entries, snapshot) = cx
+            let (entries, snapshot, includes) = cx
                 .background_spawn(async move {
-                    let entries = quick_open::scan(&roots, &standalone);
-                    quick_open::store_cache(&cache, &roots, &entries);
+                    let include = quick_open::IncludeRules::parse(&includes);
+                    let entries = quick_open::scan_with(&roots, &standalone, &include);
+                    quick_open::store_cache(&cache, &roots, &includes, &entries);
                     let snapshot = quick_open::build_snapshot(&entries, &projects, &cwds);
-                    (entries, snapshot)
+                    (entries, snapshot, includes)
                 })
                 .await;
             this.update(cx, |this, cx| {
-                this.directory_index.finish_scan(entries, Instant::now());
+                this.directory_index
+                    .finish_scan(entries, Instant::now(), includes);
                 this.quick_snapshot = snapshot;
                 if this.overlay == Some(Overlay::QuickOpen) && !this.query.text().trim().is_empty()
                 {
