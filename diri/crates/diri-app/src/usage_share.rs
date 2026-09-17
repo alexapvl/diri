@@ -58,6 +58,7 @@ pub(super) struct ShareModel {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(super) struct ShareSeries {
     pub provider: Option<usize>,
     pub points: Vec<(f32, f32)>,
@@ -70,11 +71,13 @@ pub(super) struct ShareCard {
     pub host: HostLabel,
     pub hero: String,
     pub providers: Vec<ShareProvider>,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub graph: Vec<ShareSeries>,
     pub models: Option<Vec<ShareModel>>,
 }
 
 #[derive(Clone, Copy, Debug)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(super) struct SharePalette {
     pub background: Rgba,
     pub primary: Rgba,
