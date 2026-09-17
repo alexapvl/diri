@@ -2,6 +2,8 @@
 mod usage_chart;
 #[path = "usage_page.rs"]
 mod usage_page;
+#[path = "usage_share.rs"]
+mod usage_share;
 mod worktree_settings;
 
 use std::cell::Cell;
@@ -280,6 +282,8 @@ pub struct UtilitySurfaces {
     usage_days: usize,
     usage_host: Option<String>,
     usage_tokens: bool,
+    usage_share: Option<usage_share::SharePreview>,
+    usage_share_theme_hover: Option<Task<()>>,
     usage_chart_split: Option<[bool; 3]>,
     usage_series_hover: u8,
     usage_series_menu_close: Option<Task<()>>,
@@ -450,6 +454,8 @@ impl UtilitySurfaces {
             usage_days: 30,
             usage_host: None,
             usage_tokens: false,
+            usage_share: None,
+            usage_share_theme_hover: None,
             usage_chart_split: None,
             usage_series_hover: 0,
             usage_series_menu_close: None,
@@ -1096,6 +1102,8 @@ impl UtilitySurfaces {
         } else {
             self.surface = Surface::None;
             self.clear_account_continuation();
+            self.usage_share_theme_hover = None;
+            self.usage_share = None;
             self.settings_menu = None;
             self.host_editor = None;
             self.agent_path_editor = None;
@@ -1157,6 +1165,10 @@ impl UtilitySurfaces {
 
     pub(crate) fn is_settings_open(&self) -> bool {
         self.surface == Surface::Settings
+    }
+
+    pub(crate) fn is_usage_share_open(&self) -> bool {
+        self.usage_share.is_some()
     }
 
     /// What the app sidebar paints while settings owns the workbench. `None`
@@ -1222,6 +1234,10 @@ impl UtilitySurfaces {
             self.refresh_accounts(cx);
         }
         self.settings_search_active = false;
+        if tab != SettingsTab::Usage {
+            self.usage_share_theme_hover = None;
+            self.usage_share = None;
+        }
         self.settings_menu = None;
         self.host_editor = None;
         self.agent_path_editor = None;
@@ -1558,6 +1574,15 @@ impl UtilitySurfaces {
         {
             self.worktrees.cancel_move();
             cx.notify();
+        } else if key.key == "escape"
+            && self
+                .usage_share
+                .as_ref()
+                .is_some_and(|preview| preview.theme_menu)
+        {
+            self.close_share_theme_menu(cx);
+        } else if key.key == "escape" && self.usage_share.is_some() {
+            self.dismiss_usage_share(cx);
         } else if key.key == "escape"
             && self.surface == Surface::Settings
             && self.settings_menu.is_some()
@@ -4721,17 +4746,30 @@ impl Render for UtilitySurfaces {
             .text_color(self.colors().primary);
         if let Some(overlay) = overlay {
             if self.surface == Surface::Settings {
-                root.inset_0().child(
+                let share_covers_window = self.usage_share.is_some();
+                let page = root.inset_0().child(
                     div()
                         .absolute()
-                        .inset_0()
+                        .when(share_covers_window, |backdrop| {
+                            backdrop
+                                .top(px(0.0))
+                                .right(px(0.0))
+                                .bottom(px(0.0))
+                                .left(px(sidebar_width))
+                        })
+                        .when(!share_covers_window, |backdrop| backdrop.inset_0())
                         .debug_selector(|| "surface-backdrop".into())
                         .occlude()
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
                         .bg(self.colors().background)
                         .child(overlay),
-                )
+                );
+                if self.usage_share.is_some() {
+                    page.child(self.usage_share_overlay(window, cx))
+                } else {
+                    page
+                }
             } else {
                 root.inset_0().child(
                     div()
@@ -5507,6 +5545,15 @@ fn settings_page(
     content: impl IntoElement,
     colors: SemanticColors,
 ) -> impl IntoElement {
+    settings_page_with_trailing(title, None::<AnyElement>, content, colors)
+}
+
+fn settings_page_with_trailing(
+    title: &'static str,
+    trailing: Option<impl IntoElement>,
+    content: impl IntoElement,
+    colors: SemanticColors,
+) -> impl IntoElement {
     div()
         .w_full()
         .px(px(20.0))
@@ -5517,14 +5564,23 @@ fn settings_page(
         .gap(px(16.0))
         .child(
             div()
-                .pr(px(34.0))
-                .h(px(22.0))
+                .when(trailing.is_none(), |row| row.pr(px(34.0)))
+                .min_h(px(22.0))
                 .flex()
                 .items_center()
-                .text_size(px(Typo::DISPLAY_TITLE.size))
-                .font_weight(Typo::DISPLAY_TITLE.weight)
-                .text_color(colors.primary)
-                .child(title),
+                .justify_between()
+                .gap(px(12.0))
+                .child(
+                    div()
+                        .h(px(22.0))
+                        .flex()
+                        .items_center()
+                        .text_size(px(Typo::DISPLAY_TITLE.size))
+                        .font_weight(Typo::DISPLAY_TITLE.weight)
+                        .text_color(colors.primary)
+                        .child(title),
+                )
+                .children(trailing),
         )
         .child(content)
 }
@@ -6414,6 +6470,55 @@ mod tests {
             assert!(surfaces.usage_tokens);
             assert_eq!(surfaces.usage_host.as_deref(), Some("forge"));
         });
+        let share = cx
+            .debug_bounds("usage-share")
+            .expect("visible share control");
+        cx.simulate_click(share.center(), Modifiers::default());
+        cx.run_until_parked();
+        for selector in [
+            "usage-share-preview",
+            "usage-share-models",
+            "usage-share-theme",
+            "usage-share-graph-all",
+            "usage-share-graph-individual",
+            "usage-share-cost",
+            "usage-share-tokens",
+            "usage-share-close",
+            "usage-share-copy-image",
+            "usage-share-save",
+            "usage-share-x",
+        ] {
+            assert!(
+                cx.debug_bounds(selector).is_some(),
+                "{selector} should open from Share"
+            );
+        }
+        let models = cx.debug_bounds("usage-share-models").expect("share models");
+        cx.simulate_click(models.center(), Modifiers::default());
+        cx.run_until_parked();
+        surfaces.read_with(cx, |surfaces, _| {
+            let preview = surfaces.usage_share.as_ref().expect("share stays open");
+            assert!(preview.options.include_models);
+        });
+        let tokens = cx.debug_bounds("usage-share-tokens").expect("share tokens");
+        cx.simulate_click(tokens.center(), Modifiers::default());
+        cx.run_until_parked();
+        let individual = cx
+            .debug_bounds("usage-share-graph-individual")
+            .expect("share individual");
+        cx.simulate_click(individual.center(), Modifiers::default());
+        cx.run_until_parked();
+        surfaces.read_with(cx, |surfaces, _| {
+            let preview = surfaces.usage_share.as_ref().expect("share stays open");
+            assert!(preview.options.tokens);
+            assert!(preview.options.individual);
+        });
+        let close = cx.debug_bounds("usage-share-close").expect("share close");
+        cx.simulate_click(close.center(), Modifiers::default());
+        cx.run_until_parked();
+        surfaces.read_with(cx, |surfaces, _| {
+            assert!(surfaces.usage_share.is_none());
+        });
         assert!(
             cx.debug_bounds("usage-by-day").is_none(),
             "day grouping control is gone"
@@ -6768,6 +6873,7 @@ mod tests {
             // RootView re-renders on the sidebar's own events; this harness
             // only needs to notice its measure change.
             cx.observe(&sidebar, |_, _, cx| cx.notify()).detach();
+            cx.observe(&surfaces, |_, _, cx| cx.notify()).detach();
             let subscriptions = crate::root::wire_settings_navigation(
                 sidebar.clone(),
                 surfaces.clone(),
@@ -6813,14 +6919,13 @@ mod tests {
                             .cached(StyleRefinement::default().size_full()),
                     ),
                 )
-                .child(
-                    self.surfaces.clone().cached(
-                        StyleRefinement::default()
-                            .absolute()
-                            .inset_0()
-                            .left(px(seam)),
-                    ),
-                )
+                .child({
+                    let mut placement = StyleRefinement::default().absolute().inset_0();
+                    if !self.surfaces.read(cx).is_usage_share_open() {
+                        placement = placement.left(px(seam));
+                    }
+                    self.surfaces.clone().cached(placement)
+                })
         }
     }
 
