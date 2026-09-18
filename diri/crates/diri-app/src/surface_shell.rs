@@ -14,7 +14,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::delegation::worktree_move_proposal;
 use crate::icons::{SymbolWeight, sf_symbol, sf_symbol_weighted};
 use crate::navigation::query_label;
-use crate::query_editor::{self, ClipboardEdit, Edit, QueryEditor};
+use crate::query_editor::{self, ClipboardEdit, Edit, LocalEdit, QueryEditor};
+use crate::quick_open;
 use crate::settings::{HostDraft, SettingsNav, SettingsTab, theme};
 mod account_settings;
 use crate::sidebar::DraggedSidebarItem;
@@ -30,9 +31,9 @@ use diri_ui::{
 };
 use gpui::{
     Animation, AnimationExt, AnyElement, App, Bounds, ClickEvent, Context, CursorStyle,
-    FocusHandle, Focusable, FontWeight, IntoElement, KeyDownEvent, MouseButton, PathPromptOptions,
-    Pixels, Render, Rgba, ScrollHandle, SharedString, Task, TextRun, Window, canvas, deferred, div,
-    ease_out_quint, font, point, prelude::*, px, rgba,
+    DragMoveEvent, FocusHandle, Focusable, FontWeight, IntoElement, KeyDownEvent, MouseButton,
+    MouseDownEvent, PathPromptOptions, Pixels, Render, Rgba, ScrollHandle, SharedString, Task,
+    TextRun, Window, canvas, deferred, div, ease_out_quint, font, point, prelude::*, px, rgba,
 };
 use tokio::runtime::Runtime;
 
@@ -44,6 +45,9 @@ const SETTINGS_CONTENT_MAX_WIDTH: f32 = 760.0;
 const SETTINGS_TRANSITION_DURATION: Duration = Duration::from_millis(190);
 const SETTINGS_SECTION_GAP: f32 = 16.0;
 const SETTINGS_ROW_HEIGHT: f32 = 50.0;
+const ROOTS_EDITOR_MIN: f32 = 44.0;
+const INCLUDE_EDITOR_MIN: f32 = 88.0;
+const EDITOR_MAX: f32 = 280.0;
 const HOST_FIELD_HORIZONTAL_PADDING: f32 = 10.0;
 /// Reinstall success is confirmation, not persistent host state. Errors stay
 /// actionable and first-time setup keeps its "Use by default" action.
@@ -56,6 +60,30 @@ enum Surface {
     Worktrees,
     Settings,
     Diagnostics,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QuickOpenEditor {
+    Roots,
+    Include,
+}
+
+#[derive(Clone, Debug)]
+struct NestedRootPrompt {
+    parent: String,
+    child: String,
+    child_path: PathBuf,
+    remaining: Vec<PathBuf>,
+}
+
+/// Drag payload so a corner gripper keeps receiving moves outside its hitbox.
+#[derive(Clone, Copy)]
+struct DraggedEditorResize(QuickOpenEditor);
+
+impl Render for DraggedEditorResize {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        gpui::Empty
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -294,6 +322,18 @@ pub struct UtilitySurfaces {
     shortcut_search: QueryEditor,
     shortcut_search_active: bool,
     shortcut_editor: Option<ShortcutEditor>,
+    include_path: PathBuf,
+    include_editor: QueryEditor,
+    include_editor_active: bool,
+    include_persisted: String,
+    include_save_notice: bool,
+    include_save_error: Option<String>,
+    roots_editor: QueryEditor,
+    roots_editor_active: bool,
+    roots_editor_height: f32,
+    include_editor_height: f32,
+    editor_resize: Option<(QuickOpenEditor, f32, f32)>,
+    nested_root: Option<NestedRootPrompt>,
     settings_transition_generation: u64,
     settings_menu: Option<SettingsMenu>,
     agents_host: Option<String>,
@@ -341,6 +381,11 @@ impl UtilitySurfaces {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/nonexistent"));
         let hosts_path = diri_proto::paths::DirijorPaths::hosts_config_file(&home);
+        let include_path = diri_proto::paths::DirijorPaths::diri_include_file(&home);
+        let mut include_editor = QueryEditor::default();
+        include_editor.insert_multiline(&quick_open::load_include(&include_path));
+        let include_persisted = include_editor.text().to_owned();
+        let mut roots_editor = QueryEditor::default();
         let (prefs, hosts, agents_host) = {
             let store = store_runtime
                 .store
@@ -352,6 +397,7 @@ impl UtilitySurfaces {
                 store.default_spawn_host(),
             )
         };
+        roots_editor.insert_multiline(&prefs.quick_open_roots);
         let settings_preview = std::env::var("DIRI_SETTINGS_PREVIEW")
             .ok()
             .map(|value| value.to_ascii_lowercase());
@@ -464,6 +510,18 @@ impl UtilitySurfaces {
             shortcut_search: QueryEditor::default(),
             shortcut_search_active: false,
             shortcut_editor: None,
+            include_path,
+            include_editor,
+            include_editor_active: false,
+            include_persisted,
+            include_save_notice: false,
+            include_save_error: None,
+            roots_editor,
+            roots_editor_active: false,
+            roots_editor_height: ROOTS_EDITOR_MIN,
+            include_editor_height: INCLUDE_EDITOR_MIN,
+            editor_resize: None,
+            nested_root: None,
             settings_transition_generation: 0,
             settings_menu: None,
             agents_host,
@@ -673,6 +731,10 @@ impl UtilitySurfaces {
     }
 
     fn persist_prefs(&mut self) -> bool {
+        if self.include_editor.text() != self.include_persisted && !self.persist_include() {
+            return false;
+        }
+        self.prefs.quick_open_roots = self.roots_editor.text().to_owned();
         self.prefs.normalize();
         let prefs = self.prefs.clone();
         if let Err(error) = self
@@ -688,6 +750,154 @@ impl UtilitySurfaces {
             self.activity = "Settings saved for diri".to_owned();
             true
         }
+    }
+
+    fn persist_include(&mut self) -> bool {
+        let text = self.include_editor.text().to_owned();
+        if let Err(error) = quick_open::store_include(&self.include_path, &text) {
+            let message = format!("Could not save .diri-include: {error}");
+            self.include_save_error = Some(message.clone());
+            self.activity = message;
+            self.include_save_notice = false;
+            return false;
+        }
+        self.include_persisted = text;
+        self.include_save_notice = true;
+        self.include_save_error = None;
+        true
+    }
+
+    fn persist_roots(&mut self) {
+        let _ = self.persist_prefs();
+    }
+
+    fn reload_include_editor(&mut self) {
+        self.include_editor = QueryEditor::default();
+        self.include_editor
+            .insert_multiline(&quick_open::load_include(&self.include_path));
+        self.include_persisted = self.include_editor.text().to_owned();
+        self.include_save_notice = false;
+        self.include_save_error = None;
+        self.include_editor_active = false;
+    }
+
+    fn reload_roots_editor(&mut self) {
+        self.roots_editor = QueryEditor::default();
+        self.roots_editor
+            .insert_multiline(&self.prefs.quick_open_roots);
+        self.roots_editor_active = false;
+    }
+
+    fn choose_quick_open_root(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.roots_editor_active = false;
+        self.include_editor_active = false;
+        window.focus(&self.focus, cx);
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: true,
+            prompt: Some("Select Search Root".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let selected = match paths.await {
+                Ok(Ok(Some(paths))) => paths,
+                _ => Vec::new(),
+            };
+            let _ = this.update_in(cx, |this, window, cx| {
+                if !selected.is_empty() {
+                    this.consume_root_picks(selected, cx);
+                }
+                window.focus(&this.focus, cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn consume_root_picks(&mut self, mut paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/nonexistent"));
+        let mut text = self.roots_editor.text().to_owned();
+        let mut index = 0;
+        while index < paths.len() {
+            match quick_open::classify_root(&text, &paths[index], &home) {
+                quick_open::RootAdd::Duplicate => index += 1,
+                quick_open::RootAdd::Fresh => {
+                    text = quick_open::add_root(&text, &paths[index], &home);
+                    index += 1;
+                }
+                quick_open::RootAdd::Nested { parent } => {
+                    let child_path = paths.remove(index);
+                    let remaining = paths.split_off(index);
+                    self.nested_root = Some(NestedRootPrompt {
+                        parent,
+                        child: quick_open::collapse_home(&child_path, &home),
+                        child_path,
+                        remaining,
+                    });
+                    self.apply_roots_text(&text);
+                    cx.notify();
+                    return;
+                }
+            }
+        }
+        self.apply_roots_text(&text);
+        cx.notify();
+    }
+
+    fn apply_roots_text(&mut self, text: &str) {
+        self.roots_editor = QueryEditor::default();
+        self.roots_editor.insert_multiline(text);
+        self.persist_roots();
+    }
+
+    fn confirm_nested_root(&mut self, cx: &mut Context<Self>) {
+        let Some(prompt) = self.nested_root.take() else {
+            return;
+        };
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/nonexistent"));
+        let mut text =
+            quick_open::remove_root_line(self.roots_editor.text(), &prompt.parent, &home);
+        text = quick_open::add_root(&text, &prompt.child_path, &home);
+        self.apply_roots_text(&text);
+        if !prompt.remaining.is_empty() {
+            self.consume_root_picks(prompt.remaining, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn skip_nested_root(&mut self, cx: &mut Context<Self>) {
+        let Some(prompt) = self.nested_root.take() else {
+            return;
+        };
+        if !prompt.remaining.is_empty() {
+            self.consume_root_picks(prompt.remaining, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn drag_editor_resize(&mut self, kind: QuickOpenEditor, y: f32, cx: &mut Context<Self>) {
+        let Some((active, start_y, start_h)) = self.editor_resize else {
+            return;
+        };
+        if active != kind {
+            return;
+        }
+        let min = match kind {
+            QuickOpenEditor::Roots => ROOTS_EDITOR_MIN,
+            QuickOpenEditor::Include => INCLUDE_EDITOR_MIN,
+        };
+        let next = (start_h + (y - start_y)).clamp(min, EDITOR_MAX);
+        match kind {
+            QuickOpenEditor::Roots => self.roots_editor_height = next,
+            QuickOpenEditor::Include => self.include_editor_height = next,
+        }
+        cx.notify();
     }
 
     fn reload_hosts(&mut self) {
@@ -1088,17 +1298,137 @@ impl UtilitySurfaces {
         true
     }
 
+    fn handle_include_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        if self.surface != Surface::Settings
+            || self.settings_tab != SettingsTab::General
+            || !self.include_editor_active
+        {
+            return false;
+        }
+        let key = &event.keystroke;
+        match key.key.as_str() {
+            "escape" => {
+                self.persist_include();
+                self.include_editor_active = false;
+                self.roots_editor_active = false;
+                cx.notify();
+            }
+            "enter" => {
+                self.include_editor.insert_multiline("\n");
+                self.persist_include();
+                cx.notify();
+            }
+            _ => {
+                let Some(edit) = query_editor::edit_for(key) else {
+                    return false;
+                };
+                match edit {
+                    Edit::Local(LocalEdit::Insert(text)) => {
+                        if self.include_editor.insert_multiline(&text) {
+                            self.persist_include();
+                        }
+                    }
+                    Edit::Local(local) => {
+                        if self.include_editor.apply(local) {
+                            self.persist_include();
+                        }
+                    }
+                    Edit::Clipboard(ClipboardEdit::Copy) => {
+                        query_editor::copy_selection(&self.include_editor, cx);
+                    }
+                    Edit::Clipboard(ClipboardEdit::Cut) => {
+                        if query_editor::cut_selection(&mut self.include_editor, cx) {
+                            self.persist_include();
+                        }
+                    }
+                    Edit::Clipboard(ClipboardEdit::Paste) => {
+                        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text())
+                            && self.include_editor.insert_multiline(&text)
+                        {
+                            self.persist_include();
+                        }
+                    }
+                }
+                cx.notify();
+            }
+        }
+        true
+    }
+
+    fn handle_roots_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        if self.surface != Surface::Settings
+            || self.settings_tab != SettingsTab::General
+            || !self.roots_editor_active
+        {
+            return false;
+        }
+        let key = &event.keystroke;
+        match key.key.as_str() {
+            "escape" => {
+                self.roots_editor_active = false;
+                cx.notify();
+            }
+            "enter" => {
+                self.roots_editor.insert_multiline("\n");
+                self.persist_roots();
+                cx.notify();
+            }
+            _ => {
+                let Some(edit) = query_editor::edit_for(key) else {
+                    return false;
+                };
+                match edit {
+                    Edit::Local(LocalEdit::Insert(text)) => {
+                        if self.roots_editor.insert_multiline(&text) {
+                            self.persist_roots();
+                        }
+                    }
+                    Edit::Local(local) => {
+                        if self.roots_editor.apply(local) {
+                            self.persist_roots();
+                        }
+                    }
+                    Edit::Clipboard(ClipboardEdit::Copy) => {
+                        query_editor::copy_selection(&self.roots_editor, cx);
+                    }
+                    Edit::Clipboard(ClipboardEdit::Cut) => {
+                        if query_editor::cut_selection(&mut self.roots_editor, cx) {
+                            self.persist_roots();
+                        }
+                    }
+                    Edit::Clipboard(ClipboardEdit::Paste) => {
+                        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text())
+                            && self.roots_editor.insert_multiline(&text)
+                        {
+                            self.persist_roots();
+                        }
+                    }
+                }
+                cx.notify();
+            }
+        }
+        true
+    }
+
     fn close_surface(&mut self, cx: &mut Context<Self>) {
         if self.worktrees.pending_cleanup.is_some() {
             self.worktrees.cancel_cleanup();
         } else if self.worktrees.pending_move.is_some() || self.worktrees.move_refusal.is_some() {
             self.worktrees.cancel_move();
         } else {
+            if self.include_editor.text() != self.include_persisted && !self.persist_include() {
+                cx.notify();
+                return;
+            }
+            let _ = self.persist_prefs();
             self.surface = Surface::None;
             self.clear_account_continuation();
             self.settings_menu = None;
             self.host_editor = None;
             self.agent_path_editor = None;
+            self.include_editor_active = false;
+            self.roots_editor_active = false;
+            self.nested_root = None;
         }
         cx.notify();
     }
@@ -1131,6 +1461,8 @@ impl UtilitySurfaces {
         self.shortcut_search.clear();
         self.shortcut_search_active = false;
         self.shortcut_editor = None;
+        self.reload_include_editor();
+        self.reload_roots_editor();
         if self.settings_tab == SettingsTab::Skills {
             self.refresh_skills(cx);
         }
@@ -1187,6 +1519,8 @@ impl UtilitySurfaces {
             return;
         }
         self.settings_search_active = true;
+        self.include_editor_active = false;
+        self.roots_editor_active = false;
         self.focus.focus(window, cx);
         cx.notify();
     }
@@ -1197,6 +1531,8 @@ impl UtilitySurfaces {
         }
         self.settings_search.clear();
         self.settings_search_active = true;
+        self.include_editor_active = false;
+        self.roots_editor_active = false;
         self.focus.focus(window, cx);
         cx.notify();
     }
@@ -1225,6 +1561,8 @@ impl UtilitySurfaces {
         self.settings_menu = None;
         self.host_editor = None;
         self.agent_path_editor = None;
+        self.include_editor_active = false;
+        self.roots_editor_active = false;
         self.shortcut_search_active = false;
         self.shortcut_editor = None;
         if tab == SettingsTab::Remote {
@@ -1535,6 +1873,8 @@ impl UtilitySurfaces {
             return;
         }
         if self.handle_account_key(event, cx)
+            || self.handle_include_key(event, cx)
+            || self.handle_roots_key(event, cx)
             || self.handle_agent_path_key(event, cx)
             || self.handle_host_editor_key(event, cx)
         {
@@ -1553,7 +1893,10 @@ impl UtilitySurfaces {
             return;
         }
         let key = &event.keystroke;
-        if key.key == "escape"
+        if key.key == "escape" && self.nested_root.is_some() {
+            self.nested_root = None;
+            cx.notify();
+        } else if key.key == "escape"
             && (self.worktrees.pending_move.is_some() || self.worktrees.move_refusal.is_some())
         {
             self.worktrees.cancel_move();
@@ -2078,6 +2421,75 @@ impl UtilitySurfaces {
             )
             .child(pane)
             .child(notification_titlebar_button(unread, colors))
+            .when_some(self.nested_root.as_ref(), |shell, prompt| {
+                let parent = prompt.parent.clone();
+                let child = prompt.child.clone();
+                shell.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .occlude()
+                        .bg(rgba(0x00000088))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.nested_root = None;
+                                cx.notify();
+                                cx.stop_propagation();
+                            }),
+                        )
+                        .child(FloatingSurface::new(
+                            colors,
+                            div()
+                                .w(px(360.0))
+                                .p(px(16.0))
+                                .flex()
+                                .flex_col()
+                                .gap(px(10.0))
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .child(
+                                    div()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child("Already inside a search root"),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(12.0))
+                                        .text_color(colors.secondary)
+                                        .child(wrappable_setting_copy(
+                                            format!(
+                                                "{child} is inside {parent}. Use this folder and remove the parent from Search roots, or skip it because the parent already covers it."
+                                            )
+                                            .into(),
+                                        )),
+                                )
+                                .child(
+                                    div()
+                                        .mt(px(4.0))
+                                        .flex()
+                                        .justify_end()
+                                        .gap(px(8.0))
+                                        .child(surface_button(
+                                            "Skip",
+                                            "nested-root-skip",
+                                            colors,
+                                            cx,
+                                            |this, cx| this.skip_nested_root(cx),
+                                        ))
+                                        .child(surface_button(
+                                            "Use this folder",
+                                            "nested-root-replace",
+                                            colors,
+                                            cx,
+                                            |this, cx| this.confirm_nested_root(cx),
+                                        )),
+                                ),
+                        )),
+                )
+            })
     }
 
     fn phone_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2277,11 +2689,6 @@ impl UtilitySurfaces {
 
     fn general_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = self.settings_colors();
-        let quick_open_roots = if self.prefs.quick_open_roots.is_empty() {
-            "~/fun".to_owned()
-        } else {
-            self.prefs.quick_open_roots.clone()
-        };
         settings_page(
             "General",
             div()
@@ -2381,23 +2788,86 @@ impl UtilitySurfaces {
                         .gap(px(8.0))
                         .child(
                             div()
-                                .text_size(px(13.0))
-                                .font_weight(FontWeight::MEDIUM)
-                                .child("Search roots"),
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap(px(8.0))
+                                .child(
+                                    div()
+                                        .text_size(px(13.0))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .child("Search roots"),
+                                )
+                                .child(
+                                    div()
+                                        .id("quick-open-roots-choose")
+                                        .debug_selector(|| "quick-open-roots-choose".into())
+                                        .h(px(26.0))
+                                        .px(px(9.0))
+                                        .rounded(px(Radius::BADGE))
+                                        .border_1()
+                                        .border_color(colors.primary.alpha(0.10))
+                                        .bg(colors.primary.alpha(0.04))
+                                        .flex()
+                                        .items_center()
+                                        .text_size(px(11.0))
+                                        .cursor_pointer()
+                                        .hover(move |style| style.bg(colors.primary.alpha(0.09)))
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.choose_quick_open_root(window, cx);
+                                        }))
+                                        .child("Add root"),
+                                ),
                         )
                         .child(
                             div()
+                                .id("quick-open-roots")
+                                .debug_selector(|| "quick-open-roots".into())
+                                .relative()
                                 .min_w(px(0.0))
                                 .w_full()
+                                .h(px(self.roots_editor_height))
+                                .overflow_hidden()
                                 .whitespace_normal()
                                 .p(px(10.0))
                                 .rounded(px(Radius::BADGE))
                                 .bg(colors.primary.alpha(0.055))
+                                .border_1()
+                                .border_color(colors.primary.alpha(
+                                    if self.roots_editor_active { 0.22 } else { 0.0 },
+                                ))
                                 .font_family(crate::fonts::mono_family())
                                 .text_size(px(11.0))
                                 .line_height(px(17.0))
-                                .text_color(colors.secondary)
-                                .child(wrappable_setting_copy(quick_open_roots.into())),
+                                .text_color(if self.roots_editor.is_empty()
+                                    && !self.roots_editor_active
+                                {
+                                    colors.tertiary
+                                } else {
+                                    colors.secondary
+                                })
+                                .cursor_text()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, window, cx| {
+                                        this.roots_editor_active = true;
+                                        this.include_editor_active = false;
+                                        this.settings_search_active = false;
+                                        this.focus.focus(window, cx);
+                                        cx.stop_propagation();
+                                        cx.notify();
+                                    }),
+                                )
+                                .child(if self.roots_editor_active {
+                                    query_label(&self.roots_editor)
+                                } else if self.roots_editor.is_empty() {
+                                    div().child("~/").into_any_element()
+                                } else {
+                                    div()
+                                        .child(self.roots_editor.text().to_owned())
+                                        .into_any_element()
+                                })
+                                .child(editor_resize_grip(QuickOpenEditor::Roots, colors, cx)),
                         )
                         .child(
                             div()
@@ -2408,12 +2878,153 @@ impl UtilitySurfaces {
                                 .line_height(px(16.0))
                                 .text_color(colors.tertiary)
                                 .child(wrappable_setting_copy(
-                                    if self.prefs.quick_open_roots.is_empty() {
-                                        "Using the default folder plus project parent folders."
+                                    if self.roots_editor.is_empty() {
+                                        "Empty uses your home folder plus project parent folders. Add root opens the system picker."
                                     } else {
-                                        "One folder per line, scanned four levels deep."
+                                        "One folder per line, scanned four levels deep. Add root adds another."
                                     }
                                     .into(),
+                                )),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap(px(8.0))
+                                .child(
+                                    div()
+                                        .text_size(px(13.0))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .child(".diri-include"),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(8.0))
+                                        .when(
+                                            self.include_editor.text() != self.include_persisted,
+                                            |row| {
+                                                row.child(
+                                                    div()
+                                                        .text_size(px(11.0))
+                                                        .text_color(colors.tertiary)
+                                                        .child("Unsaved"),
+                                                )
+                                            },
+                                        )
+                                        .when(
+                                            self.include_save_notice
+                                                && self.include_editor.text()
+                                                    == self.include_persisted,
+                                            |row| {
+                                                row.child(
+                                                    div()
+                                                        .text_size(px(11.0))
+                                                        .text_color(colors.tertiary)
+                                                        .child("Saved"),
+                                                )
+                                            },
+                                        )
+                                        .child(
+                                            div()
+                                                .id("quick-open-include-save")
+                                                .debug_selector(|| {
+                                                    "quick-open-include-save".into()
+                                                })
+                                                .h(px(26.0))
+                                                .px(px(9.0))
+                                                .rounded(px(Radius::BADGE))
+                                                .border_1()
+                                                .border_color(colors.primary.alpha(0.10))
+                                                .bg(colors.primary.alpha(0.04))
+                                                .flex()
+                                                .items_center()
+                                                .text_size(px(11.0))
+                                                .cursor_pointer()
+                                                .hover(move |style| {
+                                                    style.bg(colors.primary.alpha(0.09))
+                                                })
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.persist_include();
+                                                    cx.notify();
+                                                }))
+                                                .child("Save"),
+                                        ),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("quick-open-include")
+                                .debug_selector(|| "quick-open-include".into())
+                                .relative()
+                                .min_w(px(0.0))
+                                .w_full()
+                                .h(px(self.include_editor_height))
+                                .overflow_hidden()
+                                .whitespace_normal()
+                                .p(px(10.0))
+                                .rounded(px(Radius::BADGE))
+                                .bg(colors.primary.alpha(0.055))
+                                .border_1()
+                                .border_color(colors.primary.alpha(
+                                    if self.include_editor_active { 0.22 } else { 0.0 },
+                                ))
+                                .font_family(crate::fonts::mono_family())
+                                .text_size(px(11.0))
+                                .line_height(px(17.0))
+                                .text_color(if self.include_editor.is_empty()
+                                    && !self.include_editor_active
+                                {
+                                    colors.tertiary
+                                } else {
+                                    colors.secondary
+                                })
+                                .cursor_text()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, window, cx| {
+                                        this.include_editor_active = true;
+                                        this.roots_editor_active = false;
+                                        this.settings_search_active = false;
+                                        this.focus.focus(window, cx);
+                                        cx.stop_propagation();
+                                        cx.notify();
+                                    }),
+                                )
+                                .child(if self.include_editor_active {
+                                    query_label(&self.include_editor)
+                                } else if self.include_editor.is_empty() {
+                                    div()
+                                        .child("# gitignore-style paths to index\ndiri/.worktrees\n*/.worktrees")
+                                        .into_any_element()
+                                } else {
+                                    div()
+                                        .child(self.include_editor.text().to_owned())
+                                        .into_any_element()
+                                })
+                                .child(editor_resize_grip(QuickOpenEditor::Include, colors, cx)),
+                        )
+                        .when_some(self.include_save_error.as_ref(), |column, error| {
+                            column.child(
+                                div()
+                                    .debug_selector(|| "quick-open-include-error".into())
+                                    .text_size(px(11.0))
+                                    .text_color(colors.secondary)
+                                    .child(wrappable_setting_copy(error.clone().into())),
+                            )
+                        })
+                        .child(
+                            div()
+                                .min_w(px(0.0))
+                                .w_full()
+                                .whitespace_normal()
+                                .text_size(px(11.0))
+                                .line_height(px(16.0))
+                                .text_color(colors.tertiary)
+                                .child(wrappable_setting_copy(
+                                    "One pattern per line, saved to ~/.diri-include. Hidden folders stay skipped unless they match. Wildcards follow gitignore rules, including nested folders.".into(),
                                 )),
                         ),
                     colors,
@@ -4711,6 +5322,15 @@ impl Render for UtilitySurfaces {
                 cx.stop_propagation();
             }))
             .on_action(cx.listener(|this, _: &CloseSurface, _, cx| this.close_surface(cx)))
+            .on_drag_move(
+                cx.listener(|this, event: &DragMoveEvent<DraggedEditorResize>, _, cx| {
+                    this.drag_editor_resize(
+                        event.drag(cx).0,
+                        f32::from(event.event.position.y),
+                        cx,
+                    );
+                }),
+            )
             .absolute()
             // Cached entity roots are laid out independently, so insets alone
             // leave this absolute root without a definite size: its height
@@ -4772,6 +5392,57 @@ impl Render for UtilitySurfaces {
             root.size(px(0.0))
         }
     }
+}
+
+fn editor_resize_grip(
+    kind: QuickOpenEditor,
+    colors: SemanticColors,
+    cx: &mut Context<UtilitySurfaces>,
+) -> impl IntoElement {
+    let id = match kind {
+        QuickOpenEditor::Roots => "quick-open-roots-resize",
+        QuickOpenEditor::Include => "quick-open-include-resize",
+    };
+    div()
+        .id(id)
+        .debug_selector(move || id.into())
+        .absolute()
+        .right(px(1.0))
+        .bottom(px(1.0))
+        .size(px(14.0))
+        .flex()
+        .items_end()
+        .justify_end()
+        .cursor(CursorStyle::ResizeUpLeftDownRight)
+        .occlude()
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                let height = match kind {
+                    QuickOpenEditor::Roots => this.roots_editor_height,
+                    QuickOpenEditor::Include => this.include_editor_height,
+                };
+                this.editor_resize = Some((kind, f32::from(event.position.y), height));
+                cx.stop_propagation();
+            }),
+        )
+        .on_drag(DraggedEditorResize(kind), |value, _, _, cx| {
+            cx.stop_propagation();
+            cx.new(|_| *value)
+        })
+        .on_mouse_up(
+            MouseButton::Left,
+            cx.listener(|this, _, _, _cx| {
+                this.editor_resize = None;
+            }),
+        )
+        .child(
+            div()
+                .text_size(px(10.0))
+                .line_height(px(10.0))
+                .text_color(colors.tertiary)
+                .child("◢"),
+        )
 }
 
 fn surface_button(
@@ -5394,7 +6065,7 @@ fn settings_tab_matches(tab: SettingsTab, query: &str) -> bool {
     }
     let searchable = match tab {
         SettingsTab::General => {
-            "general default startup login sessions close confirmation sounds chimes support diagnostics quick open search roots updates"
+            "general default startup login sessions close confirmation sounds chimes support diagnostics quick open search roots choose folder finder picker updates diri-include include gitignore worktrees hidden folders"
         }
         SettingsTab::WhatsNew => {
             "what's new whats new release notes latest version changes features improvements"
@@ -7417,9 +8088,66 @@ mod tests {
         assert!(settings_tab_matches(SettingsTab::Remote, "ssh"));
         assert!(settings_tab_matches(SettingsTab::Resources, "memory"));
         assert!(settings_tab_matches(SettingsTab::General, "login"));
+        assert!(settings_tab_matches(SettingsTab::General, "diri-include"));
         assert!(settings_tab_matches(SettingsTab::Shortcuts, "keyboard"));
         assert!(settings_tab_matches(SettingsTab::Terminal, "appearance"));
         assert!(!settings_tab_matches(SettingsTab::Terminal, "ssh"));
+    }
+
+    #[gpui::test]
+    fn failed_include_save_retains_edits_and_keeps_settings_open(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(".diri-include");
+        // A directory at the destination fails even when tests run as root.
+        std::fs::create_dir(&path).unwrap();
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces.include_path = path.clone();
+            surfaces.include_persisted = "# existing\n".into();
+            surfaces.include_editor = QueryEditor::default();
+            surfaces.include_editor.insert_multiline("**/.worktrees/\n");
+            surfaces.persist_include();
+            assert_eq!(surfaces.include_persisted, "# existing\n");
+            assert!(!surfaces.include_save_notice);
+            assert!(surfaces.include_save_error.is_some());
+            surfaces.close_surface(cx);
+            assert!(surfaces.is_settings_open());
+            assert_eq!(surfaces.include_editor.text(), "**/.worktrees/\n");
+
+            std::fs::remove_dir(&path).unwrap();
+            surfaces.persist_include();
+            assert!(surfaces.include_save_notice);
+            assert!(surfaces.include_save_error.is_none());
+            assert_eq!(surfaces.include_persisted, "**/.worktrees/\n");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "**/.worktrees/\n");
+        });
+    }
+
+    #[gpui::test]
+    fn general_settings_shows_the_diri_include_editor(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces.open_settings_tab(SettingsTab::General, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("quick-open-include").is_some(),
+            "General settings must expose the .diri-include editor"
+        );
+        assert!(
+            cx.debug_bounds("quick-open-roots").is_some(),
+            "General settings must expose the Quick Open search-roots editor"
+        );
+        assert!(
+            cx.debug_bounds("quick-open-roots-choose").is_some(),
+            "General settings must expose a native folder picker for search roots"
+        );
+        assert!(
+            cx.debug_bounds("quick-open-include-save").is_some(),
+            "General settings must expose a Save control for .diri-include"
+        );
     }
 
     #[test]

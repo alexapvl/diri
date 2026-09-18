@@ -100,12 +100,15 @@ chmod 700 "${dev_app_support}"
 
 cd "${workspace_dir}"
 echo "==> Building ${display_name} (${profile})"
-# diri-app does not pull the Engine or Holder into target/<profile>/; build all
-# three so a clean checkout cannot launch against stale session processes.
+# diri-app does not pull Engine, Holder, or MCP helpers into target/<profile>/.
+# Build them here so a clean checkout cannot launch against stale session
+# processes or copy ~/Applications/diri.app's dirijor-mcp (no include tools).
 if (( ${#cargo_args[@]} > 0 )); then
     cargo build --package diri-app --bin diri --package diri-engine --bin dirijord-rs --bin diri-holder "${cargo_args[@]}"
+    cargo build --package dirijor-mcp "${cargo_args[@]}"
 else
     cargo build --package diri-app --bin diri --package diri-engine --bin dirijord-rs --bin diri-holder
+    cargo build --package dirijor-mcp
 fi
 
 binary="${target_dir}/${profile}/diri"
@@ -125,6 +128,14 @@ if [[ ! -x "${holder_bin}" ]]; then
     echo "error: cargo did not produce ${holder_bin}" >&2
     exit 1
 fi
+
+for helper in dirijor dirijor-mcp; do
+    helper_bin="${target_dir}/${profile}/${helper}"
+    if [[ ! -x "${helper_bin}" ]]; then
+        echo "error: cargo did not produce ${helper_bin}" >&2
+        exit 1
+    fi
+done
 
 # Every invocation gets a fresh bundle. Replacing a bundle beneath a still-
 # running process invalidates its code signature, which is especially easy to

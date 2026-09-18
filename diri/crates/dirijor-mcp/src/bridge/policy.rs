@@ -17,6 +17,7 @@ pub(super) const WRITE_POLICY: &str = "Reads are open across all sessions. Root 
 #[derive(Clone, Copy, Debug)]
 pub(super) enum WriteAction<'a> {
     Spawn,
+    QuickOpenInclude,
     SendPrompt { target: &'a str },
     Release { target: &'a str },
     Worktree { repo: &'a str },
@@ -85,7 +86,10 @@ impl<'a> McpPolicy<'a> {
     /// implementation details here.
     pub(super) fn authorize(&self, action: WriteAction<'_>) -> Result<Authorization<'a>, String> {
         let relation = match action {
-            WriteAction::Spawn | WriteAction::Browser | WriteAction::TestRun => Relation::Unrelated,
+            WriteAction::Spawn
+            | WriteAction::QuickOpenInclude
+            | WriteAction::Browser
+            | WriteAction::TestRun => Relation::Unrelated,
             WriteAction::Worktree { repo } => {
                 let project = self
                     .projects
@@ -443,6 +447,7 @@ mod tests {
         let policy = McpPolicy::new(&records, &projects, Some("root")).expect("policy");
 
         assert!(policy.authorize(WriteAction::Spawn).is_ok());
+        assert!(policy.authorize(WriteAction::QuickOpenInclude).is_ok());
         assert!(policy.authorize(WriteAction::Browser).is_ok());
         assert!(policy.authorize(WriteAction::TestRun).is_ok());
         assert!(

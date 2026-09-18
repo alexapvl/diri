@@ -94,7 +94,11 @@ fn initialize(params: &Value) -> Value {
              Messages are delivered at most once. Reuse message_id on retries; never send a new copy because the agent is slow or its screen has not changed. Inspect unknown delivery outcomes. A delivery receipt does not mean the agent finished. Waits observe current status and may return immediately; verify output for the submitted task before treating it as completed. \
              get_artifacts returns PR/Linear/preview URLs and listening ports a session has \
              produced; PR entries include live GitHub status (state, review decision, checks, \
-             comment counts, +/- lines).{browser}"
+             comment counts, +/- lines). Quick Open skips hidden folders unless they match \
+             ~/.diri-include. When the user wants extra folders in Cmd+P (for example \
+             `.worktrees`), use get_quick_open_include and add_quick_open_include with \
+             gitignore-style patterns such as `**/.worktrees/`. set_quick_open_include \
+             replaces or clears the list.{browser}"
         )
     })
 }

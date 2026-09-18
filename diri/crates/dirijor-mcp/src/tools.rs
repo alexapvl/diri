@@ -183,6 +183,36 @@ pub fn tool_definitions_for(kinds: &[String]) -> Vec<ToolDefinition> {
             browser_schema(),
         ),
         ToolDefinition::new(
+            "get_quick_open_include",
+            "Read ~/.diri-include, the gitignore-style extra folders Quick Open (Cmd+P) indexes even when they are hidden or skipped. Returns the file path, raw text, and active patterns.",
+            json!({"type": "object", "properties": {}}),
+        ),
+        ToolDefinition::new(
+            "add_quick_open_include",
+            "Append unique gitignore-style patterns to ~/.diri-include so Quick Open indexes matching folders. Trailing slashes are equivalent. Examples: **/.worktrees/ or */.worktrees/. Existing comments and order are kept.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "patterns": {
+                        "type": "array",
+                        "items": {"type": "string", "minLength": 1, "maxLength": 256}
+                    }
+                },
+                "required": ["patterns"]
+            }),
+        ),
+        ToolDefinition::new(
+            "set_quick_open_include",
+            "Replace ~/.diri-include with this text. Use after get_quick_open_include when removing or rewriting patterns. Empty text clears the list.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "maxLength": 65536}
+                },
+                "required": ["text"]
+            }),
+        ),
+        ToolDefinition::new(
             "whoami",
             "Describe this session's identity, parent, ancestors, children, worktree, and cross-session write policy.",
             json!({"type": "object", "properties": {}}),
@@ -265,6 +295,9 @@ pub fn tool_definitions_for(kinds: &[String]) -> Vec<ToolDefinition> {
             }
         }
         if let Some(field) = tool.input_schema["properties"].get_mut("session_ids") {
+            field["items"]["minLength"] = json!(1);
+        }
+        if let Some(field) = tool.input_schema["properties"].get_mut("patterns") {
             field["items"]["minLength"] = json!(1);
         }
     }
@@ -417,6 +450,22 @@ mod tests {
         names.sort();
         names.dedup();
         assert_eq!(names.len(), total);
+        assert!(names.contains(&"get_quick_open_include".into()));
+        assert!(names.contains(&"add_quick_open_include".into()));
+        assert!(names.contains(&"set_quick_open_include".into()));
+    }
+
+    #[test]
+    fn add_quick_open_include_requires_pattern_strings() {
+        assert!(validate_arguments("add_quick_open_include", &json!({})).is_err());
+        assert!(
+            validate_arguments(
+                "add_quick_open_include",
+                &json!({"patterns": ["**/.worktrees/"]})
+            )
+            .is_ok()
+        );
+        assert!(validate_arguments("set_quick_open_include", &json!({"text": ""})).is_ok());
     }
 
     #[test]

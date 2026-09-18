@@ -20,6 +20,7 @@ pub const MANIFEST_OVERRIDES_RELATIVE_PATH: &str = "manifests/overrides";
 pub const DAEMON_LOG_FILE_NAME: &str = "dirijord.log";
 pub const HOSTS_CONFIG_FILE_NAME: &str = "hosts.json";
 pub const PREFS_FILE_NAME: &str = "prefs.json";
+pub const DIRI_INCLUDE_FILE_NAME: &str = ".diri-include";
 pub const QUICK_OPEN_CACHE_FILE_NAME: &str = "quick-open-index.json";
 pub const USAGE_CACHE_FILE_NAME: &str = "usage-cache.json";
 pub const ACTIVITY_LOG_FILE_NAME: &str = "activity-log.jsonl";
@@ -138,6 +139,12 @@ impl DirijorPaths {
             .join(PREFS_FILE_NAME);
         #[cfg(not(target_os = "macos"))]
         Self::config_dir(home).join(PREFS_FILE_NAME)
+    }
+
+    /// Gitignore-style extra folders for ⌘P. Lives in `$HOME` so it can be
+    /// edited like a user gitignore, including from Settings.
+    pub fn diri_include_file(home: impl AsRef<Path>) -> PathBuf {
+        home.as_ref().join(DIRI_INCLUDE_FILE_NAME)
     }
 
     pub fn quick_open_cache_file(home: impl AsRef<Path>) -> PathBuf {

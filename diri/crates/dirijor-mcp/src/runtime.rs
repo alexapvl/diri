@@ -90,6 +90,7 @@ fn read_only(message: &Value) -> bool {
                     | "read_output"
                     | "get_artifacts"
                     | "list_worktrees"
+                    | "get_quick_open_include"
                     | "whoami"
                     | "list_children"
                     | "wait_for_children"
