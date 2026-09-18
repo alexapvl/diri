@@ -16,15 +16,15 @@ use diri_proto::{
     SessionRecord,
 };
 use diri_ui::{
-    AgentLogo, AlertChip, Fill, FloatingSurface, Glass, GlassPill, HairlineDivider, HoverMarquee,
-    Ink, LoadingIndicator, Metrics, Motion, Palette, Radius, RowFill, SemanticColors, Space,
-    StateChip, StatusGlyph, StatusState, Typo,
+    AgentLogo, AlertChip, Fill, FloatingSurface, Glass, GlassMenuRow, GlassPill, HairlineDivider,
+    HoverMarquee, Ink, LoadingIndicator, Metrics, Motion, Palette, Radius, RowFill, SemanticColors,
+    Space, StateChip, StatusGlyph, StatusState, Typo,
 };
 use gpui::{
     Anchor, Animation, AnimationExt, AnyElement, App, AppContext as _, Bounds, Context,
     CursorStyle, Entity, EventEmitter, ExternalPaths, FocusHandle, Focusable, FontWeight, Hsla,
     IntoElement, MouseButton, PathPromptOptions, Pixels, Point, Render, Rgba, Role, ScrollHandle,
-    SharedString, Task, WeakEntity, Window, anchored, deferred, div, linear_color_stop,
+    SharedString, Size, Task, WeakEntity, Window, anchored, deferred, div, linear_color_stop,
     linear_gradient, point, prelude::*, px,
 };
 use tokio::sync::mpsc;
@@ -267,6 +267,76 @@ impl Render for DragPreview {
     }
 }
 
+/// A menu-style popover before it is hosted: its anchor inside the main
+/// window, its width, and its content.
+pub(super) struct PopoverSpec {
+    pub(super) position: Point<Pixels>,
+    pub(super) anchor: Anchor,
+    pub(super) width: f32,
+    pub(super) content: AnyElement,
+}
+
+impl PopoverSpec {
+    /// Nothing to show: the record the menu was for is already gone.
+    fn empty() -> Self {
+        Self {
+            position: point(px(0.0), px(0.0)),
+            anchor: Anchor::TopLeft,
+            width: 0.0,
+            content: div().into_any_element(),
+        }
+    }
+}
+
+/// Which floating surface a panel window hosts. Each has one slot on the
+/// sidebar, a predicate for whether it should be open, and a builder for
+/// the pixels the panel paints.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PanelTarget {
+    Popover,
+    Picker,
+    HoverCard,
+    WorkspaceMenu,
+}
+
+impl PanelTarget {
+    pub(super) fn spec(self) -> crate::floating::Target<Sidebar> {
+        match self {
+            Self::Popover => crate::floating::Target {
+                key: "popover",
+                radius: crate::floating::MENU_RADIUS,
+                content: Sidebar::popover_panel_content,
+                dismiss: |sidebar, _, cx| {
+                    sidebar.ui.popover = None;
+                    cx.notify();
+                },
+            },
+            Self::Picker => crate::floating::Target {
+                key: "picker",
+                radius: Radius::FLOATING_MENU,
+                content: Sidebar::project_picker_panel_content,
+                dismiss: |sidebar, window, cx| sidebar.dismiss_project_picker(window, cx),
+            },
+            Self::HoverCard => crate::floating::Target {
+                key: "hover-card",
+                radius: Radius::ROW,
+                content: Sidebar::hover_card_panel_content,
+                dismiss: |sidebar, _, cx| sidebar.dismiss_hover_card(cx),
+            },
+            Self::WorkspaceMenu => crate::floating::Target {
+                key: "workspace-menu",
+                radius: crate::floating::MENU_RADIUS,
+                content: Sidebar::workspace_menu_panel_content,
+                dismiss: |sidebar, _, cx| sidebar.dismiss_workspace_menu(cx),
+            },
+        }
+    }
+
+    fn radius(self) -> f32 {
+        self.spec().radius
+    }
+}
+
 /// Which way a lifted row may travel: the axis its list runs along.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum LiftAxis {
@@ -505,6 +575,9 @@ pub struct Sidebar {
     activity_frame: usize,
     activity_tick: Option<Task<()>>,
     activity_activation: Option<gpui::Subscription>,
+    /// The main window's viewport, for content that sizes to it while a
+    /// panel paints it elsewhere.
+    main_viewport: Size<Pixels>,
     working_row_rendered: bool,
     /// Rebuilt once per projection render. Looking up ⌘1…⌘9 inside every row
     /// previously re-locked the store and scanned the full session list N times.
@@ -669,6 +742,7 @@ impl Sidebar {
             activity_frame: 0,
             activity_tick: None,
             activity_activation: None,
+            main_viewport: Size::default(),
             working_row_rendered: false,
             shortcut_ranks: HashMap::new(),
             focus_handle: cx.focus_handle(),
@@ -696,19 +770,18 @@ impl Sidebar {
             disclosure_tick: None,
         };
         sidebar.ui.preview_account = preview;
-        // Preview-only hook so headless screenshots can verify popover layout.
-        if preview {
-            match std::env::var("DIRIJOR_SIDEBAR_POPOVER").as_deref() {
-                Ok("new-agent") => {
-                    sidebar.ui.popover = Some(Popover::NewAgent {
-                        directory: None,
-                        host: None,
-                    });
-                }
-                Ok("account") => sidebar.ui.popover = Some(Popover::Account),
-                Ok("layout") => sidebar.ui.popover = Some(Popover::SidebarLayout),
-                _ => {}
+        // Opens a popover at launch: headless screenshots verify its layout,
+        // and a dev build shows its blurred panel without anyone clicking.
+        match std::env::var("DIRIJOR_SIDEBAR_POPOVER").as_deref() {
+            Ok("new-agent") => {
+                sidebar.ui.popover = Some(Popover::NewAgent {
+                    directory: None,
+                    host: None,
+                });
             }
+            Ok("account") => sidebar.ui.popover = Some(Popover::Account),
+            Ok("layout") => sidebar.ui.popover = Some(Popover::SidebarLayout),
+            _ => {}
         }
         sidebar
     }
@@ -4199,17 +4272,12 @@ impl Sidebar {
             .into_any_element()
     }
 
-    fn popover(
-        &self,
-        colors: SemanticColors,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
+    fn popover(&self, colors: SemanticColors, cx: &mut Context<Self>) -> Option<PopoverSpec> {
         match self.ui.popover.clone()? {
             Popover::NewAgent { directory, host } => {
                 Some(self.new_agent_popover(directory, host, colors, cx))
             }
-            Popover::Account => Some(self.account_popover(colors, window, cx)),
+            Popover::Account => Some(self.account_popover(colors, cx)),
             Popover::SidebarLayout => Some(self.sidebar_layout_popover(colors, cx)),
             Popover::ProjectActions { id, position } => {
                 Some(self.project_actions_popover(id, position, colors, cx))
@@ -4220,7 +4288,11 @@ impl Sidebar {
         }
     }
 
-    fn sidebar_layout_popover(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
+    fn sidebar_layout_popover(
+        &self,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> PopoverSpec {
         let (grouping, ordering) = {
             let store = self.store.read().expect("session store lock poisoned");
             (
@@ -4244,10 +4316,6 @@ impl Sidebar {
             .flex_col()
             .role(Role::Menu)
             .aria_label("Sidebar view options")
-            // The sidebar itself remains translucent, while menu labels need
-            // a settled semantic material so the session list cannot compete
-            // with this denser layer in light themes.
-            .bg(colors.floating_surface().alpha(0.995))
             .rounded(px(Radius::FLOATING_MENU))
             .p(px(4.0))
             .child(section_label("Grouping"))
@@ -4414,7 +4482,7 @@ impl Sidebar {
         child: impl IntoElement,
         colors: SemanticColors,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
+    ) -> PopoverSpec {
         self.popover_shell_at(
             point(px(12.0), px(top)),
             Anchor::TopLeft,
@@ -4430,10 +4498,9 @@ impl Sidebar {
         &self,
         child: impl IntoElement,
         colors: SemanticColors,
-        window: &Window,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let footer_top = f32::from(window.viewport_size().height) - 44.0;
+    ) -> PopoverSpec {
+        let footer_top = f32::from(self.main_viewport.height) - 44.0;
         self.popover_shell_at(
             point(px(12.0), px(footer_top)),
             Anchor::BottomLeft,
@@ -4444,20 +4511,173 @@ impl Sidebar {
         )
     }
 
-    /// Menu-style floating panel: the palette's FloatingSurface recipe, a
-    /// sidebar-wide scrim so stray clicks only dismiss, and mouse-down-out so
-    /// clicking anywhere else in the window also dismisses. The panel itself
-    /// is deferred + anchored in window coordinates so it escapes the sidebar
-    /// wrapper's overflow clip and never gets cut off at narrow widths.
+    /// Describes a menu-style popover: where it anchors in the main window,
+    /// how wide it is, and what it contains. `host_popover` decides whether
+    /// that becomes an in-window element or a blurred panel.
     fn popover_shell_at(
         &self,
         position: Point<Pixels>,
         anchor: Anchor,
         width: f32,
         child: impl IntoElement,
+        _colors: SemanticColors,
+        _cx: &mut Context<Self>,
+    ) -> PopoverSpec {
+        PopoverSpec {
+            position,
+            anchor,
+            width,
+            content: child.into_any_element(),
+        }
+    }
+
+    /// The popover the sidebar currently shows, whichever surface asked for
+    /// it: the header's compact New Session menu in horizontal-tab layouts,
+    /// otherwise the full popover for `ui.popover`.
+    pub(super) fn current_popover(&mut self, cx: &mut Context<Self>) -> Option<PopoverSpec> {
+        let colors = self.colors();
+        if self.project_picker.new_agent {
+            let Some(Popover::NewAgent { directory, host }) = self.ui.popover.clone() else {
+                return None;
+            };
+            return Some(self.header_new_agent_menu(directory, host, colors, cx));
+        }
+        self.popover(colors, cx)
+    }
+
+    pub(super) fn uses_floating_panels(&self, cx: &App) -> bool {
+        crate::floating::uses_panels(self.preview, self.colors(), cx)
+    }
+
+    /// The popover's pixels for its floating panel.
+    fn popover_panel_content(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let colors = self.colors();
+        let spec = self.current_popover(cx)?;
+        Some(
+            crate::floating::surface(
+                colors,
+                PanelTarget::Popover.radius(),
+                spec.width,
+                spec.content,
+            )
+            .into_any_element(),
+        )
+    }
+
+    /// Mounts `spec` for this frame. Under glass on macOS the content is only
+    /// measured here; the pixels are painted by a blurred panel window that
+    /// opens at the measured frame. Everywhere else the popover is an
+    /// in-window element.
+    pub(super) fn host_popover(
+        &mut self,
+        spec: PopoverSpec,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = self.colors();
+        if !self.uses_floating_panels(cx) {
+            return self.mount_popover_in_window(spec, colors, cx);
+        }
+        let PopoverSpec {
+            position,
+            anchor,
+            width,
+            content,
+        } = spec;
+        let measure = self.measure_for_panel(
+            PanelTarget::Popover,
+            crate::floating::surface(colors, PanelTarget::Popover.radius(), width, content)
+                .into_any_element(),
+            width,
+            position,
+            anchor,
+            window,
+            cx,
+        );
+        // The scrim stays in the main window and covers all of it: the panel
+        // is a separate window, so this is what turns a click anywhere else
+        // into a dismissal and keeps hover chrome (the sidebar's resize
+        // handle, row highlights) from reacting under the menu. It is
+        // deferred at window level for the same reason the in-window popover
+        // is: the sidebar wrapper clips its own children.
+        let viewport = self.main_viewport;
+        let dismiss =
+            |this: &mut Self, _: &gpui::MouseDownEvent, _: &mut Window, cx: &mut Context<Self>| {
+                this.ui.popover = None;
+                cx.notify();
+            };
+        div()
+            .absolute()
+            .inset_0()
+            .child(measure)
+            .child(
+                deferred(
+                    anchored().position(point(px(0.0), px(0.0))).child(
+                        div()
+                            .w(viewport.width)
+                            .h(viewport.height)
+                            .occlude()
+                            .on_mouse_down(MouseButton::Left, cx.listener(dismiss))
+                            .on_mouse_down(MouseButton::Right, cx.listener(dismiss)),
+                    ),
+                )
+                .with_priority(1),
+            )
+            .into_any_element()
+    }
+
+    /// See `crate::floating::host_element`; popovers snap to the window
+    /// with the same eight-point margin `anchored()` gives them.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn measure_for_panel(
+        &self,
+        target: PanelTarget,
+        probe: AnyElement,
+        width: f32,
+        position: Point<Pixels>,
+        anchor: Anchor,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        crate::floating::host_element(
+            target.spec(),
+            probe,
+            width,
+            position,
+            anchor,
+            8.0,
+            window,
+            cx,
+        )
+    }
+
+    /// Runs `f` against the sidebar's own window even from a panel handler.
+    pub(super) fn in_main_window(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) {
+        crate::floating::in_main_window(self, window, cx, f);
+    }
+
+    /// The in-window host: a sidebar-wide scrim so stray clicks only dismiss,
+    /// mouse-down-out so clicking anywhere else in the window also dismisses,
+    /// and the panel itself deferred + anchored in window coordinates so it
+    /// escapes the sidebar wrapper's overflow clip and never gets cut off at
+    /// narrow widths.
+    fn mount_popover_in_window(
+        &self,
+        spec: PopoverSpec,
         colors: SemanticColors,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let PopoverSpec {
+            position,
+            anchor,
+            width,
+            content,
+        } = spec;
         div()
             .absolute()
             .inset_0()
@@ -4491,13 +4711,9 @@ impl Sidebar {
                                 .child(
                                     FloatingSurface::new(
                                         colors,
-                                        div().overflow_hidden().child(child),
+                                        div().overflow_hidden().child(content),
                                     )
                                     .radius(Radius::FLOATING_MENU)
-                                    // GPUI has no per-element backdrop blur.
-                                    // Preserve the material without leaving
-                                    // terminal text legible through the menu.
-                                    .surface_opacity(0.975)
                                     .animate_entry(!self.preview),
                                 ),
                         ),
@@ -4513,7 +4729,7 @@ impl Sidebar {
         host: Option<String>,
         colors: SemanticColors,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
+    ) -> PopoverSpec {
         {
             let mut store = self.store.write().expect("session store lock poisoned");
             if store.agent_catalog(host.as_deref()).is_none() {
@@ -4702,7 +4918,9 @@ impl Sidebar {
                             .child(sf_symbol("plus", 11.0, colors.secondary))
                             .child("Browse…")
                             .on_click(cx.listener(|this, _, window, cx| {
-                                this.browse_local_folder(window, cx);
+                                this.in_main_window(window, cx, |this, window, cx| {
+                                    this.browse_local_folder(window, cx);
+                                });
                             })),
                     )
                 },
@@ -4775,7 +4993,7 @@ impl Sidebar {
                         .gap(px(8.0))
                         .rounded(px(SIDEBAR_MENU_ROW_RADIUS))
                         .cursor_pointer()
-                        .hover(move |element| element.bg(colors.primary.alpha(0.06)))
+                        .glass_menu_row(colors, false)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
                             let next_directory = if target_host != previous_host {
@@ -4926,7 +5144,7 @@ impl Sidebar {
                     .rounded(px(SIDEBAR_MENU_ROW_RADIUS))
                     .when(available, |row| {
                         row.cursor_pointer()
-                            .hover(move |element| element.bg(colors.primary.alpha(0.06)))
+                            .glass_menu_row(colors, false)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.store
                                     .write()
@@ -5023,7 +5241,7 @@ impl Sidebar {
                 .gap(px(8.0))
                 .rounded(px(SIDEBAR_MENU_ROW_RADIUS))
                 .cursor_pointer()
-                .hover(move |row| row.bg(colors.primary.alpha(0.06)))
+                .glass_menu_row(colors, false)
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.ui.popover = None;
                     cx.emit(SidebarEvent::OpenAgentSettings(manage_host.clone()));
@@ -5298,7 +5516,7 @@ impl Sidebar {
             };
             row = row
                 .cursor_pointer()
-                .hover(move |element| element.bg(colors.primary.alpha(0.06)))
+                .glass_menu_row(colors, false)
                 .child(
                     div()
                         .flex_none()
@@ -5315,12 +5533,7 @@ impl Sidebar {
         row.into_any_element()
     }
 
-    fn account_popover(
-        &self,
-        colors: SemanticColors,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn account_popover(&self, colors: SemanticColors, cx: &mut Context<Self>) -> PopoverSpec {
         /* ─────────────────────────────────────────────────────────
          * ACCOUNT MENU STORYBOARD
          *
@@ -5443,9 +5656,7 @@ impl Sidebar {
         let content = div()
             .id("account-menu")
             .debug_selector(|| "account-menu".into())
-            .max_h(px(
-                (f32::from(window.viewport_size().height) - 64.0).max(200.0)
-            ))
+            .max_h(px((f32::from(self.main_viewport.height) - 64.0).max(200.0)))
             .overflow_y_scroll()
             .flex()
             .flex_col()
@@ -5514,7 +5725,7 @@ impl Sidebar {
                     .gap(px(9.0))
                     .rounded(px(SIDEBAR_MENU_ROW_RADIUS))
                     .cursor_pointer()
-                    .hover(move |element| element.bg(colors.primary.alpha(0.06)))
+                    .glass_menu_row(colors, false)
                     .text_size(px(Typo::ROW.size))
                     .text_color(colors.primary)
                     .child(
@@ -5545,7 +5756,7 @@ impl Sidebar {
                     .gap(px(9.0))
                     .rounded(px(SIDEBAR_MENU_ROW_RADIUS))
                     .cursor_pointer()
-                    .hover(move |element| element.bg(colors.primary.alpha(0.06)))
+                    .glass_menu_row(colors, false)
                     .text_size(px(Typo::ROW.size))
                     .text_color(colors.primary)
                     .child(
@@ -5582,7 +5793,7 @@ impl Sidebar {
                     .gap(px(9.0))
                     .rounded(px(SIDEBAR_MENU_ROW_RADIUS))
                     .cursor_pointer()
-                    .hover(move |element| element.bg(colors.primary.alpha(0.06)))
+                    .glass_menu_row(colors, false)
                     .text_size(px(Typo::ROW.size))
                     .text_color(colors.primary)
                     .child(
@@ -5607,13 +5818,15 @@ impl Sidebar {
                     )
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.ui.popover = None;
-                        window.dispatch_action(Box::new(OpenSettings), cx);
+                        this.in_main_window(window, cx, |_, window, cx| {
+                            window.dispatch_action(Box::new(OpenSettings), cx);
+                        });
                         cx.notify();
                     })),
             )
             .child(self.update_menu_row(colors, cx))
             .child(div().h(px(6.0)));
-        self.popover_shell_above_footer(content, colors, window, cx)
+        self.popover_shell_above_footer(content, colors, cx)
     }
 
     fn project_actions_popover(
@@ -5622,11 +5835,11 @@ impl Sidebar {
         position: Option<Point<Pixels>>,
         colors: SemanticColors,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
+    ) -> PopoverSpec {
         let (project, host, collapsed, pinned) = {
             let store = self.store.read().expect("session store lock poisoned");
             let Some(project) = store.projects().get(&id).cloned() else {
-                return div().into_any_element();
+                return PopoverSpec::empty();
             };
             (
                 project,
@@ -5722,11 +5935,11 @@ impl Sidebar {
         position: Point<Pixels>,
         colors: SemanticColors,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
+    ) -> PopoverSpec {
         let (session, pinned, bulk, hosts, migrating) = {
             let mut store = self.store.write().expect("session store lock poisoned");
             let Some(session) = store.sessions().get(&id).cloned() else {
-                return div().into_any_element();
+                return PopoverSpec::empty();
             };
             let pinned = store.preferences().sidebar_pinned_sessions.contains(&id);
             // The whole multi-selection, when the right-clicked row is part
@@ -5924,7 +6137,10 @@ impl Sidebar {
                     colors,
                     cx.listener(move |this, _, window, cx| {
                         this.ui.popover = None;
-                        this.begin_rename(&rename_session, window, cx);
+                        let rename_session = rename_session.clone();
+                        this.in_main_window(window, cx, move |this, window, cx| {
+                            this.begin_rename(&rename_session, window, cx);
+                        });
                     }),
                 ))
                 .child(menu_row(
@@ -6044,7 +6260,11 @@ impl Sidebar {
         }
     }
 
-    fn hover_card(&self, colors: SemanticColors) -> Option<AnyElement> {
+    /// The hover card and the row it belongs to.
+    fn hover_card_body(
+        &self,
+        colors: SemanticColors,
+    ) -> Option<(gpui::Stateful<gpui::Div>, Bounds<Pixels>)> {
         let id = self.ui.hover_card.as_ref()?;
         let row = *self.row_bounds.borrow().get(id)?;
         let (session, project) = {
@@ -6088,18 +6308,13 @@ impl Sidebar {
             ));
         }
         let card = div()
+            .id("session-hover-card")
             .debug_selector(|| "session-hover-card".into())
             .w(px(280.0))
             .p(px(10.0))
             .flex()
             .flex_col()
             .gap(px(8.0))
-            .rounded(px(Radius::ROW))
-            .bg(colors.floating_surface())
-            .border_1()
-            .border_color(colors.primary.alpha(0.08))
-            .shadow_sm()
-            .overflow_hidden()
             .child(
                 div()
                     .line_clamp(3)
@@ -6110,15 +6325,55 @@ impl Sidebar {
                     .child(display_title(&session)),
             )
             .child(details);
-        // Deferred + anchored so the card floats over the terminal instead of
-        // being clipped at the sidebar edge. Anchor to the row, not the pointer,
-        // and leave a gap so the card never covers the row's hover target.
+        Some((card, row))
+    }
+
+    /// The hover card's pixels for its floating panel.
+    fn hover_card_panel_content(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let _ = cx;
+        let colors = self.colors();
+        let (card, _) = self.hover_card_body(colors)?;
+        Some(crate::floating::surface(colors, Radius::ROW, 280.0, card).into_any_element())
+    }
+
+    /// Hosts the hover card: a blurred panel under glass, otherwise deferred
+    /// and anchored so it floats over the terminal instead of being clipped
+    /// at the sidebar edge. Either way it anchors to the row, not the pointer,
+    /// with a gap so it never covers the row's hover target.
+    fn hover_card(
+        &mut self,
+        colors: SemanticColors,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let (card, row) = self.hover_card_body(colors)?;
+        let position = point(row.right() + px(8.0), row.top());
+        if self.uses_floating_panels(cx) {
+            let probe =
+                crate::floating::surface(colors, Radius::ROW, 280.0, card).into_any_element();
+            return Some(self.measure_for_panel(
+                PanelTarget::HoverCard,
+                probe,
+                280.0,
+                position,
+                Anchor::TopLeft,
+                window,
+                cx,
+            ));
+        }
         Some(
             deferred(
                 anchored()
-                    .position(point(row.right() + px(8.0), row.top()))
+                    .position(position)
                     .snap_to_window_with_margin(px(8.0))
-                    .child(card),
+                    .child(
+                        card.rounded(px(Radius::ROW))
+                            .bg(colors.floating_surface())
+                            .border_1()
+                            .border_color(colors.primary.alpha(0.08))
+                            .shadow_sm()
+                            .overflow_hidden(),
+                    ),
             )
             .into_any_element(),
         )
@@ -7365,6 +7620,7 @@ impl Render for Sidebar {
         if cx.reduce_motion() {
             self.activity_frame = 0;
         }
+        self.main_viewport = window.viewport_size();
         if self.activity_activation.is_none() {
             self.activity_activation = Some(cx.observe_window_activation(window, |this, _, cx| {
                 this.dismiss_hover_card(cx);
@@ -7667,14 +7923,15 @@ impl Render for Sidebar {
             )
         });
         if !self.project_picker.new_agent
-            && let Some(popover) = self.popover(colors, window, cx)
+            && let Some(spec) = self.popover(colors, cx)
         {
+            let popover = self.host_popover(spec, window, cx);
             root = root.child(popover);
         }
         if let Some(menu) = self.workspace_popup(colors, cx) {
             root = root.child(menu);
         }
-        if let Some(card) = self.hover_card(colors) {
+        if let Some(card) = self.hover_card(colors, window, cx) {
             root = root.child(card);
         }
         if self.hover_task.is_some() || self.ui.hover_card.is_some() {
@@ -7955,7 +8212,7 @@ fn menu_row(
         .items_center()
         .rounded(px(SIDEBAR_MENU_ROW_RADIUS))
         .cursor_pointer()
-        .hover(move |element| element.bg(colors.primary.alpha(0.06)))
+        .glass_menu_row(colors, false)
         .text_size(px(Typo::ROW.size))
         .text_color(colors.primary)
         .child(label)
@@ -7986,18 +8243,10 @@ fn choice_menu_row(
         .gap(px(8.0))
         .rounded(px(SIDEBAR_MENU_ROW_RADIUS))
         .cursor_pointer()
-        .bg(if focused {
-            colors.primary.alpha(0.075)
-        } else {
-            Fill::selected(colors, selected)
-        })
-        .border_1()
-        .border_color(if focused {
-            colors.primary.alpha(0.18)
-        } else {
-            colors.primary.alpha(0.0)
-        })
-        .hover(move |element| element.bg(colors.primary.alpha(0.07)))
+        // The checkmark names the current choice; the keyboard cursor and the
+        // pointer share the sidebar's selected pill.
+        .bg(Fill::selected(colors, selected && !focused))
+        .glass_menu_row(colors, focused)
         .active(|element| element.opacity(0.74))
         .text_size(px(Typo::ROW.size))
         .text_color(colors.primary)
@@ -8045,7 +8294,7 @@ fn directory_row(
         .gap(px(9.0))
         .rounded(px(SIDEBAR_MENU_ROW_RADIUS))
         .cursor_pointer()
-        .hover(move |row| row.bg(colors.primary.alpha(0.06)))
+        .glass_menu_row(colors, false)
         .child(sf_symbol(symbol, 11.0, colors.secondary))
         .child(
             div()
@@ -10139,6 +10388,130 @@ mod tests {
         );
     }
 
+    /// Renders every popover the way a floating panel would and checks that
+    /// the height `floating::measure` reports is the height the surface
+    /// paints at; a mismatch leaves a panel window with empty glass under
+    /// its rows (or rows cut off).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn floating_measurement_matches_painted_popover_height() {
+        use std::cell::Cell;
+        struct MeasureHarness {
+            sidebar: Entity<Sidebar>,
+            measured: Rc<Cell<Option<Pixels>>>,
+            painted: Rc<Cell<Option<Pixels>>>,
+        }
+        impl Render for MeasureHarness {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let (colors, spec, probe, probe2) = self.sidebar.update(cx, |sidebar, cx| {
+                    let colors = sidebar.colors();
+                    let spec = sidebar.current_popover(cx).expect("popover");
+                    let probe = sidebar.current_popover(cx).expect("popover");
+                    let probe2 = sidebar.current_popover(cx).expect("popover");
+                    (colors, spec, probe, probe2)
+                });
+                let width = spec.width;
+                let mut probe =
+                    crate::floating::surface(colors, 16.0, width, probe.content).into_any_element();
+                let mut probe2 = crate::floating::surface(colors, 16.0, width, probe2.content)
+                    .into_any_element();
+                let measured = self.measured.clone();
+                let painted = self.painted.clone();
+                div()
+                    .size_full()
+                    .child(
+                        gpui::canvas(
+                            move |_, window, cx| {
+                                let size = crate::floating::measure(
+                                    &mut probe,
+                                    width,
+                                    px(700.0 - 16.0),
+                                    window,
+                                    cx,
+                                );
+                                let min_content = probe2.layout_as_root(
+                                    gpui::size(
+                                        gpui::AvailableSpace::Definite(px(width)),
+                                        gpui::AvailableSpace::MinContent,
+                                    ),
+                                    window,
+                                    cx,
+                                );
+                                eprintln!(
+                                    "  definite={:?} min_content={:?}",
+                                    size.height, min_content.height
+                                );
+                                measured.set(Some(size.height));
+                            },
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .w(px(0.0))
+                        .h(px(0.0)),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .on_children_prepainted(move |bounds, _, _| {
+                                painted.set(bounds.first().map(|b| b.size.height));
+                            })
+                            .child(crate::floating::surface(colors, 16.0, width, spec.content)),
+                    )
+            }
+        }
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(diri_ui::IconAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.update(|cx| crate::fonts::init(cx));
+        for popover in [
+            Popover::Account,
+            Popover::SidebarLayout,
+            Popover::NewAgent {
+                directory: None,
+                host: None,
+            },
+            Popover::ProjectActions {
+                id: ProjectId::new("preview-dirijor"),
+                position: Some(point(px(40.0), px(100.0))),
+            },
+        ] {
+            let measured = Rc::new(Cell::new(None));
+            let painted = Rc::new(Cell::new(None));
+            let (m, p) = (measured.clone(), painted.clone());
+            let label = format!("{popover:?}");
+            let window = cx
+                .open_window(size(px(400.0), px(700.0)), move |_, cx| {
+                    let sidebar = cx.new(|cx| {
+                        let mut sidebar = Sidebar::new(None, true, PreviewScenario::Typical, cx);
+                        sidebar.main_viewport = size(px(400.0), px(700.0));
+                        sidebar.ui.popover = Some(popover);
+                        sidebar
+                    });
+                    cx.new(|_| MeasureHarness {
+                        sidebar,
+                        measured: m,
+                        painted: p,
+                    })
+                })
+                .expect("open window");
+            cx.run_until_parked();
+            cx.update_window(window.into(), |_, window, _| window.refresh())
+                .unwrap();
+            cx.run_until_parked();
+            let (measured, painted) = (measured.get().unwrap(), painted.get().unwrap());
+            eprintln!("{label}: measured={measured:?} painted={painted:?}");
+            assert!(
+                (f32::from(measured) - f32::from(painted)).abs() < 1.0,
+                "{label}: measured {measured:?} but painted {painted:?}"
+            );
+        }
+    }
+
     /// Produces a deterministic image for design review without reading live
     /// account data or requiring Screen Recording permission.
     #[cfg(target_os = "macos")]
@@ -10242,7 +10615,8 @@ mod tests {
     /// Produces the sidebar layout variants used for material and hierarchy
     /// review without touching a running Diri instance. Set
     /// `DIRI_VISUAL_GROUPING=recency`, `DIRI_VISUAL_LIGHT=1`, or
-    /// `DIRI_VISUAL_POPOVER=none` to select the state to capture.
+    /// `DIRI_VISUAL_POPOVER=none|project|session` to select the state to
+    /// capture (the default opens the grouping menu).
     /// `DIRI_VISUAL_BACKDROP=62616e` supplies a fixed RGB backdrop under glass;
     /// headless rendering cannot capture the native desktop blur.
     #[cfg(target_os = "macos")]
@@ -10255,8 +10629,28 @@ mod tests {
         let recency = std::env::var_os("DIRI_VISUAL_GROUPING")
             .is_some_and(|value| value.to_string_lossy().eq_ignore_ascii_case("recency"));
         let light = std::env::var_os("DIRI_VISUAL_LIGHT").is_some();
-        let show_popover = std::env::var_os("DIRI_VISUAL_POPOVER")
-            .is_none_or(|value| !value.to_string_lossy().eq_ignore_ascii_case("none"));
+        let popover = match std::env::var("DIRI_VISUAL_POPOVER")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "none" => None,
+            "project" => Some(Popover::ProjectActions {
+                id: ProjectId::new("preview-dirijor"),
+                position: Some(point(px(48.0), px(150.0))),
+            }),
+            "session" => Some(Popover::SessionActions {
+                id: SessionId::new("preview-codex"),
+                position: point(px(48.0), px(210.0)),
+            }),
+            _ => Some(Popover::SidebarLayout),
+        };
+        // First row of a right-click menu, for `DIRI_VISUAL_MENU_HOVER`.
+        let menu_hover = match &popover {
+            Some(Popover::ProjectActions { .. }) => Some(point(px(140.0), px(168.0))),
+            Some(Popover::SessionActions { .. }) => Some(point(px(140.0), px(228.0))),
+            _ => None,
+        };
         let scenario =
             PreviewScenario::from_env(std::env::var("DIRI_VISUAL_SCENARIO").ok().as_deref());
         let width: f32 = std::env::var("DIRI_VISUAL_WIDTH")
@@ -10334,9 +10728,7 @@ mod tests {
                         })
                         .expect("preview preferences");
                     drop(store);
-                    if show_popover {
-                        sidebar.ui.popover = Some(Popover::SidebarLayout);
-                    }
+                    sidebar.ui.popover = popover;
                     sidebar
                 });
                 cx.new(|_| SidebarPopoverHarness { sidebar })
@@ -10347,6 +10739,18 @@ mod tests {
         cx.update_window(window.into(), |_, window, _| window.refresh())
             .expect("refresh sidebar window");
         cx.run_until_parked();
+        // `DIRI_VISUAL_MENU_HOVER=1` rests the pointer on the first row of a
+        // context menu so its hover material is part of the capture.
+        if std::env::var_os("DIRI_VISUAL_MENU_HOVER").is_some() {
+            if let Some(hover) = menu_hover {
+                cx.update_window(window.into(), |_, window, cx| {
+                    window.simulate_mouse_move(hover, cx);
+                    window.refresh();
+                })
+                .expect("hover menu row");
+                cx.run_until_parked();
+            }
+        }
         if std::env::var_os("DIRI_VISUAL_BENCH").is_some() {
             // Force exactly the same work in before/after runs; warm all eight
             // frames before measuring. Includes layout, paint, and GPU submission.

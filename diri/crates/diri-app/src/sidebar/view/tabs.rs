@@ -115,7 +115,8 @@ impl Sidebar {
             return None;
         }
         let colors = self.colors();
-        let popover = self.popover(colors, window, cx)?;
+        let spec = self.popover(colors, cx)?;
+        let popover = self.host_popover(spec, window, cx);
         Some(
             div()
                 .id("strip-menu-overlay")

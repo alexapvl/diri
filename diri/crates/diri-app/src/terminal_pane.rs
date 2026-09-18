@@ -588,6 +588,9 @@ pub struct TerminalPane {
     focus: FocusHandle,
     glyphs: HashMap<SessionId, Entity<StatusGlyph>>,
     session_links: SessionLinks,
+    /// The main window's viewport, for content that sizes to it while a
+    /// panel paints it elsewhere.
+    main_viewport: gpui::Size<gpui::Pixels>,
     /// Paced PTY resizes: window and sidebar drags relayout every frame, but
     /// sustained grid frames leave the daemon at up to 120 Hz, so intermediate
     /// sizes coalesce onto that cadence (see [`RESIZE_CADENCE`]).
@@ -786,6 +789,7 @@ impl TerminalPane {
             focus,
             glyphs: HashMap::new(),
             session_links: SessionLinks::new(cx),
+            main_viewport: gpui::Size::default(),
             qol: QolState::default(),
             reconnect: Default::default(),
             pending_resizes: HashMap::new(),
@@ -1728,6 +1732,26 @@ impl TerminalPane {
         {
             cx.emit(TerminalPaneEvent::ContinueAccount(session.id.clone()));
         }
+    }
+
+    /// The sidebar palette the Links popover paints with, for its panel.
+    fn panel_colors(&self) -> SemanticColors {
+        let store = self
+            .runtime
+            .store
+            .read()
+            .expect("session store lock poisoned");
+        crate::app_theme::sidebar_colors_for(store.preferences())
+    }
+
+    /// Runs `f` against the pane's own window even from a panel handler.
+    fn in_main_window(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) {
+        crate::floating::in_main_window(self, window, cx, f);
     }
 
     fn selected_session(&self) -> Option<Arc<SessionRecord>> {
@@ -3663,6 +3687,7 @@ impl Render for TerminalPane {
         };
         self.sync_status_glyphs(colors, window, cx);
         self.update_selected_geometry(window, cx);
+        self.main_viewport = window.viewport_size();
 
         let selected = self.selected_session();
 

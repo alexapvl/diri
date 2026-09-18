@@ -293,6 +293,9 @@ pub struct RootView {
     status_banner_generation: u64,
     quote_target_picker: Option<QuoteTargetPicker>,
     notification_panel_open: bool,
+    /// The main window's viewport, for content that sizes to it while a
+    /// panel paints it elsewhere.
+    main_viewport: gpui::Size<gpui::Pixels>,
     notification_filter_unread: bool,
     notification_selected: usize,
     notification_scroll: gpui::UniformListScrollHandle,
@@ -1298,6 +1301,7 @@ impl RootView {
             status_banner_generation: 0,
             quote_target_picker: None,
             notification_panel_open: false,
+            main_viewport: gpui::Size::default(),
             notification_filter_unread: true,
             notification_selected: 0,
             notification_scroll: gpui::UniformListScrollHandle::new(),
@@ -1497,6 +1501,16 @@ impl RootView {
         self.sync_inspector_context(cx);
         self.sync_auxiliary_terminal(window, cx);
         cx.notify();
+    }
+
+    /// Runs `f` against the main window even from a panel handler.
+    fn in_main_window(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) {
+        crate::floating::in_main_window(self, window, cx, f);
     }
 
     fn colors(&self) -> SemanticColors {
@@ -4105,6 +4119,7 @@ impl RootView {
 
 impl Render for RootView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.main_viewport = window.viewport_size();
         if self.pending_notification_open.is_some()
             && self
                 .window_store
@@ -7604,6 +7619,27 @@ mod tests {
             })
             .unwrap();
             cx.run_until_parked();
+            // `DIRI_TABS_PICKER=1` captures the header's project dropdown open
+            // over the workbench instead of the bare strip.
+            if orientation == crate::store::TabOrientation::Horizontal
+                && std::env::var_os("DIRI_TABS_PICKER").is_some()
+            {
+                cx.update_window(window.into(), |view, window, cx| {
+                    view.downcast::<RootView>().unwrap().update(cx, |root, cx| {
+                        root.sidebar.update(cx, |sidebar, cx| {
+                            sidebar.open_project_picker_for_test(window, cx);
+                        });
+                    });
+                })
+                .unwrap();
+                cx.run_until_parked();
+                // Let the surface's wall-clock entry fade finish so the capture
+                // shows the settled material rather than its first frame.
+                std::thread::sleep(Duration::from_millis(220));
+                cx.update_window(window.into(), |_, window, _| window.refresh())
+                    .unwrap();
+                cx.run_until_parked();
+            }
             cx.capture_screenshot(window.into())
                 .unwrap()
                 .save(std::path::Path::new(&output).join(format!("{name}.png")))
