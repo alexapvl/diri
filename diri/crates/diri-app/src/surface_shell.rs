@@ -6470,6 +6470,16 @@ mod tests {
             assert!(surfaces.usage_tokens);
             assert_eq!(surfaces.usage_host.as_deref(), Some("forge"));
         });
+        assert!(
+            cx.debug_bounds("usage-by-day").is_none(),
+            "day grouping control is gone"
+        );
+        assert!(settings_tab_matches(SettingsTab::Usage, "cache savings"));
+        assert!(settings_tab_matches(SettingsTab::Usage, "cost"));
+        if !usage_share::SUPPORTED {
+            assert!(cx.debug_bounds("usage-share").is_none());
+            return;
+        }
         let share = cx
             .debug_bounds("usage-share")
             .expect("visible share control");
@@ -6519,12 +6529,86 @@ mod tests {
         surfaces.read_with(cx, |surfaces, _| {
             assert!(surfaces.usage_share.is_none());
         });
-        assert!(
-            cx.debug_bounds("usage-by-day").is_none(),
-            "day grouping control is gone"
-        );
-        assert!(settings_tab_matches(SettingsTab::Usage, "cache savings"));
-        assert!(settings_tab_matches(SettingsTab::Usage, "cost"));
+    }
+
+    #[gpui::test]
+    fn usage_refresh_invalidates_share_images_and_updates_caption(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces.open_settings_tab(SettingsTab::Usage, cx);
+            let options = usage_share::ShareOptions {
+                tokens: false,
+                individual: false,
+                include_models: false,
+                theme_id: "dirijor-dark".into(),
+            };
+            let card = usage_share::ShareCard::from_report(
+                &crate::usage::dashboard::UsageReport::default(),
+                30,
+                usage_share::HostLabel::Hidden,
+                &options,
+                Vec::new(),
+            );
+            let stale = Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, vec![]));
+            let mut cache = std::collections::HashMap::new();
+            cache.insert(
+                usage_share::SharePreview::cache_key(&options.theme_id, &options),
+                Arc::clone(&stale),
+            );
+            let mut alternate = options.clone();
+            alternate.tokens = true;
+            cache.insert(
+                usage_share::SharePreview::cache_key(&alternate.theme_id, &alternate),
+                Arc::clone(&stale),
+            );
+            let palette = usage_share::SharePalette {
+                background: rgba(0x000000ff),
+                primary: rgba(0xffffffff),
+                secondary: rgba(0xccccccff),
+                tertiary: rgba(0x888888ff),
+                providers: [rgba(0xffffffff); 3],
+            };
+            surfaces.usage_share = Some(usage_share::SharePreview::from_card(
+                &card,
+                palette,
+                options.clone(),
+                cache,
+                false,
+            ));
+            let mut usage = surfaces.usage.clone();
+            usage.updated_at = 1_788_523_200;
+            let mut history = crate::usage::dashboard::UsageHistory::default();
+            crate::usage::dashboard::record(
+                &mut history.claude,
+                "claude-opus-4-6",
+                usage.updated_at / 3600,
+                crate::usage::UsageHourAgg {
+                    i: 1000,
+                    c: 42.0,
+                    ..Default::default()
+                },
+                diri_usage::match_claude("claude-opus-4-6"),
+                0,
+            );
+            usage.history = Arc::new(history);
+            surfaces.set_usage(usage, cx);
+            let preview = surfaces.usage_share.as_ref().expect("share remains open");
+            assert_eq!(preview.options, options);
+            assert!(preview.caption.contains("$42.00"), "{}", preview.caption);
+            assert!(
+                preview
+                    .cache
+                    .values()
+                    .all(|image| !Arc::ptr_eq(image, &stale))
+            );
+            assert!(
+                preview
+                    .image
+                    .as_ref()
+                    .is_none_or(|image| !Arc::ptr_eq(image, &stale))
+            );
+        });
     }
 
     /// Fixture-only visual review, never populates the live usage tracker.

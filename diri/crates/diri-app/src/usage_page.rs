@@ -25,6 +25,7 @@ fn provider_color(provider: usize, colors: SemanticColors) -> Rgba {
 
 impl UtilitySurfaces {
     pub(crate) fn set_usage(&mut self, usage: UsageSnapshot, cx: &mut Context<Self>) {
+        let changed = self.usage != usage;
         if self
             .usage_host
             .as_deref()
@@ -33,6 +34,15 @@ impl UtilitySurfaces {
             self.usage_host = None;
         }
         self.usage = usage;
+        if changed && let Some(preview) = self.usage_share.as_mut() {
+            // Cached PNGs and the caption must describe the same report,
+            // including variants revisited after a background usage refresh.
+            preview.cache.clear();
+            preview.pending_theme = None;
+            let options = preview.options.clone();
+            self.usage_share_theme_hover = None;
+            self.rebuild_usage_share(options, cx);
+        }
         if self.surface == Surface::Settings && self.settings_tab == SettingsTab::Usage {
             cx.notify();
         }
@@ -453,7 +463,13 @@ impl UtilitySurfaces {
                 .child(label(format!("{:.1}% of tokens priced · {} unpriced tokens", ratio(report.total.priced_tokens as f64, total.total_tokens() as f64) * 100.0, UsageFormat::tokens(total.total_tokens() - report.total.priced_tokens)), 11.0, colors.secondary))
                 .child(label("Uses Diri’s bundled model rates for Claude and Codex. Cursor costs come from billed dashboard events. Unpriced Claude/Codex usage is excluded from cost. Cache read savings compare cached reads with uncached input rates; cache write premiums are excluded.", 11.0, colors.tertiary))
                 .child(label("Includes local and remote Claude Code and Codex transcripts, including sessions outside Diri, plus billed Cursor usage on this Mac. Remote machines refresh every 5 minutes over SSH; unavailable machines keep their last saved totals.", 11.0, colors.tertiary)));
-        settings_page_with_trailing("Usage", Some(share), content, colors).into_any_element()
+        settings_page_with_trailing(
+            "Usage",
+            usage_share::SUPPORTED.then_some(share),
+            content,
+            colors,
+        )
+        .into_any_element()
     }
 
     fn usage_now(&self) -> i64 {
@@ -891,6 +907,9 @@ impl UtilitySurfaces {
     }
 
     fn toggle_usage_share(&mut self, cx: &mut Context<Self>) {
+        if !usage_share::SUPPORTED {
+            return;
+        }
         if self.usage_share.is_some() {
             self.dismiss_usage_share(cx);
             return;

@@ -11,6 +11,9 @@ use std::sync::Arc;
 const PROVIDERS: [&str; 3] = ["Claude", "Codex", "Cursor"];
 const BRAND: &str = "diri.sh";
 pub(super) const CARD_W: f32 = 600.0;
+// The native rasterizer currently uses AppKit. Keep unsupported platforms
+// from offering copy/save actions that cannot produce an image.
+pub(super) const SUPPORTED: bool = cfg!(target_os = "macos");
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum HostLabel {
