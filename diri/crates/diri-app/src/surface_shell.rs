@@ -327,6 +327,7 @@ pub struct UtilitySurfaces {
     include_editor_active: bool,
     include_persisted: String,
     include_save_notice: bool,
+    include_save_error: Option<String>,
     roots_editor: QueryEditor,
     roots_editor_active: bool,
     roots_editor_height: f32,
@@ -514,6 +515,7 @@ impl UtilitySurfaces {
             include_editor_active: false,
             include_persisted,
             include_save_notice: false,
+            include_save_error: None,
             roots_editor,
             roots_editor_active: false,
             roots_editor_height: ROOTS_EDITOR_MIN,
@@ -729,8 +731,8 @@ impl UtilitySurfaces {
     }
 
     fn persist_prefs(&mut self) -> bool {
-        if self.include_editor.text() != self.include_persisted {
-            self.persist_include();
+        if self.include_editor.text() != self.include_persisted && !self.persist_include() {
+            return false;
         }
         self.prefs.quick_open_roots = self.roots_editor.text().to_owned();
         self.prefs.normalize();
@@ -750,11 +752,19 @@ impl UtilitySurfaces {
         }
     }
 
-    fn persist_include(&mut self) {
+    fn persist_include(&mut self) -> bool {
         let text = self.include_editor.text().to_owned();
-        quick_open::store_include(&self.include_path, &text);
+        if let Err(error) = quick_open::store_include(&self.include_path, &text) {
+            let message = format!("Could not save .diri-include: {error}");
+            self.include_save_error = Some(message.clone());
+            self.activity = message;
+            self.include_save_notice = false;
+            return false;
+        }
         self.include_persisted = text;
         self.include_save_notice = true;
+        self.include_save_error = None;
+        true
     }
 
     fn persist_roots(&mut self) {
@@ -767,6 +777,7 @@ impl UtilitySurfaces {
             .insert_multiline(&quick_open::load_include(&self.include_path));
         self.include_persisted = self.include_editor.text().to_owned();
         self.include_save_notice = false;
+        self.include_save_error = None;
         self.include_editor_active = false;
     }
 
@@ -1405,6 +1416,10 @@ impl UtilitySurfaces {
         } else if self.worktrees.pending_move.is_some() || self.worktrees.move_refusal.is_some() {
             self.worktrees.cancel_move();
         } else {
+            if self.include_editor.text() != self.include_persisted && !self.persist_include() {
+                cx.notify();
+                return;
+            }
             let _ = self.persist_prefs();
             self.surface = Surface::None;
             self.clear_account_continuation();
@@ -2991,6 +3006,15 @@ impl UtilitySurfaces {
                                 })
                                 .child(editor_resize_grip(QuickOpenEditor::Include, colors, cx)),
                         )
+                        .when_some(self.include_save_error.as_ref(), |column, error| {
+                            column.child(
+                                div()
+                                    .debug_selector(|| "quick-open-include-error".into())
+                                    .text_size(px(11.0))
+                                    .text_color(colors.secondary)
+                                    .child(wrappable_setting_copy(error.clone().into())),
+                            )
+                        })
                         .child(
                             div()
                                 .min_w(px(0.0))
@@ -8068,6 +8092,36 @@ mod tests {
         assert!(settings_tab_matches(SettingsTab::Shortcuts, "keyboard"));
         assert!(settings_tab_matches(SettingsTab::Terminal, "appearance"));
         assert!(!settings_tab_matches(SettingsTab::Terminal, "ssh"));
+    }
+
+    #[gpui::test]
+    fn failed_include_save_retains_edits_and_keeps_settings_open(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(".diri-include");
+        // A directory at the destination fails even when tests run as root.
+        std::fs::create_dir(&path).unwrap();
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces.include_path = path.clone();
+            surfaces.include_persisted = "# existing\n".into();
+            surfaces.include_editor = QueryEditor::default();
+            surfaces.include_editor.insert_multiline("**/.worktrees/\n");
+            surfaces.persist_include();
+            assert_eq!(surfaces.include_persisted, "# existing\n");
+            assert!(!surfaces.include_save_notice);
+            assert!(surfaces.include_save_error.is_some());
+            surfaces.close_surface(cx);
+            assert!(surfaces.is_settings_open());
+            assert_eq!(surfaces.include_editor.text(), "**/.worktrees/\n");
+
+            std::fs::remove_dir(&path).unwrap();
+            surfaces.persist_include();
+            assert!(surfaces.include_save_notice);
+            assert!(surfaces.include_save_error.is_none());
+            assert_eq!(surfaces.include_persisted, "**/.worktrees/\n");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "**/.worktrees/\n");
+        });
     }
 
     #[gpui::test]

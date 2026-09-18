@@ -138,8 +138,8 @@ pub fn load_include(path: &Path) -> String {
     diri_proto::include::load(path)
 }
 
-pub fn store_include(path: &Path, text: &str) {
-    let _ = diri_proto::include::store(path, text);
+pub fn store_include(path: &Path, text: &str) -> std::io::Result<()> {
+    diri_proto::include::store(path, text)
 }
 
 pub fn load_cache(path: &Path, roots: &[PathBuf], includes: &str) -> Option<Vec<DirectoryEntry>> {
@@ -1087,11 +1087,11 @@ mod tests {
     fn include_file_round_trips_and_deletes_when_empty() {
         let temp = tempdir().unwrap();
         let path = temp.path().join(".diri-include");
-        store_include(&path, "  \n");
+        store_include(&path, "  \n").unwrap();
         assert!(!path.exists());
-        store_include(&path, "**/.worktrees/\n");
+        store_include(&path, "**/.worktrees/\n").unwrap();
         assert_eq!(load_include(&path), "**/.worktrees/\n");
-        store_include(&path, "");
+        store_include(&path, "").unwrap();
         assert!(!path.exists());
         assert_eq!(load_include(&path), "");
     }
