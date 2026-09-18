@@ -91,6 +91,7 @@ pub enum IconName {
     Search,
     Server,
     Settings,
+    Share,
     Sidebar,
     Toolbar,
     SidebarRight,
@@ -109,7 +110,7 @@ pub enum IconName {
 }
 
 impl IconName {
-    pub const ALL: [Self; 60] = [
+    pub const ALL: [Self; 61] = [
         Self::Account,
         Self::Activity,
         Self::Archive,
@@ -155,6 +156,7 @@ impl IconName {
         Self::Search,
         Self::Server,
         Self::Settings,
+        Self::Share,
         Self::Sidebar,
         Self::Toolbar,
         Self::SidebarRight,
@@ -219,6 +221,7 @@ impl IconName {
             Self::Search => "icons/search.svg",
             Self::Server => "icons/server.svg",
             Self::Settings => "icons/settings.svg",
+            Self::Share => "icons/share.svg",
             Self::Sidebar => "icons/sidebar.svg",
             Self::Toolbar => "icons/toolbar.svg",
             Self::SidebarRight => "icons/sidebar-right.svg",
@@ -289,6 +292,7 @@ impl IconName {
             "magnifyingglass" => Self::Search,
             "server.rack" => Self::Server,
             "gearshape" => Self::Settings,
+            "square.and.arrow.up" => Self::Share,
             "sidebar.left" => Self::Sidebar,
             "rectangle.topthird.inset.filled" => Self::Toolbar,
             "sidebar.right" => Self::SidebarRight,
@@ -415,6 +419,7 @@ fn embedded_svg(path: &str) -> Option<&'static [u8]> {
         "icons/search.svg" => include_bytes!("../assets/icons/search.svg"),
         "icons/server.svg" => include_bytes!("../assets/icons/server.svg"),
         "icons/settings.svg" => include_bytes!("../assets/icons/settings.svg"),
+        "icons/share.svg" => include_bytes!("../assets/icons/share.svg"),
         "icons/sidebar.svg" => include_bytes!("../assets/icons/sidebar.svg"),
         "icons/toolbar.svg" => include_bytes!("../assets/icons/toolbar.svg"),
         "icons/sidebar-right.svg" => include_bytes!("../assets/icons/sidebar-right.svg"),
@@ -527,6 +532,7 @@ mod tests {
             "sidebar.right",
             "sparkle",
             "sparkles",
+            "square.and.arrow.up",
             "square.and.pencil",
             "square.grid.2x2",
             "square.stack.3d.up",

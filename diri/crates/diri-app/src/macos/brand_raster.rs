@@ -441,11 +441,11 @@ fn channel(value: f32) -> u8 {
     (value.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
-const DIRI_LOGO_VB_W: f32 = 59.5;
-const DIRI_LOGO_VB_H: f32 = 42.5;
-const DIRI_LOGO_STROKE: f32 = 8.5;
-const DIRI_LOGO_CHEVRON: [(f32, f32); 3] = [(4.25, 4.25), (25.25, 21.25), (4.25, 38.25)];
-const DIRI_LOGO_BASELINE: ((f32, f32), (f32, f32)) = ((29.25, 38.25), (55.25, 38.25));
+pub(crate) const DIRI_LOGO_VB_W: f32 = 59.5;
+pub(crate) const DIRI_LOGO_VB_H: f32 = 42.5;
+pub(crate) const DIRI_LOGO_STROKE: f32 = 8.5;
+pub(crate) const DIRI_LOGO_CHEVRON: [(f32, f32); 3] = [(4.25, 4.25), (25.25, 21.25), (4.25, 38.25)];
+pub(crate) const DIRI_LOGO_BASELINE: ((f32, f32), (f32, f32)) = ((29.25, 38.25), (55.25, 38.25));
 const DIRI_LOGO_SVG: &str = include_str!("../../../diri-ui/assets/brand/diri.svg");
 
 const SETTINGS_STROKE: f32 = 1.75;

@@ -234,6 +234,7 @@ pub struct RootView {
     session_surfaces: Option<Entity<SessionSurfaces>>,
     tab_pinch: crate::tab_peek::TabPinch,
     utility_surfaces: Option<Entity<UtilitySurfaces>>,
+    usage_share_overlay_open: bool,
     launcher: Entity<LauncherOverlay>,
     inspector: Option<Entity<WorkbenchInspector>>,
     #[cfg(target_os = "macos")]
@@ -698,6 +699,11 @@ impl RootView {
                     this.sidebar.update(cx, |sidebar, cx| sidebar.reveal(cx));
                 } else if !open && std::mem::take(&mut this.sidebar_revealed_for_settings) {
                     this.sidebar.update(cx, |sidebar, cx| sidebar.conceal(cx));
+                }
+                let share = surfaces.read(cx).is_usage_share_open();
+                if this.usage_share_overlay_open != share {
+                    this.usage_share_overlay_open = share;
+                    cx.notify();
                 }
             })
             .detach();
@@ -1223,6 +1229,7 @@ impl RootView {
             session_surfaces,
             tab_pinch: Default::default(),
             utility_surfaces,
+            usage_share_overlay_open: false,
             launcher,
             inspector,
             #[cfg(target_os = "macos")]
@@ -4683,7 +4690,7 @@ impl Render for RootView {
             // snapshotted for itself -- keeps the two edges together while the
             // sidebar slides or is dragged wider.
             let mut placement = StyleRefinement::default().absolute().inset_0();
-            if surfaces.read(cx).is_settings_open() {
+            if surfaces.read(cx).is_settings_open() && !surfaces.read(cx).is_usage_share_open() {
                 placement = placement.left(px(seam));
             }
             root = root.child(surfaces.clone().cached(placement));
