@@ -16,9 +16,9 @@ use diri_proto::{
     SessionRecord,
 };
 use diri_ui::{
-    AgentLogo, AlertChip, AttentionDot, AttentionLevel, Fill, FloatingSurface, Glass, GlassPill,
-    HairlineDivider, HoverMarquee, Ink, LoadingIndicator, Metrics, Motion, Palette, Radius,
-    RowFill, SemanticColors, Space, StateChip, StatusGlyph, StatusState, Typo,
+    AgentLogo, AlertChip, Fill, FloatingSurface, Glass, GlassPill, HairlineDivider, HoverMarquee,
+    Ink, LoadingIndicator, Metrics, Motion, Palette, Radius, RowFill, SemanticColors, Space,
+    StateChip, StatusGlyph, StatusState, Typo,
 };
 use gpui::{
     Anchor, Animation, AnimationExt, AnyElement, App, AppContext as _, Bounds, Context,
@@ -2579,10 +2579,7 @@ impl Sidebar {
                 row.child(pin_mark(colors))
             })
             .when(project_is_remote && !is_hovered, |row| {
-                row.child(remote_mark(colors))
-            })
-            .when(!is_hovered && collapsed, |row| {
-                row.child(AttentionDot::new(rollup_attention(&group.active), colors))
+                row.child(trailing_remote_mark(colors))
             })
             .when(is_hovered, |row| {
                 row.child(
@@ -7885,8 +7882,25 @@ fn remote_mark(colors: SemanticColors) -> AnyElement {
         .into_any_element()
 }
 
-/// Leading fold chevron of a project row. Same 18px slot the folder badge
-/// used to fill, so titles keep their column against session rows.
+/// The remote mark when it is the last thing on a project row. Session rows
+/// end in a 16px agent glyph, so the mark gets the same slot and is centred
+/// in it; a bare 9px glyph hugging the padding sat a few pixels to the right
+/// of that column.
+fn trailing_remote_mark(colors: SemanticColors) -> AnyElement {
+    div()
+        .debug_selector(|| "remote-mark".to_owned())
+        .flex_none()
+        .size(px(SIDEBAR_TRAILING_SLOT))
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(sf_symbol("server.rack", 9.0, colors.tertiary))
+        .into_any_element()
+}
+
+/// Leading fold chevron of a project row. Same 18px slot and rounded fill
+/// the folder badge used to have, so titles keep their column against
+/// session rows and the fold still reads as a folder tile, not a stray glyph.
 fn project_disclosure(collapsed: bool, colors: SemanticColors) -> AnyElement {
     div()
         .flex_none()
@@ -7894,6 +7908,8 @@ fn project_disclosure(collapsed: bool, colors: SemanticColors) -> AnyElement {
         .flex()
         .items_center()
         .justify_center()
+        .rounded(px(Radius::CHIP))
+        .bg(colors.primary.alpha(0.08))
         .text_size(px(9.0))
         .text_color(colors.secondary)
         .child(sf_symbol_weighted(
@@ -8489,38 +8505,6 @@ fn agent_picker_shortcut(
             .unwrap_or_default()
     } else {
         fallback.to_owned()
-    }
-}
-
-fn rollup_attention(sessions: &[Arc<SessionRecord>]) -> AttentionLevel {
-    sessions
-        .iter()
-        .fold(AttentionLevel::None, |rollup, session| {
-            let state = match status_state(session, false) {
-                StatusState::NeedsInput { destructive } => {
-                    AttentionLevel::NeedsInput { destructive }
-                }
-                StatusState::DoneUnseen => AttentionLevel::DoneUnseen,
-                StatusState::Working => AttentionLevel::Working,
-                StatusState::IdleSeen => AttentionLevel::IdleSeen,
-                StatusState::Hibernated => AttentionLevel::Hibernated,
-                StatusState::None => AttentionLevel::None,
-            };
-            if attention_rank(state) > attention_rank(rollup) {
-                state
-            } else {
-                rollup
-            }
-        })
-}
-
-const fn attention_rank(level: AttentionLevel) -> u8 {
-    match level {
-        AttentionLevel::None | AttentionLevel::Hibernated => 0,
-        AttentionLevel::IdleSeen => 1,
-        AttentionLevel::Working => 2,
-        AttentionLevel::DoneUnseen => 3,
-        AttentionLevel::NeedsInput { .. } => 4,
     }
 }
 
