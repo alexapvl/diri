@@ -125,6 +125,14 @@ directory preparation, and profile resolution belong to the local Engine;
 the Holder receives only the resulting argv/environment/cwd. This enhancement
 adds no remote service, credential store, or transport dependency.
 
+Local Codex account switching is a separate local Engine enhancement. It stores
+file-backed provider logins in owner-only slots beside the local account catalog,
+replaces only the shared `~/.codex/auth.json`, and resumes the same native IDs in
+open local Diri tabs. It never copies transcripts, MCP settings, plugins or tool
+credentials. Hosted connectors such as Slack still require authorization for the
+selected provider account. This does not alter remote launch, Helper ownership,
+SSH or the remote protocol. See [ACCOUNTS.md](ACCOUNTS.md) for limitations.
+
 ## Remote transcript usage enhancement
 
 The Usage page collects available Claude Code and Codex transcript usage from
@@ -1083,7 +1091,7 @@ worker, remote attachment, or Helper protocol change is added. PTY draining
 remains independent of every local client.
 
 Ordinary queued frames retain at most 1 MiB and 64 frame references per sink.
-One larger valid frame (up to the existing 16 MiB protocol payload limit) may be
+One larger valid frame (up to the existing 64 MiB protocol payload limit) may be
 queued with 64 bytes of mode/control overhead. Already-written prefixes still
 count toward retained allocation until their complete frame is released. The
 pump services each sink for at most 256 KiB or 1 ms per turn. While bytes remain

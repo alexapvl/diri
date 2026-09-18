@@ -919,6 +919,38 @@ impl DaemonClient {
         self.no_params(Method::ACCOUNT_PROFILES_LIST).await
     }
 
+    pub async fn login_codex_account(&self, id: String) -> Result<SessionRecord, ClientError> {
+        self.typed(
+            Method::ACCOUNT_CODEX_LOGIN,
+            &diri_proto::AgentAccountId { id },
+        )
+        .await
+    }
+
+    pub async fn capture_codex_account(
+        &self,
+        id: String,
+    ) -> Result<diri_proto::AgentAccountCatalog, ClientError> {
+        self.typed(
+            Method::ACCOUNT_CODEX_CAPTURE,
+            &diri_proto::AgentAccountId { id },
+        )
+        .await
+    }
+
+    pub async fn switch_all_accounts(
+        &self,
+        account_profile_id: String,
+    ) -> Result<diri_proto::SwitchAccountResult, ClientError> {
+        self.core
+            .request_typed(
+                Method::ACCOUNT_SWITCH_ALL,
+                Some(&diri_proto::SwitchAccountParams { account_profile_id }),
+                Some(std::time::Duration::from_secs(1800)),
+            )
+            .await
+    }
+
     pub async fn continue_with_account(
         &self,
         session_id: &SessionId,

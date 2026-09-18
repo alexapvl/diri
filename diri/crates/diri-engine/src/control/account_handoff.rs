@@ -22,6 +22,8 @@ impl<'a> SessionOperation<'a> {
         let guarded = matches!(
             method,
             Method::SESSION_CONTINUE_ACCOUNT
+                | Method::SESSION_WAKE
+                | Method::SESSION_HIBERNATE
                 | Method::SESSION_RESUME
                 | Method::SESSION_RECONNECT
                 | Method::SESSION_FORK

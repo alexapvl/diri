@@ -1,97 +1,91 @@
 # Account profiles
 
-Settings → Accounts manages named Claude Code and Codex launch profiles. Each
-profile chooses a provider configuration directory on This Mac or a saved SSH
-host. Diri stores the name, Agent, host, directory, and default selection, never
-provider credentials or authentication responses.
+The bottom-left account menu switches local Codex logins while keeping one shared
+conversation home, `~/.codex`. It replaces only `auth.json` and resumes open Diri
+tabs with the same native conversation IDs. No transcript migration runs.
 
-1. Add a profile, such as Work, and select its Agent and host.
-2. Choose an existing configuration directory or a new one such as
-   `~/.codex-work` or `~/.claude-work`. Diri creates missing directories with
-   owner-only permissions when launching. A final symlink is rejected; existing
-   directory contents and permissions are preserved.
-3. Save, then Open Agent to complete the provider's own sign-in flow. The profile
-   name is a user label, not a verified email or authentication status.
-4. Select the account in the new-session launcher (⌘⇧A). A default is scoped to
-   one Agent and host. CLI environment bypasses the saved default.
+## Set up and switch
 
-Saved launch recipes retain the selection. An explicit profile that is missing
-or belongs to another Agent/host fails with an actionable error. A recipe using
-Default resolves the current default when launched. Agents without profile
-support retain their normal CLI environment.
+1. Open the bottom-left account menu → **Add or manage accounts…**.
+2. Add a local Codex profile with a meaningful name. Use **Save current login**
+   to remember the account currently signed into `~/.codex`.
+3. Add another profile and choose **Sign in**. Diri opens a login-only terminal
+   with an isolated credential directory. Complete Codex's browser login; the
+   login process exits when finished. Close that setup tab.
+4. Choose the saved account in the bottom-left menu. Diri stops running Codex
+   conversations open in its tabs/split panes, swaps the shared login once, and
+   resumes their existing native IDs. Sleeping processes restart and return to
+   sleep; stopped tabs stay stopped. The login becomes the default for new tabs.
 
-The Engine binds `CODEX_HOME` or `CLAUDE_CONFIG_DIR`, clears ambient provider
-authentication/routing overrides, and reasserts the selection after local login
-shell startup. Provider settings inside the selected directory still apply.
-Profiles sharing a directory share its login and configuration. Use distinct
-directories for independent accounts. This is launch configuration, not a
-security sandbox or a credential vault.
+Profile names are user labels, not verified email addresses. **Save current
+login** replaces that profile's saved credential. It does not switch accounts.
+Signing in does not change the shared login until you choose the account.
 
-Sessions record a launch-profile snapshot. Editing defaults, changing
-a profile directory, or removing a profile affects future launches; resume, fork,
-and crash recovery retain the session's recorded binding. Only an explicit
-account continuation changes that binding. A session's profile
-badge describes its launch configuration. Manually running another command in
-the fallback shell is outside this binding. Removing a profile never deletes
-provider files or signs out running Agents. Cross-host migration of a bound
-session requires destination-account mapping and is currently rejected.
+Closed and archived sessions are excluded from restart. Since authentication is
+shared, their next resume also uses the current shared login. CLI processes
+outside Diri are not restarted and may retain cached credentials; do not switch
+while independently managed processes are writing the same authentication file.
+Running tools are interrupted, not replayed. A native conversation ID is required
+before any open tab is restarted. Separate-home conversations created by earlier
+builds are left in their original home and counted as unchanged. Their history is
+never copied. A legacy profile's login alone can be imported on first switch.
 
-Local transcript discovery and native title lookup use the bound configuration
-directory. Global history import and existing usage panels retain their current
-scope; this feature does not aggregate usage across profile directories.
+## What happens to MCPs
 
-## Continue a Claude conversation with another account
+Local MCP definitions, OAuth stores, plugin files, project configuration and
+conversation databases remain in the same home and are not rewritten or copied.
+This preserves local configuration; it does **not** transfer hosted connector
+installations or authorizations between provider accounts. For example, Slack
+can report **not installed** after a Codex account switch even when all local
+plugin files still exist. Install/connect that plugin for the selected account.
+Diri cannot turn an account-side grant into a portable credential file.
 
-When Claude reaches an account limit, choose **Continue with another account…**
-from the session menu or click its account badge. Select a different, already
-signed-in Claude profile on the same machine. The same Diri session restarts with
-native `claude --resume <conversation-id>` under that profile. Your working folder,
-worktree, title, and conversation ID stay the same. Claude restores the saved
-conversation; enter your next message to continue. An interrupted tool process
-is stopped, not transferred as a running task.
+## Storage and recovery
 
-Diri checks the destination and saved transcript before stopping Claude, then
-reads its final transcript after shutdown. It copies only the main conversation
-JSONL (up to 64 MiB), never credentials or provider configuration. It does not
-copy subagent or file-rewind sidecars; this is same-machine conversation resume,
-not a portable checkpoint. The selected profile's own settings apply. Diri does
-not verify remaining quota or automatically rotate accounts.
+The Engine stores the catalog in `accounts.json` beside its socket (version 1,
+0600). Local Codex logins are stored under `codex-logins/<profile-id>/auth.json`
+beside that catalog, in owner-only directories and files. These are credentials:
+protect this directory like Codex's own auth file. They are never returned in
+control responses, logged or passed as process arguments. Removing a catalog
+profile does not delete provider directories or its saved login slot.
 
-Switching back updates the older copy only when its contents are an exact prefix
-of the current conversation. Conflicting history is rejected without overwriting
-it. Missing or invalid history fails before stopping the current Agent. A failure
-after shutdown leaves the saved conversation intact and reports the stopped
-session; check its account badge and use Resume to retry. Once committed, the new
-account binding is persisted before launch and is used by crash recovery too.
+The switch accepts Codex's file credential backend. Explicit Keychain, auto or
+encrypted backends fail with an actionable error without changing configuration.
+File reads are bounded, reject symlinks/nonregular files and require owner-only
+credential permissions. Writes use fsync and atomic replacement with a concurrent
+change check. Before replacement, the current credential is retained in
+`codex-logins/previous-auth.json`. Refreshed credentials update saved slots only
+when the token's account ID and user subject match. No refresh protocol is
+reimplemented by Diri.
 
-This action supports Claude Code sessions with a known conversation ID, locally
-and on the same saved SSH host. Codex account profiles support launching, resume,
-and fork with their recorded account; cross-account Codex continuation and
-cross-host conversation transfer are not included.
+The batch reserves affected sessions and excludes concurrent launches and account
+edits. Preparation fails before stopping processes. A later failure reports the
+login/default error and attempts to resume stopped tabs; failed relaunches can be
+retried with Resume. This is not an atomic multi-process transaction.
 
-## Storage and protocol
+`account.codex.login` and `account.codex.capture` take `{id}` and return a login
+SessionRecord or the catalog. `account.switch_all` takes `{accountProfileId}` and
+returns updated sessions, unchanged IDs, failures and the default-save outcome.
+No credential material is part of these responses.
 
-The local Engine owns `accounts.json` beside `agents.json` (version 1, mode 0600,
-atomic writes, at most 64 profiles). Invalid versions, duplicate identities,
-ambiguous defaults, symlinks, and unsafe file permissions fail closed without
-overwriting the file. `account.profiles.list`, `account.profiles.save`, and
-`account.profiles.remove` expose the catalog over the existing local protocol.
+## Other profiles
 
-`session.spawn.accountProfileId` is additive: absent selects the current
-Agent/host default, an empty string explicitly selects the CLI environment,
-and a nonempty string requires that profile. `SessionRecord.accountProfile`
-and recovery capsules retain the resolved directory and profile metadata;
-older records without the field remain valid.
+Claude and remote profiles retain their existing directory-based launch behavior.
+The Engine binds `CLAUDE_CONFIG_DIR` or `CODEX_HOME`, clears ambient provider
+authentication/routing overrides and reasserts the binding after shell startup.
+They can use **Open Agent** for sign-in. The shared-login switch applies only to
+local Codex. Existing explicit Claude single-conversation continuation remains
+available; it does not transfer MCP grants. Remote profiles stay scoped to one
+Agent and host, and use the existing structured Remote PTY Holder launch path.
 
-`session.continue_with_account` takes `sessionID` and `accountProfileId` and
-returns the updated SessionRecord. Lifecycle operations reserve the session
-through preparation, shutdown, transcript installation, and relaunch.
+## Verification
 
-Remote paths resolve `~/` against the remote login environment. Directory setup
-uses the Engine's existing bounded fixed-script SSH seam, passing the path as
-stdin data. Agent launch stays structured argv/environment over the existing
-Remote PTY Holder protocol. No credential transfer or optional node is involved.
+The `codex_accounts` tests exercise credential permissions, malformed files,
+symlinks, unsupported backends, refreshed-login switch-back, running/sleeping/
+stopped open tabs and excluded closed records. A fixture with an 800 MiB invalid
+history file verifies switching never parses or copies history and leaves tool
+configuration and credentials unchanged. Tests use synthetic auth and fake Agents.
+A real hosted-connector connection must be checked separately for each account.
 
-The product pattern is inspired by [T3 Code](https://github.com/pingdotgg/t3code).
-This implementation is native to Diri's Rust Engine and GPUI app; it does not
-import T3's server, SDK, or authentication machinery.
+`toml_edit` (already present in the workspace lockfile) parses only the credential
+backend setting. It never rewrites MCP configuration.

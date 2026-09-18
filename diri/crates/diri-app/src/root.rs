@@ -454,6 +454,16 @@ impl RootView {
                 surfaces
             })
         });
+        if let Some(surfaces) = &utility_surfaces {
+            cx.subscribe(
+                surfaces,
+                |this, _, _: &crate::surface_shell::UtilitySurfacesEvent, cx| {
+                    this.sidebar
+                        .update(cx, |_, cx| cx.emit(SidebarEvent::SessionActivated));
+                },
+            )
+            .detach();
+        }
         let launcher = cx.new(|cx| {
             let mut launcher = LauncherOverlay::new(Arc::clone(&services), preview, cx);
             launcher.set_window_store(window_store.clone());
@@ -540,6 +550,21 @@ impl RootView {
                     workbench.update(cx, |workbench, cx| workbench.focus(window, cx));
                 }
                 cx.notify();
+            }
+            if let SidebarEvent::AccountAction(profile) = event {
+                let services = this.services.clone();
+                this.sidebar.update(cx, |sidebar, cx| {
+                    sidebar.account_menu_action(profile.clone(), services, cx);
+                });
+            }
+            if matches!(event, SidebarEvent::ManageAccounts)
+                && let Some(surfaces) = &this.utility_surfaces
+            {
+                surfaces.update(cx, |surfaces, cx| {
+                    surfaces.open_settings(cx);
+                    surfaces.open_settings_tab(crate::settings::SettingsTab::Accounts, cx);
+                    surfaces.focus_handle(cx).focus(window, cx);
+                });
             }
             if matches!(event, SidebarEvent::RefreshUsageLimits) {
                 let _ = this.services.usage_limits_refresh.try_send(());
