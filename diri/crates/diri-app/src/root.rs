@@ -507,6 +507,9 @@ impl RootView {
                         });
                     }
                 }
+                TerminalPaneEvent::Feedback { message } => {
+                    this.show_quote_feedback("Terminal", message.clone(), cx);
+                }
                 TerminalPaneEvent::ExternalDropFeedback { message } => {
                     this.show_quote_feedback("Dropped files", message.clone(), cx);
                 }
@@ -1447,6 +1450,9 @@ impl RootView {
                                 });
                             }
                         }
+                        crate::workspace_workbench::WorkspaceWorkbenchEvent::Terminal(
+                            TerminalPaneEvent::Feedback { message },
+                        ) => this.show_quote_feedback("Terminal", message.clone(), cx),
                         crate::workspace_workbench::WorkspaceWorkbenchEvent::Terminal(
                             TerminalPaneEvent::ExternalDropFeedback { message },
                         ) => this.show_quote_feedback("Dropped files", message.clone(), cx),
@@ -5205,6 +5211,58 @@ mod tests {
     }
 
     #[gpui::test]
+    fn terminal_feedback_reaches_the_standard_toast_in_both_layouts(cx: &mut gpui::TestAppContext) {
+        let services = test_services();
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, false, PreviewScenario::Empty, window, cx)
+        });
+        for workspace in [false, true] {
+            root.update_in(cx, |root, window, cx| {
+                let event = TerminalPaneEvent::Feedback {
+                    message: format!("Input rejected in workspace={workspace}"),
+                };
+                if workspace {
+                    root.activate_saved_workspace(
+                        Some(diri_proto::workspace::WorkspaceId::new("toast-test")),
+                        window,
+                        cx,
+                    );
+                    root.workspace_workbench
+                        .as_ref()
+                        .unwrap()
+                        .update(cx, |_, cx| {
+                            cx.emit(
+                                crate::workspace_workbench::WorkspaceWorkbenchEvent::Terminal(
+                                    event,
+                                ),
+                            );
+                        });
+                } else {
+                    root.terminal
+                        .as_ref()
+                        .unwrap()
+                        .update(cx, |_, cx| cx.emit(event));
+                }
+            });
+            cx.run_until_parked();
+            root.read_with(cx, |root, _| {
+                let banner = root
+                    .status_banner
+                    .as_ref()
+                    .expect("standard right-side toast");
+                assert_eq!(banner.title, "Terminal");
+                assert_eq!(
+                    banner.body,
+                    format!("Input rejected in workspace={workspace}")
+                );
+            });
+        }
+        cx.executor().advance_clock(Duration::from_secs(4));
+        cx.run_until_parked();
+        root.read_with(cx, |root, _| assert!(root.status_banner.is_none()));
+    }
+
+    #[gpui::test]
     fn horizontal_tabs_fill_window_on_orientation_switch(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
             cx.set_reduce_motion(false);
@@ -7211,6 +7269,73 @@ mod tests {
         if let Some(profile) = std::env::var_os("DIRI_PEEK_PROFILE") {
             super::peek_profile::run(&mut cx, window, std::path::Path::new(&profile));
         }
+        cx.capture_screenshot(window.into())
+            .unwrap()
+            .save(output)
+            .unwrap();
+        cx.update_window(window.into(), |_, window, _| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes the terminal toast preview to DIRI_TERMINAL_TOAST_SCREENSHOT"]
+    fn render_terminal_toast_screenshot() {
+        use gpui::HeadlessAppContext;
+        let output = std::env::var("DIRI_TERMINAL_TOAST_SCREENSHOT").expect("output path");
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(diri_ui::IconAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.update(|cx| {
+            crate::fonts::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let services = test_services();
+        let mut fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+        let selected = fixture.selected_session_id.clone().unwrap();
+        let session = fixture
+            .list
+            .sessions
+            .iter_mut()
+            .find(|s| s.id == selected)
+            .unwrap();
+        session.kind = diri_proto::AgentKind::CODEX;
+        session.host = None;
+        session.title = "Image drop regression".into();
+        {
+            let mut store = services.store.store.write().unwrap();
+            store.hydrate(fixture.list);
+            store.select(selected);
+            store
+                .update_preferences(|p| p.terminal_theme = "dirijor-dark".into())
+                .unwrap();
+        }
+        let window = cx.open_window(size(px(1000.0), px(650.0)), |window, cx| {
+            cx.new(|cx| {
+                let mut root = RootView::new(services, false, PreviewScenario::Empty, window, cx);
+                // This fixture has no live Engine; omit its unrelated connecting notice.
+                root.preview = true;
+                let mut grid = diri_term::buffer::GridBuffer::new(100, 36);
+                let sample = "  OpenAI Codex\n\n  /Users/you/work/diri\n\n  Ready to work on your project.\n\n› Ask Codex to do anything";
+                for (y, line) in sample.lines().enumerate() {
+                    for (x, ch) in line.chars().enumerate() {
+                        grid.cells[y * 100 + x].scalar = ch as u32;
+                    }
+                }
+                root.terminal.as_ref().unwrap().update(cx, |terminal, cx| {
+                    terminal.seed_preview_grid_for_test(grid, cx);
+                    cx.emit(TerminalPaneEvent::Feedback {
+                        message: "This terminal is active in another view. Focus it to type here.".into(),
+                    });
+                });
+                root
+            })
+        }).unwrap();
+        cx.run_until_parked();
         cx.capture_screenshot(window.into())
             .unwrap()
             .save(output)
