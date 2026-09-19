@@ -158,10 +158,6 @@ pub(crate) enum SidebarEvent {
     /// through the typed `OpenSettings` action; this event carries the host
     /// the picker row was about, which an action cannot.
     OpenAgentSettings(Option<String>),
-    /// One-click path from the footer menu into the Remote host editor.
-    AddRemoteHost,
-    /// One-click path from the account menu to the latest release notes.
-    OpenWhatsNew,
     /// A plain click (or shortcut) selected a session: hand keyboard focus
     /// to its terminal surface so the user can type immediately.
     SessionActivated,
@@ -589,9 +585,6 @@ pub struct Sidebar {
     number_flows: crate::number_flow::Bank,
     number_tick: Option<Task<()>>,
     accounts: accounts::MenuAccounts,
-    account_context: Option<crate::transcript::ContextUsage>,
-    account_context_session: Option<SessionId>,
-    account_context_task: Option<Task<()>>,
     update: UpdateState,
     /// When visibility last flipped, so a held ⌘B cannot outrun the slide.
     last_toggle: Option<Instant>,
@@ -691,7 +684,6 @@ impl Sidebar {
                             if this
                                 .update(cx, |this, cx| {
                                     this.store.write().expect("store").reconcile();
-                                    this.refresh_account_context(false, cx);
                                     cx.notify();
                                 })
                                 .is_err()
@@ -752,9 +744,6 @@ impl Sidebar {
             number_flows: crate::number_flow::Bank::default(),
             number_tick: None,
             accounts: accounts::MenuAccounts::new(preview),
-            account_context: None,
-            account_context_session: None,
-            account_context_task: None,
             update: UpdateState::default(),
             last_toggle: None,
             preview,
@@ -921,63 +910,7 @@ impl Sidebar {
             cx.emit(SidebarEvent::RefreshUsageLimits);
         }
         self.usage = Some(snapshot);
-        self.refresh_account_context(true, cx);
         cx.notify();
-    }
-
-    fn refresh_account_context(&mut self, force: bool, cx: &mut Context<Self>) {
-        if self.preview || self.ui.popover != Some(Popover::Account) {
-            return;
-        }
-        let session = self
-            .store
-            .read()
-            .expect("session store lock poisoned")
-            .selected_session()
-            .cloned();
-        let id = session.as_ref().map(|session| session.id.clone());
-        if !force && self.account_context_session == id {
-            return;
-        }
-        self.account_context_task = None;
-        if self.account_context_session != id {
-            self.account_context = None;
-        }
-        self.account_context_session = id.clone();
-        let Some(session) = session.filter(|session| session.host.is_none()) else {
-            self.account_context = None;
-            return;
-        };
-        let Some((path, agent_id)) = session.transcript_path.zip(session.agent_session_id) else {
-            self.account_context = None;
-            return;
-        };
-        let home = std::env::var_os("HOME")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from("/nonexistent"));
-        self.account_context_task = Some(cx.spawn(async move |this, cx| {
-            let context = cx
-                .background_spawn(async move {
-                    crate::transcript::load(
-                        &home,
-                        std::path::Path::new(&path),
-                        &session.kind,
-                        &agent_id,
-                        &session.cwd,
-                        None,
-                    )
-                    .ok()
-                    .flatten()
-                    .and_then(|snapshot| snapshot.document.context_usage)
-                })
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                if this.account_context_session == id {
-                    this.account_context = context;
-                    cx.notify();
-                }
-            });
-        }));
     }
 
     pub fn pending_close_copy(&self) -> Option<(String, String)> {
@@ -4228,7 +4161,6 @@ impl Sidebar {
                         } else {
                             Some(Popover::Account)
                         };
-                        this.refresh_account_context(true, cx);
                         if !this.preview && this.ui.popover == Some(Popover::Account) {
                             cx.emit(SidebarEvent::RefreshUsageLimits);
                             cx.emit(SidebarEvent::AccountAction(None));
@@ -5585,11 +5517,9 @@ impl Sidebar {
         panel
     }
 
-    /// Version line in the account popover, doubling as the manual check.
-    ///
-    /// Whatever the pill is showing wins here, so the popover never contradicts
-    /// the footer two pixels above it; with nothing pending it falls back to
-    /// the running version and a click starts a check.
+    /// Version and update state, always present: Check when idle, Download
+    /// or Restart when an update is available or staged, no action while a
+    /// check or download runs or on builds that cannot update themselves.
     fn update_menu_row(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
         let unsupported = matches!(self.update.phase, UpdatePhase::Unsupported(_));
         let command = match &self.update.phase {
@@ -5610,13 +5540,13 @@ impl Sidebar {
         };
         let mut row = div()
             .id("account-version")
+            .debug_selector(|| "account-version".into())
             .mx(px(6.0))
             .px(px(8.0))
-            .h(px(30.0))
+            .h(px(ACCOUNT_MENU_ACTION_ROW_HEIGHT))
             .flex()
             .items_center()
-            .justify_between()
-            .gap(px(9.0))
+            .gap(px(8.0))
             .rounded(px(SIDEBAR_MENU_ROW_RADIUS))
             .text_size(px(Typo::ROW.size))
             .text_color(if unsupported {
@@ -5624,19 +5554,6 @@ impl Sidebar {
             } else {
                 colors.primary
             })
-            .child(
-                div()
-                    .w(px(24.0))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(sf_symbol(
-                        "arrow.triangle.2.circlepath",
-                        11.0,
-                        colors.secondary,
-                    )),
-            )
             .child(
                 div()
                     .min_w(px(0.0))
@@ -5659,7 +5576,7 @@ impl Sidebar {
                     div()
                         .flex_none()
                         .text_size(px(Typo::META.size))
-                        .text_color(colors.secondary)
+                        .text_color(colors.tertiary)
                         .child(action),
                 )
                 .on_click(cx.listener(move |this, _, _, cx: &mut Context<Self>| {
@@ -5680,19 +5597,12 @@ impl Sidebar {
          *
          * The shared FloatingSurface owns the entry timing. Rows never
          * animate independently: this is a frequent, keyboard-adjacent menu.
+         *
+         * Who is signed in, which login open tabs use, how much of each
+         * plan window is spent, Settings, and the version with its update
+         * action. Everything else lives in Settings or the command palette.
          * ───────────────────────────────────────────────────────── */
         let account_label = local_account_label(self.preview);
-        let context = if self.preview {
-            Some(crate::transcript::ContextUsage {
-                tokens: 17_800,
-                window: 258_400,
-            })
-        } else {
-            let store = self.store.read().expect("session store lock poisoned");
-            (store.selected_session_id() == self.account_context_session.as_ref())
-                .then_some(self.account_context)
-                .flatten()
-        };
         let limits = if self.preview {
             crate::usage::limits::preview()
         } else {
@@ -5700,97 +5610,6 @@ impl Sidebar {
                 .as_ref()
                 .map_or_else(Vec::new, |usage| usage.limits.clone())
         };
-        let mut usage = div().flex().flex_col().py(px(3.0)).child(
-            div()
-                .px(px(14.0))
-                .pt(px(3.0))
-                .pb(px(2.0))
-                .text_size(px(Typo::META.size))
-                .text_color(colors.tertiary)
-                .child("Usage cost · estimates included"),
-        );
-        if self.preview {
-            usage = usage
-                .child(usage_menu_row(
-                    "account-usage-session",
-                    "clock",
-                    "5h block",
-                    "estimated",
-                    "$2.31",
-                    colors,
-                ))
-                .child(usage_menu_row(
-                    "account-usage-today",
-                    "chart.bar.xaxis",
-                    "Today",
-                    "1.8M tokens",
-                    "$4.82",
-                    colors,
-                ))
-                .child(usage_menu_row(
-                    "account-usage-month",
-                    "calendar",
-                    "This month",
-                    "",
-                    "$86.40",
-                    colors,
-                ));
-        } else if let Some(snapshot) = &self.usage {
-            usage = usage
-                .child(usage_menu_row(
-                    "account-usage-session",
-                    "clock",
-                    "5h block",
-                    "estimated",
-                    &snapshot
-                        .session_cost
-                        .map(UsageFormat::money)
-                        .unwrap_or_else(|| "—".into()),
-                    colors,
-                ))
-                .child(usage_menu_row(
-                    "account-usage-today",
-                    "chart.bar.xaxis",
-                    "Today",
-                    &format!(
-                        "{} tokens",
-                        UsageFormat::tokens(snapshot.today().total_tokens())
-                    ),
-                    &UsageFormat::money(snapshot.today().cost),
-                    colors,
-                ))
-                .child(usage_menu_row(
-                    "account-usage-month",
-                    "calendar",
-                    "This month",
-                    "",
-                    &UsageFormat::money(snapshot.month().cost),
-                    colors,
-                ));
-        } else {
-            usage = usage.child(
-                div()
-                    .id("account-usage-measuring")
-                    .mx(px(6.0))
-                    .px(px(8.0))
-                    .h(px(30.0))
-                    .flex()
-                    .items_center()
-                    .gap(px(9.0))
-                    .text_size(px(Typo::ROW.size))
-                    .text_color(colors.tertiary)
-                    .child(
-                        div()
-                            .w(px(24.0))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(sf_symbol("chart.bar.xaxis", 11.0, colors.tertiary)),
-                    )
-                    .child("Measuring…"),
-            );
-        }
         let content = div()
             .id("account-menu")
             .debug_selector(|| "account-menu".into())
@@ -5802,168 +5621,50 @@ impl Sidebar {
                 div()
                     .mx(px(6.0))
                     .px(px(8.0))
-                    .h(px(40.0))
+                    .h(px(32.0))
                     .flex()
                     .items_center()
-                    .gap(px(9.0))
-                    .child(account_avatar(&account_label, 24.0, colors))
+                    .gap(px(8.0))
+                    .child(account_avatar(&account_label, 20.0, colors))
                     .child(
                         div()
                             .min_w(px(0.0))
                             .flex_1()
-                            .flex()
-                            .flex_col()
-                            .child(
-                                div()
-                                    .whitespace_nowrap()
-                                    .overflow_hidden()
-                                    .text_ellipsis()
-                                    .text_size(px(Typo::ROW.size))
-                                    .text_color(colors.primary)
-                                    .child(account_label),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(Typo::META.size))
-                                    .text_color(colors.tertiary)
-                                    .child("Local agents"),
-                            ),
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .text_size(px(Typo::ROW.size))
+                            .text_color(colors.primary)
+                            .child(account_label),
                     )
                     .child(
                         div()
-                            .px(px(5.0))
-                            .py(px(2.0))
-                            .rounded(px(Radius::CHIP))
-                            .bg(colors.primary.alpha(0.06))
+                            .flex_none()
                             .text_size(px(Typo::META.size))
-                            .text_color(colors.secondary)
+                            .text_color(colors.tertiary)
                             .child("This Mac"),
                     ),
             )
             .child(menu_divider(colors))
             .child(self.account_switch_menu(colors, cx))
             .child(menu_divider(colors))
-            .when_some(context, |menu, context| {
-                menu.child(account_context_menu(context, colors))
-                    .child(menu_divider(colors))
-            })
-            .child(account_limits_menu(&limits, colors, cx))
+            .child(account_limits_menu(&limits, colors))
             .child(menu_divider(colors))
-            .child(usage)
-            .child(menu_divider(colors))
-            .child(
-                div()
-                    .id("account-whats-new")
-                    .debug_selector(|| "account-whats-new".into())
-                    .mx(px(6.0))
-                    .px(px(8.0))
-                    .h(px(30.0))
-                    .flex()
-                    .items_center()
-                    .gap(px(9.0))
-                    .rounded(px(SIDEBAR_MENU_ROW_RADIUS))
-                    .cursor_pointer()
-                    .glass_menu_row(colors, false)
-                    .text_size(px(Typo::ROW.size))
-                    .text_color(colors.primary)
-                    .child(
-                        div()
-                            .w(px(24.0))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(sf_symbol("sparkles", 11.0, colors.secondary)),
-                    )
-                    .child(div().flex_1().child("What's New"))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.ui.popover = None;
-                        cx.emit(SidebarEvent::OpenWhatsNew);
-                        cx.notify();
-                    })),
-            )
-            .child(
-                div()
-                    .id("quick-add-remote-host")
-                    .debug_selector(|| "quick-add-remote-host".into())
-                    .mx(px(6.0))
-                    .px(px(8.0))
-                    .h(px(30.0))
-                    .flex()
-                    .items_center()
-                    .gap(px(9.0))
-                    .rounded(px(SIDEBAR_MENU_ROW_RADIUS))
-                    .cursor_pointer()
-                    .glass_menu_row(colors, false)
-                    .text_size(px(Typo::ROW.size))
-                    .text_color(colors.primary)
-                    .child(
-                        div()
-                            .w(px(24.0))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(sf_symbol("plus", 11.0, colors.secondary)),
-                    )
-                    .child(div().flex_1().child("Add remote host"))
-                    .child(
-                        div()
-                            .text_size(px(Typo::META.size))
-                            .text_color(colors.tertiary)
-                            .child("SSH"),
-                    )
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.ui.popover = None;
-                        cx.emit(SidebarEvent::AddRemoteHost);
-                        cx.notify();
-                    })),
-            )
-            .child(
-                div()
-                    .id("account-settings")
-                    .debug_selector(|| "account-settings".into())
-                    .mx(px(6.0))
-                    .px(px(8.0))
-                    .h(px(30.0))
-                    .flex()
-                    .items_center()
-                    .gap(px(9.0))
-                    .rounded(px(SIDEBAR_MENU_ROW_RADIUS))
-                    .cursor_pointer()
-                    .glass_menu_row(colors, false)
-                    .text_size(px(Typo::ROW.size))
-                    .text_color(colors.primary)
-                    .child(
-                        div()
-                            .w(px(24.0))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(sf_symbol("gearshape", 11.0, colors.secondary)),
-                    )
-                    .child(div().flex_1().child("Settings"))
-                    .child(
-                        div()
-                            .text_size(px(Typo::META.size))
-                            .text_color(colors.tertiary)
-                            .child(
-                                crate::commands::command(CommandId::OpenSettings)
-                                    .shortcut_label()
-                                    .unwrap_or_default(),
-                            ),
-                    )
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.ui.popover = None;
-                        this.in_main_window(window, cx, |_, window, cx| {
-                            window.dispatch_action(Box::new(OpenSettings), cx);
-                        });
-                        cx.notify();
-                    })),
-            )
+            .child(account_action_row(
+                "account-settings",
+                "Settings",
+                crate::commands::command(CommandId::OpenSettings).shortcut_label(),
+                colors,
+                cx.listener(|this, _, window, cx| {
+                    this.ui.popover = None;
+                    this.in_main_window(window, cx, |_, window, cx| {
+                        window.dispatch_action(Box::new(OpenSettings), cx);
+                    });
+                    cx.notify();
+                }),
+            ))
             .child(self.update_menu_row(colors, cx))
-            .child(div().h(px(6.0)));
+            .child(div().h(px(3.0)));
         self.popover_shell_above_footer(content, colors, cx)
     }
 
@@ -8557,278 +8258,213 @@ fn account_avatar(label: &str, size: f32, colors: SemanticColors) -> AnyElement 
         .into_any_element()
 }
 
-fn account_context_menu(
-    context: crate::transcript::ContextUsage,
+/// Height of the plain action rows at the bottom of the account menu.
+const ACCOUNT_MENU_ACTION_ROW_HEIGHT: f32 = 28.0;
+
+/// Height of the single-line stat rows in the account menu.
+const ACCOUNT_MENU_STAT_ROW_HEIGHT: f32 = 22.0;
+
+/// One meter per plan window, prefixed with its provider. Limits refresh
+/// when the menu opens, so there is no control here.
+fn account_limits_menu(
+    limits: &[crate::usage::limits::AccountLimits],
     colors: SemanticColors,
 ) -> AnyElement {
-    let percent = (context.tokens as f64 / context.window as f64 * 100.0).clamp(0.0, 100.0);
-    div()
-        .id("account-context-window")
-        .debug_selector(|| "account-context-window".into())
+    let now = crate::usage::Clock::read(&crate::usage::SystemClock).unix_seconds;
+    let mut section = div()
+        .id("account-plan-limits")
+        .debug_selector(|| "account-plan-limits".into())
         .flex_none()
-        .px(px(14.0))
-        .py(px(8.0))
         .flex()
         .flex_col()
-        .gap(px(5.0))
+        .py(px(3.0));
+    if limits.is_empty() {
+        section = section.child(menu_note("Checking provider limits…", colors));
+    }
+    for account in limits {
+        for (index, limit) in account.windows.iter().enumerate() {
+            let expired = limit.resets_at.is_some_and(|reset| reset <= now);
+            let stale = expired || account.error.is_some() || now - account.checked_at > 360;
+            let trailing = if stale {
+                "stale".to_owned()
+            } else {
+                match limit.resets_at {
+                    Some(reset) if reset > now => compact_reset(reset - now),
+                    _ => String::new(),
+                }
+            };
+            section = section.child(account_meter_row(
+                SharedString::from(format!(
+                    "account-limit-{}-{index}",
+                    account.provider.to_ascii_lowercase()
+                )),
+                format!("{} {}", account.provider, limit_window_label(&limit.label)),
+                limit.used_percent,
+                stale,
+                trailing,
+                colors,
+            ));
+        }
+        if let Some(error) = account.error {
+            section = section.child(menu_note(error, colors));
+        }
+    }
+    section.into_any_element()
+}
+
+/// One quiet line of status under an eyebrow: loading, stale, or an error.
+fn menu_note(text: impl Into<SharedString>, colors: SemanticColors) -> AnyElement {
+    div()
+        .px(px(14.0))
+        .py(px(3.0))
+        .text_size(px(Typo::META.size))
+        .text_color(colors.tertiary)
+        .child(text.into())
+        .into_any_element()
+}
+
+/// "5-hour limit" → "5-hour", "Weekly · Fable" → "weekly · Fable". The
+/// provider name in front already says what is being limited.
+fn limit_window_label(label: &str) -> String {
+    let label = label.strip_suffix(" limit").unwrap_or(label);
+    let mut chars = label.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_uppercase() => {
+            let mut short = first.to_ascii_lowercase().to_string();
+            short.push_str(chars.as_str());
+            short
+        }
+        _ => label.to_owned(),
+    }
+}
+
+/// Time until a limit window resets, narrow enough for a trailing column.
+fn compact_reset(seconds: i64) -> String {
+    if seconds >= 86_400 {
+        let days = seconds / 86_400;
+        let hours = seconds % 86_400 / 3_600;
+        if hours == 0 {
+            format!("{days}d")
+        } else {
+            format!("{days}d {hours}h")
+        }
+    } else {
+        compact_duration(seconds)
+    }
+}
+
+/// A label, a short meter, the percentage, and a trailing note on one line.
+fn account_meter_row(
+    id: SharedString,
+    label: String,
+    percent: f64,
+    stale: bool,
+    trailing: String,
+    colors: SemanticColors,
+) -> AnyElement {
+    let selector = id.clone();
+    div()
+        .id(id)
+        .debug_selector(move || selector.to_string())
+        .mx(px(6.0))
+        .px(px(8.0))
+        .h(px(ACCOUNT_MENU_STAT_ROW_HEIGHT))
+        .flex()
+        .items_center()
+        .gap(px(6.0))
         .child(
             div()
-                .flex()
-                .items_center()
-                .gap(px(6.0))
-                .child(
-                    div()
-                        .flex_1()
-                        .text_size(px(Typo::ROW.size))
-                        .text_color(colors.primary)
-                        .child("Context window"),
-                )
-                .child(
-                    div()
-                        .text_size(px(Typo::META.size))
-                        .text_color(colors.secondary)
-                        .child(format!("{percent:.0}%")),
-                ),
+                .min_w(px(0.0))
+                .flex_1()
+                .whitespace_nowrap()
+                .overflow_hidden()
+                .text_ellipsis()
+                .text_size(px(Typo::META.size))
+                .text_color(colors.secondary)
+                .child(label),
         )
         .child(
             div()
+                .flex_none()
+                .w(px(36.0))
                 .h(px(3.0))
-                .w_full()
                 .rounded_full()
                 .bg(colors.primary.alpha(0.09))
                 .child(
                     div()
                         .h_full()
-                        .w(gpui::relative(percent as f32 / 100.0))
+                        .w(gpui::relative((percent / 100.0).clamp(0.0, 1.0) as f32))
                         .rounded_full()
-                        .bg(Palette::GEMINI_BLUE),
+                        .bg(if stale {
+                            colors.tertiary
+                        } else {
+                            Palette::GEMINI_BLUE
+                        }),
                 ),
         )
         .child(
             div()
-                .text_size(px(10.0))
+                .flex_none()
+                .w(px(30.0))
+                .flex()
+                .justify_end()
+                .font_family(crate::fonts::mono_family())
+                .text_size(px(Typo::META_MONO.size))
+                .text_color(if stale {
+                    colors.tertiary
+                } else {
+                    colors.primary
+                })
+                .child(format!("{percent:.0}%")),
+        )
+        .child(
+            div()
+                .flex_none()
+                .w(px(60.0))
+                .flex()
+                .justify_end()
+                .whitespace_nowrap()
+                .overflow_hidden()
+                .text_size(px(Typo::META.size))
                 .text_color(colors.tertiary)
-                .child(format!(
-                    "{} / {} · selected session",
-                    UsageFormat::tokens(context.tokens),
-                    UsageFormat::tokens(context.window)
-                )),
+                .child(trailing),
         )
         .into_any_element()
 }
 
-/// Subscription quotas are provider facts, separate from cost estimates below.
-fn account_limits_menu(
-    limits: &[crate::usage::limits::AccountLimits],
-    colors: SemanticColors,
-    cx: &mut Context<Sidebar>,
-) -> AnyElement {
-    let now = crate::usage::Clock::read(&crate::usage::SystemClock).unix_seconds;
-    let mut content = div()
-        .id("account-plan-limits")
-        .debug_selector(|| "account-plan-limits".into())
-        .flex_none()
-        .px(px(14.0))
-        .py(px(8.0))
-        .flex()
-        .flex_col()
-        .gap(px(8.0))
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .child(
-                    div()
-                        .text_size(px(Typo::META.size))
-                        .text_color(colors.secondary)
-                        .child("Plan limits"),
-                )
-                .child(
-                    div()
-                        .id("account-refresh-limits")
-                        .cursor_pointer()
-                        .rounded(px(4.0))
-                        .p(px(2.0))
-                        .glass_menu_row(colors, false)
-                        .child(sf_symbol(
-                            "arrow.triangle.2.circlepath",
-                            11.0,
-                            colors.secondary,
-                        ))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            if !this.preview {
-                                cx.emit(SidebarEvent::RefreshUsageLimits);
-                            }
-                        })),
-                ),
-        );
-    if limits.is_empty() {
-        return content
-            .child(
-                div()
-                    .text_size(px(Typo::META.size))
-                    .text_color(colors.tertiary)
-                    .child("Checking provider limits…"),
-            )
-            .into_any_element();
-    }
-    for account in limits {
-        let mut provider = div().flex().flex_col().gap(px(7.0)).child(
-            div()
-                .text_size(px(Typo::META.size))
-                .text_color(colors.secondary)
-                .child(format!("{} · {}", account.provider, account.account)),
-        );
-        for limit in &account.windows {
-            let expired = limit.resets_at.is_some_and(|reset| reset <= now);
-            let stale = expired || account.error.is_some() || now - account.checked_at > 360;
-            let reset = match limit.resets_at {
-                Some(reset) if reset > now => {
-                    let seconds = reset - now;
-                    if seconds >= 86_400 {
-                        format!(
-                            "Resets in {}d {}h",
-                            seconds / 86_400,
-                            seconds % 86_400 / 3_600
-                        )
-                    } else {
-                        format!("Resets in {}", compact_duration(seconds))
-                    }
-                }
-                Some(_) => "Awaiting refresh".into(),
-                None => "Reset time unavailable".into(),
-            };
-            provider = provider.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(4.0))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(8.0))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .text_size(px(Typo::ROW.size))
-                                    .text_color(colors.primary)
-                                    .child(limit.label.clone()),
-                            )
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .text_size(px(Typo::META.size))
-                                    .text_color(colors.secondary)
-                                    .child(format!(
-                                        "{:.0}%{}",
-                                        limit.used_percent,
-                                        if stale { " · last" } else { "" }
-                                    )),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .h(px(3.0))
-                            .w_full()
-                            .rounded_full()
-                            .bg(colors.primary.alpha(0.09))
-                            .child(
-                                div()
-                                    .h_full()
-                                    .w(gpui::relative(limit.used_percent as f32 / 100.0))
-                                    .rounded_full()
-                                    .bg(if stale {
-                                        colors.tertiary
-                                    } else {
-                                        Palette::GEMINI_BLUE
-                                    }),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(10.0))
-                            .text_color(colors.tertiary)
-                            .child(reset),
-                    ),
-            );
-        }
-        if let Some(error) = account.error {
-            provider = provider.child(
-                div()
-                    .text_size(px(Typo::META.size))
-                    .text_color(colors.tertiary)
-                    .child(error),
-            );
-        }
-        content = content.child(provider);
-    }
-    content.into_any_element()
-}
-
-fn usage_menu_row(
+/// A plain menu action: label on the left, shortcut or hint on the right.
+fn account_action_row(
     id: &'static str,
-    icon: &'static str,
-    label: &str,
-    detail: &str,
-    value: &str,
+    label: &'static str,
+    trailing: Option<String>,
     colors: SemanticColors,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> AnyElement {
     div()
         .id(id)
         .debug_selector(move || id.into())
         .mx(px(6.0))
         .px(px(8.0))
-        .h(px(30.0))
+        .h(px(ACCOUNT_MENU_ACTION_ROW_HEIGHT))
         .flex()
         .items_center()
         .gap(px(8.0))
         .rounded(px(SIDEBAR_MENU_ROW_RADIUS))
-        .child(
-            div()
-                .w(px(24.0))
-                .flex_none()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(sf_symbol(icon, 11.0, colors.secondary)),
-        )
-        .child(
-            div()
-                .min_w(px(0.0))
-                .flex_1()
-                .flex()
-                .items_baseline()
-                .gap(px(6.0))
-                .child(
-                    div()
-                        .flex_none()
-                        .text_size(px(Typo::ROW.size))
-                        .text_color(colors.text(diri_ui::TextTone::Label))
-                        .child(label.to_owned()),
-                )
-                .when(!detail.is_empty(), |row| {
-                    row.child(
-                        div()
-                            .min_w(px(0.0))
-                            .whitespace_nowrap()
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .text_size(px(Typo::META.size))
-                            .text_color(colors.tertiary)
-                            .child(detail.to_owned()),
-                    )
-                }),
-        )
-        .child(
-            div()
-                .flex_none()
-                .font_family(crate::fonts::mono_family())
-                .text_size(px(Typo::META_MONO.size))
-                .text_color(colors.secondary)
-                .child(value.to_owned()),
-        )
+        .cursor_pointer()
+        .glass_menu_row(colors, false)
+        .text_size(px(Typo::ROW.size))
+        .text_color(colors.primary)
+        .child(div().min_w(px(0.0)).flex_1().child(label))
+        .when_some(trailing, |row, trailing| {
+            row.child(
+                div()
+                    .flex_none()
+                    .text_size(px(Typo::META.size))
+                    .text_color(colors.tertiary)
+                    .child(trailing),
+            )
+        })
+        .on_click(on_click)
         .into_any_element()
 }
 
@@ -9313,6 +8949,16 @@ mod tests {
         let result = clamp_path("/Users/preview/Projects/a/very/long/path/settings-kit");
         assert!(result.ends_with("/settings-kit"));
         assert!(result.contains('…'));
+    }
+
+    #[test]
+    fn limit_rows_use_short_labels_and_narrow_resets() {
+        assert_eq!(limit_window_label("5-hour limit"), "5-hour");
+        assert_eq!(limit_window_label("Weekly limit"), "weekly");
+        assert_eq!(limit_window_label("Weekly · Fable"), "weekly · Fable");
+        assert_eq!(compact_reset(8_040), "2h 14m");
+        assert_eq!(compact_reset(172_800), "2d");
+        assert_eq!(compact_reset(6 * 86_400 + 16 * 3_600 + 120), "6d 16h");
     }
 
     #[test]
@@ -10734,13 +10380,7 @@ mod tests {
         assert!(cx.debug_bounds("account-switcher").is_some());
         assert!(cx.debug_bounds("switch-account-preview-1").is_some());
         assert!(cx.debug_bounds("manage-accounts").is_some());
-        assert!(cx.debug_bounds("account-context-window").is_some());
         assert!(cx.debug_bounds("account-plan-limits").is_some());
-        assert!(cx.debug_bounds("account-usage-session").is_some());
-        assert!(cx.debug_bounds("account-usage-today").is_some());
-        assert!(cx.debug_bounds("account-usage-month").is_some());
-        assert!(cx.debug_bounds("account-whats-new").is_some());
-        assert!(cx.debug_bounds("quick-add-remote-host").is_some());
         assert!(cx.debug_bounds("account-settings").is_some());
         let target = cx.debug_bounds("switch-account-preview-1").unwrap();
         cx.simulate_click(target.center(), Modifiers::default());
