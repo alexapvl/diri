@@ -310,7 +310,8 @@ struct FindHighlights {
     current_bounds: Option<Bounds<Pixels>>,
 }
 
-/// Shaped lines for history rows, keyed by absolute row and content-addressed
+/// Shaped lines for every row of a reading view (history and the held live
+/// rows under it), keyed by absolute row and content-addressed
 /// by a digest of the row's cells and combining text, so shaping survives across scrolled frames
 /// instead of being redone per frame.
 ///
@@ -456,7 +457,9 @@ pub struct TerminalPrepaintState {
     background_quads: Vec<PaintQuad>,
     decoration_quads: Vec<PaintQuad>,
     overlay_quads: Vec<PaintQuad>,
-    lines: Vec<(u16, ShapedLine)>,
+    /// Reading path: window row and the absolute row whose shape paint reads
+    /// from the history cache, as the live path reads the row cache.
+    lines: Vec<(u16, i64)>,
     metrics: Option<CellMetrics>,
     cursor: Option<CursorPaint>,
     cache_hits: u64,
@@ -1034,11 +1037,40 @@ impl TerminalElement {
         }
     }
 
+    /// How many leading cells of `row` reach the shaper.
+    ///
+    /// Blanks paint no glyph, yet each one was shaped, stored and looked up in
+    /// the glyph cache on every paint, and most rows are mostly trailing
+    /// blanks. Their backgrounds and decorations are quads built from the
+    /// cells, not from this text. Glyphs are positioned left to right from the
+    /// ones before them, so dropping the tail cannot move what remains; one
+    /// blank is kept so the last glyph still shapes as followed by a space.
+    /// A row with right-to-left text is positioned from the whole line and is
+    /// shaped whole.
+    fn shaped_cells(&self, row: &[GridCell], graphemes: &[(u16, String)]) -> usize {
+        let reorders = row.iter().any(|cell| is_bidi_sensitive(cell.scalar))
+            || graphemes
+                .iter()
+                .any(|(_, text)| text.chars().any(|ch| is_bidi_sensitive(u32::from(ch))));
+        if reorders {
+            return row.len();
+        }
+        let last_glyph = row.iter().enumerate().rposition(|(column, cell)| {
+            let visible = self.theme.resolve_cell(*cell).visible;
+            render_char(*cell, visible) != ' '
+                || (visible
+                    && cell.scalar != 0
+                    && graphemes.iter().any(|(col, _)| usize::from(*col) == column))
+        });
+        last_glyph.map_or(1, |last| last + 2).min(row.len())
+    }
+
     fn row_text_and_runs(
         &self,
         row: &[GridCell],
         graphemes: &[(u16, String)],
     ) -> (String, Vec<TextRun>) {
+        let row = &row[..self.shaped_cells(row, graphemes)];
         let mut text = String::with_capacity(row.len());
         let mut runs = Vec::<TextRun>::new();
 
@@ -1289,9 +1321,10 @@ impl Element for TerminalElement {
             let mut history = mutex_lock(&self.shared.history_lines);
             history.validate(key, viewport.absolute_row(0));
             let mut hits = 0u64;
+            let mut cells = Vec::with_capacity(usize::from(grid_cols));
             for row_index in 0..visible_rows {
                 let absolute = viewport.absolute_row(row_index);
-                let mut cells = viewport.window_row(&buffer, row_index);
+                viewport.window_row_into(&buffer, row_index, &mut cells);
                 cells.truncate(visible_cols);
                 append_row_quads(
                     &cells,
@@ -1302,26 +1335,21 @@ impl Element for TerminalElement {
                     &mut background_quads,
                     &mut decoration_quads,
                 );
-                let is_history = absolute < viewport.live_start_row();
                 let graphemes = viewport.row_graphemes(&buffer, absolute);
                 let digest = digest_row(&cells, graphemes);
-                let line = if let Some(line) =
-                    is_history.then(|| history.get(absolute, digest)).flatten()
-                {
+                if history.get(absolute, digest).is_some() {
                     hits += 1;
-                    line.clone()
                 } else {
-                    let line = self.shape_row(&cells, graphemes, metrics, window);
                     // A row the viewport has not fetched yet composes as
                     // blank. Caching it is safe now that entries are content
                     // addressed: the blank's digest stops matching the moment
-                    // the fetch lands.
-                    if is_history {
-                        history.insert(absolute, digest, line.clone());
-                    }
-                    line
-                };
-                lines.push((row_index as u16, line));
+                    // the fetch lands. The same holds for the held live rows
+                    // under the history, which used to be reshaped and copied
+                    // every frame.
+                    let line = self.shape_row(&cells, graphemes, metrics, window);
+                    history.insert(absolute, digest, line);
+                }
+                lines.push((row_index as u16, absolute));
             }
             cache_hits = hits;
             cache_misses = (visible_rows as u64).saturating_sub(hits);
@@ -1602,10 +1630,6 @@ impl Element for TerminalElement {
         };
 
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
-            for quad in prepaint.background_quads.drain(..) {
-                window.paint_quad(quad);
-            }
-
             // Live path: rows come straight from the shared cache. Quads are
             // plain structs (a stack copy each) and `ShapedLine::paint` takes
             // a reference, so nothing per-row is heap-cloned per frame.
@@ -1613,17 +1637,32 @@ impl Element for TerminalElement {
                 .paint_from_cache
                 .then(|| mutex_lock(&self.shared.row_cache));
 
-            if let Some(cache) = &cache {
-                for prepared in cache.iter().flatten() {
-                    for quad in &prepared.background_quads {
-                        window.paint_quad(quad.clone());
+            // Outside a layer every quad is inserted into the scene's bounds
+            // tree to be given its own draw order; a row of block elements
+            // pays that per cell. A layer gives its contents one order, and
+            // the scene's stable sort keeps quads of equal order in insertion
+            // order, which is the order overlapping quads already had. Each
+            // layer spans the terminal, so the passes stack as they did:
+            // backgrounds, overlays, text, decorations, cursor.
+            //
+            // Glyphs stay outside: sprites of equal order are drawn sorted by
+            // atlas tile, which reorders overlapping ink, and measured no
+            // faster than per-glyph ordering.
+            window.paint_layer(bounds, |window| {
+                for quad in prepaint.background_quads.drain(..) {
+                    window.paint_quad(quad);
+                }
+                if let Some(cache) = &cache {
+                    for prepared in cache.iter().flatten() {
+                        for quad in &prepared.background_quads {
+                            window.paint_quad(quad.clone());
+                        }
                     }
                 }
-            }
-
-            for quad in prepaint.overlay_quads.drain(..) {
-                window.paint_quad(quad);
-            }
+                for quad in prepaint.overlay_quads.drain(..) {
+                    window.paint_quad(quad);
+                }
+            });
 
             if let Some(cache) = &cache {
                 for (row_index, prepared) in cache.iter().enumerate() {
@@ -1656,14 +1695,25 @@ impl Element for TerminalElement {
                         );
                     }
                 }
-                for prepared in cache.iter().flatten() {
-                    for quad in &prepared.decoration_quads {
-                        window.paint_quad(quad.clone());
+                window.paint_layer(bounds, |window| {
+                    for prepared in cache.iter().flatten() {
+                        for quad in &prepared.decoration_quads {
+                            window.paint_quad(quad.clone());
+                        }
                     }
-                }
+                });
             }
 
-            for (row, line) in &prepaint.lines {
+            // Reading path: shapes stay in the history cache, which only
+            // prepaint evicts, so a frame copies no `ShapedLine` (about 3 KB
+            // each, inline).
+            let history =
+                (!prepaint.lines.is_empty()).then(|| mutex_lock(&self.shared.history_lines));
+            let lines = prepaint.lines.iter().filter_map(|(row, absolute)| {
+                let (_, line) = history.as_ref()?.lines.get(absolute)?;
+                Some((row, line))
+            });
+            for (row, line) in lines {
                 let origin = point(bounds.left(), bounds.top() + metrics.y_for_row(*row));
                 if prepaint
                     .cursor
@@ -1684,9 +1734,11 @@ impl Element for TerminalElement {
                 }
             }
 
-            for quad in prepaint.decoration_quads.drain(..) {
-                window.paint_quad(quad);
-            }
+            window.paint_layer(bounds, |window| {
+                for quad in prepaint.decoration_quads.drain(..) {
+                    window.paint_quad(quad);
+                }
+            });
 
             if let Some(cursor) = prepaint.cursor.take() {
                 window.paint_quad(cursor.quad);
@@ -1803,16 +1855,42 @@ fn append_row_quads(
     append_background_quads(row, row_index, origin, metrics, theme, background_quads);
     // Keep blocks in the foreground layer, above selection/search backgrounds
     // and below the cursor. The same path serves cached live rows and history.
-    for (col, cell) in row.iter().enumerate() {
-        if let Some(block) = BlockGlyph::from_scalar(cell.scalar) {
-            let style = theme.resolve_cell(*cell);
-            if style.visible {
-                decoration_quads.extend(
-                    block
-                        .rectangles(origin, metrics, col, row_index)
-                        .map(|bounds| fill(bounds, style.foreground)),
-                );
+    let mut col = 0;
+    while col < row.len() {
+        let cell = row[col];
+        let start = col;
+        col += 1;
+        let Some(block) = BlockGlyph::from_scalar(cell.scalar) else {
+            continue;
+        };
+        let style = theme.resolve_cell(cell);
+        if !style.visible {
+            continue;
+        }
+        let mut rectangles = block.rectangles(origin, metrics, start, row_index);
+        if block.spans_cell_width()
+            && let Some(mut bar) = rectangles.next()
+        {
+            // A progress bar is one block repeated; paint the run as one quad
+            // for as long as that is provably the same pixels.
+            let continues = |next: &GridCell| {
+                let next_style = theme.resolve_cell(*next);
+                next.scalar == cell.scalar
+                    && next_style.visible
+                    && next_style.foreground == style.foreground
+            };
+            while row.get(col).is_some_and(continues)
+                && let Some(joined) = block
+                    .rectangles(origin, metrics, col, row_index)
+                    .next()
+                    .and_then(|bounds| crate::blocks::join_horizontally(bar, bounds))
+            {
+                bar = joined;
+                col += 1;
             }
+            decoration_quads.push(fill(bar, style.foreground));
+        } else {
+            decoration_quads.extend(rectangles.map(|bounds| fill(bounds, style.foreground)));
         }
     }
     append_decoration_quads(row, row_index, origin, metrics, theme, decoration_quads);
@@ -1953,6 +2031,22 @@ fn styled_font(base: &Font, style: ResolvedCellStyle) -> Font {
     } else {
         base.clone()
     }
+}
+
+/// Strong right-to-left scalars and explicit bidi controls: the presence of
+/// one makes glyph order and position a property of the entire line.
+fn is_bidi_sensitive(scalar: u32) -> bool {
+    matches!(
+        scalar,
+        0x0590..=0x08FF
+            | 0x200F
+            | 0x202A..=0x202E
+            | 0x2066..=0x2069
+            | 0xFB1D..=0xFDFF
+            | 0xFE70..=0xFEFF
+            | 0x10800..=0x10FFF
+            | 0x1E800..=0x1EFFF
+    )
 }
 
 fn render_char(cell: GridCell, visible: bool) -> char {
@@ -2262,6 +2356,44 @@ mod block_tests {
                 "the block must reserve one text column without painting a second glyph"
             );
         }
+    }
+
+    #[test]
+    fn a_bar_of_one_block_in_one_colour_is_one_quad() {
+        let metrics =
+            CellMetrics::from_measurements(px(8.5), px(12.0), px(5.0), px(0.0), FontId(0));
+        fn bar(text: &str, color: u8) -> impl Iterator<Item = GridCell> + '_ {
+            text.chars().map(move |ch| {
+                GridCell::new(
+                    ch as u32,
+                    TermColor::Ansi(color),
+                    TermColor::DefaultInverted,
+                    TermStyle::empty(),
+                )
+            })
+        }
+        let row: Vec<_> = bar("████", 2)
+            .chain(bar("██", 1))
+            .chain(bar("▄▄▀", 1))
+            .chain(bar("▌▌", 1))
+            .collect();
+        let mut backgrounds = Vec::new();
+        let mut foregrounds = Vec::new();
+        append_row_quads(
+            &row,
+            0,
+            point(px(0.0), px(0.0)),
+            metrics,
+            TermTheme::DIRIJOR_DARK,
+            &mut backgrounds,
+            &mut foregrounds,
+        );
+        let widths: Vec<_> = foregrounds
+            .iter()
+            .map(|quad| f32::from(quad.bounds.size.width) / 8.5)
+            .collect();
+        // Colour, glyph, and partial-width blocks each end a run.
+        assert_eq!(widths, [4.0, 2.0, 2.0, 1.0, 0.5, 0.5]);
     }
 
     #[test]
@@ -3240,6 +3372,30 @@ mod grapheme_paint_tests {
             terminal.row_text_and_runs(grid.row(0).unwrap(), &grid.annotations[0].graphemes);
         assert!(!hidden.contains('\u{301}'));
         assert!(hidden.starts_with(' '));
+    }
+
+    #[test]
+    fn trailing_blanks_are_not_shaped_unless_the_line_reorders() {
+        let shaped = |text: &str, graphemes: &[(u16, String)]| {
+            let mut row: Vec<_> = text
+                .chars()
+                .map(|ch| GridCell {
+                    scalar: u32::from(ch),
+                    ..GridCell::BLANK
+                })
+                .collect();
+            row.resize(12, GridCell::BLANK);
+            TerminalElement::with_buffer(GridBuffer::default())
+                .row_text_and_runs(&row, graphemes)
+                .0
+        };
+        assert_eq!(shaped("ab  c", &[]), "ab  c ");
+        assert_eq!(shaped("", &[]), " ");
+        assert_eq!(shaped("full  width!", &[]), "full  width!");
+        // Block elements are quads; a mark on a blank cell is still a glyph.
+        assert_eq!(shaped("a█", &[]), "a ");
+        assert_eq!(shaped("a", &[(3, "\u{301}".into())]), "a   \u{301} ");
+        assert_eq!(shaped("שלום", &[]).chars().count(), 12);
     }
 
     #[test]
