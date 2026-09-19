@@ -530,9 +530,35 @@ impl WorkbenchInspector {
             self.ask_draft = None;
             self.ask_feedback = None;
             self.ask_query.clear();
+            self.release_hidden_state();
         }
         self.reconcile_diff_polling(cx);
         cx.notify();
+    }
+
+    /// A hidden panel paints none of this, and the diff and transcript are
+    /// its largest allocations. Becoming visible forces a full refresh, so
+    /// holding them only kept megabytes alive for a closed panel.
+    fn release_hidden_state(&mut self) {
+        self.refresh_task = None;
+        self.review_task = None;
+        self.transcript_task = None;
+        self.loading = false;
+        // Row indices and the transcript version describe the dropped
+        // snapshots; a kept version would turn the reload into a no-op.
+        self.diff_selection.clear();
+        self.selected_turn = None;
+        self.transcript_version = None;
+        self.state = LoadState::NoSession;
+        self.review_state = ReviewLoadState::NoSession;
+        self.transcript_state = TranscriptLoadState::Unavailable;
+        self.markdown_cache = HashMap::new();
+    }
+
+    /// The transcript is only painted by Details → Info.
+    fn transcript_showing(&self) -> bool {
+        self.workspace_selected == Some(WorkspaceSurface::Details)
+            && self.selected_tab == InspectorTab::Info
     }
 
     pub fn set_terminal_surface(
@@ -807,8 +833,11 @@ impl WorkbenchInspector {
         } else {
             // Info and Artifacts are projections of the live session record,
             // so same-session store changes repaint and schedule one bounded
-            // transcript mtime check without installing an idle poll.
-            if let Some(context) = self.context.clone() {
+            // transcript mtime check without installing an idle poll. Other
+            // tabs skip it: activating Info performs its own version check.
+            if self.transcript_showing()
+                && let Some(context) = self.context.clone()
+            {
                 self.refresh_transcript(&context, true, cx);
             }
             cx.notify();
@@ -834,9 +863,15 @@ impl WorkbenchInspector {
         {
             let store = self.runtime.store.read().expect("store");
             self.session_workspaces.retain(|id, workspace| {
-                let keep = id
-                    .as_ref()
-                    .is_none_or(|id| store.sessions().contains_key(id));
+                // Archived records stay in the store, so membership alone
+                // would keep their viewers, indexes and web pages for good.
+                // Unarchiving starts from a fresh workspace.
+                let keep = id.as_ref().is_none_or(|id| {
+                    store
+                        .sessions()
+                        .get(id)
+                        .is_some_and(|session| !session.is_archived())
+                });
                 if !keep {
                     #[cfg(target_os = "macos")]
                     if let Some(browser) = &self.native_browser {
@@ -6733,6 +6768,59 @@ mod tests {
     }
 
     #[gpui::test]
+    fn archiving_a_session_releases_its_hidden_workspace(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+        let sessions = fixture.list.sessions.clone();
+        let ids: Vec<_> = sessions.iter().map(|s| s.id.clone()).collect();
+        {
+            let mut store = runtime.store.write().unwrap();
+            store.hydrate(fixture.list);
+            store.select(ids[0].clone());
+        }
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let inspector = cx.new(|cx| WorkbenchInspector::new(runtime.clone(), tokio, cx));
+        inspector.update(cx, |i, cx| {
+            i.refresh_if_context_changed(cx);
+            i.add_workspace(WorkspaceSurface::Browser, cx);
+        });
+        runtime.store.write().unwrap().select(ids[1].clone());
+        inspector.update(cx, |i, cx| {
+            i.refresh_if_context_changed(cx);
+            assert!(i.session_workspaces.contains_key(&Some(ids[0].clone())));
+        });
+        let mut archived = sessions[0].clone();
+        archived.archived_at = Some(DateMillis(1.0));
+        runtime.store.write().unwrap().upsert_session(archived);
+        inspector.update(cx, |i, cx| {
+            i.sync_workspace_session(cx);
+            assert!(
+                !i.session_workspaces.contains_key(&Some(ids[0].clone())),
+                "an archived session keeps no hidden tabs"
+            );
+        });
+        // Unarchived and reselected, it starts from the default workspace.
+        let mut restored = sessions[0].clone();
+        restored.archived_at = None;
+        {
+            let mut store = runtime.store.write().unwrap();
+            store.upsert_session(restored);
+            store.select(ids[0].clone());
+        }
+        inspector.update(cx, |i, cx| {
+            i.refresh_if_context_changed(cx);
+            assert_eq!(i.workspace_session, Some(ids[0].clone()));
+            assert_eq!(i.workspace_tabs.len(), 1);
+            assert_eq!(i.workspace_tabs[0].surface, WorkspaceSurface::Details);
+        });
+    }
+
+    #[gpui::test]
     fn active_tab_and_close_control_remain_visible_in_narrow_sidebar(cx: &mut TestAppContext) {
         let (inspector, cx) = cx.add_window_view(|_, cx| {
             let runtime = Arc::new(StoreRuntime::inert());
@@ -7241,6 +7329,38 @@ mod tests {
         });
         assert_eq!(appended_turns.len(), 2);
         assert_eq!(appended_turns[1].text, "The appended turn is visible");
+
+        // Off Info, a same-session store change arms no transcript read.
+        inspector.update(cx, |inspector, cx| {
+            inspector.selected_tab = InspectorTab::Artifacts;
+            let generation = inspector.transcript_generation;
+            inspector.refresh_if_context_changed(cx);
+            assert_eq!(inspector.transcript_generation, generation);
+            inspector.selected_tab = InspectorTab::Info;
+        });
+
+        // Hiding releases the loaded documents; the next load is a full
+        // read rather than a version no-op against the dropped snapshot.
+        inspector.update(cx, |inspector, cx| {
+            inspector.set_visible(false, cx);
+            assert!(matches!(inspector.state, LoadState::NoSession));
+            assert!(matches!(
+                inspector.transcript_state,
+                TranscriptLoadState::Unavailable
+            ));
+            assert!(inspector.transcript_version.is_none());
+            assert!(inspector.markdown_cache.is_empty());
+            let context = inspector.selected_context().expect("selected context");
+            inspector.visible = true;
+            inspector.refresh_transcript(&context, false, cx);
+        });
+        cx.run_until_parked();
+        inspector.read_with(cx, |inspector, _| {
+            let TranscriptLoadState::Ready(document) = &inspector.transcript_state else {
+                panic!("transcript did not reload after the panel was shown again");
+            };
+            assert_eq!(document.turns.len(), 2);
+        });
 
         inspector.update(cx, |inspector, _| {
             inspector.refresh_task = None;
