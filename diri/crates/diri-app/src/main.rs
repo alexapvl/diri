@@ -407,6 +407,8 @@ fn main() {
         diri_ui::set_mark_rasterizer(macos::brand_raster::raster_mark);
         #[cfg(target_os = "macos")]
         macos::observe_scroller_style(cx);
+        #[cfg(target_os = "macos")]
+        macos::observe_reduce_motion(cx);
         let shortcut_overrides = services
             .store
             .store
