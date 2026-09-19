@@ -3163,7 +3163,7 @@ impl TerminalPane {
             .element
             .clone()
             .theme(theme)
-            // The surface around the grid paints the work-surface tint, so
+            // The surface around the grid paints the terminal tint, so
             // the grid only adds its own fill on an opaque window.
             .background_opacity(match colors.material() {
                 diri_ui::Material::Opaque => 1.0,
@@ -3732,7 +3732,7 @@ impl Render for TerminalPane {
                 .overflow_hidden()
                 .border_l_1()
                 .border_color(sidebar_colors.primary.alpha(0.08))
-                .bg(colors.work_surface())
+                .bg(colors.terminal_surface())
                 .when(!self.header_hidden, |pane| {
                     pane.child(self.render_header(&session, sidebar_colors, cx))
                 });
@@ -3769,7 +3769,7 @@ impl Render for TerminalPane {
                 .h_full()
                 .flex()
                 .flex_col()
-                .bg(colors.work_surface())
+                .bg(colors.terminal_surface())
                 .when_some(sidebar_reveal, |pane, control| {
                     pane.child(
                         div()
