@@ -8,6 +8,7 @@ pub mod cursor_focus;
 pub mod cursor_motion;
 pub mod element;
 pub mod find;
+pub mod identity_hue;
 pub mod keys;
 pub mod metrics;
 pub mod scroll_glide;
