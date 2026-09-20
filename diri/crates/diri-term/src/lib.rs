@@ -16,5 +16,6 @@ pub mod selection;
 mod selection_shape;
 pub mod selection_shimmer;
 pub mod smooth_scroll;
+mod sprites;
 pub mod theme;
 pub mod tints;
