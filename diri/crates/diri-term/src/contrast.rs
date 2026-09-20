@@ -113,14 +113,18 @@ pub(crate) fn painted_foreground(
             set[..=way].rotate_right(1);
             return set[0].map_or(foreground, |(_, color)| color);
         }
-        let mut color = if dim {
+        // What the cell paints when nothing corrects it: SGR faint already
+        // faded. A theme fading toward light blends from here.
+        let authored = if dim {
             faint::faded(theme, foreground, background)
         } else {
             foreground
         };
+        let mut color = authored;
         if own {
             let on_paper = !inverse && is_default(cell.bg);
-            color = correct(theme, color, background, on_paper, dim);
+            let corrected = correct(theme, authored, background, on_paper, dim);
+            color = phased_in(theme, authored, corrected);
         }
         set.rotate_right(1);
         set[0] = Some((key, color));
@@ -128,6 +132,34 @@ pub(crate) fn painted_foreground(
     });
     LAST.set(Some((key, color)));
     color
+}
+
+/// Paper lightness, in Oklab, below which a light theme corrects nothing and
+/// at which it corrects in full. Below the lower bound white still reads on
+/// the paper, so the solver may answer on either side of it and its answer
+/// can swap sides from one frame to the next; above it every answer is darker
+/// than the paper and moves continuously. Every catalog light theme sits far
+/// above the upper bound and is unaffected.
+const PHASE_IN_FROM: f32 = 0.65;
+const PHASE_IN_FULL: f32 = 0.85;
+
+/// A theme fading between dark and light is light for the whole fade (see
+/// `TermTheme::mix`) while its paper is anywhere in between. Correction
+/// arrives with the paper's lightness instead of with the flag, so the dark
+/// end of a fade paints exactly what the dark theme paints and nothing pops
+/// on the first or last frame. Only a cache miss pays for this.
+#[cold]
+#[inline(never)]
+fn phased_in(theme: &TermTheme, authored: Rgba, corrected: Rgba) -> Rgba {
+    let paper = oklch(linear(theme.background)).lightness;
+    if paper >= PHASE_IN_FULL {
+        return corrected;
+    }
+    crate::crossfade::mix_color(
+        authored,
+        corrected,
+        ramp(paper, PHASE_IN_FROM, PHASE_IN_FULL),
+    )
 }
 
 pub(crate) fn contrast_ratio(left: Rgba, right: Rgba) -> f32 {
@@ -182,9 +214,12 @@ thread_local! {
 
 /// Identifies everything in a theme the solver reads, cheaply enough to
 /// compute per cell. Catalog themes are distinguished by their static id;
-/// the default colors guard a theme value rebuilt under the same id.
+/// the default colors guard a theme value rebuilt under the same id. A theme
+/// fading into another keeps one id while its palette moves every frame, and
+/// two frames can share default colors, so `TermTheme::mix` stamps each
+/// palette it produces and the stamp stands in for the accents here.
 fn theme_key(theme: &TermTheme) -> u64 {
-    let mut key = theme.id.as_ptr() as u64;
+    let mut key = theme.id.as_ptr() as u64 ^ theme.blend;
     for color in [theme.background, theme.foreground] {
         for channel in [color.r, color.g, color.b] {
             key = key.rotate_left(11) ^ u64::from(channel.to_bits());
@@ -792,6 +827,31 @@ mod tests {
                 assert_eq!(theme.resolve_cell(probe).foreground, fresh, "{}", theme.id);
             }
         }
+    }
+
+    #[test]
+    fn a_theme_in_transit_never_answers_from_another_palette() {
+        // Two frames of one fade: the same id and, because the endpoints
+        // agree on them, the same default colors, under different accents.
+        let to = TermTheme::DIRIJOR_LIGHT;
+        let mut from = to;
+        from.ansi[3] = to.ansi[5];
+        let (early, late) = (from.mix(&to, 0.2), from.mix(&to, 0.8));
+        assert_eq!(
+            (early.id, early.background, early.foreground),
+            (late.id, late.background, late.foreground)
+        );
+        assert_ne!(theme_key(&early), theme_key(&late));
+
+        // A saturated yellow travels far enough to be pulled onto the accent.
+        let yellow = cell(
+            TermColor::Rgb(255, 255, 0),
+            TermColor::Default,
+            TermStyle::empty(),
+        );
+        let first = early.resolve_cell(yellow).foreground;
+        assert_ne!(late.resolve_cell(yellow).foreground, first);
+        assert_eq!(early.resolve_cell(yellow).foreground, first);
     }
 
     #[test]
