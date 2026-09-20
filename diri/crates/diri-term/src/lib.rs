@@ -13,3 +13,4 @@ mod selection_shape;
 pub mod selection_shimmer;
 pub mod smooth_scroll;
 pub mod theme;
+pub mod tints;
