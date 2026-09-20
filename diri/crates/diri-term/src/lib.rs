@@ -10,6 +10,7 @@ pub mod element;
 pub mod find;
 pub mod keys;
 pub mod metrics;
+pub mod scroll_glide;
 pub mod scrollback;
 pub mod selection;
 mod selection_shape;
