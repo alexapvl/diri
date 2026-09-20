@@ -2278,15 +2278,17 @@ impl Sidebar {
             .into_any_element()
     }
 
+    /// A sidebar with nothing in it says so and nothing more, the way Finder
+    /// and Mail do. The main pane beside it carries the explanation and the
+    /// button; an icon, a slogan and a stray shortcut here only competed with
+    /// it. The whole area still accepts a dropped folder.
     fn empty_state(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
         div()
             .id("sidebar-empty-state")
             .flex_1()
             .flex()
-            .flex_col()
             .items_center()
             .justify_center()
-            .gap(px(12.0))
             .rounded(px(Radius::PANEL))
             .drag_over::<ExternalPaths>(move |element, paths, _, _| {
                 if Self::can_accept_external_drop(paths, ExternalDropTarget::EmptySpace) {
@@ -2302,49 +2304,11 @@ impl Sidebar {
                 cx.stop_propagation();
                 this.external_drop(paths, ExternalDropTarget::EmptySpace, cx);
             }))
-            .child(sf_symbol("square.stack.3d.up", 28.0, colors.tertiary))
             .child(
                 div()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .gap(px(3.0))
-                    .child(
-                        div()
-                            .text_size(px(Typo::ROW_EMPHASIZED.size))
-                            .font_weight(Typo::ROW_EMPHASIZED.weight)
-                            .text_color(colors.secondary)
-                            .child("Your sessions live here"),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(Typo::META.size))
-                            .text_color(colors.tertiary)
-                            .child(
-                                crate::commands::command(CommandId::OpenLauncher)
-                                    .shortcut_label()
-                                    .unwrap_or_default(),
-                            ),
-                    ),
-            )
-            .child(
-                div()
-                    .id("empty-new-agent")
-                    .px(px(10.0))
-                    .h(px(SIDEBAR_NAV_ROW_HEIGHT))
-                    .flex()
-                    .items_center()
-                    .rounded(px(SIDEBAR_ROW_RADIUS))
                     .text_size(px(Typo::ROW.size))
-                    .text_color(colors.secondary)
-                    .cursor_pointer()
-                    .hover(move |element| element.bg(colors.primary.alpha(0.06)))
-                    .on_click(|_, window, cx| {
-                        window.dispatch_action(Box::new(crate::commands::OpenLauncher), cx);
-                    })
-                    .gap(px(7.0))
-                    .child(sf_symbol("square.and.pencil", 13.0, colors.secondary))
-                    .child("Start a session"),
+                    .text_color(colors.tertiary)
+                    .child("No Sessions"),
             )
             .into_any_element()
     }
@@ -9133,6 +9097,7 @@ mod tests {
                             url: Some("https://opencode.ai/docs".into()),
                             install_hint: Some("Install OpenCode.".into()),
                             sign_in_hint: Some("Run /connect.".into()),
+                            ..diri_proto::AgentSetup::default()
                         }),
                         ..diri_proto::AgentDescriptor::default()
                     }),

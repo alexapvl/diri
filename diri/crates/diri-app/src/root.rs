@@ -4562,6 +4562,11 @@ impl Render for RootView {
                     });
                 }
             }))
+            .on_action(cx.listener(|this, _: &commands::ShowAgentSettings, _, cx| {
+                if let Some(surfaces) = &this.utility_surfaces {
+                    surfaces.update(cx, |surfaces, cx| surfaces.open_agent_settings(None, cx));
+                }
+            }))
             .on_action(cx.listener(|this, _: &ToggleSidebar, window, cx| {
                 this.run_command(CommandId::ToggleSidebar, window, cx);
             }))
@@ -8035,6 +8040,70 @@ mod tests {
                     .unwrap();
                 cx.run_until_parked();
             }
+            cx.capture_screenshot(window.into())
+                .unwrap()
+                .save(std::path::Path::new(&output).join(format!("{name}.png")))
+                .unwrap();
+            cx.update_window(window.into(), |_, window, _| window.remove_window())
+                .unwrap();
+            cx.run_until_parked();
+        }
+    }
+
+    /// The first-run and resting pages inside the real window, so they are
+    /// judged beside the sidebar and title bar they ship with.
+    /// `DIRI_FIRST_RUN_SCREENSHOTS=<dir>`; `DIRI_VISUAL_BACKDROP=62616e` paints
+    /// a fake desktop behind the window's translucent surfaces.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes first-run window previews to DIRI_FIRST_RUN_SCREENSHOTS"]
+    fn render_first_run_window_screenshots() {
+        use gpui::{AppContext as _, HeadlessAppContext};
+        let output =
+            std::env::var("DIRI_FIRST_RUN_SCREENSHOTS").expect("DIRI_FIRST_RUN_SCREENSHOTS");
+        std::fs::create_dir_all(&output).unwrap();
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(diri_ui::IconAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.update(|cx| {
+            crate::fonts::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let ready: &[&str] = &["claude-code", "codex"];
+        for (name, installed, sessions, light) in [
+            ("no-agents-dark", &[][..], false, false),
+            ("ready-dark", ready, false, false),
+            ("ready-light", ready, false, true),
+            ("resting-dark", ready, true, false),
+        ] {
+            let services = test_services();
+            {
+                let mut store = services.store.store.write().unwrap();
+                if sessions {
+                    store.hydrate(SidebarPreviewFixture::make(PreviewScenario::Typical).list);
+                }
+                store.set_agent_catalog(crate::agent_setup::bundled_catalog(installed));
+                store
+                    .update_preferences(|prefs| {
+                        prefs.sidebar_visible = true;
+                        prefs.terminal_theme = if light {
+                            "dirijor-light"
+                        } else {
+                            "dirijor-dark"
+                        }
+                        .into()
+                    })
+                    .unwrap();
+            }
+            let window = cx
+                .open_window(size(px(1100.0), px(720.0)), |window, cx| {
+                    cx.new(|cx| RootView::new(services, false, PreviewScenario::Empty, window, cx))
+                })
+                .unwrap();
+            cx.run_until_parked();
             cx.capture_screenshot(window.into())
                 .unwrap()
                 .save(std::path::Path::new(&output).join(format!("{name}.png")))

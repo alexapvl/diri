@@ -14,6 +14,7 @@ mod reconnect;
 use qol::QolState;
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -1881,6 +1882,100 @@ impl TerminalPane {
     #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn session_id_for_test(&self) -> Option<SessionId> {
         self.selected_id()
+    }
+
+    /// The resting page reads this Mac's detection facts, never a remote
+    /// target's: a newcomer's first session is local, and only a local
+    /// installer can be run from here.
+    fn render_empty_workbench(&self, colors: SemanticColors) -> impl IntoElement + use<> {
+        let state = {
+            let store = self
+                .runtime
+                .store
+                .read()
+                .expect("session store lock poisoned");
+            crate::empty_workbench::EmptyWorkbench {
+                has_sessions: !store.sessions().is_empty(),
+                agents: crate::agent_setup::AgentSetupState::from_catalog(
+                    store.agent_catalog(None),
+                ),
+                installing: store.installing_agent().cloned(),
+                scanning: store.agent_catalog_is_loading(None),
+            }
+        };
+        let canonical = Arc::clone(&self.runtime.store);
+        let window_store = self.window_store.clone();
+        let install: crate::agent_setup::InstallHandler = Rc::new(move |option, cx| {
+            if let Some(window_store) = &window_store {
+                window_store
+                    .write()
+                    .expect("window navigation lock poisoned")
+                    .install_agent(option);
+            } else {
+                canonical
+                    .write()
+                    .expect("session store lock poisoned")
+                    .install_agent(option, None);
+            }
+            cx.refresh_windows();
+        });
+        let canonical = Arc::clone(&self.runtime.store);
+        let check_again: crate::agent_setup::ActionHandler = Rc::new(move |_, cx| {
+            canonical
+                .write()
+                .expect("session store lock poisoned")
+                .request_agent_catalog(None, true);
+            cx.refresh_windows();
+        });
+        // A direct launch, the same one the New Agent shortcut performs: the
+        // agent's own prompt takes the task, so there is nothing to compose
+        // or inject on the way in.
+        let canonical = Arc::clone(&self.runtime.store);
+        let window_store = self.window_store.clone();
+        let start_in_folder: crate::agent_setup::ActionHandler = Rc::new(move |_, cx| {
+            let paths = cx.prompt_for_paths(gpui::PathPromptOptions {
+                files: false,
+                directories: true,
+                multiple: false,
+                prompt: Some("Start Here".into()),
+            });
+            let canonical = Arc::clone(&canonical);
+            let window_store = window_store.clone();
+            cx.spawn(async move |cx| {
+                let Ok(Ok(Some(mut paths))) = paths.await else {
+                    return;
+                };
+                let Some(path) = paths.pop() else {
+                    return;
+                };
+                let options = crate::store::SpawnOptions {
+                    cwd: Some(path.to_string_lossy().into_owned()),
+                    ..crate::store::SpawnOptions::default()
+                };
+                if let Some(window_store) = &window_store {
+                    window_store
+                        .write()
+                        .expect("window navigation lock poisoned")
+                        .spawn_default(options);
+                } else {
+                    canonical
+                        .write()
+                        .expect("session store lock poisoned")
+                        .spawn_default(options);
+                }
+                cx.update(|cx| cx.refresh_windows());
+            })
+            .detach();
+        });
+        crate::empty_workbench::render(
+            state,
+            crate::empty_workbench::EmptyWorkbenchActions {
+                install,
+                check_again,
+                start_in_folder,
+            },
+            colors,
+        )
     }
 
     fn selected_id(&self) -> Option<SessionId> {
@@ -4076,16 +4171,7 @@ impl Render for TerminalPane {
                             .child(control),
                     )
                 })
-                .child(crate::empty_workbench::render(
-                    !self
-                        .runtime
-                        .store
-                        .read()
-                        .expect("session store lock poisoned")
-                        .sessions()
-                        .is_empty(),
-                    colors,
-                ))
+                .child(self.render_empty_workbench(colors))
                 .into_any_element()
         };
 
@@ -5413,6 +5499,73 @@ mod tests {
             cx.debug_bounds("show-sidebar").is_some(),
             "collapsing the sidebar must leave a way to reveal it"
         );
+    }
+
+    #[gpui::test]
+    fn a_first_launch_without_agents_installs_one_from_the_empty_pane(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        runtime
+            .store
+            .write()
+            .unwrap()
+            .set_agent_catalog(crate::agent_setup::bundled_catalog(&[]));
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime"),
+        );
+        let store = Arc::clone(&runtime.store);
+        let (pane, cx) =
+            cx.add_window_view(move |window, cx| TerminalPane::new(runtime, tokio, window, cx));
+
+        assert!(
+            cx.debug_bounds("empty-start-session").is_none(),
+            "with no agent, starting a session is not the next step"
+        );
+        let install = cx
+            .debug_bounds("welcome-install-claude-code")
+            .expect("the shortest path to a first session is one button");
+        cx.simulate_click(install.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        // Nothing runs on the click: the system sheet shows the exact command
+        // first, and Cancel leaves the Mac untouched.
+        let (_, detail) = cx.pending_prompt().expect("install asks before running");
+        assert!(
+            detail.contains("curl -fsSL https://claude.ai/install.sh | bash"),
+            "the sheet must show the command it is about to type: {detail}"
+        );
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert_eq!(store.read().unwrap().installing_agent(), None);
+
+        cx.simulate_click(install.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        cx.simulate_prompt_answer("Install");
+        cx.run_until_parked();
+
+        assert_eq!(
+            store.read().unwrap().installing_agent(),
+            Some(&diri_proto::AgentKind::CLAUDE_CODE)
+        );
+        assert!(
+            cx.debug_bounds("welcome-install-claude-code").is_none(),
+            "a running install cannot be started twice"
+        );
+        assert!(cx.debug_bounds("welcome-install-codex").is_some());
+
+        // Detection finding any agent ends setup: the page now leads with
+        // the session it was blocking.
+        store
+            .write()
+            .unwrap()
+            .set_agent_catalog(crate::agent_setup::bundled_catalog(&["claude-code"]));
+        // The inert runtime has no change broadcast to repaint the pane.
+        pane.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("empty-start-session").is_some());
+        assert!(cx.debug_bounds("welcome-install-codex").is_none());
     }
 
     #[cfg(target_os = "macos")]
