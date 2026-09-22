@@ -839,7 +839,8 @@ impl TerminalElement {
     ///
     /// Terminal hosts use this to keep the authoritative buffer current while
     /// coalescing bursts and suppressing paints for offscreen residents.
-    pub fn apply_damage(&self, update: GridUpdate) -> ApplySummary {
+    pub fn apply_damage(&self, mut update: GridUpdate) -> ApplySummary {
+        write_lock(&self.buffer).promote_fake_caret(&mut update);
         self.damage_observer().prepare(&update);
         write_lock(&self.buffer).apply(update)
     }

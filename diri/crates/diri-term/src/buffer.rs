@@ -1,4 +1,4 @@
-use diri_proto::grid::{GridCell, GridUpdate, RowMetadata};
+use diri_proto::grid::{GridCell, GridUpdate, RowMetadata, TermStyle};
 use unicode_width::UnicodeWidthChar;
 
 /// Cursor state carried by every daemon grid update.
@@ -46,6 +46,7 @@ pub struct GridBuffer {
     generation: u64,
     row_generations: Vec<u64>,
     dirty_rows: Vec<bool>,
+    fake_caret: Option<(u16, u16)>,
 }
 
 impl GridBuffer {
@@ -61,6 +62,54 @@ impl GridBuffer {
             generation: 0,
             row_generations: vec![0; row_count],
             dirty_rows: vec![true; row_count],
+            fake_caret: None,
+        }
+    }
+
+    /// Some agents (cursor-agent) hide the hardware cursor and mark their
+    /// caret with inverse video on one cell. Turn that cell back into a plain
+    /// cell carrying the visible cursor so it paints, moves, and follows focus
+    /// exactly like a real one. A run of inverse cells is a selection.
+    /// Call before damage observers and `apply` see the update.
+    pub fn promote_fake_caret(&mut self, update: &mut GridUpdate) {
+        let previous = self.fake_caret.take();
+        if update.cursor_visible {
+            return;
+        }
+        let found = update
+            .changed_rows
+            .iter()
+            .enumerate()
+            .rev()
+            .filter(|(index, row)| {
+                row.y < update.rows
+                    && update.changed_rows[*index + 1..]
+                        .iter()
+                        .all(|later| later.y != row.y)
+            })
+            .find_map(|(index, row)| {
+                let cells = &row.cells[..row.cells.len().min(usize::from(update.cols))];
+                (0..cells.len())
+                    .rev()
+                    .find(|&col| is_lone_inverse(cells, col))
+                    .map(|col| (index, col))
+            });
+        let caret = if let Some((index, col)) = found {
+            let row = &mut update.changed_rows[index];
+            row.cells[col].style &= TermStyle::from_bits_retain(!TermStyle::INVERSE.bits());
+            u16::try_from(col).ok().map(|col| (col, row.y))
+        } else {
+            let geometry_kept =
+                !update.is_full_snapshot && update.cols == self.cols && update.rows == self.rows;
+            previous.filter(|&(_, y)| {
+                geometry_kept && !update.changed_rows.iter().any(|row| row.y == y)
+            })
+        };
+        if let Some((col, row)) = caret {
+            update.cursor_col = col;
+            update.cursor_row = row;
+            update.cursor_visible = true;
+            self.fake_caret = Some((col, row));
         }
     }
 
@@ -311,11 +360,90 @@ impl GridBuffer {
     }
 }
 
+fn is_lone_inverse(cells: &[GridCell], col: usize) -> bool {
+    let inverse = |col: usize| {
+        cells
+            .get(col)
+            .is_some_and(|cell| cell.style.contains(TermStyle::INVERSE))
+    };
+    inverse(col) && !(col > 0 && inverse(col - 1)) && !inverse(col + 1)
+}
+
 #[cfg(test)]
 mod tests {
-    use diri_proto::grid::{ChangedRow, TermColor, TermStyle};
+    use diri_proto::grid::{ChangedRow, TermColor};
 
     use super::*;
+
+    #[test]
+    fn a_lone_inverse_cell_becomes_the_cursor_and_a_run_does_not() {
+        let inverse = |ch| {
+            let mut cell = cell(ch);
+            cell.style = TermStyle::INVERSE;
+            cell
+        };
+        let mut buffer = GridBuffer::new(4, 3);
+        let mut hidden = update(
+            true,
+            vec![ChangedRow::new(
+                2,
+                vec![cell('a'), inverse('b'), cell('c'), cell('d')],
+            )],
+        );
+        hidden.cursor_visible = false;
+        buffer.promote_fake_caret(&mut hidden);
+        assert_eq!(
+            (hidden.cursor_visible, hidden.cursor_col, hidden.cursor_row),
+            (true, 1, 2)
+        );
+        assert!(
+            !hidden.changed_rows[0].cells[1]
+                .style
+                .contains(TermStyle::INVERSE)
+        );
+        buffer.apply(hidden);
+
+        let mut unrelated = update(false, vec![ChangedRow::new(0, vec![cell('x'); 4])]);
+        unrelated.cursor_visible = false;
+        buffer.promote_fake_caret(&mut unrelated);
+        assert!(
+            unrelated.cursor_visible,
+            "an untouched caret row keeps the caret"
+        );
+
+        let mut selection = update(
+            false,
+            vec![ChangedRow::new(
+                2,
+                vec![inverse('a'), inverse('b'), cell('c'), cell('d')],
+            )],
+        );
+        selection.cursor_visible = false;
+        buffer.promote_fake_caret(&mut selection);
+        assert!(
+            !selection.cursor_visible,
+            "a run of inverse cells is a selection"
+        );
+        assert!(
+            selection.changed_rows[0].cells[1]
+                .style
+                .contains(TermStyle::INVERSE)
+        );
+
+        let mut stale = update(
+            false,
+            vec![
+                ChangedRow::new(2, vec![cell('a'), inverse('b'), cell('c'), cell('d')]),
+                ChangedRow::new(2, vec![cell('a'), cell('b'), cell('c'), cell('d')]),
+            ],
+        );
+        stale.cursor_visible = false;
+        buffer.promote_fake_caret(&mut stale);
+        assert!(
+            !stale.cursor_visible,
+            "an older inverse copy does not outrank the row that replaced it"
+        );
+    }
 
     fn cell(ch: char) -> GridCell {
         GridCell::new(
