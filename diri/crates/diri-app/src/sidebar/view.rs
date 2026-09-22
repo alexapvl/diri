@@ -7709,17 +7709,16 @@ impl Render for Sidebar {
                 .get(id)
                 .is_some_and(|bounds| !bounds.contains(&window.mouse_position()))
         });
-        if self.settings_nav.is_some()
+        if (self.settings_nav.is_some()
             || pointer_left_hovered_row
             || self
                 .ui
                 .hovered_session
                 .as_ref()
-                .is_some_and(|id| !visible_set.contains(id))
+                .is_some_and(|id| !visible_set.contains(id)))
+            && self.ui.hovered_session.take().is_some()
         {
-            if self.ui.hovered_session.take().is_some() {
-                self.dismiss_hover_card(cx);
-            }
+            self.dismiss_hover_card(cx);
         }
         self.shortcut_ranks.clear();
         let session_count = visible.len();
