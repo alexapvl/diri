@@ -454,9 +454,15 @@ impl Registry {
             .map(|(id, _)| id.clone())
             .collect();
         for id in ids {
-            let Some((capture, run)) = self.sessions.get(&id).and_then(|session| {
-                Some((session.take_completed_capture()?, session.holder_run()?))
-            }) else {
+            let Some(session) = self.sessions.get(&id) else {
+                continue;
+            };
+            // The capture is one-shot. A fast exit can land before the Holder
+            // reports its identity; taking the capture first drops it.
+            let Some(run) = session.holder_run() else {
+                continue;
+            };
+            let Some(capture) = session.take_completed_capture() else {
                 continue;
             };
             // Publish against the folded record so its status carries the
