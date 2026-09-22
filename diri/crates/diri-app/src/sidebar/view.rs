@@ -2,6 +2,7 @@ mod accounts;
 mod filter;
 #[cfg(test)]
 mod hue_tests;
+mod lineage;
 mod project_picker;
 mod tabs;
 mod titles;
@@ -61,6 +62,7 @@ use super::{
     CursorMove, DragItem, DropZone, Popover, PreviewScenario, SidebarPreviewFixture,
     SidebarUiState, drop_zone, move_before, move_past, move_to_end,
 };
+use lineage::{LineageRole, LineageSession, lineage_anchor, lineage_marks};
 
 /// Height of each insertion band at the top and bottom of a session row. A
 /// quarter of the row on each side leaves half the row as the drop-onto core.
@@ -592,6 +594,10 @@ pub struct Sidebar {
     /// Rebuilt once per projection render. Looking up ⌘1…⌘9 inside every row
     /// previously re-locked the store and scanned the full session list N times.
     shortcut_ranks: HashMap<SessionId, usize>,
+    /// Direct parent (turn up-left) and children (turn down-right) of the hovered
+    /// session, or of the keyboard cursor while the sidebar is focused and
+    /// nothing is hovered.
+    lineage_roles: HashMap<SessionId, LineageRole>,
     focus_handle: FocusHandle,
     hover_task: Option<Task<()>>,
     hover_keystrokes: Option<gpui::Subscription>,
@@ -762,6 +768,7 @@ impl Sidebar {
             working_row_rendered: false,
             hues: Default::default(),
             shortcut_ranks: HashMap::new(),
+            lineage_roles: HashMap::new(),
             focus_handle: cx.focus_handle(),
             hover_task: None,
             hover_keystrokes: None,
@@ -1097,6 +1104,9 @@ impl Sidebar {
             // A popover anchored to a session row has nothing to point at once
             // the rows are gone.
             self.ui.popover = None;
+            // Rows unmount with the session list, so a leave event never
+            // arrives if the pointer moves while settings is open.
+            self.ui.hovered_session = None;
             self.dismiss_hover_card(cx);
         }
         self.settings_nav = nav;
@@ -3280,6 +3290,7 @@ impl Sidebar {
         let focused = self.focus_handle.is_focused(window)
             && self.ui.renaming.is_none()
             && self.ui.focus_cursor.as_ref() == Some(&id);
+        let lineage = self.lineage_roles.get(&id).copied();
         let archived = session.is_archived();
         let hibernated = session.hibernation.is_some();
         let loading = is_loading(session, migrating);
@@ -3324,7 +3335,13 @@ impl Sidebar {
         } else {
             RowFill::Clear
         };
-        let fill_color = fill.color(colors);
+        // A relative wears its parent or child color. A selected relative
+        // keeps the selection pill, shifted onto that same color.
+        let fill_color = if let Some(role) = lineage {
+            lineage_fill(role, colors, selected || multi)
+        } else {
+            fill.color(colors)
+        };
 
         if self.ui.renaming.as_ref() == Some(&id) {
             return div()
@@ -3372,7 +3389,12 @@ impl Sidebar {
                     }
                 }))
                 .children(indent_rails(row, colors))
-                .child(activity_mark(activity_state, self.activity_frame, colors))
+                .child(session_leading_mark(
+                    lineage,
+                    activity_state,
+                    self.activity_frame,
+                    colors,
+                ))
                 .child(
                     div()
                         .min_w(px(0.0))
@@ -3426,10 +3448,12 @@ impl Sidebar {
             .items_center()
             .gap(px(8.0))
             .rounded(px(SIDEBAR_ROW_RADIUS))
-            .bg(fill.color(colors))
+            .bg(fill_color)
             .border_1()
             .border_color(if marked {
                 Palette::CLAY.alpha(0.78)
+            } else if selected && let Some(role) = lineage {
+                lineage_ink(role, colors).alpha(0.55)
             } else if selected {
                 Glass::stroke(colors)
             } else {
@@ -3567,7 +3591,12 @@ impl Sidebar {
             // Activity shares the project's icon column. Leaf rows reserve
             // no empty disclosure column; only parents get a trailing fold.
             // Hover keeps activity visible and swaps identity for the close action.
-            .child(activity_mark(activity_state, self.activity_frame, colors))
+            .child(session_leading_mark(
+                lineage,
+                activity_state,
+                self.activity_frame,
+                colors,
+            ))
             .child(
                 if let Some(range) = super::filter::label_match(&title, self.filter_query.text()) {
                     div()
@@ -3912,12 +3941,22 @@ impl Sidebar {
         let focused = self.focus_handle.is_focused(window)
             && self.ui.renaming.is_none()
             && self.ui.focus_cursor.as_ref() == Some(&id);
+        let lineage = self.lineage_roles.get(&id).copied();
         let selected = self
             .store
             .read()
             .expect("session store lock poisoned")
             .selected_session_id()
             == Some(&id);
+        let fill_color = if let Some(role) = lineage {
+            lineage_fill(role, colors, selected)
+        } else if selected {
+            RowFill::Selected.color(colors)
+        } else if hovered || focused {
+            RowFill::Hover.color(colors)
+        } else {
+            RowFill::Clear.color(colors)
+        };
         let row_session = session.clone();
         let revive_id = id.clone();
         let title = display_title(session);
@@ -3934,13 +3973,7 @@ impl Sidebar {
             .items_center()
             .gap(px(8.0))
             .rounded(px(SIDEBAR_ROW_RADIUS))
-            .bg(if selected {
-                RowFill::Selected.color(colors)
-            } else if hovered || focused {
-                RowFill::Hover.color(colors)
-            } else {
-                RowFill::Clear.color(colors)
-            })
+            .bg(fill_color)
             .border_1()
             .border_color(colors.primary.alpha(0.0))
             .cursor_pointer()
@@ -4008,15 +4041,18 @@ impl Sidebar {
                     preview
                 },
             )
-            .child(
+            .child(if let Some(role) = lineage {
+                lineage_mark(role, colors)
+            } else {
                 div()
                     .size(px(18.0))
                     .flex_none()
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(sf_symbol("archivebox", 12.0, colors.tertiary)),
-            )
+                    .child(sf_symbol("archivebox", 12.0, colors.tertiary))
+                    .into_any_element()
+            })
             .child(
                 div()
                     .min_w(px(0.0))
@@ -7540,6 +7576,26 @@ fn reveal_tracked_row(
     true
 }
 
+impl Sidebar {
+    /// The session whose direct parent and children are marked. The pointer
+    /// wins while it rests on a row. A gap in the session list marks nothing,
+    /// so leaving a row cannot fall through to the selected session. The
+    /// keyboard cursor marks only while the sidebar is focused and the pointer
+    /// is outside that list.
+    fn lineage_target(&self, window: &Window) -> Option<&SessionId> {
+        let keyboard = if self.focus_handle.is_focused(window) && self.ui.renaming.is_none() {
+            self.ui.focus_cursor.as_ref()
+        } else {
+            None
+        };
+        lineage_anchor(
+            self.ui.hovered_session.as_ref(),
+            self.list_scroll.bounds().contains(&window.mouse_position()),
+            keyboard,
+        )
+    }
+}
+
 impl Render for Sidebar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.reconcile_workspace_navigation(cx);
@@ -7647,14 +7703,23 @@ impl Render for Sidebar {
         self.row_bounds
             .borrow_mut()
             .retain(|id, _| visible_set.contains(id));
-        if self
-            .ui
-            .hovered_session
-            .as_ref()
-            .is_some_and(|id| !visible_set.contains(id))
+        let pointer_left_hovered_row = self.ui.hovered_session.as_ref().is_some_and(|id| {
+            self.row_bounds
+                .borrow()
+                .get(id)
+                .is_some_and(|bounds| !bounds.contains(&window.mouse_position()))
+        });
+        if self.settings_nav.is_some()
+            || pointer_left_hovered_row
+            || self
+                .ui
+                .hovered_session
+                .as_ref()
+                .is_some_and(|id| !visible_set.contains(id))
         {
-            self.dismiss_hover_card(cx);
-            self.ui.hovered_session = None;
+            if self.ui.hovered_session.take().is_some() {
+                self.dismiss_hover_card(cx);
+            }
         }
         self.shortcut_ranks.clear();
         let session_count = visible.len();
@@ -7670,6 +7735,27 @@ impl Render for Sidebar {
                 self.shortcut_ranks.insert(id.clone(), shortcut);
             }
         }
+        let lineage_target = self.lineage_target(window).cloned();
+        let lineage_roles = lineage_target
+            .as_ref()
+            .map(|target| {
+                let store = self.store.read().expect("session store lock poisoned");
+                if !store.preferences().sidebar_lineage_highlights {
+                    return HashMap::new();
+                }
+                let listed: Vec<LineageSession<'_>> = store
+                    .sessions()
+                    .values()
+                    .map(|session| LineageSession {
+                        id: &session.id,
+                        parent: session.parent.as_ref(),
+                        project: &session.project_id,
+                    })
+                    .collect();
+                lineage_marks(&listed, target)
+            })
+            .unwrap_or_default();
+        self.lineage_roles = lineage_roles;
         retain_live_glyphs(&mut self.glyphs, &projection.display_order);
         self.end_lift_if_released(cx);
         // The session list is the sidebar's most expensive frame work,
@@ -8882,6 +8968,53 @@ fn agent_picker_shortcut(
     } else {
         fallback.to_owned()
     }
+}
+
+fn session_leading_mark(
+    lineage: Option<LineageRole>,
+    state: StatusState,
+    frame: usize,
+    colors: SemanticColors,
+) -> AnyElement {
+    match lineage {
+        Some(role) => lineage_mark(role, colors),
+        None => activity_mark(state, frame, colors),
+    }
+}
+
+fn lineage_mark(role: LineageRole, colors: SemanticColors) -> AnyElement {
+    let symbol = match role {
+        LineageRole::Parent => "arrow.turn.up.left",
+        LineageRole::Child => "arrow.turn.down.right",
+    };
+    div()
+        .size(px(18.0))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(sf_symbol(symbol, 13.0, lineage_ink(role, colors)))
+        .into_any_element()
+}
+
+fn lineage_ink(role: LineageRole, colors: SemanticColors) -> Rgba {
+    Ink::on_surface(
+        match role {
+            LineageRole::Parent => Ink::ATTENTION,
+            LineageRole::Child => Ink::FRESH,
+        },
+        colors,
+    )
+}
+
+fn lineage_fill(role: LineageRole, colors: SemanticColors, selected: bool) -> Rgba {
+    let alpha = match (selected, colors.appearance) {
+        (true, diri_ui::Appearance::Light) => 0.34,
+        (true, diri_ui::Appearance::Dark) => 0.42,
+        (false, diri_ui::Appearance::Light) => 0.24,
+        (false, diri_ui::Appearance::Dark) => 0.18,
+    };
+    lineage_ink(role, colors).alpha(alpha)
 }
 
 /// Unread inbox entries share the completion mark, while active work and

@@ -2804,6 +2804,22 @@ impl UtilitySurfaces {
                         ))
                         .child(setting_divider(colors))
                         .child(toggle_row(
+                            "Highlight parent and children",
+                            "Mark them while the pointer or keyboard cursor rests on a session.",
+                            self.prefs.sidebar_lineage_highlights,
+                            "toggle-lineage-highlights",
+                            colors,
+                            cx,
+                            |this, cx| {
+                                let enabled = !this.prefs.sidebar_lineage_highlights;
+                                this.update_prefs(move |prefs| {
+                                    prefs.sidebar_lineage_highlights = enabled;
+                                });
+                                cx.notify();
+                            },
+                        ))
+                        .child(setting_divider(colors))
+                        .child(toggle_row(
                             "Gentle status chimes",
                             "Quiet cues for input, completion, and memory pauses.",
                             self.prefs.status_sounds,
