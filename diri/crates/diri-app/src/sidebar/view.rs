@@ -87,6 +87,37 @@ const SECTION_GAP: f32 = 8.0;
 /// project row is hovered. One width keeps them on a single vertical line.
 const SIDEBAR_TRAILING_SLOT: f32 = 16.0;
 
+/// Which hover control a point in a project header lands on.
+/// The strip sits `Space::ROW_H` in from the header's right edge.
+enum ProjectHoverAction {
+    Menu,
+    Add,
+    Close,
+}
+
+fn project_hover_action(
+    header: Bounds<Pixels>,
+    position: Point<Pixels>,
+) -> Option<ProjectHoverAction> {
+    if !header.contains(&position) {
+        return None;
+    }
+    let strip_width = px(SIDEBAR_ACTION_SLOT * 2.0 + SIDEBAR_TRAILING_SLOT);
+    let strip_right = header.right() - px(Space::ROW_H);
+    let strip_left = strip_right - strip_width;
+    if position.x < strip_left || position.x >= strip_right {
+        return None;
+    }
+    let into = position.x - strip_left;
+    if into < px(SIDEBAR_ACTION_SLOT) {
+        Some(ProjectHoverAction::Menu)
+    } else if into < px(SIDEBAR_ACTION_SLOT * 2.0) {
+        Some(ProjectHoverAction::Add)
+    } else {
+        Some(ProjectHoverAction::Close)
+    }
+}
+
 /// How far a swapped-in body travels before it settles, and how long the
 /// whole swap takes. The travel is deliberately short: the sidebar itself
 /// never moves, so this reads as its contents changing, not the panel.
@@ -2420,9 +2451,61 @@ impl Sidebar {
                     cx.notify();
                 }
             }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener({
+                    let id = id.clone();
+                    move |this, _, _, _| {
+                        this.ui.project_hover_press =
+                            (this.ui.hovered_project.as_ref() == Some(&id)).then(|| id.clone());
+                    }
+                }),
+            )
             .on_click(cx.listener({
                 let id = id.clone();
-                move |this, _, _, cx| {
+                let project = project_for_click.clone();
+                let project_root = project_root.clone();
+                let project_host = project_host.clone();
+                move |this, event: &gpui::ClickEvent, _, cx| {
+                    let armed = this
+                        .ui
+                        .project_hover_press
+                        .take()
+                        .filter(|pressed| pressed == &id);
+                    let header = this
+                        .fade_bounds
+                        .borrow()
+                        .get(&SharedString::from(format!("project:{}", id.0)))
+                        .copied();
+                    if armed.is_some()
+                        && let Some(header) = header
+                        && let Some(action) = project_hover_action(header, event.position())
+                    {
+                        match action {
+                            ProjectHoverAction::Menu => {
+                                this.ui.popover = Some(Popover::ProjectActions {
+                                    id: project.id.clone(),
+                                    position: Some(point(
+                                        px(12.0),
+                                        event.position().y + px(SIDEBAR_NAV_ROW_HEIGHT / 2.0 + 3.0),
+                                    )),
+                                });
+                            }
+                            ProjectHoverAction::Add => {
+                                this.open_new_agent_popover_below(
+                                    Some(project_root.clone()),
+                                    project_host.clone(),
+                                    event.position(),
+                                    cx,
+                                );
+                            }
+                            ProjectHoverAction::Close => {
+                                this.close_project_sessions(&id, cx);
+                            }
+                        }
+                        cx.notify();
+                        return;
+                    }
                     this.commit_rename();
                     let _ = this
                         .store
@@ -2598,6 +2681,13 @@ impl Sidebar {
                         .h(px(SIDEBAR_NAV_ROW_HEIGHT))
                         .flex()
                         .items_center()
+                        // The header drags, and GPUI treats a pressed header as
+                        // unhovered, which unmounts this strip before mouse-up.
+                        // Stopping the press here keeps plus, ellipsis, and
+                        // close as clicks on themselves.
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                            cx.stop_propagation();
+                        })
                         .child(
                             div()
                                 .id(format!("project-menu:{}", id.0))
@@ -11398,6 +11488,94 @@ mod tests {
         );
         assert!(cx.debug_bounds("AGENT_OPTION_0").is_some());
         assert!(cx.debug_bounds("AGENT_OPTION_1").is_some());
+    }
+
+    /// A still click on + opens the menu. Two gestures do not:
+    /// - the press moves, so GPUI drops hover and unmounts + before mouse-up;
+    /// - + was not the mouse-down target yet (the controls had just appeared),
+    ///   so the header owns the click.
+    /// Either way the header used to collapse the project.
+    #[gpui::test]
+    fn project_plus_click_survives_a_moving_press(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let sidebar = cx.new(|cx| Sidebar::new(None, true, PreviewScenario::Typical, cx));
+            SidebarPopoverHarness { sidebar }
+        });
+        let sidebar = view.read_with(cx, |harness, _| harness.sidebar.clone());
+        let project_id = ProjectId::new("preview-dirijor");
+        let collapsed = |sidebar: &Entity<Sidebar>, cx: &mut VisualTestContext| {
+            sidebar.read_with(cx, |sidebar, _| {
+                sidebar
+                    .store
+                    .read()
+                    .expect("session store lock poisoned")
+                    .preferences()
+                    .sidebar_collapsed_projects
+                    .contains(&project_id)
+            })
+        };
+        let menu = Popover::NewAgent {
+            directory: Some("/Users/preview/Projects/dirijor".to_owned()),
+            host: None,
+        };
+
+        let project = cx
+            .debug_bounds("PROJECT_preview-dirijor")
+            .expect("project row");
+        cx.simulate_mouse_move(project.center(), None, Modifiers::default());
+        let plus = cx
+            .debug_bounds("PROJECT_ADD_preview-dirijor")
+            .expect("project add button");
+
+        // Press begins on the header, where + is not the hit target yet, and
+        // ends on +. No move event, so this is not a drag.
+        cx.simulate_mouse_down(project.center(), MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_up(plus.center(), MouseButton::Left, Modifiers::default());
+        assert!(!collapsed(&sidebar, cx), "+ must not collapse the project");
+        assert_eq!(
+            sidebar.read_with(cx, |sidebar, _| sidebar.ui.popover.clone()),
+            Some(menu.clone()),
+            "+ must open the New Agent menu when the press started on the header"
+        );
+
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar.ui.popover = None;
+            cx.notify();
+        });
+        let plus = cx
+            .debug_bounds("PROJECT_ADD_preview-dirijor")
+            .expect("project add button");
+        let down = plus.center();
+        // Under GPUI's 2px drag threshold, so this stays a click, and far
+        // enough that the header records a move while the button is down.
+        cx.simulate_mouse_down(down, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(
+            down + point(px(1.0), px(0.0)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        cx.simulate_mouse_up(
+            down + point(px(1.0), px(0.0)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        assert!(
+            !collapsed(&sidebar, cx),
+            "+ must not collapse the project when the press moves"
+        );
+        assert_eq!(
+            sidebar.read_with(cx, |sidebar, _| sidebar.ui.popover.clone()),
+            Some(menu),
+            "+ must open the New Agent menu for that project"
+        );
+        assert!(
+            cx.debug_bounds("SESSION_preview-claude").is_some(),
+            "the project stays expanded"
+        );
+        assert!(
+            sidebar.read_with(cx, |sidebar, _| sidebar.ui.drag.is_none()),
+            "a short press on + must not drag the project"
+        );
     }
 
     #[gpui::test]
