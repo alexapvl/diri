@@ -8567,9 +8567,12 @@ mod tests {
         cx.run_until_parked();
 
         root.update_in(cx, |root, window, cx| {
-            root.inspector.as_ref().unwrap().update(cx, |inspector, cx| {
-                inspector.select_workspace(crate::inspector::WorkspaceSurface::Terminal, cx);
-            });
+            root.inspector
+                .as_ref()
+                .unwrap()
+                .update(cx, |inspector, cx| {
+                    inspector.select_workspace(crate::inspector::WorkspaceSurface::Terminal, cx);
+                });
             root.run_command(CommandId::ToggleAuxiliaryTerminal, window, cx);
             assert!(root.inspector_open);
             assert!(
