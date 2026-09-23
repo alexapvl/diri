@@ -2,6 +2,36 @@
 
 set -euo pipefail
 
+# Byte length. sockaddr_un counts bytes, and ${#path} counts characters.
+path_bytes() {
+    printf '%s' "$1" | wc -c | tr -d '[:space:]'
+}
+
+# Support directory for one dev build. daemon.sock has to fit in
+# sockaddr_un.sun_path (104 bytes including the trailing NUL). A long
+# worktree under target/ overflows that and the Engine never binds.
+# ponytail: per-user temp, then /tmp. Both fit this filename.
+choose_dev_app_support() {
+    local target_dir="$1"
+    local short_sha="$2"
+    local short_root="${3:-${TMPDIR:-/tmp}}"
+    local support="${target_dir}/diri-dev-${short_sha}-support"
+    local socket_path="${support}/daemon.sock"
+    if (( $(path_bytes "${socket_path}") >= 104 )); then
+        short_root="${short_root%/}"
+        support="${short_root}/diri-dev-${short_sha}-support"
+        socket_path="${support}/daemon.sock"
+        if (( $(path_bytes "${socket_path}") >= 104 )); then
+            support="/tmp/diri-dev-${short_sha}-support"
+        fi
+    fi
+    printf '%s\n' "${support}"
+}
+
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+    return 0
+fi
+
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 workspace_dir="$(cd "${script_dir}/.." && pwd)"
 target_dir="${CARGO_TARGET_DIR:-${workspace_dir}/target}"
@@ -93,7 +123,11 @@ fi
 build_label="${branch}@${short_sha}${dirty}"
 bundle_id="com.dirijor.diri.dev.${short_sha}"
 display_name="diri dev ${short_sha}"
-dev_app_support="${target_dir}/diri-dev-${short_sha}-support"
+preferred_app_support="${target_dir}/diri-dev-${short_sha}-support"
+dev_app_support="$(choose_dev_app_support "${target_dir}" "${short_sha}")"
+if [[ "${dev_app_support}" != "${preferred_app_support}" ]]; then
+    echo "==> App support exceeds the Unix socket limit; using ${dev_app_support}"
+fi
 
 mkdir -p "${target_dir}" "${dev_app_support}"
 chmod 700 "${dev_app_support}"
