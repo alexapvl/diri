@@ -490,7 +490,8 @@ impl SessionController {
         }
     }
 
-    fn apply(&mut self, update: GridUpdate) {
+    fn apply(&mut self, mut update: GridUpdate) {
+        self.buffer.write().unwrap().promote_fake_caret(&mut update);
         for view in self.views.values() {
             if let Some(damage) = &view.damage {
                 damage.prepare(&update);
