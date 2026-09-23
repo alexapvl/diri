@@ -420,6 +420,23 @@ impl Ink {
         }
     }
 
+    /// A status hue that stays readable on the current surface. Light themes
+    /// pull the bright ink toward the foreground, the same way an agent logo
+    /// uses the theme's own text color. Dark themes keep the authored hue.
+    pub fn on_surface(hue: Rgba, colors: SemanticColors) -> Rgba {
+        if colors.appearance == Appearance::Dark {
+            return hue;
+        }
+        const TOWARD_FOREGROUND: f32 = 0.5;
+        let keep = 1.0 - TOWARD_FOREGROUND;
+        rgba_f32(
+            hue.r * keep + colors.primary.r * TOWARD_FOREGROUND,
+            hue.g * keep + colors.primary.g * TOWARD_FOREGROUND,
+            hue.b * keep + colors.primary.b * TOWARD_FOREGROUND,
+            hue.a,
+        )
+    }
+
     pub const fn overprint(kind: crate::AgentKind) -> Rgba {
         match kind {
             crate::AgentKind::ClaudeCode => rgba_f32(1.0, 0.435, 0.380, 1.0),
@@ -616,6 +633,16 @@ mod tests {
         assert_eq!(dark.with_lightness(0.75).appearance, Appearance::Light);
         let stroke = dark.with_lightness(0.5).floating_stroke();
         assert!((stroke.r - 0.5).abs() < 0.001 && (stroke.a - 0.09).abs() < 0.001);
+    }
+
+    #[test]
+    fn status_ink_darkens_on_light_surfaces_and_stays_bright_on_dark() {
+        let light = Ink::on_surface(Ink::FRESH, SemanticColors::light());
+        let dark = Ink::on_surface(Ink::FRESH, SemanticColors::dark());
+        assert!(light.g < Ink::FRESH.g && light.r <= Ink::FRESH.r);
+        assert_eq!(dark, Ink::FRESH);
+        let attention = Ink::on_surface(Ink::ATTENTION, SemanticColors::light());
+        assert!(attention.r < Ink::ATTENTION.r && attention.g < Ink::ATTENTION.g);
     }
 
     #[test]

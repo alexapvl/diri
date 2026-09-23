@@ -170,6 +170,10 @@ where
     })
 }
 
+fn sidebar_lineage_highlights_default() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Prefs {
@@ -226,6 +230,10 @@ pub struct Prefs {
     pub sidebar_visible: bool,
     pub sidebar_width: f32,
     pub sidebar_grouping: SidebarGrouping,
+    /// Mark a session's parent and children while the pointer or keyboard
+    /// cursor rests on it. Missing files pick this up as on.
+    #[serde(default = "sidebar_lineage_highlights_default")]
+    pub sidebar_lineage_highlights: bool,
     pub tab_orientation: TabOrientation,
     /// Visibility of the top tab strip, independent of the vertical sidebar.
     pub horizontal_tabs_visible: bool,
@@ -296,6 +304,7 @@ impl Default for Prefs {
             sidebar_visible: false,
             sidebar_width: 248.0,
             sidebar_grouping: SidebarGrouping::Project,
+            sidebar_lineage_highlights: true,
             tab_orientation: TabOrientation::Vertical,
             horizontal_tabs_visible: true,
             active_workspace: None,
@@ -533,6 +542,7 @@ mod tests {
     fn fresh_preferences_close_panels_but_saved_choices_survive() {
         let fresh: Prefs = serde_json::from_str("{}").expect("missing preferences use defaults");
         assert!(!fresh.sidebar_visible);
+        assert!(fresh.sidebar_lineage_highlights);
         assert!(!fresh.inspector_open);
         assert_eq!(fresh.sidebar_grouping, SidebarGrouping::Project);
         assert_eq!(fresh.sidebar_ordering, SidebarOrdering::Custom);
