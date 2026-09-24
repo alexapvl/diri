@@ -1881,78 +1881,78 @@ fn spawned_project_is_published_into_sidebar_order() {
         .unwrap();
     let mut writer = client.try_clone().unwrap();
     let mut reader = BufReader::new(client);
-    let mut call = |request_id: u64, method: &str, params: serde_json::Value| {
-        let message = ControlMessage::Request {
-            id: request_id,
-            method: method.to_owned(),
-            params: Some(params),
+    {
+        let mut call = |request_id: u64, method: &str, params: serde_json::Value| {
+            let message = ControlMessage::Request {
+                id: request_id,
+                method: method.to_owned(),
+                params: Some(params),
+            };
+            let mut bytes = serde_json::to_vec(&message).unwrap();
+            bytes.push(b'\n');
+            writer.write_all(&bytes).unwrap();
+            writer.flush().unwrap();
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            match serde_json::from_str::<ControlMessage>(&line).unwrap() {
+                ControlMessage::Response {
+                    result: Ok(value), ..
+                } => value,
+                other => panic!("expected success, got {other:?}"),
+            }
         };
-        let mut bytes = serde_json::to_vec(&message).unwrap();
-        bytes.push(b'\n');
-        writer.write_all(&bytes).unwrap();
-        writer.flush().unwrap();
-        let mut line = String::new();
-        reader.read_line(&mut line).unwrap();
-        match serde_json::from_str::<ControlMessage>(&line).unwrap() {
-            ControlMessage::Response {
-                result: Ok(value), ..
-            } => value,
-            other => panic!("expected success, got {other:?}"),
-        }
-    };
-    let spawn_params = serde_json::json!({
-        "kind": { "shell": {} },
-        "cwd": cwd,
-        "argv": ["/bin/sh", "-c", "sleep 30"],
-    });
-
-    let first = call(1, "session.spawn", spawn_params.clone());
-    let session_id = first["id"].as_str().unwrap().to_owned();
-    let published = drain_ready(&bus);
-    let project_events: Vec<_> = published
-        .iter()
-        .filter(|event| event.name == EventName::PROJECT_UPDATED)
-        .collect();
-    assert_eq!(project_events.len(), 1, "a new cwd publishes one project");
-    assert!(project_events[0].params.get("pinnedOrder").is_none());
-    let inserted: Project = serde_json::from_value(project_events[0].params.clone()).unwrap();
-    assert_eq!(inserted.root, cwd);
-
-    let (mut store, _) = hydrated(
-        vec![session("kept", "kept", 1.0)],
-        vec![project("kept", "Kept")],
-        Prefs::default(),
-    );
-    for event in &published {
-        store.handle_event(EventEnvelope {
-            name: event.name.clone(),
-            seq: event.seq,
-            params: event.params.clone(),
+        let spawn_params = serde_json::json!({
+            "kind": { "shell": {} },
+            "cwd": cwd,
+            "argv": ["/bin/sh", "-c", "sleep 30"],
         });
-    }
-    let order = store.sidebar_project_order();
-    assert!(
-        order.contains(&pid("kept")) && order.contains(&inserted.id),
-        "reorder needs both project ids in the sidebar order: {order:?}"
-    );
-    assert_eq!(
-        store
-            .sessions
-            .get(&id(&session_id))
-            .map(|session| session.project_id.clone()),
-        Some(inserted.id)
-    );
 
-    let _second = call(2, "session.spawn", spawn_params);
-    let again = drain_ready(&bus);
-    assert!(
-        again
+        let first = call(1, "session.spawn", spawn_params.clone());
+        let session_id = first["id"].as_str().unwrap().to_owned();
+        let published = drain_ready(&bus);
+        let project_events: Vec<_> = published
             .iter()
-            .all(|event| event.name != EventName::PROJECT_UPDATED),
-        "an existing project is not published again: {again:?}"
-    );
+            .filter(|event| event.name == EventName::PROJECT_UPDATED)
+            .collect();
+        assert_eq!(project_events.len(), 1, "a new cwd publishes one project");
+        assert!(project_events[0].params.get("pinnedOrder").is_none());
+        let inserted: Project = serde_json::from_value(project_events[0].params.clone()).unwrap();
+        assert_eq!(inserted.root, cwd);
 
-    drop(call);
+        let (mut store, _) = hydrated(
+            vec![session("kept", "kept", 1.0)],
+            vec![project("kept", "Kept")],
+            Prefs::default(),
+        );
+        for event in &published {
+            store.handle_event(EventEnvelope {
+                name: event.name.clone(),
+                seq: event.seq,
+                params: event.params.clone(),
+            });
+        }
+        let order = store.sidebar_project_order();
+        assert!(
+            order.contains(&pid("kept")) && order.contains(&inserted.id),
+            "reorder needs both project ids in the sidebar order: {order:?}"
+        );
+        assert_eq!(
+            store
+                .sessions
+                .get(&id(&session_id))
+                .map(|session| session.project_id.clone()),
+            Some(inserted.id)
+        );
+
+        let _second = call(2, "session.spawn", spawn_params);
+        let again = drain_ready(&bus);
+        assert!(
+            again
+                .iter()
+                .all(|event| event.name != EventName::PROJECT_UPDATED),
+            "an existing project is not published again: {again:?}"
+        );
+    }
     let _ = writer.shutdown(std::net::Shutdown::Write);
     drop(reader);
     serving.join().unwrap();
