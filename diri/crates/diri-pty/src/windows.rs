@@ -102,8 +102,9 @@ impl Pty {
         let job = job()?;
         let mut startup: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
         startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
-        // Null std handles prevent accidental inheritance; ConPTY supplies them.
-        startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        // The pseudoconsole attribute supplies the child's console handles.
+        // STARTF_USESTDHANDLES with null handles would override that setup.
+        // bInheritHandles=false below prevents unrelated parent inheritance.
         let attributes = Attributes::new(console.0)?;
         startup.lpAttributeList = attributes.pointer();
         let mut child: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
