@@ -305,9 +305,22 @@ fn shell_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// Claude Code's project-directory slug for a working directory: `/` and `.`
-/// replaced by `-`, verified against real dirs under `~/.claude/projects`.
+/// Claude Code's project-directory slug. Native Windows paths also encode the
+/// drive colon, backslashes, spaces and other non-ASCII-alphanumeric characters.
 pub fn claude_project_slug(cwd: &str) -> String {
+    #[cfg(windows)]
+    {
+        // Match the vendor's UTF-16 /[^a-zA-Z0-9]/g replacement, including two
+        // replacements for a non-BMP character. Never join a raw drive path
+        // beneath the transcript root: Path::join would replace that root.
+        cwd.encode_utf16()
+            .map(|unit| match unit {
+                0x30..=0x39 | 0x41..=0x5a | 0x61..=0x7a => char::from_u32(unit.into()).unwrap(),
+                _ => '-',
+            })
+            .collect()
+    }
+    #[cfg(not(windows))]
     cwd.replace(['/', '.'], "-")
 }
 
