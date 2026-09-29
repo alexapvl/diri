@@ -4,10 +4,11 @@ version = "0.8.10"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+autobins = false
 
 [[bin]]
 name = "diri"
-path = "src/main.rs"
+path = "src/entry.rs"
 
 [[test]]
 name = "tab_gesture_appkit"
