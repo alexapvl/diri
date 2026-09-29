@@ -1,149 +1,84 @@
 # diri performance record
 
-## Terminal interactions other than typing (2026-09-29)
+## Cheap column changes: deferred history reflow (2026-09-29)
 
-Every interaction except keystroke echo was measured separately: scrolling
-history, dragging a window or split, sliding a seam, switching sessions,
-selection drags, large pastes, Find, zoom and theme changes. The content was
-10,000 rows of coloured build log with wrapped lines, and CJK/emoji variants.
-Client frames went through GPUI's production text system and the headless
-Metal renderer. Anything that crosses a socket ran against a private Engine
-and real Holders. The renderer met the 120 Hz budget on every interaction.
-The Engine did not:
-
-- **Dragging stalled the whole Engine.** A column change reflows the
-  emulator's history. Over 10,000 wrapped rows that took 8 ms at p50 and
-  43 ms at p95 per step. It ran on the attach thread while that thread held
-  the Registry lock, so every other session's input and publication queued
-  behind it. The desktop sends a resize every 8 ms and the Engine applied
-  each one, so steps backed up for the length of the drag.
-- **Pastes over 1 MiB were lost.** The Holder input stream bounds a frame at
-  1 MiB and rejects a larger one whole. The Engine then dropped the attach,
-  so the paste disappeared and the client had to reseed.
+#561 made a drag stop blocking other sessions, but each column change still
+reflowed 10,000 wrapped history rows by decoding, reflowing and re-encoding
+the whole compact history (8 ms p50, `encode_cells`/`lz::compress` ~57%,
+decode ~20%, memmove ~20%). A window drag kept the Engine about a core busy,
+and a Remote Helper did the same for each Resize it received.
 
 Changes:
 
-- `Session::resize_pty` resizes the PTY (a syscall or one Holder stream
-  write) under the Registry lock and returns the emulator reflow still owed.
-  The attach and control paths run that reflow after releasing the lock. The
-  owed reflow always applies the newest size the PTY was given. Racing
-  resizes therefore still leave the emulator at the PTY's size, and a reflow
-  that finds a newer one already applied does nothing.
-- The attach reader skips a Resize frame when the next frame in the same
-  read is also a Resize. Only an adjacent resize supersedes one, so input and
-  mouse frames keep their order. Each skipped frame saves a reflow and a
-  SIGWINCH repaint.
-- `HolderClient` splits input larger than one stream frame into chunks. They
-  are sent back to back under the input-stream lock, so no other input can
-  land between them. There is no Holder or wire change: old live Holders
-  accept every chunk.
-- When a terminal's origin moves and nothing else about it changes (a
-  sidebar or inspector seam, or a split divider, sliding past), the renderer
-  translates its cached rows instead of preparing every row again. It does
-  this only when the move is a whole number of device pixels, so snapping
-  stays exact.
+- History reflow never moves cells across a hard line break, so compact
+  storage now reflows only the editable rows (screen, newest history, any
+  line ending there) and **defers** older logical lines. A line whose reflow
+  is greedy placement of its content (almost every output line, including
+  wide characters) is stored as 8 bytes and its rows at any width are counted
+  without decoding. Other lines (styled trailing blanks, tabs, broken wide
+  characters) are kept as rows and reflowed by `Grid::resize` itself on a
+  one-line grid, up to 256 KiB. Rows are built from the compressed payloads
+  when history is read or edited, once. Recycling and dropping the oldest rows
+  need no decoding. Details and the exact conditions are in
+  `vendor/alacritty_terminal/DIRI-PATCH.md` ("Deferred column changes").
+- Growing now takes kept-back history into the screen when merged rows leave
+  too few, as dense storage does. The hard-line case used to append blank rows
+  instead (a pre-existing compact/dense divergence).
+- The Remote Helper applies only the last of adjacent valid Resize frames in
+  one read, like the Engine's attach reader.
 
 ### Measurements
 
-Apple M4 Max, macOS 27.0, release builds, load average 4–11 during the A/B
-(25–80 earlier). Base is `42bf00a`. Engine runs alternated base and branch,
-3 invocations each of 3 runs, and medians of all 9 are shown. The drag steps
-160→120→160 columns twice, then ends at 150×49, sending one Resize frame
-every 8 ms (1.3 s). A second session is typed into every 20 ms throughout.
-Engine CPU is this process's user+sys time; Holders are separate processes
-and do not reflow.
+Apple M4 Max, macOS 27.0, release builds, load average 4.5–9.4. Base is
+`923a98a` (origin/main + #554 + #561). Base and branch alternated three times
+each; ranges over the runs are shown.
 
-| Interaction (Engine, real Holders) | Base | Branch |
+`cargo bench -p diri-terminal-state --bench terminal_interactions` (160×50,
+10,000 rows of the coloured build log with wrapped lines, one resize + grid
+update per step; CPU is this process's user+sys from `getrusage`):
+
+| | Base | Branch |
 | --- | ---: | ---: |
-| Drag: last resize → grid at final size | 57.0 ms | 10.6 ms |
-| Drag: other session's echo, p50 | 23.8 ms | 0.29 ms |
-| Drag: other session's echo, p95 | 382 ms | 7.7 ms |
-| Drag: grids published to the dragged pane | 20 | 93 |
-| Drag: Engine CPU for the drag | 1.32 s | 1.21 s |
-| Paste 1 MiB into a reading program | lost, attach dropped | 74 ms |
-| Paste 100 KiB into a reading program | 10.1–11.3 ms | 9.4–11.8 ms |
+| Drag step, ASCII, p50 / p95 | 7.8–8.1 / 9.9–10.1 ms | 54–62 / 60–69 µs |
+| Drag step, CJK/emoji, p50 / p95 | 8.9–9.8 / 11.2–11.7 ms | 95–97 / 100–104 µs |
+| First column change (max), ASCII / CJK | 16.5–17.4 / 13.3–15.2 ms | 5.4–6.8 / 6.6–6.7 ms |
+| Drag 160→100→160 as 60 changes, CPU, ASCII | 417–424 ms | 8.3–8.6 ms |
+| same, CJK/emoji | 523–527 ms | 12.1 ms |
+| Allocations per step, ASCII / CJK | 26,598 / 27,756 | 154 / 173 |
+| 20,000 lines streamed after the drag, CPU, ASCII / CJK | 15.5–16.1 / 18.8–19.7 ms | 15.7–16.1 / 19.3–19.6 ms |
+| 380×110 (no history row wraps), 60-change drag CPU | 11.5–11.8 ms | 11.3–11.4 ms |
 
-With load average 25–80, the base drag settled in 140 ms–1.06 s, the other
-session's echo reached p95 0.54–1.8 s, and only 5–12 grids were published.
+The first change of a drag scans history once (decode, no encode); later
+changes only count lines. `--gate` now also gates the drag step p95 at the
+8.3 ms frame budget.
 
-The renderer (headless Metal, 120 fps harness, 3 alternating runs, draw time
-per frame from the GPUI report):
+Engine, real Holders (`cargo test --release -p diri-engine --test
+interactions -- --ignored --nocapture --test-threads=1 drag`: 161 Resize
+frames over 1.3 s while another session is typed into every 20 ms):
 
-| Interaction (renderer) | Base p50 / p95 | Branch p50 / p95 |
+| | Base | Branch |
 | --- | ---: | ---: |
-| Seam slide past a 160×50 terminal, 1 px/frame | 0.566 / 0.594 ms | 0.424 / 0.456 ms |
-| Seam slide: rows reused | 0% | 99% |
-| Pane narrowing 1 px/frame (clips the grid) | 0.42 / 1.73 ms | unchanged |
-| Reflowed full snapshot arriving each frame | 0.56 / 0.60 ms | unchanged |
-| Switch: first frame of a fresh 160×50 element | 1.72 / 1.86 ms | unchanged |
-| Switch: 160×50 CJK/emoji | 2.47 / 2.68 ms | unchanged |
-| Switch: 240×66 (4K display at 2×) | 2.21 / 2.36 ms | unchanged |
-| Zoom: font size changes every frame | 1.70 / 1.81 ms | unchanged |
-| Selection drag, one row per frame | 0.48 / 0.51 ms | unchanged |
-| Output scrolling a 240×66 CJK grid | 0.64 / 0.68 ms | unchanged |
-| Theme crossfade, 200×60 (existing bench) | 0.62 / 0.69 ms | unchanged |
-| Trackpad fling through history (existing) | 0.60 / 1.49 ms | unchanged |
+| Engine CPU for the drag | 1.21–1.24 s | 129–160 ms |
+| Last resize → grid at final size | 7.7–17.2 ms | 0.37–12.2 ms |
+| Other session's echo, p95 | 6.7–10.4 ms | 0.38–1.2 ms |
+| Grids published to the dragged pane | 88–94 | 128–136 |
 
-Engine-side costs per operation (`terminal_interactions` probe, 10,000 rows,
-160×50). These did not change:
+Memory: `terminal_fleet` gates pass (fresh/full-history heap +80 bytes per
+core). While history is deferred it keeps its line index: +110 KB for 10,000
+ASCII log lines (compressed history 375 KB), +190 KB when every third line
+has wide characters, until history is read or edited.
 
-| Operation | p50 | p95 |
-| --- | ---: | ---: |
-| Column-change reflow + grid update, ASCII | 8.0 ms | 43.2 ms |
-| Column-change reflow + grid update, CJK/emoji | 9.5 ms | 11.0 ms |
-| Rows-only resize + grid update | 34 µs | 54 µs |
-| Reflow at 340–380 columns (no history row wraps) | 0.19 ms | 0.21 ms |
-| 50-row history page (wheel, 3-row steps) | 65 µs | 72 µs |
-| Client decode of one page | 28 µs | 30 µs |
-| Attach seed (full snapshot + encode, 48 KB) | 41 µs | 45 µs |
-| Find capture of all retained rows | 1.1 ms | 1.5 ms |
+Equivalence: `transcript_digest` and the new `reflow_digest` probe (drags
+160↔100, jumps 300/40/13/2 columns, output and coloured-template scrolling
+between resizes, alternate screen, paged, full and no history reads) print the
+same digests on base and branch. The vendored tests compare against dense
+storage over random output/resize sequences (600 seeds fuzzed) and against
+eager compact reflow.
 
-Over the real sockets, a 50-row history page round trip measured 0.21–0.48 ms
-at p50 and at most 1.0 ms at p95. Attach to seed grid measured 0.84–2.4 ms at
-p50.
-
-### Not fixed
-
-- **Reflow cost.** Reflowing 10,000 wrapped history rows still decodes and
-  re-encodes the whole compact history on every column change (8–43 ms). A
-  drag is now bounded by one reflow at a time and no longer blocks other
-  sessions, but the Engine spends about a core for the length of the drag.
-  The fix belongs in `vendor/alacritty_terminal` compact history, for
-  example deferring history reflow until a gesture settles.
-- **Paste into a program that is not reading.** The Holder gives up on a PTY
-  that stays unwritable for 1 s and rejects the rest of the input. The Engine
-  then drops the attach, and the unread tail of the paste is lost. Input is
-  still written while the Registry lock is held, so meanwhile every other
-  session's input waits. This measured 0.99 s with 100 KiB into a program
-  that reads only after 1.5 s. A 1 MiB paste into a program that is reading
-  holds that lock for about 70 ms (other sessions' echo max 56–64 ms). Fixing
-  this means moving input writes off the Registry lock and changing the
-  Holder's give-up policy.
-- The Remote Helper still reflows and re-snapshots every Resize it receives.
-  Coalescing in the Engine reduces how many reach it.
-- `cargo bench -p diri-term --bench find_retained` panics on `main`
-  ("Find releases all retained rows"). It was left as it is.
-
-Reproduce from `diri/`:
-
-```sh
-cargo test --release -p diri-engine --test interactions -- --ignored --nocapture --test-threads=1
-cargo bench -p diri-term --bench terminal_interactions
-cargo bench -p diri-terminal-state --bench terminal_interactions -- --gate
-cargo test -p diri-term --test moved_pixels
-cargo test -p diri-engine --lib resize_tests
-cargo test -p diri-engine --test holder a_paste_larger_than_one_input_frame_arrives_whole
-```
-
-The Engine measurements start their own Engine and Holders under `/tmp` and
-never touch an installed app. `DIRI_PASTE_CASE=<bytes>,<busy_ms>` runs one
-paste case. The renderer bench gates seam slide, pane resize, reflow arrival,
-selection drag and grid scrolling at the 8.3 ms frame budget. The
-terminal-state probe's `--gate` covers history pages and attach seeds; the
-reflow is reported but not gated. `moved_pixels` requires the moved frame to
-match a fresh render pixel for pixel and to prepare no row again. The
-existing `paint_fixture` raw pixels (live, overlapping and reading) were
-byte-identical between base and branch.
+Not claimed: RSS or renderer effects; byte-budget-limited histories (their
+retained rows can differ after a resize, since the stored representation
+differs). Not done: a payload-level shape scan to make the first change of a
+drag cheaper (~5 ms); per-thread stack samples of the Engine drag.
 ## Keystroke echo draws without waiting for the display link (2026-09-29)
 
 **Where a keystroke's time goes.** `DIRI_LATENCY_TRACE=1` now stamps every
@@ -231,6 +166,12 @@ frame-rate request. #540 covers animations that ran below it.
 Reproduce from `diri/`:
 
 ```sh
+cargo bench -p diri-terminal-state --bench terminal_interactions -- --gate
+cargo test --release -p diri-terminal-state --test transcript_digest -- --ignored --nocapture
+cargo test --release -p diri-engine --test interactions -- --ignored --nocapture --test-threads=1 drag
+cd vendor/alacritty_terminal && DIRI_REFLOW_SEEDS=600 cargo --config 'patch.crates-io.vte.path="../vte"' test --release --features compact-history reflow
+```
+
 cargo test -p gpui_macos --release --lib echo_frame_scheduling -- --ignored --nocapture
 cargo build --release -p diri-engine --bin diri-holder
 DIRI_HOLDER_BIN=$PWD/target/release/diri-holder \
@@ -497,6 +438,151 @@ cargo build --release -p diri-engine --example feedbench
 cargo bench -p diri-terminal-state --bench terminal_parity
 cargo test --release -p diri-terminal-state --test transcript_digest -- --ignored --nocapture
 ```
+
+## Terminal interactions other than typing (2026-09-29)
+
+Every interaction except keystroke echo was measured separately: scrolling
+history, dragging a window or split, sliding a seam, switching sessions,
+selection drags, large pastes, Find, zoom and theme changes. The content was
+10,000 rows of coloured build log with wrapped lines, and CJK/emoji variants.
+Client frames went through GPUI's production text system and the headless
+Metal renderer. Anything that crosses a socket ran against a private Engine
+and real Holders. The renderer met the 120 Hz budget on every interaction.
+The Engine did not:
+
+- **Dragging stalled the whole Engine.** A column change reflows the
+  emulator's history. Over 10,000 wrapped rows that took 8 ms at p50 and
+  43 ms at p95 per step. It ran on the attach thread while that thread held
+  the Registry lock, so every other session's input and publication queued
+  behind it. The desktop sends a resize every 8 ms and the Engine applied
+  each one, so steps backed up for the length of the drag.
+- **Pastes over 1 MiB were lost.** The Holder input stream bounds a frame at
+  1 MiB and rejects a larger one whole. The Engine then dropped the attach,
+  so the paste disappeared and the client had to reseed.
+
+Changes:
+
+- `Session::resize_pty` resizes the PTY (a syscall or one Holder stream
+  write) under the Registry lock and returns the emulator reflow still owed.
+  The attach and control paths run that reflow after releasing the lock. The
+  owed reflow always applies the newest size the PTY was given. Racing
+  resizes therefore still leave the emulator at the PTY's size, and a reflow
+  that finds a newer one already applied does nothing.
+- The attach reader skips a Resize frame when the next frame in the same
+  read is also a Resize. Only an adjacent resize supersedes one, so input and
+  mouse frames keep their order. Each skipped frame saves a reflow and a
+  SIGWINCH repaint.
+- `HolderClient` splits input larger than one stream frame into chunks. They
+  are sent back to back under the input-stream lock, so no other input can
+  land between them. There is no Holder or wire change: old live Holders
+  accept every chunk.
+- When a terminal's origin moves and nothing else about it changes (a
+  sidebar or inspector seam, or a split divider, sliding past), the renderer
+  translates its cached rows instead of preparing every row again. It does
+  this only when the move is a whole number of device pixels, so snapping
+  stays exact.
+
+### Measurements
+
+Apple M4 Max, macOS 27.0, release builds, load average 4–11 during the A/B
+(25–80 earlier). Base is `42bf00a`. Engine runs alternated base and branch,
+3 invocations each of 3 runs, and medians of all 9 are shown. The drag steps
+160→120→160 columns twice, then ends at 150×49, sending one Resize frame
+every 8 ms (1.3 s). A second session is typed into every 20 ms throughout.
+Engine CPU is this process's user+sys time; Holders are separate processes
+and do not reflow.
+
+| Interaction (Engine, real Holders) | Base | Branch |
+| --- | ---: | ---: |
+| Drag: last resize → grid at final size | 57.0 ms | 10.6 ms |
+| Drag: other session's echo, p50 | 23.8 ms | 0.29 ms |
+| Drag: other session's echo, p95 | 382 ms | 7.7 ms |
+| Drag: grids published to the dragged pane | 20 | 93 |
+| Drag: Engine CPU for the drag | 1.32 s | 1.21 s |
+| Paste 1 MiB into a reading program | lost, attach dropped | 74 ms |
+| Paste 100 KiB into a reading program | 10.1–11.3 ms | 9.4–11.8 ms |
+
+With load average 25–80, the base drag settled in 140 ms–1.06 s, the other
+session's echo reached p95 0.54–1.8 s, and only 5–12 grids were published.
+
+The renderer (headless Metal, 120 fps harness, 3 alternating runs, draw time
+per frame from the GPUI report):
+
+| Interaction (renderer) | Base p50 / p95 | Branch p50 / p95 |
+| --- | ---: | ---: |
+| Seam slide past a 160×50 terminal, 1 px/frame | 0.566 / 0.594 ms | 0.424 / 0.456 ms |
+| Seam slide: rows reused | 0% | 99% |
+| Pane narrowing 1 px/frame (clips the grid) | 0.42 / 1.73 ms | unchanged |
+| Reflowed full snapshot arriving each frame | 0.56 / 0.60 ms | unchanged |
+| Switch: first frame of a fresh 160×50 element | 1.72 / 1.86 ms | unchanged |
+| Switch: 160×50 CJK/emoji | 2.47 / 2.68 ms | unchanged |
+| Switch: 240×66 (4K display at 2×) | 2.21 / 2.36 ms | unchanged |
+| Zoom: font size changes every frame | 1.70 / 1.81 ms | unchanged |
+| Selection drag, one row per frame | 0.48 / 0.51 ms | unchanged |
+| Output scrolling a 240×66 CJK grid | 0.64 / 0.68 ms | unchanged |
+| Theme crossfade, 200×60 (existing bench) | 0.62 / 0.69 ms | unchanged |
+| Trackpad fling through history (existing) | 0.60 / 1.49 ms | unchanged |
+
+Engine-side costs per operation (`terminal_interactions` probe, 10,000 rows,
+160×50). These did not change:
+
+| Operation | p50 | p95 |
+| --- | ---: | ---: |
+| Column-change reflow + grid update, ASCII | 8.0 ms | 43.2 ms |
+| Column-change reflow + grid update, CJK/emoji | 9.5 ms | 11.0 ms |
+| Rows-only resize + grid update | 34 µs | 54 µs |
+| Reflow at 340–380 columns (no history row wraps) | 0.19 ms | 0.21 ms |
+| 50-row history page (wheel, 3-row steps) | 65 µs | 72 µs |
+| Client decode of one page | 28 µs | 30 µs |
+| Attach seed (full snapshot + encode, 48 KB) | 41 µs | 45 µs |
+| Find capture of all retained rows | 1.1 ms | 1.5 ms |
+
+Over the real sockets, a 50-row history page round trip measured 0.21–0.48 ms
+at p50 and at most 1.0 ms at p95. Attach to seed grid measured 0.84–2.4 ms at
+p50.
+
+### Not fixed
+
+- **Reflow cost.** Reflowing 10,000 wrapped history rows still decodes and
+  re-encodes the whole compact history on every column change (8–43 ms). A
+  drag is now bounded by one reflow at a time and no longer blocks other
+  sessions, but the Engine spends about a core for the length of the drag.
+  The fix belongs in `vendor/alacritty_terminal` compact history, for
+  example deferring history reflow until a gesture settles.
+- **Paste into a program that is not reading.** The Holder gives up on a PTY
+  that stays unwritable for 1 s and rejects the rest of the input. The Engine
+  then drops the attach, and the unread tail of the paste is lost. Input is
+  still written while the Registry lock is held, so meanwhile every other
+  session's input waits. This measured 0.99 s with 100 KiB into a program
+  that reads only after 1.5 s. A 1 MiB paste into a program that is reading
+  holds that lock for about 70 ms (other sessions' echo max 56–64 ms). Fixing
+  this means moving input writes off the Registry lock and changing the
+  Holder's give-up policy.
+- The Remote Helper still reflows and re-snapshots every Resize it receives.
+  Coalescing in the Engine reduces how many reach it.
+- `cargo bench -p diri-term --bench find_retained` panics on `main`
+  ("Find releases all retained rows"). It was left as it is.
+
+Reproduce from `diri/`:
+
+```sh
+cargo test --release -p diri-engine --test interactions -- --ignored --nocapture --test-threads=1
+cargo bench -p diri-term --bench terminal_interactions
+cargo bench -p diri-terminal-state --bench terminal_interactions -- --gate
+cargo test -p diri-term --test moved_pixels
+cargo test -p diri-engine --lib resize_tests
+cargo test -p diri-engine --test holder a_paste_larger_than_one_input_frame_arrives_whole
+```
+
+The Engine measurements start their own Engine and Holders under `/tmp` and
+never touch an installed app. `DIRI_PASTE_CASE=<bytes>,<busy_ms>` runs one
+paste case. The renderer bench gates seam slide, pane resize, reflow arrival,
+selection drag and grid scrolling at the 8.3 ms frame budget. The
+terminal-state probe's `--gate` covers history pages and attach seeds; the
+reflow is reported but not gated. `moved_pixels` requires the moved frame to
+match a fresh render pixel for pixel and to prepare no row again. The
+existing `paint_fixture` raw pixels (live, overlapping and reading) were
+byte-identical between base and branch.
 ## Busy local fleets: Holder output path stops serializing (2026-09-28)
 
 **Where the time went.** `fleetbench` (N sessions each `cat`-ing a 64 MiB
