@@ -250,7 +250,14 @@ pub struct RetentionReport {
 
 impl CompletedTerminalStore {
     pub fn open(directory: &Path) -> Result<Self> {
-        let file = diri_platform::directory::PrivateDirectory::open(directory)?;
+        let file =
+            diri_platform::directory::PrivateDirectory::open(directory).map_err(|error| {
+                if error.kind() == io::ErrorKind::InvalidData {
+                    StorageError::Corrupt
+                } else {
+                    StorageError::Io(error)
+                }
+            })?;
         Ok(Self {
             directory: file,
             path: directory.to_path_buf(),

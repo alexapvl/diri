@@ -30,7 +30,10 @@ impl PrivateDirectory {
             use std::os::unix::fs::MetadataExt;
             let m = file.metadata()?;
             if !m.is_dir() || m.uid() != unsafe { libc::geteuid() } || m.mode() & 0o077 != 0 {
-                return Err(io::ErrorKind::PermissionDenied.into());
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "directory ownership or permissions are unsafe",
+                ));
             }
             Ok(Self { file })
         }
@@ -69,7 +72,8 @@ impl PrivateDirectory {
                 }
                 ancestors.push(file);
             }
-            crate::security::validate_directory(path, 0o077)?;
+            crate::security::validate_directory(path, 0o077)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
             Ok(Self {
                 _ancestors: ancestors,
                 path: path.into(),
