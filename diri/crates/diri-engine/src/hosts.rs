@@ -53,6 +53,15 @@ pub fn run_shell(
     timeout: Duration,
 ) -> Option<ShellOutput> {
     let mut argv: Vec<String> = match host {
+        Some(host) if host.wsl_distribution().is_some() => vec![
+            "wsl.exe".into(),
+            "--distribution".into(),
+            host.wsl_distribution().unwrap().into(),
+            "--exec".into(),
+            "/bin/sh".into(),
+            "-c".into(),
+            command.into(),
+        ],
         Some(host) => {
             let mut argv = vec!["ssh".to_string()];
             argv.extend(SSH_OPTIONS.iter().map(ToString::to_string));
@@ -61,12 +70,20 @@ pub fn run_shell(
             argv.push(command.to_string());
             argv
         }
-        None => vec!["/bin/sh".into(), "-c".into(), command.to_string()],
+        None => vec![
+            diri_platform::launch::maintenance_shell()
+                .ok()?
+                .to_string_lossy()
+                .into_owned(),
+            "-c".into(),
+            command.to_string(),
+        ],
     };
     let program = argv.remove(0);
     run_argv(&program, &argv, timeout)
 }
 
+#[cfg(unix)]
 fn run_argv(program: &str, args: &[String], timeout: Duration) -> Option<ShellOutput> {
     let mut child = Command::new(program)
         .args(args)
@@ -102,6 +119,19 @@ fn run_argv(program: &str, args: &[String], timeout: Duration) -> Option<ShellOu
         exit_code: status.code().unwrap_or(-1),
         stdout,
         stderr,
+    })
+}
+
+#[cfg(windows)]
+fn run_argv(program: &str, args: &[String], timeout: Duration) -> Option<ShellOutput> {
+    let output =
+        diri_platform::child::output(Command::new(program).args(args), timeout, 4 * 1024 * 1024)
+            .ok()?;
+    Some(ShellOutput {
+        ok: output.status.success(),
+        exit_code: output.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     })
 }
 
@@ -175,6 +205,38 @@ fn sync_tool(spec: &ToolSpec, host: &HostEntry) -> PrefsSyncToolReport {
         synced: Vec::new(),
         error: Some(error),
     };
+    #[cfg(windows)]
+    if host.wsl_distribution().is_some() {
+        let result = (|| -> std::io::Result<()> {
+            let home = run_shell(Some(host), "printf '%s' \"$HOME\"", Duration::from_secs(10))
+                .filter(|output| output.ok)
+                .ok_or_else(|| std::io::Error::other("Cannot read WSL home"))?
+                .stdout;
+            let destination = crate::wsl::explorer_path(
+                host,
+                &format!("{}/{}", home.trim_end_matches('/'), spec.remote_dir),
+            )?;
+            let mut remaining = 10_000;
+            for item in &present {
+                copy_preference(
+                    &spec.local_dir.join(item),
+                    &Path::new(&destination).join(item),
+                    0,
+                    &mut remaining,
+                )?;
+            }
+            Ok(())
+        })();
+        return match result {
+            Ok(()) => PrefsSyncToolReport {
+                tool: spec.name.into(),
+                ok: true,
+                synced: present,
+                error: None,
+            },
+            Err(error) => failure(format!("WSL preference copy failed: {error}")),
+        };
+    }
     match run_shell(
         Some(host),
         &format!("mkdir -p {}", shell_quote(spec.remote_dir)),
@@ -217,6 +279,56 @@ fn sync_tool(spec: &ToolSpec, host: &HostEntry) -> PrefsSyncToolReport {
         Some(result) => failure(rsync_failure_message(&result, host)),
         None => failure(format!("rsync to {} timed out", host.display_name())),
     }
+}
+
+#[cfg(windows)]
+fn copy_preference(
+    source: &Path,
+    destination: &Path,
+    depth: usize,
+    remaining: &mut usize,
+) -> std::io::Result<()> {
+    use std::{io, os::windows::fs::MetadataExt};
+    if depth > 32 || *remaining == 0 {
+        return Err(io::Error::other("preference tree exceeds limit"));
+    }
+    *remaining -= 1;
+    let metadata = std::fs::symlink_metadata(source)?;
+    if metadata.file_attributes() & 0x400 != 0 {
+        return Err(io::Error::other("preference links are not copied"));
+    }
+    // Check each destination ancestor: a remote config symlink must not redirect
+    // a copy outside the user's requested preference directory.
+    for ancestor in destination.ancestors() {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(m) if m.file_attributes() & 0x400 != 0 => {
+                return Err(io::Error::other("preference destination contains a link"));
+            }
+            Ok(_) => (),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+            Err(e) => return Err(e),
+        }
+    }
+    if metadata.is_dir() {
+        std::fs::create_dir_all(destination)?;
+        for entry in std::fs::read_dir(source)? {
+            let entry = entry?;
+            copy_preference(
+                &entry.path(),
+                &destination.join(entry.file_name()),
+                depth + 1,
+                remaining,
+            )?;
+        }
+    } else if metadata.is_file() && metadata.len() <= 2 * 1024 * 1024 {
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(source, destination)?;
+    } else {
+        return Err(io::Error::other("unsupported or oversized preference file"));
+    }
+    Ok(())
 }
 
 /// The classic trap is a remote box without rsync installed: the remote shell
@@ -285,6 +397,12 @@ pub fn normalize_git_url(url: &str) -> String {
 /// The origin URL of the repository containing `cwd` on `host` (None host =
 /// local). None when cwd isn't in a git repo or the repo has no origin.
 pub fn origin_of_cwd(cwd: &str, host: Option<&HostEntry>) -> Option<String> {
+    if host.is_none() {
+        let args = ["-C", cwd, "remote", "get-url", "origin"].map(str::to_owned);
+        let result = run_argv("git", &args, Duration::from_secs(20))?;
+        return (result.ok && !result.stdout.trim().is_empty())
+            .then(|| result.stdout.trim().to_owned());
+    }
     let command = format!("cd {} && git remote get-url origin", shell_quote_path(cwd));
     let result = run_shell(host, &command, Duration::from_secs(20))?;
     if !result.ok {
@@ -342,13 +460,7 @@ pub fn locate(origin: &str, host: Option<&HostEntry>, local_roots: &[String]) ->
             if !Path::new(root).exists() {
                 return None;
             }
-            let result = run_shell(
-                None,
-                &format!("git -C {} remote get-url origin", shell_quote(root)),
-                Duration::from_secs(10),
-            )?;
-            (result.ok && normalize_git_url(result.stdout.trim()) == normalized)
-                .then(|| root.clone())
+            (normalize_git_url(&origin_of_cwd(root, None)?) == normalized).then(|| root.clone())
         }),
     }
 }
@@ -397,6 +509,7 @@ mod tests {
         let empty = tempfile::tempdir().expect("temp");
         let result = sync_prefs(
             &HostEntry {
+                transport: Default::default(),
                 id: "x".into(),
                 name: None,
                 ssh: "nonexistent.invalid".into(),

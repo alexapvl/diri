@@ -638,7 +638,8 @@ pub(crate) fn take_first_run_notice() -> bool {
 /// thread.
 pub(crate) fn upload_now_blocking() -> Result<diri_proto::TelemetryUploadNowResult, String> {
     // Tests never reach the real Engine.
-    let home = std::env::var_os("HOME")
+    let home = diri_platform::home_dir()
+        .map(|p| p.into_os_string())
         .filter(|_| !cfg!(test))
         .ok_or_else(|| "no home directory".to_owned())?;
     // What this process recorded a moment ago goes in the same upload.

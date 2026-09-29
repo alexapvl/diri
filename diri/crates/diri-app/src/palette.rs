@@ -835,6 +835,7 @@ mod tests {
             ..AgentReadinessResult::default()
         };
         let host = HostEntry {
+            transport: Default::default(),
             id: "forge".into(),
             name: Some("Forge".into()),
             ssh: "forge.local".into(),
@@ -897,6 +898,7 @@ mod tests {
     #[test]
     fn live_palette_uses_target_catalog_without_duplicate_default_host_actions() {
         let host = HostEntry {
+            transport: Default::default(),
             id: "forge".into(),
             name: Some("Forge".into()),
             ssh: "forge".into(),
@@ -937,6 +939,7 @@ mod tests {
     #[test]
     fn a_host_whose_catalog_has_not_been_fetched_does_not_borrow_local_actions() {
         let host = HostEntry {
+            transport: Default::default(),
             id: "forge".into(),
             name: Some("Forge".into()),
             ssh: "forge".into(),
@@ -988,6 +991,7 @@ mod tests {
     #[test]
     fn an_unscanned_default_target_keeps_the_shortcut_on_the_saved_preference() {
         let host = HostEntry {
+            transport: Default::default(),
             id: "forge".into(),
             name: Some("Forge".into()),
             ssh: "forge".into(),
@@ -1131,6 +1135,7 @@ mod tests {
     fn configured_hosts_add_remote_spawn_entries_per_agent() {
         let hosts = [
             HostEntry {
+                transport: Default::default(),
                 id: "forge".into(),
                 name: Some("Forge".into()),
                 ssh: "cristi@forge".into(),
@@ -1138,6 +1143,7 @@ mod tests {
                 node: None,
             },
             HostEntry {
+                transport: Default::default(),
                 id: "studio".into(),
                 name: Some("Studio Mac".into()),
                 ssh: "studio.local".into(),
@@ -1183,6 +1189,7 @@ mod tests {
     #[test]
     fn global_palette_shortcuts_follow_the_selected_default_host() {
         let host = HostEntry {
+            transport: Default::default(),
             id: "forge".into(),
             name: Some("Forge".into()),
             ssh: "cristi@forge".into(),
@@ -1265,6 +1272,7 @@ mod tests {
     #[test]
     fn account_bound_sessions_do_not_offer_unsupported_migration() {
         let host = HostEntry {
+            transport: Default::default(),
             id: "forge".into(),
             name: None,
             ssh: "forge".into(),
@@ -1307,6 +1315,7 @@ mod tests {
     #[test]
     fn selected_claude_session_gets_migration_and_sync_entries() {
         let host = HostEntry {
+            transport: Default::default(),
             id: "forge".into(),
             name: Some("Forge".into()),
             ssh: "cristi@forge".into(),

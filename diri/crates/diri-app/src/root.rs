@@ -153,6 +153,8 @@ pub(crate) fn wire_settings_navigation<V: 'static>(
 
 #[cfg(target_os = "macos")]
 use crate::macos::{menu_bar::NativeMenuBar, notifier::NativeNotifier};
+#[cfg(windows)]
+use crate::windows_notifications::NativeNotifier;
 
 /// Drag payload for the sidebar resize seam. Renders nothing -- it exists so
 /// GPUI keeps routing mouse moves to the root while the seam is being dragged.
@@ -211,7 +213,16 @@ enum QuoteSurface {
 /// The platform window background that realizes a preferred material.
 pub(crate) fn window_background(material: WindowMaterial) -> WindowBackgroundAppearance {
     match material {
-        WindowMaterial::Glass => WindowBackgroundAppearance::Blurred,
+        WindowMaterial::Glass => {
+            #[cfg(windows)]
+            {
+                WindowBackgroundAppearance::MicaBackdrop
+            }
+            #[cfg(not(windows))]
+            {
+                WindowBackgroundAppearance::Blurred
+            }
+        }
         WindowMaterial::Opaque => WindowBackgroundAppearance::Opaque,
     }
 }
@@ -334,7 +345,7 @@ pub struct RootView {
     preview_scenario: PreviewScenario,
     #[cfg(target_os = "macos")]
     menu_bar: Option<NativeMenuBar>,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     notifier: std::rc::Rc<NativeNotifier>,
     /// Hold-⌘ shortcut hints for this window; published while it is key.
     held_hints: crate::held_hints::HeldHints,
@@ -950,7 +961,7 @@ impl RootView {
                 let _ = this.update(cx, |this, cx| {
                     this.show_banner(
                         "diri shares diagnostics",
-                        "Crashes, hangs and errors help fix bugs; terminal contents never leave your Mac. Turn it off in Settings › General › Privacy.",
+                        "Crashes, hangs and errors help fix bugs; terminal contents never leave your computer. Turn it off in Settings › General › Privacy.",
                         Duration::from_secs(20),
                         cx,
                     );
@@ -958,7 +969,7 @@ impl RootView {
             })
             .detach();
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         let notifier = crate::application_notifications::notifier(cx);
 
         let activation = cx.observe_window_activation(window, move |this, window, cx| {
@@ -1394,7 +1405,7 @@ impl RootView {
             notification_focus: cx.focus_handle(),
             pending_notification_open: None,
             notification_health:
-                "Use Test alert to check macOS delivery. Notifications remain available here."
+                "Use Test alert to check system delivery. Notifications remain available here."
                     .into(),
             last_quote_surface: QuoteSurface::default(),
             sidebar_revealed_for_settings: false,
@@ -1404,7 +1415,7 @@ impl RootView {
             preview_scenario,
             #[cfg(target_os = "macos")]
             menu_bar,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", windows))]
             notifier,
             held_hints: crate::held_hints::HeldHints::default(),
             _held_hint_timer: None,
@@ -4565,7 +4576,7 @@ impl Render for RootView {
                 }),
             )
         };
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         {
             self.notification_health = crate::application_notifications::health(cx);
         }

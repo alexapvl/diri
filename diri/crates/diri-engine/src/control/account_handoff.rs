@@ -2,7 +2,6 @@
 use super::*;
 use diri_proto::{AgentKind, ContinueAccountParams, SessionRecord};
 use std::fs;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 
 const MAX_TRANSCRIPT: usize = 64 * 1024 * 1024;
 const MARKER: &[u8] = b"\x1eDIRI-ACCOUNT-TRANSCRIPT\n";
@@ -462,32 +461,18 @@ impl Storage {
 }
 
 fn private_directory(path: &Path, create: bool) -> Result<bool, ControlError> {
-    if create {
-        fs::DirBuilder::new()
-            .mode(0o700)
-            .create(path)
-            .or_else(|e| {
-                if e.kind() == std::io::ErrorKind::AlreadyExists {
-                    Ok(())
-                } else {
-                    Err(e)
-                }
-            })
+    if create && !path.exists() {
+        diri_platform::security::private_dir_all(path)
             .map_err(|_| ControlError::bad_request("Cannot create the conversation directory"))?;
     }
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
+    match diri_platform::security::validate_directory(path, 0) {
+        Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(_) => {
             return Err(ControlError::bad_request(
-                "Cannot inspect the conversation directory",
+                "Conversation directories must belong to you and must not be symlinks",
             ));
         }
-    };
-    if !metadata.is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
-        return Err(ControlError::bad_request(
-            "Conversation directories must belong to you and must not be symlinks",
-        ));
     }
     Ok(true)
 }
@@ -509,11 +494,7 @@ fn read_local(location: &Location) -> Result<Option<Vec<u8>>, ControlError> {
     if !check_directories(location, false)? {
         return Ok(None);
     }
-    let file = match fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(location.path())
-    {
+    let file = match diri_platform::security::open_regular(&location.path(), false, false, false) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(_) => {
@@ -525,8 +506,7 @@ fn read_local(location: &Location) -> Result<Option<Vec<u8>>, ControlError> {
     let metadata = file
         .metadata()
         .map_err(|_| ControlError::bad_request("Cannot inspect the Claude transcript"))?;
-    if !metadata.is_file()
-        || metadata.uid() != unsafe { libc::geteuid() }
+    if diri_platform::security::validate_file(&file, false).is_err()
         || metadata.len() > MAX_TRANSCRIPT as u64
     {
         return Err(ControlError::bad_request(
@@ -550,11 +530,7 @@ fn install_local(location: &Location, bytes: &[u8]) -> Result<(), ControlError> 
         .directory()
         .join(format!(".diri-account-{}.tmp", crate::inject::uuid_v4()));
     let result = (|| {
-        let mut file = fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .mode(0o600)
-            .open(&temporary)
+        let mut file = diri_platform::security::create_private(&temporary)
             .map_err(|_| ControlError::internal("Cannot stage the Claude conversation"))?;
         file.write_all(bytes)
             .and_then(|()| file.sync_all())
@@ -576,6 +552,8 @@ const INSTALL_TRANSCRIPT: &str = r#"sh -c 'IFS= read -r root && IFS= read -r pro
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::process::{Command, Stdio};
 

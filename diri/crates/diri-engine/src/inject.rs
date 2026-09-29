@@ -99,7 +99,7 @@ fn mcp_launch(cli_path: &Path) -> (String, Vec<String>) {
     let proxy = cli_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
-        .join("dirijor-mcp");
+        .join(diri_platform::executable_name("dirijor-mcp"));
     if is_executable(&proxy) {
         (proxy.to_string_lossy().into_owned(), Vec::new())
     } else {
@@ -219,22 +219,44 @@ pub fn write_cursor_plugin(
         let (target, target_args) = mcp_launch(cli_path);
         // Cursor splits `command` on spaces before spawning it. Keep the
         // App Support path in argv, where JSON preserves it as one argument.
-        let args = std::iter::once(target)
-            .chain(target_args)
-            .collect::<Vec<_>>();
+        #[cfg(unix)]
+        let (command, args, environment) = (
+            "/usr/bin/env".to_owned(),
+            std::iter::once(target)
+                .chain(target_args)
+                .collect::<Vec<_>>(),
+            json!({ "DIRIJOR_SESSION_ID": session_id, "DIRIJOR_SOCKET": socket_path.to_string_lossy(), "DIRIJOR_CLI": cli_path.to_string_lossy() }),
+        );
+        #[cfg(windows)]
+        let (command, args, environment) = {
+            let binary = Path::new(&target);
+            let directory = binary
+                .parent()
+                .ok_or_else(|| io::Error::other("MCP executable has no directory"))?;
+            let path = std::env::var_os("PATH").unwrap_or_default();
+            let path = std::env::join_paths(
+                std::iter::once(directory.to_path_buf()).chain(std::env::split_paths(&path)),
+            )
+            .map_err(io::Error::other)?;
+            (
+                binary
+                    .file_name()
+                    .ok_or_else(|| io::Error::other("MCP executable has no filename"))?
+                    .to_string_lossy()
+                    .into_owned(),
+                target_args,
+                json!({ "PATH": path.to_string_lossy(), "DIRIJOR_SESSION_ID": session_id, "DIRIJOR_SOCKET": socket_path.to_string_lossy(), "DIRIJOR_CLI": cli_path.to_string_lossy() }),
+            )
+        };
         write_atomic(
             &staging.join("mcp.json"),
             &serde_json::to_vec_pretty(&json!({
                 "mcpServers": {
                     "dirijor": {
                         "type": "stdio",
-                        "command": "/usr/bin/env",
+                        "command": command,
                         "args": args,
-                        "env": {
-                            "DIRIJOR_SESSION_ID": session_id,
-                            "DIRIJOR_SOCKET": socket_path.to_string_lossy(),
-                            "DIRIJOR_CLI": cli_path.to_string_lossy(),
-                        }
+                        "env": environment
                     }
                 }
             }))?,

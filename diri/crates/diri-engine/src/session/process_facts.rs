@@ -132,13 +132,24 @@ fn inspect_local(
     deadline: Instant,
 ) -> io::Result<ProcessFacts> {
     diri_pty::unix_socket::remaining(deadline)?;
+    #[cfg(unix)]
     let executable = HolderLauncher::default_executable_path();
     let facts = diri_pty::process_facts::inspect(identity, |uid| {
-        diri_pty::process_facts::account::lookup_until(
-            &executable,
-            uid,
-            deadline.min(Instant::now() + Duration::from_millis(250)),
-        )
+        #[cfg(unix)]
+        {
+            diri_pty::process_facts::account::lookup_until(
+                &executable,
+                uid,
+                deadline.min(Instant::now() + Duration::from_millis(250)),
+            )
+        }
+        #[cfg(windows)]
+        {
+            let _ = uid;
+            diri_proto::process_facts::ProcessValue::unavailable(
+                diri_proto::process_facts::UnavailableReason::Unsupported,
+            )
+        }
     })?;
     diri_pty::unix_socket::remaining(deadline)?;
     Ok(facts)
@@ -155,8 +166,8 @@ pub(super) fn capture_holder(shared: &Shared, stat: &HolderStat) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use diri_platform::ipc::UnixListener;
     use std::io::{BufRead, BufReader, Write};
-    use std::os::unix::net::UnixListener;
 
     fn fixture(
         temp: &Path,

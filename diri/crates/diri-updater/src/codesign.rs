@@ -18,6 +18,7 @@
 //! only ever offers a strictly-newer version.
 
 use std::path::Path;
+#[cfg(unix)]
 use std::process::Command;
 
 use crate::error::{Result, UpdateError};
@@ -62,6 +63,7 @@ impl SignatureInfo {
     }
 }
 
+#[cfg(not(windows))]
 pub fn signature_of(bundle: &Path) -> Result<SignatureInfo> {
     let output = Command::new("/usr/bin/codesign")
         .arg("-dv")
@@ -83,6 +85,7 @@ pub fn signature_of(bundle: &Path) -> Result<SignatureInfo> {
 
 /// Confirms `candidate` is a notarized build signed by the same team as
 /// `installed`, and refuses it otherwise.
+#[cfg(not(windows))]
 pub fn verify_matches_installed(candidate: &Path, installed: &SignatureInfo) -> Result<()> {
     let Some(expected_team) = installed.team_identifier.as_deref() else {
         return Err(UpdateError::NotUpdatable(
@@ -143,6 +146,7 @@ pub fn check_identity(
     Ok(())
 }
 
+#[cfg(unix)]
 fn assess_with_gatekeeper(candidate: &Path) -> Result<()> {
     let output = Command::new("/usr/sbin/spctl")
         .arg("--assess")
@@ -247,4 +251,13 @@ TeamIdentifier=not set
             check_identity(&apple_development, "AH8WARWU6L", Some("com.dirijor.diri")).is_err()
         );
     }
+}
+
+#[cfg(windows)]
+pub fn signature_of(bundle: &Path) -> Result<SignatureInfo> {
+    crate::windows::signature_of(bundle)
+}
+#[cfg(windows)]
+pub fn verify_matches_installed(candidate: &Path, installed: &SignatureInfo) -> Result<()> {
+    crate::windows::verify(candidate, installed)
 }

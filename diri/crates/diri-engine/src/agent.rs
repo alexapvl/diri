@@ -427,7 +427,7 @@ impl AgentDescriptor {
             spec.env.retain(|(existing, _)| existing != key);
             spec.env.push((key.clone(), value.clone()));
         }
-        if self.return_to_login_shell {
+        if self.return_to_login_shell && cfg!(unix) {
             // Keep the shell as the PTY's session leader. When the agent exits
             // (notably after Codex updates itself), the command re-enters that
             // shell and leaves a usable prompt instead of ending the session.

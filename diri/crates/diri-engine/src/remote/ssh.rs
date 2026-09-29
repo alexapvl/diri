@@ -23,6 +23,7 @@ pub struct SshTransport {
     destination: String,
     control_path: PathBuf,
     batch_mode: bool,
+    distribution: Option<String>,
 }
 
 impl SshTransport {
@@ -33,6 +34,7 @@ impl SshTransport {
             destination: host.ssh.clone(),
             control_path: control_path.into(),
             batch_mode: false,
+            distribution: host.wsl_distribution().map(str::to_owned),
         }
     }
 
@@ -51,6 +53,27 @@ impl SshTransport {
     #[must_use]
     pub(crate) fn control_path(&self) -> &Path {
         &self.control_path
+    }
+
+    pub fn uses_control_master(&self) -> bool {
+        !cfg!(windows) && self.distribution.is_none()
+    }
+
+    fn wsl_channel(distribution: &str, script: &str) -> CommandSpec {
+        CommandSpec {
+            program: OsString::from("wsl.exe"),
+            arguments: [
+                "--distribution",
+                distribution,
+                "--exec",
+                "/bin/sh",
+                "-c",
+                script,
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect(),
+        }
     }
 
     /// Long-lived connection used only to amortize authentication and SSH
@@ -188,6 +211,12 @@ impl SshTransport {
     /// text; user argv, cwd, prompts, and environment travel over stdin later.
     #[must_use]
     pub fn channel(&self, remote_command: &str) -> CommandSpec {
+        if let Some(distribution) = &self.distribution {
+            return Self::wsl_channel(distribution, remote_command);
+        }
+        if cfg!(windows) {
+            return self.independent_channel(remote_command);
+        }
         let mut arguments = vec![
             OsString::from("-T"),
             OsString::from("-o"),
@@ -221,6 +250,9 @@ impl SshTransport {
     /// multiplexing master. Persistence probes use this path so returning from
     /// the command proves that its underlying SSH connection has closed.
     fn independent_channel(&self, remote_command: &str) -> CommandSpec {
+        if let Some(distribution) = &self.distribution {
+            return Self::wsl_channel(distribution, remote_command);
+        }
         let mut arguments = vec![
             OsString::from("-T"),
             OsString::from("-o"),
@@ -322,6 +354,7 @@ mod tests {
 
     fn host() -> HostEntry {
         HostEntry {
+            transport: Default::default(),
             id: "forge".into(),
             name: None,
             ssh: "developer@forge".into(),

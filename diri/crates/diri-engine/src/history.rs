@@ -427,6 +427,7 @@ pub(crate) fn claude_resumable_conversation(
 fn open_trusted_regular_file(root: &Path, path: &Path) -> Option<File> {
     let canonical_root = root.canonicalize().ok()?;
     let file = open_regular_readonly(path)?;
+    #[cfg(unix)]
     let opened_metadata = file.metadata().ok()?;
     let link_metadata = std::fs::symlink_metadata(path).ok()?;
     let canonical_path = path.canonicalize().ok()?;
@@ -2126,7 +2127,12 @@ mod tests {
             eprintln!("skipped: DIRI_INTEROP_HISTORY is not set");
             return;
         }
-        let home = PathBuf::from(std::env::var("HOME").expect("HOME"));
+        let home = PathBuf::from(
+            diri_platform::home_dir()
+                .map(|p| p.to_string_lossy().into_owned())
+                .ok_or(std::env::VarError::NotPresent)
+                .expect("HOME"),
+        );
         let started = std::time::Instant::now();
         let entries = scan(&home, &[]);
         let elapsed = started.elapsed();

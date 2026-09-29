@@ -4,10 +4,8 @@
 //! No raw replay, process observation, input, notifications, or Holder launch occurs.
 
 use std::ffi::CString;
-use std::fs::{File, OpenOptions};
+
 use std::io::{self, Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -237,7 +235,7 @@ impl Drop for Admission {
 /// Directory is supplied by Engine configuration, not a control caller. It must
 /// already be a private, owned directory; neither opening nor loading creates it.
 pub struct CompletedTerminalStore {
-    directory: File,
+    directory: diri_platform::directory::PrivateDirectory,
     path: std::path::PathBuf,
 }
 
@@ -252,17 +250,7 @@ pub struct RetentionReport {
 
 impl CompletedTerminalStore {
     pub fn open(directory: &Path) -> Result<Self> {
-        let file = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(directory)?;
-        let metadata = file.metadata()?;
-        if !metadata.is_dir()
-            || metadata.uid() != unsafe { libc::geteuid() }
-            || metadata.mode() & 0o077 != 0
-        {
-            return Err(StorageError::Corrupt);
-        }
+        let file = diri_platform::directory::PrivateDirectory::open(directory)?;
         Ok(Self {
             directory: file,
             path: directory.to_path_buf(),
@@ -323,15 +311,11 @@ impl CompletedTerminalStore {
     }
 
     fn unlink(&self, name: &str) -> Result<()> {
-        let name = CString::new(name).map_err(|_| StorageError::Corrupt)?;
-        // SAFETY: the owned directory fd and NUL-terminated name remain live.
-        if unsafe { libc::unlinkat(self.directory.as_raw_fd(), name.as_ptr(), 0) } != 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::NotFound {
-                return Err(error.into());
-            }
+        match self.directory.unlink(name) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
         }
-        Ok(())
     }
 
     /// Publish once after observed child exit AND complete PTY drain. Caller
@@ -407,20 +391,9 @@ impl CompletedTerminalStore {
         getrandom::fill(&mut random).map_err(io::Error::other)?;
         let nonce =
             CString::new(format!(".completed-{}.tmp", digest_hex(&random))).expect("hex filename");
-        // SAFETY: the owned directory fd and NUL-terminated name remain live.
-        let fd = unsafe {
-            libc::openat(
-                self.directory.as_raw_fd(),
-                nonce.as_ptr(),
-                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                0o600,
-            )
-        };
-        if fd < 0 {
-            return Err(io::Error::last_os_error().into());
-        }
-        // SAFETY: successful openat returned a new fd, transferred exactly once.
-        let mut file = unsafe { File::from_raw_fd(fd) };
+        let mut file = self
+            .directory
+            .create(nonce.to_str().map_err(|_| StorageError::Corrupt)?)?;
         let result = (|| -> Result<()> {
             file.write_all(MAGIC)?;
             file.write_all(&(metadata.len() as u32).to_be_bytes())?;
@@ -428,29 +401,18 @@ impl CompletedTerminalStore {
             file.write_all(&metadata)?;
             file.write_all(&payload.0)?;
             file.sync_all()?;
-            // Atomic no-replace publication. Hardlink stays within the owned
-            // directory and the private temporary name is removed below.
-            // SAFETY: both relative names and the directory fd remain live.
-            if unsafe {
-                libc::linkat(
-                    self.directory.as_raw_fd(),
-                    nonce.as_ptr(),
-                    self.directory.as_raw_fd(),
-                    name.as_ptr(),
-                    0,
-                )
-            } != 0
-            {
-                return Err(io::Error::last_os_error().into());
-            }
+            self.directory.publish(
+                nonce.to_str().map_err(|_| StorageError::Corrupt)?,
+                name.to_str().map_err(|_| StorageError::Corrupt)?,
+            )?;
             Ok(())
         })();
-        let unlinked = unsafe { libc::unlinkat(self.directory.as_raw_fd(), nonce.as_ptr(), 0) };
+        let unlinked = self
+            .directory
+            .unlink(nonce.to_str().map_err(|_| StorageError::Corrupt)?);
         if result.is_ok() {
-            if unlinked != 0 {
-                return Err(io::Error::last_os_error().into());
-            }
-            self.directory.sync_all()?;
+            unlinked?;
+            self.directory.sync()?;
         }
         result
     }
@@ -458,15 +420,7 @@ impl CompletedTerminalStore {
     /// Removes the artifact for one exact run, for example when its record is
     /// deleted. Absence is not an error; nothing else in the directory is touched.
     pub fn discard(&self, key: &CompletedRunKey) -> Result<()> {
-        let name = key.name()?;
-        // SAFETY: the owned directory fd and NUL-terminated name remain live.
-        if unsafe { libc::unlinkat(self.directory.as_raw_fd(), name.as_ptr(), 0) } != 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::NotFound {
-                return Err(error.into());
-            }
-        }
-        Ok(())
+        self.unlink(key.name()?.to_str().map_err(|_| StorageError::Corrupt)?)
     }
 
     /// Returns None only for an absent exact-run artifact. The expected key must
@@ -484,32 +438,16 @@ impl CompletedTerminalStore {
         };
         check_exit(record, exit)?;
         let name = expected.name()?;
-        // SAFETY: the owned directory fd and NUL-terminated name remain live.
-        let fd = unsafe {
-            libc::openat(
-                self.directory.as_raw_fd(),
-                name.as_ptr(),
-                libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            let error = io::Error::last_os_error();
-            return if error.kind() == io::ErrorKind::NotFound {
-                Ok(None)
-            } else {
-                Err(error.into())
-            };
-        }
-        // SAFETY: successful openat returned a new fd, transferred exactly once.
-        let mut file = unsafe { File::from_raw_fd(fd) };
-        let stat = file.metadata()?;
-        if !stat.is_file()
-            || stat.uid() != unsafe { libc::geteuid() }
-            || stat.mode() & 0o077 != 0
-            || stat.nlink() != 1
+        let mut file = match self
+            .directory
+            .read(name.to_str().map_err(|_| StorageError::Corrupt)?)
         {
-            return Err(StorageError::Corrupt);
-        }
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        diri_platform::security::validate_file(&file, true).map_err(|_| StorageError::Corrupt)?;
+        let stat = file.metadata()?;
         if stat.len() > (HEADER_BYTES + MAX_METADATA + MAX_CHECKPOINT_BYTES) as u64 {
             return Err(StorageError::TooLarge);
         }

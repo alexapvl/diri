@@ -429,7 +429,8 @@ impl UtilitySurfaces {
         cx: &mut Context<Self>,
     ) -> Self {
         let focus = cx.focus_handle();
-        let home = std::env::var_os("HOME")
+        let home = diri_platform::home_dir()
+            .map(|p| p.into_os_string())
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/nonexistent"));
         let hosts_path = diri_proto::paths::DirijorPaths::hosts_config_file(&home);
@@ -885,7 +886,8 @@ impl UtilitySurfaces {
     }
 
     fn consume_root_picks(&mut self, mut paths: Vec<PathBuf>, cx: &mut Context<Self>) {
-        let home = std::env::var_os("HOME")
+        let home = diri_platform::home_dir()
+            .map(|p| p.into_os_string())
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/nonexistent"));
         let mut text = self.roots_editor.text().to_owned();
@@ -926,7 +928,8 @@ impl UtilitySurfaces {
         let Some(prompt) = self.nested_root.take() else {
             return;
         };
-        let home = std::env::var_os("HOME")
+        let home = diri_platform::home_dir()
+            .map(|p| p.into_os_string())
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/nonexistent"));
         let mut text =
@@ -1004,11 +1007,9 @@ impl UtilitySurfaces {
     }
 
     fn reload_hosts(&mut self) {
-        self.hosts = HostsConfig::load(&self.hosts_path).hosts;
-        self.store
-            .write()
-            .expect("session store lock poisoned")
-            .set_hosts(self.hosts.clone());
+        let mut store = self.store.write().expect("session store lock poisoned");
+        store.reload_hosts();
+        self.hosts = store.hosts().to_vec();
     }
 
     fn begin_adding_host(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1019,6 +1020,19 @@ impl UtilitySurfaces {
     }
 
     fn begin_editing_host(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .hosts
+            .iter()
+            .any(|h| h.id == id && h.wsl_distribution().is_some())
+        {
+            self.store
+                .write()
+                .expect("session store lock poisoned")
+                .set_default_spawn_host(Some(id.into()));
+            self.activity = "WSL distribution selected for new sessions".into();
+            cx.notify();
+            return;
+        }
         let Some(host) = self.hosts.iter().find(|host| host.id == id) else {
             return;
         };
@@ -4682,7 +4696,10 @@ impl UtilitySurfaces {
                 }
                 let id = host.id.clone();
                 let name = host.display_name().to_owned();
-                let destination = host.ssh.clone();
+                let destination = host
+                    .wsl_distribution()
+                    .map(|d| format!("WSL · {d}"))
+                    .unwrap_or_else(|| host.ssh.clone());
                 let folder = host.default_cwd.clone();
                 let first_party = host.node.is_some();
                 let is_default = default_host.as_deref() == Some(host.id.as_str());
@@ -5548,7 +5565,8 @@ impl UtilitySurfaces {
 }
 
 fn build_diagnostics_report(store: &SessionStore) -> String {
-    let home = std::env::var_os("HOME")
+    let home = diri_platform::home_dir()
+        .map(|p| p.into_os_string())
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/nonexistent"));
     let platform = crate::diagnostics::PlatformMetadata::current();
@@ -5588,6 +5606,12 @@ impl Focusable for UtilitySurfaces {
 
 impl Render for UtilitySurfaces {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.hosts = self
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .hosts()
+            .to_vec();
         self.release_retired_share_images(window, cx);
         // Worktree delegation starts in the sidebar, so that one surface
         // deliberately leaves the visible sidebar interactive. The shaded
@@ -8469,6 +8493,7 @@ mod tests {
             let surfaces = cx.new(|cx| {
                 let mut surfaces = UtilitySurfaces::new(runtime, tokio, updates, window, cx);
                 let host = HostEntry {
+                    transport: Default::default(),
                     id: "forge".into(),
                     name: Some("Forge".into()),
                     ssh: "you@forge".into(),
@@ -8534,6 +8559,7 @@ mod tests {
             let surfaces = cx.new(|cx| {
                 let mut surfaces = UtilitySurfaces::new(runtime, tokio, updates, window, cx);
                 surfaces.hosts = vec![HostEntry {
+                    transport: Default::default(),
                     id: "forge".into(),
                     name: Some("Forge".into()),
                     ssh: "you@forge".into(),

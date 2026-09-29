@@ -698,6 +698,45 @@ fn copy_file(
     to: &str,
     to_host: Option<&HostEntry>,
 ) -> Result<(), String> {
+    #[cfg(windows)]
+    let (from_path, from_host, to_path, to_host) = {
+        let local = |path: &str, host: Option<&HostEntry>| -> Result<String, String> {
+            if let Some(host) = host.filter(|host| host.wsl_distribution().is_some()) {
+                return crate::wsl::explorer_path(host, path).map_err(|e| e.to_string());
+            }
+            if host.is_none() && path.starts_with('/') {
+                // mktemp in fixed Git-for-Windows maintenance scripts returns
+                // an MSYS path. Convert it before passing it to native file APIs.
+                let shell =
+                    diri_platform::launch::maintenance_shell().map_err(|e| e.to_string())?;
+                let output = diri_platform::child::output(
+                    std::process::Command::new(shell.with_file_name("cygpath.exe"))
+                        .args(["-w", path]),
+                    Duration::from_secs(5),
+                    32768,
+                )
+                .map_err(|e| e.to_string())?;
+                if !output.status.success() {
+                    return Err("Cannot resolve Git for Windows maintenance path".into());
+                }
+                return Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned());
+            }
+            Ok(path.into())
+        };
+        (
+            local(from, from_host)?,
+            from_host.filter(|host| host.wsl_distribution().is_none()),
+            local(to, to_host)?,
+            to_host.filter(|host| host.wsl_distribution().is_none()),
+        )
+    };
+    #[cfg(windows)]
+    let (from, to) = (from_path.as_str(), to_path.as_str());
+    if from_host.is_none() && to_host.is_none() {
+        return std::fs::copy(from, to)
+            .map(|_| ())
+            .map_err(|e| e.to_string());
+    }
     let mut argv = copy_argv(from, from_host, to, to_host);
     let program = argv.remove(0);
     let output = std::process::Command::new(&program)
@@ -724,6 +763,7 @@ mod tests {
 
     fn host(id: &str) -> HostEntry {
         HostEntry {
+            transport: Default::default(),
             id: id.into(),
             name: None,
             ssh: format!("user@{id}"),

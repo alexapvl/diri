@@ -36,3 +36,9 @@ harness = false
 [[bench]]
 name = "terminal_interactions"
 harness = false
+
+[dev-dependencies]
+diri-pty.workspace = true
+diri-platform.workspace = true
+serde.workspace = true
+serde_json.workspace = true

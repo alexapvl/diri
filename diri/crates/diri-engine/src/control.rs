@@ -11,8 +11,8 @@
 //! `not_found` control error, which is what an older daemon does for a method
 //! it does not know, rather than dropping the connection.
 
+use diri_platform::ipc::{UnixListener, UnixStream};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -48,9 +48,42 @@ const fn default_shell() -> &'static str {
     "/bin/zsh"
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 const fn default_shell() -> &'static str {
     "/bin/sh"
+}
+
+#[cfg(windows)]
+const fn default_shell() -> &'static str {
+    "powershell.exe"
+}
+fn local_shell_argv(command: Option<&str>) -> Vec<String> {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| default_shell().into());
+    #[cfg(unix)]
+    {
+        match command {
+            Some(command) => vec![shell, "-lc".into(), command.into()],
+            None => vec![shell, "-l".into()],
+        }
+    }
+    #[cfg(windows)]
+    {
+        let name = Path::new(&shell)
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_ascii_lowercase();
+        match (name.as_str(), command) {
+            ("cmd", Some(command)) => vec![shell, "/D".into(), "/C".into(), command.into()],
+            ("cmd", None) => vec![shell, "/D".into()],
+            ("bash" | "sh" | "zsh" | "fish", Some(command)) => {
+                vec![shell, "-lc".into(), command.into()]
+            }
+            ("bash" | "sh" | "zsh" | "fish", None) => vec![shell, "-l".into()],
+            (_, Some(command)) => vec![shell, "-NoLogo".into(), "-Command".into(), command.into()],
+            (_, None) => vec![shell, "-NoLogo".into()],
+        }
+    }
 }
 
 pub struct ControlServer {
@@ -298,7 +331,7 @@ impl ControlServer {
         let Ok(bindings) = store.load_all() else {
             return Vec::new();
         };
-        let hosts = diri_proto::HostsConfig::load(self.hosts_file());
+        let hosts = crate::wsl::catalog(self.hosts_file());
         // Clone the engine under the lock, then let it go. Every step below is an SSH
         // round trip, and a delegated fleet is dozens of bindings on one host:
         // holding the Registry across all of them blocked attaches, hook
@@ -909,12 +942,7 @@ impl ControlServer {
             Method::HOST_INITIALIZE => self.host_initialize(params),
             Method::HOST_USAGE => self.host_usage(params),
             Method::HOST_LIST_DIRECTORIES => self.host_list_directories(params),
-            Method::HOST_LIST => Ok(
-                json!({"hosts": diri_proto::HostsConfig::load(self.hosts_file())
-                .hosts.iter().map(|host| json!({
-                    "id": host.id, "name": host.display_name(), "defaultCwd": host.default_cwd
-                })).collect::<Vec<_>>() }),
-            ),
+            Method::HOST_LIST => encode(&crate::wsl::catalog(self.hosts_file())),
             Method::SESSION_MIGRATE => self.session_migrate(params),
             Method::SESSION_REPARENT_WORKTREE => self.session_reparent_worktree(params),
             Method::HOST_LOCATE_REPO => self.host_locate_repo(params),
@@ -998,7 +1026,19 @@ impl ControlServer {
         // argv keeps manifest launch behavior; an explicit malformed argv must
         // never silently drop arguments or fall back to a login shell.
         let argv = decode_launch_argv(&raw)?;
-        let p: diri_proto::SessionSpawnParams = decode(Some(raw))?;
+        let mut p: diri_proto::SessionSpawnParams = decode(Some(raw))?;
+        if let Some((host, cwd)) =
+            crate::wsl::route_unc(&p.cwd, &crate::wsl::catalog(self.hosts_file()))
+                .map_err(io_control_error)?
+        {
+            if p.host.as_ref().is_some_and(|requested| requested != &host) {
+                return Err(ControlError::bad_request(
+                    "The project path belongs to a different WSL distribution",
+                ));
+            }
+            p.host = Some(host);
+            p.cwd = cwd;
+        }
         let mut account_profile = self.accounts.lock().map_err(poisoned)?.resolve(
             p.account_profile_id.as_deref(),
             p.kind.id(),
@@ -1011,9 +1051,12 @@ impl ControlServer {
             && profile.agent == "codex"
             && !profile.is_default
             && (profile.config_home == "~/.codex"
-                || std::env::var("HOME").is_ok_and(|home| {
-                    PathBuf::from(home).join(".codex") == Path::new(&profile.config_home)
-                }))
+                || diri_platform::home_dir()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .ok_or(std::env::VarError::NotPresent)
+                    .is_ok_and(|home| {
+                        PathBuf::from(home).join(".codex") == Path::new(&profile.config_home)
+                    }))
         {
             return Err(ControlError::bad_request(
                 "Select this Codex account in the bottom-left menu before starting a conversation. Shared-home profiles use the active login.",
@@ -1024,14 +1067,8 @@ impl ControlServer {
         // A generic kind carries the user's command line inside itself.
         let argv = if argv.is_empty() {
             match p.kind.command() {
-                Some(command) if !command.is_empty() => {
-                    let shell = std::env::var("SHELL").unwrap_or_else(|_| default_shell().into());
-                    vec![shell, "-lc".into(), command.to_string()]
-                }
-                _ if kind == diri_proto::AgentKind::SHELL_ID => {
-                    let shell = std::env::var("SHELL").unwrap_or_else(|_| default_shell().into());
-                    vec![shell, "-l".into()]
-                }
+                Some(command) if !command.is_empty() => local_shell_argv(Some(command)),
+                _ if kind == diri_proto::AgentKind::SHELL_ID => local_shell_argv(None),
                 _ => Vec::new(),
             }
         } else {
@@ -1112,7 +1149,7 @@ impl ControlServer {
             agent_session_id = plan.agent_session_id;
         }
 
-        let inherited: Vec<(String, String)> = std::env::vars().collect();
+        let inherited: Vec<(String, String)> = diri_platform::launch::local_environment();
         let mut pty = match descriptor.spawn_spec(&cwd_path, inherited.clone(), &launch_args) {
             Some(spec) => spec,
             // No binary in the manifest: the caller has to say what to run.
@@ -1183,7 +1220,9 @@ impl ControlServer {
             if let Some(uuid) = &agent_session_id {
                 record.agent_session_id = Some(uuid.clone());
                 if descriptor.injection.claude_hooks
-                    && let Ok(home) = std::env::var("HOME")
+                    && let Ok(home) = diri_platform::home_dir()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .ok_or(std::env::VarError::NotPresent)
                 {
                     record.transcript_path = Some(
                         record
@@ -1353,7 +1392,7 @@ impl ControlServer {
                 .map_err(io_control_error)?
         };
         let cwd = PathBuf::from(&captured.cwd);
-        if !cwd.is_absolute() {
+        if !captured.cwd.starts_with('/') {
             return Err(ControlError::internal(
                 "remote Helper returned a non-absolute cwd",
             ));
@@ -1378,7 +1417,12 @@ impl ControlServer {
                 .iter()
                 .rev()
                 .find(|(name, value)| name == "HOME" && !value.is_empty())
-                .map(|(_, home)| Path::new(home).join(".diri/session-storage").join(&id));
+                .map(|(_, home)| {
+                    PathBuf::from(format!(
+                        "{}/.diri/session-storage/{id}",
+                        home.trim_end_matches('/')
+                    ))
+                });
             let plan = descriptor
                 .conversation_plan(
                     &launch_args,
@@ -1658,7 +1702,9 @@ impl ControlServer {
             .as_deref()
             .map(|host| self.resolve_host(host))
             .transpose()?;
-        let home = std::env::var("HOME")
+        let home = diri_platform::home_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .ok_or(std::env::VarError::NotPresent)
             .map(PathBuf::from)
             .map_err(|_| ControlError::internal("HOME is not set"))?;
 
@@ -1885,7 +1931,9 @@ impl ControlServer {
     fn host_sync_prefs(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
         let p: diri_proto::HostSyncPrefsParams = decode(params)?;
         let entry = self.resolve_host(&p.host)?;
-        let home = std::env::var("HOME")
+        let home = diri_platform::home_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .ok_or(std::env::VarError::NotPresent)
             .map(PathBuf::from)
             .map_err(|_| ControlError::internal("HOME is not set"))?;
         encode(&crate::hosts::sync_prefs(&entry, &home))
@@ -1970,7 +2018,19 @@ impl ControlServer {
     /// requested execution machine. Remote work stays behind the Engine and
     /// uses the verified Helper over `ssh -T`; the app never executes SSH.
     fn host_list_directories(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
-        let p: diri_proto::HostListDirectoriesParams = decode(params)?;
+        let mut p: diri_proto::HostListDirectoriesParams = decode(params)?;
+        if let Some((host, path)) =
+            crate::wsl::route_unc(&p.path, &crate::wsl::catalog(self.hosts_file()))
+                .map_err(io_control_error)?
+        {
+            if p.host.as_ref().is_some_and(|requested| requested != &host) {
+                return Err(ControlError::bad_request(
+                    "The path belongs to a different WSL distribution",
+                ));
+            }
+            p.host = Some(host);
+            p.path = path;
+        }
         let request = diri_proto::remote_pty::DirectoryListRequest {
             path: p.path,
             mode: p.mode,
@@ -2043,7 +2103,7 @@ impl ControlServer {
     /// Resolves a host id against `hosts.json`, read fresh each call so
     /// Settings edits apply without a daemon restart.
     fn resolve_host(&self, host_id: &str) -> Result<diri_proto::HostEntry, ControlError> {
-        diri_proto::HostsConfig::load(self.hosts_file())
+        crate::wsl::catalog(self.hosts_file())
             .hosts
             .into_iter()
             .find(|entry| entry.id == host_id)
@@ -3025,7 +3085,7 @@ impl ControlServer {
                 .map_err(io_control_error)?
         };
         let cwd = PathBuf::from(&captured.cwd);
-        if !cwd.is_absolute() {
+        if !captured.cwd.starts_with('/') {
             return Err(ControlError::internal(
                 "remote Helper returned a non-absolute cwd",
             ));
@@ -3037,9 +3097,10 @@ impl ControlServer {
             .rev()
             .find(|variable| variable.name == "HOME" && !variable.value.is_empty())
             .map(|variable| {
-                Path::new(&variable.value)
-                    .join(".diri/session-storage")
-                    .join(target_id)
+                PathBuf::from(format!(
+                    "{}/.diri/session-storage/{target_id}",
+                    variable.value.trim_end_matches('/')
+                ))
             });
         let launch = match action {
             ConversationAction::Resume => crate::agent::ConversationLaunch::Resume {
@@ -3272,7 +3333,7 @@ impl ControlServer {
             })?
             .args;
 
-        let inherited: Vec<(String, String)> = std::env::vars().collect();
+        let inherited: Vec<(String, String)> = diri_platform::launch::local_environment();
         let mut pty = descriptor
             .spawn_spec(Path::new(cwd), inherited, &launch_args)
             .ok_or_else(|| ControlError::internal("resume spec without a binary"))?;
@@ -3615,6 +3676,27 @@ impl ControlServer {
             let descriptor = raw_descriptor.and_then(|value| {
                 serde_json::from_value::<diri_proto::AgentDescriptor>(value).ok()
             });
+            #[cfg(windows)]
+            let descriptor = descriptor.map(|mut descriptor| {
+                if params.host.is_none() && let Some(setup) = &mut descriptor.setup {
+                    // POSIX installer snippets must never be typed into PowerShell.
+                    setup.install_command = match id.as_str() {
+                        "claude-code" => Some("irm https://claude.ai/install.ps1 | iex".into()),
+                        "codex" => Some("npm.cmd install -g @openai/codex".into()),
+                        "gemini" => Some("npm.cmd install -g @google/gemini-cli".into()),
+                        _ => None,
+                    };
+                    setup.install_requirement = match id.as_str() {
+                        "claude-code" => Some("Git for Windows".into()),
+                        "codex" | "gemini" => Some("Node.js with npm".into()),
+                        _ => None,
+                    };
+                    if setup.install_command.is_none() {
+                        setup.install_hint = Some("Use the vendor's Windows installer, or select a WSL host for its Linux CLI.".into());
+                    }
+                }
+                descriptor
+            });
             agents.push(diri_proto::AgentReadinessItem {
                 kind: diri_proto::AgentKind::new(id),
                 binary,
@@ -3860,7 +3942,9 @@ impl ControlServer {
             let registry = self.registry.lock().map_err(poisoned)?;
             registry.tracked_agent_session_ids()
         };
-        let home = std::env::var("HOME")
+        let home = diri_platform::home_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .ok_or(std::env::VarError::NotPresent)
             .map(PathBuf::from)
             .map_err(|_| ControlError::internal("HOME is not set"))?;
         let entries: Vec<diri_proto::HistoryEntry> = crate::history::scan(&home, &tracked)
@@ -3927,7 +4011,10 @@ impl Drop for ControlServer {
 /// against), `Some(Some(id))` resumes a conversation whose transcript exists,
 /// and `Some(None)` means the tab's id was never written and must start fresh.
 fn claude_resume_target(record: &diri_proto::SessionRecord) -> Option<Option<String>> {
-    claude_resume_target_in(record, Path::new(&std::env::var_os("HOME")?))
+    claude_resume_target_in(
+        record,
+        Path::new(&diri_platform::home_dir().map(|p| p.into_os_string())?),
+    )
 }
 
 fn claude_resume_target_in(
@@ -6828,6 +6915,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp");
         diri_proto::HostsConfig {
             hosts: vec![diri_proto::HostEntry {
+                transport: Default::default(),
                 id: "forge".into(),
                 name: Some("Forge".into()),
                 ssh: "you@forge".into(),

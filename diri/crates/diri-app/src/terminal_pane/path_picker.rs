@@ -274,7 +274,8 @@ impl TerminalPane {
         let placeholder = picker.root().map_or_else(
             || "Finding files…".to_owned(),
             |root| {
-                let home = std::env::var_os("HOME")
+                let home = diri_platform::home_dir()
+                    .map(|p| p.into_os_string())
                     .map(PathBuf::from)
                     .unwrap_or_default();
                 crate::quick_open::collapse_home(root, &home)

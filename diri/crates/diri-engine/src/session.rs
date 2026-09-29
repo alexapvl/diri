@@ -18,8 +18,8 @@
 
 mod process_facts;
 
+use diri_platform::poll::AsRawIo;
 use std::io::Read;
-use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -1063,7 +1063,7 @@ impl RemoteStop {
             .terminate_requested
             .store(true, Ordering::SeqCst);
         if !self.shared.exited.load(Ordering::SeqCst) {
-            let _ = self.client.signal(libc::SIGTERM);
+            let _ = self.client.signal(diri_platform::signals::SIGTERM);
             let deadline = Instant::now() + grace;
             while Instant::now() < deadline && !self.shared.exited.load(Ordering::SeqCst) {
                 std::thread::sleep(Duration::from_millis(20));
@@ -2860,7 +2860,7 @@ impl Session {
                 let _ = pump.join();
             }
             self.shared.exited.store(true, Ordering::SeqCst);
-            return Ok(Exit::Signal(libc::SIGKILL));
+            return Ok(Exit::Signal(diri_platform::signals::SIGKILL));
         }
         let exit = match &self.transport {
             Transport::Direct(pty) => terminate_direct(pty, grace)?,
@@ -2889,7 +2889,7 @@ impl Session {
             }
             Transport::Remote(client) => {
                 if !self.shared.exited.load(Ordering::SeqCst) {
-                    let _ = client.signal(libc::SIGTERM);
+                    let _ = client.signal(diri_platform::signals::SIGTERM);
                     let deadline = std::time::Instant::now() + grace;
                     while std::time::Instant::now() < deadline
                         && !self.shared.exited.load(Ordering::SeqCst)
@@ -2939,7 +2939,7 @@ impl Drop for Session {
             && !self.shared.exited.load(Ordering::SeqCst)
             && let Ok(pty) = pty.lock()
         {
-            let _ = pty.kill_group(libc::SIGKILL);
+            let _ = pty.kill_group(diri_platform::signals::SIGKILL);
         }
         if let Transport::Remote(client) = &self.transport {
             client.close();
@@ -3428,7 +3428,7 @@ fn pump_remote_connection(
     engine: &ManifestEngine,
     client: &RemoteSessionClient,
     generation: u64,
-    output: &mut std::process::ChildStdout,
+    output: &mut diri_platform::pipe::ChildStdout,
     manifest_id: &str,
 ) -> RemoteConnectionDisposition {
     let mut codec = RemoteCodec::new();
@@ -3439,7 +3439,7 @@ fn pump_remote_connection(
     let mut last_eval_seq = 0_u64;
     let mut last_scan_at = None;
     let mut last_scan_seq = 0_u64;
-    let fd = output.as_raw_fd();
+    let fd = output.as_raw_io();
     let Ok(mut write_wakeup) = client.take_write_wakeup(generation) else {
         return RemoteConnectionDisposition::Reconnect;
     };
@@ -3474,26 +3474,26 @@ fn pump_remote_connection(
             Err(_) => return RemoteConnectionDisposition::Reconnect,
         };
         let mut descriptors = [
-            libc::pollfd {
+            diri_platform::poll::PollFd {
                 fd,
-                events: libc::POLLIN,
+                events: diri_platform::poll::POLLIN,
                 revents: 0,
             },
-            libc::pollfd {
-                fd: write_wakeup.as_raw_fd(),
-                events: libc::POLLIN,
+            diri_platform::poll::PollFd {
+                fd: write_wakeup.as_raw_io(),
+                events: diri_platform::poll::POLLIN,
                 revents: 0,
             },
-            libc::pollfd {
-                fd: pending_fd.as_ref().map_or(-1, AsRawFd::as_raw_fd),
-                events: libc::POLLOUT,
+            diri_platform::poll::PollFd {
+                fd: pending_fd.as_ref().map_or(-1, AsRawIo::as_raw_io),
+                events: diri_platform::poll::POLLOUT,
                 revents: 0,
             },
         ];
         // SAFETY: the owned output, wakeup and cloned pending descriptors stay
         // alive throughout poll; generation checks precede every write.
         let ready = unsafe {
-            libc::poll(
+            diri_platform::poll::poll(
                 descriptors.as_mut_ptr(),
                 descriptors.len() as _,
                 tick.as_millis() as i32,
@@ -4057,7 +4057,7 @@ fn pump(
     let mut last_eval_seq = 0u64;
     let mut last_scan_at = None;
     let mut last_scan_seq = 0u64;
-    let fd = reader.as_raw_fd();
+    let fd = reader.as_raw_io();
 
     loop {
         if shared.stop.load(Ordering::SeqCst) {
@@ -4068,13 +4068,15 @@ fn pump(
         // Wait for output, but never longer than a tick. Output interrupts the
         // wait immediately, so the idle tick only slows reducer timers — which
         // are no-ops outside Working anyway.
-        let mut poll_fd = libc::pollfd {
+        let mut poll_fd = diri_platform::poll::PollFd {
             fd,
-            events: libc::POLLIN,
+            events: diri_platform::poll::POLLIN,
             revents: 0,
         };
         // SAFETY: one initialized pollfd, a millisecond timeout.
-        let ready = unsafe { libc::poll(&mut poll_fd, 1, shared.quiet_tick().as_millis() as i32) };
+        let ready = unsafe {
+            diri_platform::poll::poll(&mut poll_fd, 1, shared.quiet_tick().as_millis() as i32)
+        };
         if ready < 0 {
             let error = std::io::Error::last_os_error();
             if error.kind() == std::io::ErrorKind::Interrupted {
@@ -4082,8 +4084,9 @@ fn pump(
             }
             break;
         }
-        let hung_up = poll_fd.revents & (libc::POLLHUP | libc::POLLERR) != 0;
-        let readable = poll_fd.revents & libc::POLLIN != 0;
+        let hung_up =
+            poll_fd.revents & (diri_platform::poll::POLLHUP | diri_platform::poll::POLLERR) != 0;
+        let readable = poll_fd.revents & diri_platform::poll::POLLIN != 0;
 
         let read_result = if readable || hung_up {
             reader.read(&mut buffer)
@@ -4213,11 +4216,15 @@ fn terminate_direct(pty: &Mutex<Pty>, grace: Duration) -> std::io::Result<Exit> 
             std::thread::sleep(crate::pty::REAP_POLL_INTERVAL);
         }
     };
-    pty.lock().expect("pty").kill_group(libc::SIGTERM)?;
+    pty.lock()
+        .expect("pty")
+        .kill_group(diri_platform::signals::SIGTERM)?;
     if let Some(exit) = wait(grace)? {
         return Ok(exit);
     }
-    pty.lock().expect("pty").kill_group(libc::SIGKILL)?;
+    pty.lock()
+        .expect("pty")
+        .kill_group(diri_platform::signals::SIGKILL)?;
     wait(crate::pty::KILL_REAP_TIMEOUT)?.ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::TimedOut,
@@ -6307,6 +6314,7 @@ fi
                 .unwrap(),
             );
             let host = HostEntry {
+                transport: Default::default(),
                 id: "fixture".into(),
                 name: None,
                 ssh: "fixture".into(),

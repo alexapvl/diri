@@ -3,9 +3,9 @@
 //! At most one write is active and one latest snapshot is pending. The worker
 //! never owns a terminal, PTY, connection or lifecycle policy. It sleeps on a
 //! condition variable when idle; disk I/O never holds the submission lock.
+use diri_platform::ipc::UnixStream;
+use diri_platform::poll::{AsRawIo, RawIo};
 use std::io;
-use std::os::fd::{AsRawFd, RawFd};
-use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 
@@ -132,8 +132,8 @@ impl<T: Send + 'static> CheckpointWriter<T> {
 
     /// Poll for HUP to observe a persistence failure without idle polling.
     #[must_use]
-    pub fn failure_fd(&self) -> RawFd {
-        self.failure.as_raw_fd()
+    pub fn failure_fd(&self) -> RawIo {
+        self.failure.as_raw_io()
     }
 }
 

@@ -349,7 +349,7 @@ pub(crate) mod screenshot_fixture {
             let runtime = tokio::runtime::Runtime::new().unwrap();
             let listener = {
                 let _entered = runtime.enter();
-                tokio::net::UnixListener::bind(&socket).unwrap()
+                diri_platform::ipc::asynchronous::UnixListener::bind(&socket).unwrap()
             };
             runtime.spawn(async move {
                 loop {

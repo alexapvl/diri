@@ -83,6 +83,9 @@ impl HolderManagerPaths {
 /// The budget check and the FNV-1a hash both match `HolderPaths.safeDirectory`
 /// in Swift exactly — a mismatch would strand every live holder on switch.
 pub fn safe_directory(preferred: &Path) -> PathBuf {
+    if cfg!(windows) {
+        return preferred.to_path_buf();
+    }
     let path = normalized(preferred);
     // Swift budgets `preferred/ssss…s.sock` (40 s's): path + "/" + 45 bytes.
     let budgeted_socket = path.len() + 1 + 45;

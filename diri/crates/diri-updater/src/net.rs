@@ -14,7 +14,19 @@ use std::time::Duration;
 
 use crate::error::{Result, UpdateError};
 
-const CURL: &str = "/usr/bin/curl";
+fn curl_path() -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        std::path::PathBuf::from(
+            std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into()),
+        )
+        .join("System32/curl.exe")
+    }
+    #[cfg(not(windows))]
+    {
+        "/usr/bin/curl".into()
+    }
+}
 const FEED_TIMEOUT_SECONDS: u32 = 20;
 const DOWNLOAD_TIMEOUT_SECONDS: u32 = 900;
 const PROGRESS_POLL: Duration = Duration::from_millis(150);
@@ -147,10 +159,15 @@ impl Http {
     }
 
     fn curl(&self) -> Command {
-        let mut command = Command::new(CURL);
+        let mut command = Command::new(curl_path());
         // -K - keeps the URL and (more importantly) the credentials out of the
         // process arguments, where any user on the machine could read them.
         command.arg("-K").arg("-");
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x08000000);
+        }
         command
     }
 
@@ -171,7 +188,12 @@ impl Http {
         config.push_str("max-redirs = 5\n");
         config.push_str(&format!("user-agent = \"diri-updater/{}\"\n", crate::AGENT));
         if let Some(path) = output {
-            config.push_str(&format!("output = \"{}\"\n", path.display()));
+            config.push_str(&format!(
+                "output = \"{}\"\n",
+                path.to_string_lossy()
+                    .replace('\\', "\\\\")
+                    .replace('"', "\\\"")
+            ));
         }
         config
     }

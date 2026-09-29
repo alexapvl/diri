@@ -23,6 +23,8 @@ pub mod feed;
 pub mod install;
 pub mod net;
 pub mod version;
+#[cfg(windows)]
+mod windows;
 
 use std::path::{Path, PathBuf};
 
@@ -105,6 +107,11 @@ pub struct UpdaterConfig {
 }
 
 impl UpdaterConfig {
+    #[cfg(windows)]
+    pub fn for_running_app(current_version: &str) -> Result<Self> {
+        windows::running_config(current_version)
+    }
+
     /// Builds the configuration for the running app, or explains why this
     /// build cannot update itself.
     ///
@@ -112,6 +119,7 @@ impl UpdaterConfig {
     /// Info.plist so the app and the updater agree on one source of truth —
     /// `CARGO_PKG_VERSION`, which is also what cargo-packager stamps into the
     /// plist at package time.
+    #[cfg(not(windows))]
     pub fn for_running_app(current_version: &str) -> Result<Self> {
         let bundle = bundle::running_bundle().ok_or_else(|| {
             UpdateError::NotUpdatable("diri is not running from an app bundle".to_owned())
@@ -127,7 +135,8 @@ impl UpdaterConfig {
             ));
         }
 
-        let home = std::env::var_os("HOME")
+        let home = diri_platform::home_dir()
+            .map(|p| p.into_os_string())
             .map(PathBuf::from)
             .ok_or_else(|| UpdateError::NotUpdatable("HOME is unset".to_owned()))?;
         Ok(Self {
@@ -285,6 +294,7 @@ impl Updater {
 }
 
 /// Reads `CFBundleShortVersionString` out of a staged bundle's Info.plist.
+#[cfg(not(windows))]
 fn verify_staged_version(app: &Path, release: &Release) -> Result<()> {
     let output = std::process::Command::new("/usr/bin/defaults")
         .arg("read")
@@ -513,4 +523,9 @@ mod tests {
             "unrecognized entries are left alone"
         );
     }
+}
+
+#[cfg(windows)]
+fn verify_staged_version(app: &Path, release: &Release) -> Result<()> {
+    windows::verify_version(app, release)
 }

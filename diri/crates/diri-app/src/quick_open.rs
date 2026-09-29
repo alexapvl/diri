@@ -553,7 +553,7 @@ impl RankCandidate {
 
 fn home_relative(path: &Path) -> String {
     let text = path.to_string_lossy();
-    let Some(home) = std::env::var_os("HOME") else {
+    let Some(home) = diri_platform::home_dir().map(|p| p.into_os_string()) else {
         return text.into_owned();
     };
     let home = home.to_string_lossy();

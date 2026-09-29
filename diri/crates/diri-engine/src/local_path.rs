@@ -1,11 +1,14 @@
 //! Local desktop PATH normalization shared by discovery and Agent launches.
 
 use std::collections::{BTreeMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
 
 /// Keep the shell's choices first, preserve inherited tools, then fill gaps
 /// left by desktop launchers or failed shell initialization. Do not scan
 /// version-manager installs: their shell-selected version remains authoritative.
+#[cfg(unix)]
 pub fn search_path(
     shell_path: Option<&str>,
     environment: impl IntoIterator<Item = (String, String)>,
@@ -289,4 +292,44 @@ mod tests {
             "/remote/bin"
         );
     }
+}
+
+#[cfg(windows)]
+pub fn search_path(
+    shell_path: Option<&str>,
+    environment: impl IntoIterator<Item = (String, String)>,
+) -> String {
+    let environment = environment
+        .into_iter()
+        .map(|(k, v)| (k.to_ascii_uppercase(), v))
+        .collect::<BTreeMap<_, _>>();
+    let mut directories = Vec::new();
+    for value in [shell_path, environment.get("PATH").map(String::as_str)]
+        .into_iter()
+        .flatten()
+    {
+        directories.extend(std::env::split_paths(value).filter(|p| p.is_absolute()));
+    }
+    for (key, suffix) in [
+        ("APPDATA", "npm"),
+        ("LOCALAPPDATA", "pnpm"),
+        ("PNPM_HOME", ""),
+        ("USERPROFILE", ".local/bin"),
+        ("USERPROFILE", ".cargo/bin"),
+        ("USERPROFILE", ".bun/bin"),
+    ] {
+        if let Some(root) = environment
+            .get(key)
+            .map(Path::new)
+            .filter(|p| p.is_absolute())
+        {
+            directories.push(root.join(suffix));
+        }
+    }
+    let mut seen = HashSet::new();
+    directories.retain(|p| seen.insert(p.to_string_lossy().to_ascii_lowercase()));
+    std::env::join_paths(directories)
+        .ok()
+        .and_then(|p| p.into_string().ok())
+        .unwrap_or_default()
 }

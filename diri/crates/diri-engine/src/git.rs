@@ -9,7 +9,9 @@
 //! Ported from the Swift `DirijorGit`.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
+#[cfg(unix)]
+use std::process::Stdio;
 use std::time::Duration;
 
 use diri_proto::HostEntry;
@@ -469,6 +471,7 @@ printf 'DIRI_GIT_V1\0%s\0%s\0' "$root" "$base_ref"
 /// the cwd, emit `root\0base_ref\0`, then stream tracked + staged + untracked
 /// changes through a hard byte cap. `xargs -0` keeps spaces and newlines in
 /// untracked filenames intact.
+#[cfg(unix)]
 pub fn working_diff(
     cwd: &Path,
     base: Option<&diri_proto::SessionDiffBase>,
@@ -492,6 +495,7 @@ pub fn working_diff(
 /// A child that stops reading fails the write, and returning there would drop
 /// a process nobody ever waits for: still running, then a zombie for as long
 /// as the Engine lives. It is killed and reaped before the error goes back.
+#[cfg(unix)]
 fn feed_and_collect(
     mut child: std::process::Child,
     input: &[u8],
@@ -508,6 +512,141 @@ fn feed_and_collect(
         return Err(error);
     }
     child.wait_with_output()
+}
+
+#[cfg(windows)]
+pub fn working_diff(
+    cwd: &Path,
+    base: Option<&diri_proto::SessionDiffBase>,
+) -> std::io::Result<diri_proto::SessionReadDiffResult> {
+    let execute = |args: &[&str], limit| {
+        let mut command = Command::new("git");
+        command
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .env("LC_ALL", "C");
+        diri_platform::child::output(&mut command, REMOTE_GIT_TIMEOUT, limit)
+    };
+    let text = |args: &[&str]| -> std::io::Result<String> {
+        let output = execute(args, 64 * 1024)?;
+        if !output.status.success() {
+            return Err(diff_failure(&output.stderr));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    };
+    let repo_root = text(&["rev-parse", "--show-toplevel"])?;
+    text(&["status", "--porcelain=v1", "-uno"])?;
+    let mut base_ref = "HEAD".to_string();
+    let mut commit = text(&["rev-parse", "--verify", "HEAD"]).ok();
+    if commit.is_some() && !matches!(base, Some(diri_proto::SessionDiffBase::Head)) {
+        let origin = text(&[
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ])
+        .unwrap_or_default();
+        for candidate in [
+            origin.as_str(),
+            "origin/main",
+            "main",
+            "origin/master",
+            "master",
+        ] {
+            if candidate.is_empty() {
+                continue;
+            }
+            if text(&["rev-parse", "--verify", &format!("{candidate}^{{commit}}")]).is_ok() {
+                if let Ok(merged) = text(&["merge-base", candidate, "HEAD"]) {
+                    commit = Some(merged);
+                    base_ref = candidate.into();
+                }
+                break;
+            }
+        }
+    }
+    let mut patch = Vec::new();
+    let mut append = |args: &[&str], no_index: bool| -> std::io::Result<()> {
+        let remaining = (MAX_PATCH_BYTES + 1).saturating_sub(patch.len());
+        if remaining == 0 {
+            return Ok(());
+        }
+        let output = execute(args, remaining)?;
+        if !output.status.success() && !(no_index && output.status.code() == Some(1)) {
+            return Err(diff_failure(&output.stderr));
+        }
+        patch.extend_from_slice(&output.stdout);
+        Ok(())
+    };
+    if let Some(commit) = &commit {
+        append(
+            &[
+                "diff",
+                "--no-ext-diff",
+                "--no-color",
+                "--unified=3",
+                commit,
+                "--",
+            ],
+            false,
+        )?;
+    } else {
+        append(
+            &[
+                "diff",
+                "--no-ext-diff",
+                "--no-color",
+                "--unified=3",
+                "--cached",
+                "--",
+            ],
+            false,
+        )?;
+        append(
+            &["diff", "--no-ext-diff", "--no-color", "--unified=3", "--"],
+            false,
+        )?;
+    }
+    let untracked = execute(
+        &["ls-files", "--others", "--exclude-standard", "-z"],
+        MAX_DIFF_RESPONSE_BYTES,
+    )?;
+    if !untracked.status.success() {
+        return Err(diff_failure(&untracked.stderr));
+    }
+    if untracked.stdout.len() == MAX_DIFF_RESPONSE_BYTES {
+        return Err(std::io::Error::other("untracked file list exceeds limit"));
+    }
+    for name in untracked
+        .stdout
+        .split(|&b| b == 0)
+        .filter(|name| !name.is_empty())
+    {
+        let name = std::str::from_utf8(name).map_err(std::io::Error::other)?;
+        append(
+            &[
+                "diff",
+                "--no-index",
+                "--no-ext-diff",
+                "--no-color",
+                "--unified=3",
+                "--",
+                "NUL",
+                name,
+            ],
+            true,
+        )?;
+    }
+    let truncated = patch.len() > MAX_PATCH_BYTES;
+    patch.truncate(MAX_PATCH_BYTES);
+    Ok(diri_proto::SessionReadDiffResult {
+        patch,
+        repo_root,
+        truncated,
+        base_ref: Some(base_ref),
+    })
 }
 
 pub fn working_diff_remote(

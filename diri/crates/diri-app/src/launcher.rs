@@ -5105,6 +5105,7 @@ mod tests {
         let stored = {
             let mut store = runtime.store.write().expect("store lock");
             store.set_hosts(vec![diri_proto::HostEntry {
+                transport: Default::default(),
                 id: "forge".into(),
                 name: Some("Build Forge".into()),
                 ssh: "forge".into(),
@@ -5312,6 +5313,7 @@ mod tests {
         {
             let mut store = runtime.store.write().expect("store lock");
             store.set_hosts(vec![diri_proto::HostEntry {
+                transport: Default::default(),
                 id: "forge".into(),
                 name: Some("Build Forge".into()),
                 ssh: "forge".into(),

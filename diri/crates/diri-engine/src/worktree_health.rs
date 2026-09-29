@@ -2,7 +2,7 @@
 //! Git and gh are read through bounded subprocesses; no fetch or branch deletion.
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Read};
-use std::os::fd::AsRawFd;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -26,10 +26,8 @@ fn output(program: &str, args: &[&str], cwd: &Path, timeout: Duration) -> Option
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
-    let mut stdout = child.stdout.take()?;
-    let fd = stdout.as_raw_fd();
-    // SAFETY: stdout owns this descriptor for the duration of the read loop.
-    let configured = unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) } >= 0;
+    let mut stdout = diri_platform::pipe::output(child.stdout.take()?).ok()?;
+    let configured = diri_platform::poll::set_nonblocking(&stdout, true).is_ok();
     let start = Instant::now();
     let mut bytes = Vec::new();
     let mut buffer = [0; 8192];

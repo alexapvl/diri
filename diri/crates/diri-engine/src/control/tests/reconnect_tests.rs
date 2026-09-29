@@ -166,6 +166,7 @@ fi
             .unwrap(),
         );
         let host = diri_proto::HostEntry {
+            transport: Default::default(),
             id: "fixture".into(),
             name: None,
             ssh: "fixture".into(),

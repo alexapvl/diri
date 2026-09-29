@@ -7659,7 +7659,12 @@ fn local_day_ordinal(timestamp_ms: f64) -> Option<i64> {
     // a null pointer. No returned pointer escapes this function.
     let local = unsafe {
         let mut local = std::mem::zeroed::<libc::tm>();
+        #[cfg(unix)]
         if libc::localtime_r(&timestamp, &mut local).is_null() {
+            return None;
+        }
+        #[cfg(windows)]
+        if libc::localtime_s(&mut local, &timestamp) != 0 {
             return None;
         }
         local
@@ -11658,6 +11663,7 @@ mod tests {
                                     &[("claude-code", "Claude Code"), ("codex", "Codex")],
                                 ));
                                 store.set_hosts(vec![diri_proto::HostEntry {
+                                    transport: Default::default(),
                                     id: "forge".into(),
                                     name: Some("Forge".into()),
                                     ssh: "you@forge".into(),
@@ -12472,6 +12478,7 @@ mod tests {
                     .write()
                     .expect("session store lock poisoned")
                     .set_hosts(vec![diri_proto::HostEntry {
+                        transport: Default::default(),
                         id: "forge".into(),
                         name: Some("Forge".into()),
                         ssh: "you@forge".into(),
@@ -12547,6 +12554,7 @@ mod tests {
                 .write()
                 .expect("session store lock poisoned")
                 .set_hosts(vec![diri_proto::HostEntry {
+                    transport: Default::default(),
                     id: "forge".into(),
                     name: Some("Forge".into()),
                     ssh: "you@forge".into(),
@@ -12682,6 +12690,7 @@ mod tests {
                     .write()
                     .expect("session store lock poisoned")
                     .set_hosts(vec![diri_proto::HostEntry {
+                        transport: Default::default(),
                         id: "forge".into(),
                         name: Some("Forge".into()),
                         ssh: "you@forge".into(),
@@ -12735,6 +12744,7 @@ mod tests {
                 {
                     let mut store = sidebar.store.write().expect("session store lock poisoned");
                     store.set_hosts(vec![diri_proto::HostEntry {
+                        transport: Default::default(),
                         id: "forge".into(),
                         name: Some("Forge".into()),
                         ssh: "you@forge".into(),

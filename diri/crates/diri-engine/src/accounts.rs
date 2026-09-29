@@ -4,7 +4,6 @@ use serde::{Deserialize, Serialize};
 use std::{
     fs,
     io::{self, Read, Write},
-    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
@@ -24,10 +23,7 @@ impl AccountStore {
     }
 
     pub fn catalog(&self) -> Result<AgentAccountCatalog, ControlError> {
-        let mut input = match fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(&self.path)
+        let mut input = match diri_platform::security::open_regular(&self.path, false, false, false)
         {
             Ok(input) => input,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -35,18 +31,9 @@ impl AccountStore {
             }
             Err(_) => return Err(ControlError::internal("Cannot read account profiles")),
         };
-        let metadata = input
-            .metadata()
-            .map_err(|_| ControlError::internal("Cannot inspect account profiles"))?;
-        if !metadata.is_file()
-            || metadata.file_type().is_symlink()
-            || metadata.permissions().mode() & 0o077 != 0
-            || metadata.uid() != unsafe { libc::geteuid() }
-        {
-            return Err(ControlError::bad_request(
-                "Account profiles must be an owner-only regular file",
-            ));
-        }
+        diri_platform::security::validate_file(&input, true).map_err(|_| {
+            ControlError::bad_request("Account profiles must be an owner-only regular file")
+        })?;
         let mut bytes = Vec::new();
         (&mut input)
             .take(512 * 1024 + 1)
@@ -159,12 +146,8 @@ impl AccountStore {
             .ok_or_else(|| ControlError::internal("Missing account directory"))?;
         let temporary = parent.join(format!(".accounts-{}.tmp", crate::inject::uuid_v4()));
         let result = (|| -> io::Result<()> {
-            fs::create_dir_all(parent)?;
-            let mut file = fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .mode(0o600)
-                .open(&temporary)?;
+            diri_platform::security::private_dir_all(parent)?;
+            let mut file = diri_platform::security::create_private(&temporary)?;
             serde_json::to_writer_pretty(
                 &mut file,
                 &File {
@@ -231,7 +214,7 @@ fn validate(profile: &AgentAccountProfile) -> Result<(), ControlError> {
     let path = &profile.config_home;
     if path.len() > 4096
         || path.chars().any(char::is_control)
-        || !(Path::new(path).is_absolute() || path.starts_with("~/"))
+        || !(path.starts_with('/') || Path::new(path).is_absolute() || path.starts_with("~/"))
         || Path::new(path)
             .components()
             .any(|p| p == std::path::Component::ParentDir)
@@ -320,18 +303,13 @@ pub fn bind_pty(
 }
 
 fn prepare_local_directory(path: &str) -> Result<(), ControlError> {
-    fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(path)
-        .map_err(|_| ControlError::bad_request("Cannot create the account directory"))?;
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|_| ControlError::bad_request("Cannot inspect the account directory"))?;
-    if !metadata.is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
-        return Err(ControlError::bad_request(
-            "Account directory must be a directory owned by you, not a symlink",
-        ));
-    }
+    diri_platform::security::private_dir_all(Path::new(path))
+        .and_then(|()| diri_platform::security::validate_directory(Path::new(path), 0))
+        .map_err(|_| {
+            ControlError::bad_request(
+                "Account directory must be an ordinary directory owned by you",
+            )
+        })?;
     Ok(())
 }
 
@@ -342,9 +320,7 @@ pub fn prepare_remote_directory(
     manager: &crate::remote::manager::RemoteManager,
 ) -> Result<(), ControlError> {
     validate(profile)?;
-    if profile.host.as_deref() != Some(host.id.as_str())
-        || !Path::new(&profile.config_home).is_absolute()
-    {
+    if profile.host.as_deref() != Some(host.id.as_str()) || !profile.config_home.starts_with('/') {
         return Err(ControlError::bad_request(
             "Account directory is not bound to this host",
         ));
@@ -387,6 +363,8 @@ const ACCOUNT_ENVIRONMENT: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     fn profile(id: &str) -> AgentAccountProfile {
         AgentAccountProfile {
             id: id.into(),

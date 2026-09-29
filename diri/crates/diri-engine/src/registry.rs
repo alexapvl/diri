@@ -249,7 +249,9 @@ impl Registry {
     /// ignored: treating it as a fresh install would make the next write
     /// overwrite every session record the user had.
     pub fn load(&mut self) -> std::io::Result<usize> {
-        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let home = diri_platform::home_dir()
+            .map(|p| p.into_os_string())
+            .map(PathBuf::from);
         self.load_with_home(home.as_deref())
     }
 
@@ -901,7 +903,7 @@ impl Registry {
                     continue;
                 }
                 let mut recovered = recovered_record(capsule);
-                if let Some(home) = std::env::var_os("HOME") {
+                if let Some(home) = diri_platform::home_dir().map(|p| p.into_os_string()) {
                     repair_codex_conversation(&mut recovered, Path::new(&home));
                 }
                 self.ensure_session_project(&recovered.cwd, None);
@@ -946,7 +948,10 @@ impl Registry {
                             || seed.occurred_at_ms as f64 >= record_updated_at)
                         && let Some((signal, metadata)) = crate::hooks::parse_activity_seed(&seed)
                     {
-                        let home = std::env::var("HOME").ok();
+                        let home = diri_platform::home_dir()
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .ok_or(std::env::VarError::NotPresent)
+                            .ok();
                         let accepted = self
                             .accept_hook_metadata(
                                 &session_id,
@@ -1502,7 +1507,7 @@ impl Registry {
             .is_some_and(|record| record.hibernation.is_some())
             || self.sessions.get(id).is_some_and(Session::is_hibernated);
         if let Some(session) = self.sessions.get(id) {
-            session.signal_tree(libc::SIGCONT)?;
+            session.signal_tree(diri_platform::signals::SIGCONT)?;
             // Flush AFTER the CONT so the tree is drinking again.
             let _ = session.set_hibernated(false);
         }
@@ -1533,7 +1538,10 @@ impl Registry {
         signal: StatusSignal,
         meta: &crate::hooks::HookMetadata,
     ) -> bool {
-        let home = std::env::var("HOME").ok();
+        let home = diri_platform::home_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .ok_or(std::env::VarError::NotPresent)
+            .ok();
         let Some(changed) = self.accept_hook_metadata(id, meta, home.as_deref().map(Path::new))
         else {
             return false;
@@ -1550,7 +1558,10 @@ impl Registry {
     /// and the provider's native conversation title when it becomes available.
     /// Returns whether anything changed.
     pub fn apply_hook_metadata(&mut self, id: &str, meta: &crate::hooks::HookMetadata) -> bool {
-        let Ok(home) = std::env::var("HOME") else {
+        let Ok(home) = diri_platform::home_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .ok_or(std::env::VarError::NotPresent)
+        else {
             return self.apply_hook_metadata_with_home(id, meta, None);
         };
         self.apply_hook_metadata_with_home(id, meta, Some(Path::new(&home)))
@@ -1726,7 +1737,7 @@ impl Registry {
     ) -> std::io::Result<()> {
         let tree = {
             let session = self.sessions.get(id).ok_or_else(|| not_found(id))?;
-            let tree = session.signal_tree(libc::SIGSTOP)?;
+            let tree = session.signal_tree(diri_platform::signals::SIGSTOP)?;
             let _ = session.set_hibernated(true);
             tree
         };
@@ -2081,7 +2092,9 @@ pub struct TelemetryCounts {
 }
 
 fn user_home() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    diri_platform::home_dir()
+        .map(|p| p.into_os_string())
+        .map(PathBuf::from)
 }
 
 pub(crate) fn scan_cursor_refreshes(
@@ -2711,14 +2724,7 @@ impl CompletedRunHandle {
 }
 
 fn ensure_private_dir(directory: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-    match std::fs::DirBuilder::new().mode(0o700).create(directory) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
-        }
-        Err(error) => Err(error),
-    }
+    diri_platform::security::private_dir_all(directory)
 }
 
 fn not_found(id: &str) -> std::io::Error {

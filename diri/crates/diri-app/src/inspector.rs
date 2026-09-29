@@ -475,7 +475,8 @@ impl WorkbenchInspector {
             transcript_version: None,
             transcript_generation: 0,
             transcript_task: None,
-            transcript_home: std::env::var_os("HOME")
+            transcript_home: diri_platform::home_dir()
+                .map(|p| p.into_os_string())
                 .map(PathBuf::from)
                 .unwrap_or_default(),
             review_action_task: None,
@@ -2388,7 +2389,7 @@ impl WorkbenchInspector {
                     .when(!has_url, |body| body
                         .child(sf_symbol("network", 26.0, colors.tertiary))
                         .child(div().text_size(px(13.0)).font_weight(FontWeight::MEDIUM).text_color(colors.secondary).child("Open a page"))
-                        .child(div().max_w(px(230.0)).text_size(px(11.0)).line_height(px(17.0)).child("Browse a local preview or any secure web address without leaving the workspace.")))
+                        .child(div().max_w(px(230.0)).text_size(px(11.0)).line_height(px(17.0)).child(if cfg!(target_os = "macos") { "Browse a local preview or any secure web address without leaving the workspace." } else { "Open a local preview or secure web address in your default browser." })))
                     .when_some(self.browser_state.error.clone(), |body, error| body.child(div().max_w(px(260.0)).text_size(px(12.0)).child(error)))
                     .when(self.browser_state.is_loading, |body| body.child(div().text_size(px(10.0)).child("Loading…")))
                     .map(|body| {

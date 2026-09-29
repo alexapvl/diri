@@ -102,7 +102,9 @@ impl SkillsPage {
         self.document = None;
         self.instructions = None;
         self.detail_task = None;
-        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let home = diri_platform::home_dir()
+            .map(|p| p.into_os_string())
+            .map(PathBuf::from);
         let project = self.project.clone();
         self.scan_task = Some(cx.spawn(async move |this, cx| {
             let catalog = cx

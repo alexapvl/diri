@@ -7,6 +7,7 @@
 //! are blocking by design so GPUI can dispatch them to its background executor.
 
 use std::collections::HashSet;
+#[cfg(unix)]
 use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, File};
@@ -33,7 +34,7 @@ const MAX_SYMBOLS_PER_FILE: usize = 256;
 pub(crate) fn local_reference_url(cwd: &Path, reference: &str) -> Option<url::Url> {
     let parsed = parse_reference_fragment(reference)?;
     let path = if let Ok(relative) = parsed.path.strip_prefix("~") {
-        PathBuf::from(std::env::var_os("HOME")?).join(relative)
+        PathBuf::from(diri_platform::home_dir().map(|p| p.into_os_string())?).join(relative)
     } else if parsed.path.is_absolute() {
         parsed.path
     } else {
@@ -1393,7 +1394,7 @@ mod tests {
                 expected
             );
         }
-        if let Some(home) = std::env::var_os("HOME") {
+        if let Some(home) = diri_platform::home_dir().map(|p| p.into_os_string()) {
             assert_eq!(
                 local_reference_url(cwd, "~/Desktop/preview.png"),
                 url::Url::from_file_path(PathBuf::from(home).join("Desktop/preview.png")).ok(),
