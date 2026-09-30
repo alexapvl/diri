@@ -36,6 +36,34 @@ impl UnixStream {
         let (a, b) = super::UnixStream::pair()?;
         Ok((Self::from_std(a)?, Self::from_std(b)?))
     }
+    pub fn try_read(&self, buf: &mut [u8]) -> io::Result<usize> {
+        self.0.try_read(buf)
+    }
+}
+
+/// Test-fixture listener. Production accept loops stay on blocking threads:
+/// std/mio parse accepted peers as IP addresses, so an AF_UNIX listener cannot
+/// be registered with IOCP the way a connected stream can. Accept therefore
+/// polls a nonblocking socket, which is acceptable only for fixtures.
+#[derive(Debug)]
+pub struct UnixListener(super::UnixListener);
+impl UnixListener {
+    pub fn bind(path: impl AsRef<Path>) -> io::Result<Self> {
+        let listener = super::UnixListener::bind(path)?;
+        listener.set_nonblocking(true)?;
+        Ok(Self(listener))
+    }
+    pub async fn accept(&self) -> io::Result<(UnixStream, ())> {
+        loop {
+            match self.0.accept() {
+                Ok((stream, _)) => return UnixStream::from_std(stream).map(|s| (s, ())),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
 }
 impl AsyncRead for UnixStream {
     fn poll_read(

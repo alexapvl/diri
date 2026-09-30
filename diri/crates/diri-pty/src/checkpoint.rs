@@ -223,13 +223,13 @@ mod tests {
         })
         .unwrap();
         writer.submit(1).unwrap();
-        let mut fd = libc::pollfd {
+        let mut fd = diri_platform::poll::PollFd {
             fd: writer.failure_fd(),
-            events: libc::POLLIN,
+            events: diri_platform::poll::POLLIN,
             revents: 0,
         };
         // SAFETY: the descriptor is owned by writer throughout the poll.
-        assert_eq!(unsafe { libc::poll(&mut fd, 1, 2000) }, 1);
+        assert_eq!(unsafe { diri_platform::poll::poll(&mut fd, 1, 2000) }, 1);
         assert_eq!(
             writer.flush().unwrap_err().kind(),
             io::ErrorKind::PermissionDenied
