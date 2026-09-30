@@ -186,6 +186,10 @@ pub fn read_line_until(
     }
 }
 
+#[cfg(windows)]
+pub fn connect_until(path: &Path, deadline: Instant) -> io::Result<UnixStream> {
+    UnixStream::connect_timeout(path, remaining(deadline)?)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,9 +243,4 @@ mod tests {
             io::ErrorKind::TimedOut
         );
     }
-}
-
-#[cfg(windows)]
-pub fn connect_until(path: &Path, deadline: Instant) -> io::Result<UnixStream> {
-    UnixStream::connect_timeout(path, remaining(deadline)?)
 }

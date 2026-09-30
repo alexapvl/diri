@@ -1,4 +1,4 @@
-﻿//! Host-local observation. Never pass a PID obtained from another host here.
+//! Host-local observation. Never pass a PID obtained from another host here.
 #[cfg(unix)]
 use diri_proto::process::BootId;
 use diri_proto::process::{ProcessBirth, ProcessIdentity};
@@ -163,6 +163,50 @@ fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
+#[cfg(windows)]
+fn platform_observe(pid: u32) -> io::Result<ProcessIdentity> {
+    use diri_platform::windows_sys::Win32::{Foundation::FILETIME, System::Threading::*};
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    // SAFETY: query-only process handle, owned until all time fields are copied.
+    unsafe {
+        let raw = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if raw.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let handle = OwnedHandle::from_raw_handle(raw);
+        let mut creation: FILETIME = std::mem::zeroed();
+        let mut exit = std::mem::zeroed();
+        let mut kernel = std::mem::zeroed();
+        let mut user = std::mem::zeroed();
+        if GetProcessTimes(
+            handle.as_raw_handle(),
+            &mut creation,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        ) == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        // Any open handle keeps an exited process object (and its PID and
+        // birth) queryable. An exit time means it is gone, like a reaped
+        // Unix child; never vouch for it.
+        if exit.dwLowDateTime != 0 || exit.dwHighDateTime != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "process has exited",
+            ));
+        }
+        ProcessIdentity::new(
+            pid,
+            ProcessBirth::Windows {
+                creation_filetime: ((creation.dwHighDateTime as u64) << 32)
+                    | creation.dwLowDateTime as u64,
+            },
+        )
+        .map_err(invalid)
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,50 +319,5 @@ mod tests {
             "owned birth is immutable after exit"
         );
         assert!(inspect_verified(&expected, || Ok("stale")).is_err());
-    }
-}
-
-#[cfg(windows)]
-fn platform_observe(pid: u32) -> io::Result<ProcessIdentity> {
-    use diri_platform::windows_sys::Win32::{Foundation::FILETIME, System::Threading::*};
-    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-    // SAFETY: query-only process handle, owned until all time fields are copied.
-    unsafe {
-        let raw = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-        if raw.is_null() {
-            return Err(io::Error::last_os_error());
-        }
-        let handle = OwnedHandle::from_raw_handle(raw);
-        let mut creation: FILETIME = std::mem::zeroed();
-        let mut exit = std::mem::zeroed();
-        let mut kernel = std::mem::zeroed();
-        let mut user = std::mem::zeroed();
-        if GetProcessTimes(
-            handle.as_raw_handle(),
-            &mut creation,
-            &mut exit,
-            &mut kernel,
-            &mut user,
-        ) == 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        // Any open handle keeps an exited process object (and its PID and
-        // birth) queryable. An exit time means it is gone, like a reaped
-        // Unix child; never vouch for it.
-        if exit.dwLowDateTime != 0 || exit.dwHighDateTime != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "process has exited",
-            ));
-        }
-        ProcessIdentity::new(
-            pid,
-            ProcessBirth::Windows {
-                creation_filetime: ((creation.dwHighDateTime as u64) << 32)
-                    | creation.dwLowDateTime as u64,
-            },
-        )
-        .map_err(invalid)
     }
 }
