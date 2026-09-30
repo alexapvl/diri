@@ -165,20 +165,34 @@ pub fn parse_porcelain(porcelain: &str) -> Vec<WorktreeInfo> {
 /// git that can hang forever, and ambient config from the host has no business
 /// affecting what the daemon sees.
 fn run(args: &[&str], cwd: &Path) -> std::io::Result<String> {
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .args(args)
         .current_dir(cwd)
         .stdin(std::process::Stdio::null())
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
+        .env_clear();
+
+    #[cfg(unix)]
+    command.env("PATH", "/usr/bin:/bin");
+
+    #[cfg(windows)]
+    {
+        let path = std::env::var("PATH").unwrap_or_else(|_| String::new());
+        if !path.is_empty() {
+            command.env("PATH", path);
+        }
+    }
+
+    command
         .env("HOME", cwd)
         .env("LC_ALL", "C")
         .env("LANG", "C")
         .env("LANGUAGE", "C")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .output()?;
+        .env("GIT_OPTIONAL_LOCKS", "0");
+
+    let output = command.output()?;
     if !output.status.success() {
         return Err(std::io::Error::other(format!(
             "git {} failed: {}",
