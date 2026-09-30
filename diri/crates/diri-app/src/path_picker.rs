@@ -158,7 +158,7 @@ fn is_dir(path: &Path) -> bool {
 }
 
 fn git_files(root: &Path) -> Option<Vec<String>> {
-    let output = Command::new("git")
+    let output = diri_platform::hide_console_window(&mut Command::new("git"))
         .arg("-C")
         .arg(root)
         .args([

@@ -169,28 +169,29 @@ fn run(args: &[&str], cwd: &Path) -> std::io::Result<String> {
     command
         .args(args)
         .current_dir(cwd)
-        .stdin(std::process::Stdio::null());
-
+        .stdin(std::process::Stdio::null())
+        .env_clear();
     #[cfg(unix)]
-    {
-        command.env_clear();
-        command.env("PATH", "/usr/bin:/bin");
-    }
-
+    command.env("PATH", "/usr/bin:/bin");
+    // Git for Windows lives on the user's PATH, and fails to start (0xc0000142)
+    // without the system variables every Windows process expects.
     #[cfg(windows)]
-    {
-        command.env_clear();
-        let path = std::env::var("PATH").unwrap_or_else(|_| String::new());
-        if !path.is_empty() {
-            command.env("PATH", path);
-        }
-        for var in &["SYSTEMROOT", "WINDIR", "TEMP", "TMP", "APPDATA", "USERPROFILE"] {
-            if let Ok(val) = std::env::var(var) {
-                command.env(var, val);
-            }
+    for name in [
+        "PATH",
+        "PATHEXT",
+        "SystemRoot",
+        "windir",
+        "ComSpec",
+        "TEMP",
+        "TMP",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "USERPROFILE",
+    ] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
         }
     }
-
     command
         .env("HOME", cwd)
         .env("LC_ALL", "C")

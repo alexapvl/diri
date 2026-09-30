@@ -739,12 +739,14 @@ fn spawn_detached(daemon: &Path, boot_log: Option<&Path>) -> io::Result<()> {
     // daemon or its PTYs. Equivalent intent to the Swift POSIX_SPAWN_SETSID path.
     #[cfg(unix)]
     command.process_group(0);
+    // An invisible console rather than none: with DETACHED_PROCESS every git or
+    // gh the Engine runs would open its own console window.
     #[cfg(windows)]
     {
         use diri_platform::windows_sys::Win32::System::Threading::*;
         use std::os::windows::process::CommandExt;
         command.creation_flags(
-            DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB,
+            CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB,
         );
     }
 

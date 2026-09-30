@@ -35,6 +35,17 @@ pub fn canonicalize(path: impl AsRef<std::path::Path>) -> std::io::Result<std::p
     }
 }
 
+/// The GUI and the Engine have no visible console, so Windows opens a new
+/// console window for every console child unless it is created without one.
+pub fn hide_console_window(command: &mut std::process::Command) -> &mut std::process::Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+    }
+    command
+}
+
 pub fn executable_name(stem: &str) -> String {
     if cfg!(windows) {
         format!("{stem}.exe")

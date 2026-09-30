@@ -723,7 +723,7 @@ struct ParsedReference {
 }
 
 fn discover_workspace_root(session_cwd: &Path) -> Result<PathBuf, CodeIntelligenceError> {
-    if let Ok(output) = Command::new("git")
+    if let Ok(output) = diri_platform::hide_console_window(&mut Command::new("git"))
         .current_dir(session_cwd)
         .args(["rev-parse", "--show-toplevel"])
         .output()
@@ -794,7 +794,7 @@ fn build_index(workspace_root: &Path) -> WorkspaceIndex {
 }
 
 fn git_paths(workspace_root: &Path) -> Option<Vec<PathBuf>> {
-    let output = Command::new("git")
+    let output = diri_platform::hide_console_window(&mut Command::new("git"))
         .current_dir(workspace_root)
         .args([
             "ls-files",
