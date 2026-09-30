@@ -140,7 +140,7 @@ impl FrameQueue {
     }
 
     /// Takes a frame only if one is already waiting.
-    #[cfg(unix)]
+    #[cfg(any(unix, test))]
     pub(super) fn try_pop(&self) -> Option<Frame> {
         let mut state = self.state.lock().expect("frame queue");
         let frame = Self::take_front(&mut state)?;

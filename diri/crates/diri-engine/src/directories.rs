@@ -15,7 +15,7 @@ pub fn list(request: &DirectoryListRequest) -> io::Result<DirectoryListResult> {
     request
         .validate()
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-    let canonical = fs::canonicalize(expand_home(&request.path)?)?;
+    let canonical = diri_platform::canonicalize(expand_home(&request.path)?)?;
     if !canonical.is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,

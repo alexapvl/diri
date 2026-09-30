@@ -123,6 +123,7 @@ mod tests {
         assert_eq!(paths.pid_file(), Path::new("/tmp/holders/s_abc.pid"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_long_directory_hashes_to_the_stable_short_root() {
         let long = format!("/private/var/folders/{}", "x".repeat(80));
@@ -163,6 +164,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_budget_boundary_matches_swift() {
         // budget = len + 46; the fallback starts at budget >= 100, len >= 54.

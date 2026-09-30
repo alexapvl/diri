@@ -144,7 +144,7 @@ fn local_session_uses_worktree(record: &diri_proto::SessionRecord, target: &Path
         .into_iter()
         .chain(std::iter::once(record.cwd.as_str()))
         .any(|path| {
-            std::fs::canonicalize(path).map_or_else(
+            diri_platform::canonicalize(path).map_or_else(
                 |_| {
                     let path = Path::new(path);
                     path == target || path.starts_with(target)
@@ -1858,10 +1858,10 @@ impl ControlServer {
         params: Option<JsonValue>,
     ) -> Result<JsonValue, ControlError> {
         let p: diri_proto::SessionReparentWorktreeParams = decode(params)?;
-        let project_root = std::fs::canonicalize(&p.project_root).map_err(|error| {
+        let project_root = diri_platform::canonicalize(&p.project_root).map_err(|error| {
             ControlError::bad_request(format!("project root is unavailable: {error}"))
         })?;
-        let worktree_path = std::fs::canonicalize(&p.worktree_path).map_err(|error| {
+        let worktree_path = diri_platform::canonicalize(&p.worktree_path).map_err(|error| {
             ControlError::bad_request(format!("worktree is unavailable: {error}"))
         })?;
         let worktrees = crate::git::list_worktrees(&project_root).map_err(|error| {
@@ -4891,8 +4891,11 @@ const MAX_PROBE_CHARS: usize = 20;
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     mod find_capture_tests;
+    #[cfg(unix)]
     mod reconnect_tests;
+    #[cfg(unix)]
     mod send_key_tests;
 
     #[test]
@@ -5045,7 +5048,7 @@ mod tests {
             attention_state: None,
             id: SessionId(id.into()),
             kind: AgentKind::SHELL,
-            cwd: "/tmp".into(),
+            cwd: std::env::temp_dir().to_string_lossy().into_owned(),
             project_id: ProjectId("p".into()),
             worktree_path: None,
             git_branch: None,
@@ -5106,8 +5109,8 @@ mod tests {
             target.to_str().expect("utf8 target"),
         ]);
         (
-            repo.canonicalize().expect("repo"),
-            target.canonicalize().expect("target"),
+            diri_platform::canonicalize(repo).expect("repo"),
+            diri_platform::canonicalize(target).expect("target"),
         )
     }
 
@@ -5182,6 +5185,7 @@ mod tests {
         assert_eq!(result["profiles"], json!([]));
     }
 
+    #[cfg(unix)]
     #[test]
     fn read_screen_serves_a_retained_terminal_for_a_completed_session() {
         use diri_proto::process::{BootId, ProcessBirth, ProcessIdentity};
@@ -5470,8 +5474,10 @@ mod tests {
         assert!(cursor_descriptor.injection.cursor_hooks);
     }
 
+    #[cfg(unix)]
     #[test]
     fn resuming_an_agent_directly_executes_the_agent() {
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt as _;
 
         let temp = tempfile::tempdir().expect("temp");
@@ -5531,8 +5537,10 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn account_binding_survives_profile_edits_removal_resume_and_fork() {
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir().unwrap();
         let server = server(temp.path());
@@ -5638,6 +5646,7 @@ mod tests {
         assert!(server.session_spawn(Some(json!({"kind": diri_proto::AgentKind::CODEX, "cwd": temp.path(), "accountProfileId": "work"}))).is_err());
     }
 
+    #[cfg(unix)]
     /// Without a manual path the manifest's binary stays bare: the interactive
     /// login shell (or `spawn_spec`'s PATH absolutization) resolves it at
     /// launch against nvm/mise/Homebrew PATHs the daemon never inherited.
@@ -5645,6 +5654,7 @@ mod tests {
     /// spawns the login shell can serve, and pin versions to daemon startup.
     #[test]
     fn local_spawns_keep_the_bare_binary_unless_a_path_is_configured() {
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir().expect("temp");
         let server = server(temp.path());
@@ -5680,6 +5690,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn history_resume_keeps_the_identity_needed_for_another_resume() {
         let temp = tempfile::tempdir().expect("temp");
@@ -5777,6 +5788,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     /// An agent that dies on its own — a dropped ssh, a crash — leaves its
     /// session in the registry, because only an explicit kill takes one out.
     /// Resume used to read that presence as "already live", call itself a
@@ -5787,6 +5799,7 @@ mod tests {
         check_resume_relaunches(false);
     }
 
+    #[cfg(unix)]
     #[test]
     fn revive_archived_session_clears_archive_durably() {
         check_resume_relaunches(true);
@@ -5885,6 +5898,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     fn check_resume_relaunches(archived: bool) {
         let temp = tempfile::tempdir().expect("temp");
         // A manifest that resumes by flag, onto a binary that outlives the
@@ -6166,6 +6180,7 @@ mod tests {
         assert_eq!(list["sessions"].as_array().map(Vec::len), Some(0));
     }
 
+    #[cfg(unix)]
     #[test]
     fn codex_subagent_completion_does_not_finish_the_parent_turn() {
         let temp = tempfile::tempdir().unwrap();
@@ -6424,6 +6439,7 @@ mod tests {
         assert_eq!(empty.code, "bad_request");
     }
 
+    #[cfg(unix)]
     #[test]
     fn reopening_a_resumable_session_relaunches_it() {
         let temp = tempfile::tempdir().expect("temp");
@@ -6788,6 +6804,7 @@ mod tests {
         assert_eq!(record.worktree_path, None);
     }
 
+    #[cfg(unix)]
     #[test]
     fn worktree_reparent_refuses_unknown_session_inside_symlinked_subdirectory() {
         let temp = tempfile::tempdir().expect("temp");
@@ -6973,8 +6990,10 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_socket_is_owner_only() {
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir().expect("temp");
         let server = server(temp.path());
@@ -7109,7 +7128,9 @@ mod tests {
             assert!(
                 error.message.contains("not-a-directory")
                     || error.message.contains("Not a directory")
-                    || error.message.contains("File exists"),
+                    || error.message.contains("File exists")
+                    // Windows: ERROR_ALREADY_EXISTS creating the parent.
+                    || error.message.contains("os error 183"),
                 "unexpected persistence error: {error}"
             );
         }

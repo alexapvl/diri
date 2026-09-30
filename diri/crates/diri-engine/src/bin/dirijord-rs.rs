@@ -88,7 +88,7 @@ fn main() {
     // run before any thread exists, and the recorder starts one.
     let exe_dir = std::env::current_exe()
         .ok()
-        .and_then(|exe| exe.canonicalize().ok())
+        .and_then(|exe| diri_platform::canonicalize(exe).ok())
         .and_then(|exe| exe.parent().map(Path::to_path_buf))
         .unwrap_or_else(|| PathBuf::from("."));
     start_telemetry(&home, &state_dir, &exe_dir);
@@ -635,7 +635,7 @@ fn install_cli_helpers(exe_dir: &Path, app_support: &Path) -> PathBuf {
         else {
             continue;
         };
-        if source.canonicalize().ok() == dest.canonicalize().ok() {
+        if diri_platform::canonicalize(&source).ok() == diri_platform::canonicalize(&dest).ok() {
             continue;
         }
         match install_cli_helper(&source, &dest) {
@@ -692,7 +692,7 @@ fn install_cli_resource_bundle(exe_dir: &Path, bin_dir: &Path) {
         return;
     };
     let dest = bin_dir.join(NAME);
-    if source.canonicalize().ok() == dest.canonicalize().ok() {
+    if diri_platform::canonicalize(&source).ok() == diri_platform::canonicalize(&dest).ok() {
         return;
     }
     let staging = bin_dir.join(format!(".{NAME}.{}.tmp", std::process::id()));

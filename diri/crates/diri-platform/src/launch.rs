@@ -107,7 +107,7 @@ pub fn find_executable(program: &str, env: &[(String, String)], cwd: &Path) -> i
                     }
                 }
                 #[cfg(windows)]
-                return candidate.canonicalize();
+                return crate::canonicalize(candidate);
                 #[cfg(unix)]
                 return Ok(candidate);
             }
@@ -168,7 +168,7 @@ fn npm_shim(path: &Path, env: &[(String, String)], cwd: &Path) -> io::Result<Vec
                 Some("js" | "cjs" | "mjs")
             )
         {
-            let script = script.canonicalize()?;
+            let script = crate::canonicalize(script)?;
             if !scripts.contains(&script) {
                 scripts.push(script);
             }

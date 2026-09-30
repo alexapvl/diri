@@ -506,7 +506,8 @@ impl HolderClient {
     }
 }
 
-#[cfg(test)]
+// The fixtures bind short Unix socket paths under /tmp.
+#[cfg(all(test, unix))]
 mod deadline_tests {
     use super::*;
     use diri_platform::ipc::UnixListener;

@@ -554,17 +554,21 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
+    #[cfg(unix)]
     use std::os::unix::fs::{PermissionsExt, symlink};
+    #[cfg(unix)]
     use std::process::{Command, Stdio};
 
     fn transcript(text: &str) -> Vec<u8> {
         format!("{}\n", json!({"type":"user", "sessionId":"conversation-1", "message":{"role":"user","content":text}})).into_bytes()
     }
 
+    #[cfg(unix)]
     fn location(root: PathBuf) -> Location {
         Location::new(root, "-project".into(), "conversation-1".into()).unwrap()
     }
 
+    #[cfg(unix)]
     fn script(script: &str, location: &Location, bytes: Option<&[u8]>) -> std::process::Output {
         let mut input = location.input();
         if let Some(bytes) = bytes {
@@ -601,6 +605,7 @@ mod tests {
         assert!(Location::new("/tmp".into(), "../p".into(), "id".into()).is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn local_round_trip_preserves_credentials_permissions_and_conflicting_history() {
         let temp = tempfile::tempdir().unwrap();
@@ -636,6 +641,7 @@ mod tests {
         }));
     }
 
+    #[cfg(unix)]
     #[test]
     fn local_and_remote_scripts_reject_symlinks_and_oversized_files() {
         let temp = tempfile::tempdir().unwrap();
@@ -671,6 +677,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn remote_scripts_round_trip_literal_paths_and_refuse_divergence() {
         let temp = tempfile::tempdir().unwrap();
@@ -730,6 +737,7 @@ mod tests {
         assert!(SessionOperation::acquire(&server, Method::SESSION_RESUME, Some(&params)).is_ok());
     }
 
+    #[cfg(unix)]
     #[test]
     fn claude_switches_live_accounts_and_back_with_same_conversation() {
         let temp = tempfile::tempdir().unwrap();

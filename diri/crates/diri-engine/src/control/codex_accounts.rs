@@ -381,12 +381,15 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
     fn auth(account: &str, refresh: &str) -> Vec<u8> {
         let payload =
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"sub":"fixture-user"}"#);
         serde_json::to_vec(&json!({"tokens":{"account_id":account,"id_token":format!("x.{payload}.x"),"access_token":"fixture-access","refresh_token":refresh}})).unwrap()
     }
+    #[cfg(unix)]
     #[test]
     fn login_files_are_private_atomic_and_reject_symlinks_and_malformed_auth() {
         let tmp = tempfile::tempdir().unwrap();
@@ -404,6 +407,7 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         assert!(read(&path).is_err());
     }
+    #[cfg(unix)]
     #[test]
     fn login_is_a_separate_setup_session_and_cancel_does_not_switch_auth() {
         let tmp = tempfile::tempdir().unwrap();
@@ -474,6 +478,7 @@ mod tests {
             "cli_auth_credentials_store='keyring'\n"
         );
     }
+    #[cfg(unix)]
     #[test]
     fn shared_switch_restarts_open_tabs_without_reading_history_or_touching_tools() {
         let tmp = tempfile::tempdir().unwrap();
@@ -635,6 +640,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn shared_switch_identifies_unbound_tabs_from_their_rollout_and_never_refuses() {
         let tmp = tempfile::tempdir().unwrap();

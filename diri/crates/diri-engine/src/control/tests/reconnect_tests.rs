@@ -8,6 +8,7 @@ use crate::remote::{
 };
 use diri_proto::remote_pty::*;
 use diri_proto::{RemoteConnectionState as State, SessionReconnectResult};
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::time::Instant;
 

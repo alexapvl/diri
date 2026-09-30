@@ -527,6 +527,7 @@ mod tests {
         assert!(received.iter().all(|byte| *byte == 0));
         worker.join().unwrap();
     }
+    #[cfg(unix)]
     #[test]
     fn capacity_retry_recaptures_the_seed_without_holding_registry() {
         let temp = tempfile::tempdir().unwrap();

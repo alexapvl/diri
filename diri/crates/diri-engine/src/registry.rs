@@ -3615,6 +3615,7 @@ mod tests {
         assert_eq!(updated.title_source, TitleSource::AgentProvided);
     }
 
+    #[cfg(unix)]
     #[test]
     fn codex_subagent_notify_does_not_replace_the_parent_conversation() {
         let temp = tempfile::tempdir().unwrap();
@@ -3713,6 +3714,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn first_codex_notify_associates_the_matching_live_rollout() {
         let temp = tempfile::tempdir().expect("temp");
@@ -4007,6 +4009,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn codex_provider_prompt_refresh_stays_consistent_with_live_records() {
         let temp = tempfile::tempdir().unwrap();
@@ -4182,6 +4185,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn codex_terminal_input_names_a_session_before_the_first_idle_observation() {
         let temp = tempfile::tempdir().unwrap();
@@ -4235,6 +4239,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn quiet_natural_exit_reaches_disk_without_a_title_or_turn_change() {
         // A shell command that exits without ever changing its title or
@@ -4323,6 +4328,7 @@ mod tests {
             .ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn codex_pty_names_update_even_after_the_first_prompt_was_captured() {
         let temp = tempfile::tempdir().unwrap();
@@ -4442,6 +4448,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn codex_prompt_titles_stay_stable_across_native_refresh_and_live_views() {
         for resumed in [false, true] {

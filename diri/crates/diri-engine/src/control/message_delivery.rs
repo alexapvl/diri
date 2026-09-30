@@ -146,6 +146,7 @@ pub(super) fn open(path: &Path) -> Result<Connection, ControlError> {
         );",
     )
     .map_err(storage_error)?;
+    #[cfg(unix)]
     std::fs::File::open(parent)
         .and_then(|dir| dir.sync_all())
         .map_err(|_| unavailable())?;
@@ -169,6 +170,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn receipt_survives_reopen_and_rejects_conflicting_payloads() {
         let temp = tempfile::tempdir().unwrap();
@@ -262,6 +264,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn corrupt_or_symlinked_receipts_fail_before_input() {
         let temp = tempfile::tempdir().unwrap();

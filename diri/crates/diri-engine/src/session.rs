@@ -5580,8 +5580,10 @@ mod held_foreground_tests {
 
 #[cfg(test)]
 mod resize_tests {
+    #[cfg(unix)]
     use super::*;
 
+    #[cfg(unix)]
     fn session(temp: &Path) -> Session {
         let (engine, _) = ManifestEngine::load_dir(&crate::detect::bundled_manifest_dir()).unwrap();
         let spec = SessionSpec {
@@ -5602,6 +5604,7 @@ mod resize_tests {
         Session::spawn(spec, Arc::new(engine)).expect("spawn")
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_pty_half_of_a_resize_never_waits_for_the_emulator() {
         let temp = tempfile::tempdir().unwrap();
@@ -5635,6 +5638,7 @@ mod resize_tests {
         let _ = session.terminate(Duration::from_secs(2));
     }
 
+    #[cfg(unix)]
     #[test]
     fn an_owed_reflow_applies_the_newest_pty_size_once() {
         let temp = tempfile::tempdir().unwrap();
@@ -6175,7 +6179,9 @@ mod preview_tests {
 
 #[cfg(test)]
 mod remote_connection_tests {
+    #[cfg(unix)]
     use super::*;
+    #[cfg(unix)]
     use crate::remote::{
         binding::RemoteBindingStore,
         bootstrap::RemoteTarget,
@@ -6183,9 +6189,12 @@ mod remote_connection_tests {
         manager::{ArtifactCatalog, InstalledHelper, RemoteManager},
         ssh::SshTransport,
     };
+    #[cfg(unix)]
     use diri_proto::{HostEntry, RemoteConnectionState as State};
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
+    #[cfg(unix)]
     fn wait_for(label: &str, mut predicate: impl FnMut() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while !predicate() {
@@ -6194,7 +6203,9 @@ mod remote_connection_tests {
         }
     }
 
+    #[cfg(unix)]
     struct ChildGuard(std::process::Child);
+    #[cfg(unix)]
     impl Drop for ChildGuard {
         fn drop(&mut self) {
             let _ = self.0.kill();
@@ -6202,6 +6213,7 @@ mod remote_connection_tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn bridge_loss_preserves_process_and_grid_until_a_validated_reconnect() {
         for fatal in [false, true] {

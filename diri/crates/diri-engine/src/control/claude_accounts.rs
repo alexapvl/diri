@@ -693,8 +693,10 @@ exit $LASTEXITCODE
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
+    #[cfg(unix)]
     #[test]
     fn a_helper_that_outlives_its_deadline_is_killed_and_reaped() {
         let mut child = Command::new("/bin/sleep")
@@ -726,6 +728,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn identity_snapshot_and_install_round_trip_under_the_config_lock() {
         let tmp = tempfile::tempdir().unwrap();
@@ -781,6 +784,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn file_backed_login_copies_into_the_slot_with_private_permissions() {
@@ -802,6 +806,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn shared_claude_switch_relaunches_open_tabs_with_the_profile_store() {
         let tmp = tempfile::tempdir().unwrap();

@@ -909,6 +909,7 @@ impl Drop for RemoteSessionClient {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use diri_platform::poll::AsRawIo;
     use diri_proto::frames::FrameType;
     #[cfg(unix)]
@@ -1042,6 +1043,7 @@ mod tests {
             FrameType::Input
         );
     }
+    #[cfg(unix)]
     fn pipe_writer() -> (WriterState, UnixStream) {
         let (input, output) = UnixStream::pair().unwrap();
         input.set_nonblocking(true).unwrap();
@@ -1072,6 +1074,7 @@ mod tests {
         )
     }
 
+    #[cfg(unix)]
     #[test]
     fn fatal_transport_discards_queued_effects_and_rejects_future_writes() {
         let (mut writer, _peer) = pipe_writer();
@@ -1095,6 +1098,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn nonblocking_frames_resume_in_order_and_reject_overflow_atomically() {
         use std::io::Read;
@@ -1133,6 +1137,7 @@ mod tests {
         assert_eq!(writer.pending_bytes, 0);
     }
 
+    #[cfg(unix)]
     #[test]
     fn disconnect_never_replays_a_partially_written_effect() {
         let (mut writer, _output) = pipe_writer();
@@ -1153,6 +1158,7 @@ mod tests {
         assert!(queue_input(&mut writer, b"retry").is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn disconnect_retains_only_wholly_unwritten_input() {
         let (mut writer, _output) = pipe_writer();
@@ -1172,6 +1178,7 @@ mod tests {
         assert!(!writer.uncertain_effect);
         assert_eq!(writer.queued_input, b"safe");
     }
+    #[cfg(unix)]
     #[test]
     fn explicit_restart_discards_uncertain_effects_and_revokes_the_old_writer() {
         let (mut writer, _output) = pipe_writer();

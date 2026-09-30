@@ -370,6 +370,7 @@ mod tests {
             .collect()
     }
 
+    #[cfg(unix)]
     #[test]
     fn every_protocol_channel_disables_ssh_pty_allocation() {
         let transport = SshTransport::new(&host(), "/tmp/diri master/socket");
@@ -473,6 +474,7 @@ mod tests {
         assert!(!cleanup.contains("diri-remote"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn login_shell_wrapper_preserves_quotes_inside_the_fixed_script() {
         let script = "printf '%s' \"hello world\"";

@@ -288,10 +288,12 @@ fn target_key(host: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use super::*;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
+    #[cfg(unix)]
     #[test]
     fn owner_only_config_round_trips_and_invalidates_cache() {
         let temp = tempfile::tempdir().expect("temp");

@@ -20,6 +20,21 @@ pub fn home_dir() -> Option<std::path::PathBuf> {
         .filter(|p| p.is_absolute())
 }
 
+/// `std::fs::canonicalize`, except that Windows results use the ordinary
+/// `C:\...` / `\\server\share` form whenever it names the same file. Verbatim
+/// `\\?\` paths break Git, shells and Agents, and never compare equal to the
+/// paths those tools report.
+pub fn canonicalize(path: impl AsRef<std::path::Path>) -> std::io::Result<std::path::PathBuf> {
+    #[cfg(windows)]
+    {
+        dunce::canonicalize(path)
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::canonicalize(path)
+    }
+}
+
 pub fn executable_name(stem: &str) -> String {
     if cfg!(windows) {
         format!("{stem}.exe")

@@ -178,9 +178,7 @@ fn local_session<'a>(records: &'a [SessionRecord], path: &Path) -> Option<&'a Se
                 .into_iter()
                 .flatten()
                 .any(|p| {
-                    let p = Path::new(p)
-                        .canonicalize()
-                        .unwrap_or_else(|_| PathBuf::from(p));
+                    let p = diri_platform::canonicalize(p).unwrap_or_else(|_| PathBuf::from(p));
                     p.starts_with(path)
                 })
         })
@@ -199,9 +197,7 @@ fn session_index(records: &[SessionRecord]) -> HashMap<PathBuf, &SessionRecord> 
             .into_iter()
             .flatten()
         {
-            let path = Path::new(path)
-                .canonicalize()
-                .unwrap_or_else(|_| path.into());
+            let path = diri_platform::canonicalize(path).unwrap_or_else(|_| path.into());
             for ancestor in path.ancestors() {
                 let entry = index.entry(ancestor.to_path_buf()).or_insert(record);
                 if !matches!(record.status, SessionStatus::Exited(_)) {
@@ -387,7 +383,7 @@ pub(crate) fn scan(
         if !emit(None, false) {
             return Err("Scan paused after leaving Worktrees. Refresh to continue.".into());
         }
-        let root = root.canonicalize().unwrap_or(root);
+        let root = diri_platform::canonicalize(&root).unwrap_or(root);
         // Session subdirectories reuse discovered checkouts, but an inner
         // .git boundary may be a separately saved nested repository/submodule.
         let mut discovered = false;
@@ -464,7 +460,7 @@ fn refused(reason: &str) -> io::Error {
 }
 fn cleanup_tree(p: &WorktreeCleanupParams) -> io::Result<Tree> {
     let root = Path::new(&p.repo_path);
-    let path = Path::new(&p.worktree_path).canonicalize()?;
+    let path = diri_platform::canonicalize(&p.worktree_path)?;
     if path != Path::new(&p.worktree_path) {
         return Err(refused("Worktree path changed; refresh before cleanup"));
     }
@@ -527,7 +523,9 @@ mod tests {
     }
     fn fixture() -> (tempfile::TempDir, PathBuf, Tree) {
         let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap().join("repo");
+        let root = diri_platform::canonicalize(temp.path())
+            .unwrap()
+            .join("repo");
         std::fs::create_dir(&root).unwrap();
         run(&root, &["init", "-b", "main"]);
         run(&root, &["commit", "--allow-empty", "-m", "initial"]);
@@ -617,6 +615,7 @@ mod tests {
         );
         assert!(tree.path.exists());
     }
+    #[cfg(unix)]
     #[test]
     fn worktree_cleanup_protects_unknown_sessions_in_symlinked_subdirectories() {
         let (_temp, root, tree) = fixture();

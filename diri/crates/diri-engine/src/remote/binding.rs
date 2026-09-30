@@ -209,6 +209,7 @@ mod tests {
         assert_eq!(loaded[0].session_id, "session-good");
     }
 
+    #[cfg(unix)]
     #[test]
     fn binding_is_owner_only_and_redacts_the_bearer_from_debug() {
         let temporary = tempfile::tempdir().expect("temp");

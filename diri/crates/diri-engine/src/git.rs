@@ -283,7 +283,7 @@ pub fn create_worktree(
     // repo can easily sit under one too. Handing back the unresolved path means
     // a caller that stores it cannot later match it against `list_worktrees` or
     // remove it by path.
-    let resolved = std::fs::canonicalize(&worktree_path)
+    let resolved = diri_platform::canonicalize(&worktree_path)
         .map(|path| path.to_string_lossy().to_string())
         .unwrap_or(worktree_str);
 
@@ -953,7 +953,7 @@ mod tests {
         );
         assert_eq!(
             Path::new(&info.path).parent(),
-            std::fs::canonicalize(&repo).unwrap().parent()
+            diri_platform::canonicalize(&repo).unwrap().parent()
         );
         assert!(create_worktree(&repo, Some("phone/fix"), Some("main")).is_err());
     }
@@ -968,6 +968,7 @@ mod tests {
         assert_eq!(list_worktrees(&repo).unwrap().len(), 1);
     }
 
+    #[cfg(unix)]
     #[test]
     fn remote_workspace_script_uses_stdin_and_preserves_the_original_checkout() {
         use std::io::Write as _;
@@ -1058,6 +1059,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     /// Exercises create/list/remove against real git in a temp repo.
     #[test]
     fn worktrees_can_be_created_listed_and_removed() {
@@ -1105,7 +1107,7 @@ mod tests {
         );
         assert_eq!(
             created.path,
-            std::fs::canonicalize(&created.path)
+            diri_platform::canonicalize(&created.path)
                 .expect("exists")
                 .to_string_lossy(),
             "the reported path is the resolved one git also reports"
@@ -1264,6 +1266,8 @@ mod tests {
         git(&["config", "user.name", "Test"], &target);
         git(&["config", "user.email", "test@example.invalid"], &target);
         git(&["config", "commit.gpgsign", "false"], &target);
+        // Git for Windows enables autocrlf system-wide; fixtures compare bytes.
+        git(&["config", "core.autocrlf", "false"], &target);
         std::fs::write(target.join("shared.txt"), "base\n").unwrap();
         git(&["add", "."], &target);
         git(&["commit", "-m", "base"], &target);

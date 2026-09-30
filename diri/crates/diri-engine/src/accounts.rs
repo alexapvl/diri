@@ -376,6 +376,7 @@ mod tests {
             login_store: None,
         }
     }
+    #[cfg(unix)]
     #[test]
     fn persistence_defaults_targets_and_explicit_cli() {
         let root = tempfile::tempdir().unwrap();
@@ -401,6 +402,7 @@ mod tests {
             0o600
         );
     }
+    #[cfg(unix)]
     #[test]
     fn binding_uses_remote_home_and_removes_ambient_credentials() {
         let mut p = profile("work");
@@ -415,6 +417,7 @@ mod tests {
         assert!(env.contains(&("CODEX_HOME".into(), p.config_home)));
     }
 
+    #[cfg(unix)]
     #[test]
     fn remote_configuration_arguments_are_never_rewritten_as_shell_commands() {
         let mut profile = profile("work");
@@ -448,6 +451,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn shell_startup_overrides_cannot_replace_the_selected_account() {
         let root = tempfile::tempdir().unwrap();
@@ -492,6 +496,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn remote_directory_setup_treats_paths_as_data_and_is_idempotent() {
         use std::process::{Command, Stdio};
@@ -515,6 +520,7 @@ mod tests {
         assert!(prepare_local_directory(link.to_str().unwrap()).is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn unsafe_or_ambiguous_catalogs_fail_closed() {
         let root = tempfile::tempdir().unwrap();

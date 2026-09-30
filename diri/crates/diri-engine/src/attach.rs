@@ -819,7 +819,7 @@ impl AttachHub {
 
     /// Recipients were captured with the grid under Registry. Looking them
     /// up after encoding could send an older diff behind a newer client's seed.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn enqueue_publication(
         &self,
         session_id: &str,
@@ -1202,6 +1202,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     fn constrained_output() -> (SinkOutput, UnixStream) {
         let (writer, reader) = UnixStream::pair().unwrap();
         let size: libc::c_int = 1024;
@@ -1222,8 +1223,10 @@ mod tests {
         (SinkOutput::new(writer).unwrap(), reader)
     }
 
+    #[cfg(unix)]
     fn retained_registry(temp: &std::path::Path) -> Arc<Mutex<Registry>> {
         use diri_proto::process::{BootId, ProcessBirth, ProcessIdentity};
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
         let exit = diri_proto::ExitInfo {
             reason: diri_proto::ExitReason::Exited,
@@ -1310,6 +1313,7 @@ mod tests {
         Arc::new(Mutex::new(registry))
     }
 
+    #[cfg(unix)]
     fn read_frames(codec: &mut FrameCodec, stream: &mut UnixStream, want: usize) -> Vec<Frame> {
         let mut frames = Vec::new();
         let mut chunk = [0u8; 64 << 10];
@@ -1328,6 +1332,7 @@ mod tests {
         frames
     }
 
+    #[cfg(unix)]
     #[test]
     fn attaching_to_a_completed_session_seeds_its_retained_terminal_read_only() {
         let temp = tempfile::tempdir().unwrap();
@@ -1382,6 +1387,7 @@ mod tests {
         serve.join().unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn keyboard_publication_preserves_legacy_bytes_and_shares_grid() {
         let hub = AttachHub::new();
@@ -1456,6 +1462,7 @@ mod tests {
         assert!(!preview.lock().unwrap().closed);
     }
 
+    #[cfg(unix)]
     #[test]
     fn late_registration_cannot_receive_a_pre_seed_publication() {
         let hub = AttachHub::new();
@@ -1513,6 +1520,7 @@ mod tests {
         assert_eq!(old.lock().unwrap().frames.len(), 2);
     }
 
+    #[cfg(unix)]
     #[test]
     fn an_idle_pump_stops_as_soon_as_its_last_sink_leaves() {
         let temp = tempfile::tempdir().unwrap();
@@ -1584,6 +1592,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn output_between_seed_and_registration_is_not_lost() {
         let temp = tempfile::tempdir().unwrap();
@@ -1721,6 +1730,7 @@ mod tests {
             .unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn partial_writes_keep_exact_frame_boundaries_and_release_retained_bytes() {
         let (mut output, mut reader) = constrained_output();
@@ -1765,6 +1775,7 @@ mod tests {
         assert!(output.frames.is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn overflow_after_partial_frame_closes_instead_of_splicing_a_new_frame() {
         let (mut output, mut reader) = constrained_output();
@@ -1786,6 +1797,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn small_frames_are_count_bounded_and_stalled_sinks_close() {
         let (mut output, _) = constrained_output();

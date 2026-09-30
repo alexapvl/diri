@@ -1185,7 +1185,9 @@ fn persistence_key(host: &HostEntry) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::io::Write as _;
+    #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt as _;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -1290,6 +1292,7 @@ mod tests {
         assert!(error.to_string().contains("directory-list"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn long_control_directories_use_a_short_stable_owner_path() {
         let requested = PathBuf::from("/very-long").join("segment".repeat(20));
@@ -1670,6 +1673,7 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::Unsupported);
     }
 
+    #[cfg(unix)]
     #[test]
     fn fake_ssh_bootstrap_uploads_activates_and_then_reuses_exact_build() {
         let temporary = tempfile::tempdir().expect("temp");

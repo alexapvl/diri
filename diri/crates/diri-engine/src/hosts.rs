@@ -536,6 +536,7 @@ mod tests {
         assert_eq!(shell_quote_path("/abs/path"), "'/abs/path'");
     }
 
+    #[cfg(unix)]
     /// These two functions build every remote shell command the Engine sends,
     /// so this is the injection guard. It travelled here from the deleted
     /// `remote` module and would otherwise have been lost with it — `hosts`
@@ -558,6 +559,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_command_substitution_cannot_escape_shell_quote() {
         let quoted = shell_quote("$(touch /tmp/diri-injection-canary)");

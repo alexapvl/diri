@@ -144,10 +144,22 @@ pub fn accept_retry_delay(error: &io::Error) -> Duration {
         _ => Duration::from_secs(1),
     }
     #[cfg(windows)]
-    match error.kind() {
-        io::ErrorKind::WouldBlock | io::ErrorKind::ConnectionAborted => Duration::from_millis(10),
-        io::ErrorKind::OutOfMemory => Duration::from_millis(100),
-        _ => Duration::from_secs(1),
+    {
+        use diri_platform::windows_sys::Win32::Networking::WinSock::{
+            WSAECONNABORTED, WSAEMFILE, WSAENOBUFS, WSAEWOULDBLOCK,
+        };
+        match error.raw_os_error() {
+            Some(WSAEMFILE | WSAENOBUFS) => return Duration::from_millis(100),
+            Some(WSAECONNABORTED | WSAEWOULDBLOCK) => return Duration::from_millis(10),
+            _ => {}
+        }
+        match error.kind() {
+            io::ErrorKind::WouldBlock | io::ErrorKind::ConnectionAborted => {
+                Duration::from_millis(10)
+            }
+            io::ErrorKind::OutOfMemory => Duration::from_millis(100),
+            _ => Duration::from_secs(1),
+        }
     }
 }
 
@@ -192,6 +204,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(unix)]
     #[test]
     fn raising_the_limit_is_monotonic_and_stays_within_the_hard_limit() {
         let before = raise_fd_limit().expect("rlimit readable");
@@ -203,9 +216,16 @@ mod tests {
 
     #[test]
     fn descriptor_exhaustion_pauses_briefly_instead_of_ending_the_daemon() {
-        let emfile = io::Error::from_raw_os_error(libc::EMFILE);
+        #[cfg(unix)]
+        let (emfile, aborted) = (libc::EMFILE, libc::ECONNABORTED);
+        #[cfg(windows)]
+        let (emfile, aborted) = {
+            use diri_platform::windows_sys::Win32::Networking::WinSock::*;
+            (WSAEMFILE, WSAECONNABORTED)
+        };
+        let emfile = io::Error::from_raw_os_error(emfile);
         assert_eq!(accept_retry_delay(&emfile), Duration::from_millis(100));
-        let aborted = io::Error::from_raw_os_error(libc::ECONNABORTED);
+        let aborted = io::Error::from_raw_os_error(aborted);
         assert_eq!(accept_retry_delay(&aborted), Duration::from_millis(10));
         let unknown = io::Error::other("listener vanished");
         assert_eq!(accept_retry_delay(&unknown), Duration::from_secs(1));

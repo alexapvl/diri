@@ -16,6 +16,8 @@ tokio = { workspace = true, optional = true }
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
+# Already in the lockfile; strips `\\?\` only when the plain form is exact.
+dunce = "1.0.5"
 uds_windows = "1.2.1"
 socket2 = "0.6.5"
 windows-sys = { version = "0.61.2", features = [

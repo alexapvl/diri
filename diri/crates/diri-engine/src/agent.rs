@@ -713,6 +713,7 @@ mod tests {
         assert!(!keys.contains(&"CLAUDECODE"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn bare_binaries_resolve_to_absolute_paths_for_foreign_executors() {
         // The holder manager that execs the argv may carry a launchd-minimal
@@ -750,6 +751,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn shipped_agents_land_in_a_login_shell_when_the_agent_exits() {
         // Codex replaces its own binary when it self-updates and then exits.

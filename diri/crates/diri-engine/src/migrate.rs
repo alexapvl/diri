@@ -809,13 +809,26 @@ mod tests {
     }
 
     /// A bare origin plus a seeded `source` clone (one `root` commit holding
-    /// `file.txt`) and an empty `target` clone.
+    /// `file.txt`) and an empty `target` clone. Both pin `core.autocrlf=false`:
+    /// Git for Windows enables it system-wide and these fixtures compare bytes.
     fn seeded_repos(temp: &Path) -> (PathBuf, PathBuf) {
         let origin = temp.join("origin.git");
         std::fs::create_dir_all(&origin).unwrap();
         git(&origin, &["init", "-q", "--bare", "-b", "main"]);
         let source = temp.join("source");
-        git(temp, &["clone", "-q", origin.to_str().unwrap(), "source"]);
+        git(
+            temp,
+            &[
+                "-c",
+                "core.autocrlf=false",
+                "clone",
+                "-q",
+                "--config",
+                "core.autocrlf=false",
+                origin.to_str().unwrap(),
+                "source",
+            ],
+        );
         // `prepare` invokes git in a separate shell and must not inherit a
         // developer machine's global identity. Give every fixture checkout
         // its own author, just as a real configured checkout has one.
@@ -829,7 +842,19 @@ mod tests {
         git(&source, &["commit", "-q", "-m", "root"]);
         git(&source, &["push", "-q", "-u", "origin", "main"]);
         let target = temp.join("target");
-        git(temp, &["clone", "-q", origin.to_str().unwrap(), "target"]);
+        git(
+            temp,
+            &[
+                "-c",
+                "core.autocrlf=false",
+                "clone",
+                "-q",
+                "--config",
+                "core.autocrlf=false",
+                origin.to_str().unwrap(),
+                "target",
+            ],
+        );
         git(&target, &["config", "user.name", "Diri Test"]);
         git(
             &target,
@@ -1083,9 +1108,11 @@ mod tests {
         assert_eq!(git_out(&landed, &["rev-parse", "HEAD"]), before);
     }
 
+    #[cfg(unix)]
     /// Installs a fixture-only pre-push hook: a deterministic stand-in for an
     /// agent that keeps working while the slow transfer is under way.
     fn work_during_transfer(source: &Path, script: &str) {
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
         let hook = source.join(".git/hooks/pre-push");
         git(source, &["config", "core.hooksPath", ".git/hooks"]);
@@ -1101,6 +1128,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     /// The agent is alive while `prepare` snapshots and transfers, so the
     /// snapshot can be stale by the time it is stopped. A tracked edit, a new
     /// untracked file and a deletion made in that window must all be on the
@@ -1156,6 +1184,7 @@ mod tests {
         assert!(!source.join("notes.md").exists());
     }
 
+    #[cfg(unix)]
     /// A source that was clean at snapshot time has no snapshot commit to
     /// grow; late work still travels, and still as uncommitted state.
     #[test]
@@ -1180,6 +1209,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     /// A commit the agent makes on top of the snapshot mid-transfer must not
     /// drag the snapshot onto origin, and its content must still arrive.
     #[test]

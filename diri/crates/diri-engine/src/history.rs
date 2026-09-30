@@ -425,12 +425,12 @@ pub(crate) fn claude_resumable_conversation(
 }
 
 fn open_trusted_regular_file(root: &Path, path: &Path) -> Option<File> {
-    let canonical_root = root.canonicalize().ok()?;
+    let canonical_root = diri_platform::canonicalize(root).ok()?;
     let file = open_regular_readonly(path)?;
     #[cfg(unix)]
     let opened_metadata = file.metadata().ok()?;
     let link_metadata = std::fs::symlink_metadata(path).ok()?;
-    let canonical_path = path.canonicalize().ok()?;
+    let canonical_path = diri_platform::canonicalize(path).ok()?;
     if link_metadata.file_type().is_symlink()
         || !link_metadata.is_file()
         || !canonical_path.starts_with(&canonical_root)
@@ -923,8 +923,8 @@ fn read_cursor_metadata(root: &Path, path: &Path) -> Option<CursorMetadata> {
 }
 
 fn confined_dir(root: impl AsRef<Path>, path: &Path) -> Option<PathBuf> {
-    let root = root.as_ref().canonicalize().ok()?;
-    let canonical = path.canonicalize().ok()?;
+    let root = diri_platform::canonicalize(root).ok()?;
+    let canonical = diri_platform::canonicalize(path).ok()?;
     canonical.starts_with(&root).then_some(canonical)
 }
 
@@ -1542,6 +1542,7 @@ mod tests {
         lines.join("\n") + "\n"
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_claude_transcript_yields_a_resumable_entry() {
         let temp = tempfile::tempdir().expect("temp");

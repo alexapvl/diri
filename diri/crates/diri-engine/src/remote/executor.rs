@@ -303,8 +303,10 @@ fn join_reader(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn capture_is_bounded_while_the_child_is_fully_drained() {
         let executor = ProcessExecutor::new("/bin/sh");
@@ -321,6 +323,7 @@ mod tests {
         assert!(output.stdout_truncated);
     }
 
+    #[cfg(unix)]
     #[test]
     fn timeout_terminates_a_stuck_command() {
         let executor = ProcessExecutor::new("/bin/sh");
@@ -334,6 +337,7 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     }
 
+    #[cfg(unix)]
     #[test]
     fn authentication_diagnostics_are_bounded_and_propagated() {
         let executor = ProcessExecutor::new("/bin/sh");
@@ -352,6 +356,7 @@ mod tests {
         assert!(error.to_string().contains("authentication-required"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn askpass_is_forced_without_consuming_protocol_stdin() {
         let executor = ProcessExecutor::new("/bin/sh").with_askpass("/tmp/diri-askpass");

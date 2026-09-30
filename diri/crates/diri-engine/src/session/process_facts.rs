@@ -165,10 +165,14 @@ pub(super) fn capture_holder(shared: &Shared, stat: &HolderStat) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use super::*;
+    #[cfg(unix)]
     use diri_platform::ipc::UnixListener;
+    #[cfg(unix)]
     use std::io::{BufRead, BufReader, Write};
 
+    #[cfg(unix)]
     fn fixture(
         temp: &Path,
         identity: diri_proto::process::ProcessIdentity,
@@ -213,6 +217,7 @@ mod tests {
             stat,
         )
     }
+    #[cfg(unix)]
     fn serve(listener: UnixListener, replies: Vec<HolderStat>) -> JoinHandle<()> {
         std::thread::spawn(move || {
             for stat in replies {
@@ -230,6 +235,7 @@ mod tests {
             }
         })
     }
+    #[cfg(unix)]
     #[test]
     fn process_facts_preserve_activity_and_require_the_captured_holder_epoch() {
         let temp = tempfile::tempdir_in("/tmp").unwrap();
@@ -273,6 +279,7 @@ mod tests {
             io::ErrorKind::NotConnected
         );
     }
+    #[cfg(unix)]
     #[test]
     fn old_holder_and_changed_second_observation_fail_closed() {
         let temp = tempfile::tempdir_in("/tmp").unwrap();
