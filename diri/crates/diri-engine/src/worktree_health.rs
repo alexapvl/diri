@@ -184,6 +184,30 @@ fn local_session<'a>(records: &'a [SessionRecord], path: &Path) -> Option<&'a Se
         })
         .max_by_key(|r| !matches!(r.status, SessionStatus::Exited(_)))
 }
+/// `du -sk -P` for Windows, which has no `du`: apparent file sizes, without
+/// following reparse points, abandoned (None) at the same deadline.
+#[cfg(windows)]
+fn directory_bytes(root: &Path, timeout: Duration) -> Option<u64> {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut pending = vec![root.to_path_buf()];
+    let mut total = 0_u64;
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(&directory).ok()? {
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            let entry = entry.ok()?;
+            // symlink_metadata never follows a reparse point.
+            let metadata = entry.path().symlink_metadata().ok()?;
+            if metadata.is_dir() {
+                pending.push(entry.path());
+            } else if metadata.is_file() {
+                total = total.saturating_add(metadata.len());
+            }
+        }
+    }
+    Some(total)
+}
 struct RepoFacts<'a> {
     base: Option<String>,
     pulls: Option<Vec<Value>>,
@@ -320,6 +344,7 @@ fn inspect_cached(
         .and_then(|t| t.elapsed().ok())
         .map(|d| (d.as_secs() / 86400) as i64)
         .unwrap_or(-1);
+    #[cfg(unix)]
     let disk_bytes = (disk && protection.is_none())
         .then(|| {
             output(
@@ -333,6 +358,10 @@ fn inspect_cached(
         .and_then(|b| String::from_utf8(b).ok())
         .and_then(|s| s.split_whitespace().next()?.parse::<u64>().ok())
         .and_then(|kb| kb.checked_mul(1024));
+    #[cfg(windows)]
+    let disk_bytes = (disk && protection.is_none())
+        .then(|| directory_bytes(path, Duration::from_secs(2)))
+        .flatten();
     WorktreeOverviewEntry {
         path: path.to_string_lossy().into_owned(),
         branch: tree.branch.clone(),

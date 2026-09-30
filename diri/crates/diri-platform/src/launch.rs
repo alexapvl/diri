@@ -311,6 +311,17 @@ pub fn local_environment() -> Vec<(String, String)> {
 
 /// Only fixed internal POSIX maintenance scripts use Git for Windows' shell.
 /// Agent launches always use resolve_argv and never this interpreter.
+/// PATH for a [`maintenance_shell`] child. MSYS mounts the Git root at `/`,
+/// so a user PATH naming `<Git>\bin` becomes `/usr/bin`, which has no `git`.
+/// `<Git>\cmd` holds the `git` launcher in every Git for Windows layout.
+#[cfg(windows)]
+pub fn maintenance_path(shell: &Path) -> Option<std::ffi::OsString> {
+    // <Git>\usr\bin\sh.exe -> <Git>
+    let command = shell.parent()?.parent()?.parent()?.join("cmd");
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    std::env::join_paths(std::iter::once(command).chain(std::env::split_paths(&inherited))).ok()
+}
+
 pub fn maintenance_shell() -> io::Result<PathBuf> {
     #[cfg(unix)]
     {

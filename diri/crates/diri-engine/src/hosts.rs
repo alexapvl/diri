@@ -70,6 +70,17 @@ pub fn run_shell(
             argv.push(command.to_string());
             argv
         }
+        #[cfg(windows)]
+        None => {
+            let shell = diri_platform::launch::maintenance_shell().ok()?;
+            let mut child = Command::new(&shell);
+            child.args(["-c", command]);
+            if let Some(path) = diri_platform::launch::maintenance_path(&shell) {
+                child.env("PATH", path);
+            }
+            return shell_output(&mut child, timeout);
+        }
+        #[cfg(unix)]
         None => vec![
             diri_platform::launch::maintenance_shell()
                 .ok()?
@@ -124,9 +135,12 @@ fn run_argv(program: &str, args: &[String], timeout: Duration) -> Option<ShellOu
 
 #[cfg(windows)]
 fn run_argv(program: &str, args: &[String], timeout: Duration) -> Option<ShellOutput> {
-    let output =
-        diri_platform::child::output(Command::new(program).args(args), timeout, 4 * 1024 * 1024)
-            .ok()?;
+    shell_output(Command::new(program).args(args), timeout)
+}
+
+#[cfg(windows)]
+fn shell_output(command: &mut Command, timeout: Duration) -> Option<ShellOutput> {
+    let output = diri_platform::child::output(command, timeout, 4 * 1024 * 1024).ok()?;
     Some(ShellOutput {
         ok: output.status.success(),
         exit_code: output.status.code().unwrap_or(-1),
