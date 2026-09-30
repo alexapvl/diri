@@ -169,17 +169,25 @@ fn run(args: &[&str], cwd: &Path) -> std::io::Result<String> {
     command
         .args(args)
         .current_dir(cwd)
-        .stdin(std::process::Stdio::null())
-        .env_clear();
+        .stdin(std::process::Stdio::null());
 
     #[cfg(unix)]
-    command.env("PATH", "/usr/bin:/bin");
+    {
+        command.env_clear();
+        command.env("PATH", "/usr/bin:/bin");
+    }
 
     #[cfg(windows)]
     {
+        command.env_clear();
         let path = std::env::var("PATH").unwrap_or_else(|_| String::new());
         if !path.is_empty() {
             command.env("PATH", path);
+        }
+        for var in &["SYSTEMROOT", "WINDIR", "TEMP", "TMP", "APPDATA", "USERPROFILE"] {
+            if let Ok(val) = std::env::var(var) {
+                command.env(var, val);
+            }
         }
     }
 
