@@ -257,10 +257,11 @@ fn main() {
     telemetry::start(preview);
     #[cfg(target_os = "macos")]
     let bundle_id = macos::bundle_identifier();
-    #[cfg(target_os = "macos")]
+    #[cfg(windows)]
+    let bundle_id = dev_build::windows_bundle_id();
+    #[cfg(not(any(target_os = "macos", windows)))]
+    let bundle_id: Option<String> = None;
     let dev_build = DevBuildIdentity::from_process_environment(bundle_id.as_deref());
-    #[cfg(not(target_os = "macos"))]
-    let dev_build = DevBuildIdentity::from_process_environment(None);
 
     // The client runtime multiplexes one daemon socket plus a handful of
     // event-driven housekeeping tasks. The default Tokio constructor creates
@@ -424,6 +425,11 @@ fn main() {
     app.run(move |cx: &mut App| {
         load_system_fonts(cx);
         telemetry::install(cx);
+        // Its own taskbar group, never merged with the installed app's.
+        #[cfg(windows)]
+        if let Some(build) = &services.dev_build {
+            cx.set_app_identity(build.bundle_id(), &build.window_title());
+        }
         // Menus and popovers open as blurred panels under glass; DIRI_FLOATING_PANELS=0
         // keeps them inside the window for comparison or when a panel misbehaves.
         if std::env::var_os("DIRI_FLOATING_PANELS").is_none_or(|value| value != "0") {
