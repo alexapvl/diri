@@ -17,15 +17,30 @@ $body = @"
 `$ErrorActionPreference = 'Stop'
 Set-Location $(Quote $PWD.Path)
 try {
-  `$test = Start-Process -FilePath $(Quote $artifacts[0]) -ArgumentList '--test-threads=1' -Wait -PassThru -RedirectStandardOutput $(Quote $log) -RedirectStandardError $(Quote $errors)
+  # Start-Process -Wait creates its own restrictive tracking Job. Use the
+  # plain .NET process API so this wrapper does not recreate the CI constraint.
+  `$test = [Diagnostics.Process]::new()
+  `$test.StartInfo.FileName = $(Quote $artifacts[0])
+  `$test.StartInfo.Arguments = '--test-threads=1'
+  `$test.StartInfo.UseShellExecute = `$false
+  `$test.StartInfo.CreateNoWindow = `$true
+  `$test.StartInfo.RedirectStandardOutput = `$true
+  `$test.StartInfo.RedirectStandardError = `$true
+  `$null = `$test.Start()
+  `$stdout = `$test.StandardOutput.ReadToEndAsync()
+  `$stderr = `$test.StandardError.ReadToEndAsync()
+  if (!`$test.WaitForExit(240000)) { `$test.Kill(`$true); throw 'Holder test binary timed out' }
+  [IO.File]::WriteAllText($(Quote $log), `$stdout.GetAwaiter().GetResult())
+  [IO.File]::WriteAllText($(Quote $errors), `$stderr.GetAwaiter().GetResult())
   [IO.File]::WriteAllText($(Quote $result), [string]`$test.ExitCode)
+  `$test.Dispose()
 } catch {
   `$_ | Out-File -Append -FilePath $(Quote $log)
   [IO.File]::WriteAllText($(Quote $result), '1')
 }
 "@
 $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($body))
-$powershell = (Get-Command powershell.exe).Source
+$powershell = (Get-Process -Id $PID).Path
 # Pass only the environment needed by these disposable tests, never the runner's
 # credential-bearing environment. WMI does not inherit the caller's environment.
 $environment = @('USERPROFILE', 'SystemRoot', 'WINDIR', 'TEMP', 'TMP', 'PATH') | ForEach-Object {
