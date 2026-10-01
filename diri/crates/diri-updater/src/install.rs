@@ -6,31 +6,31 @@
 //! and puts it back if anything fails, so an interrupted install leaves a
 //! working app rather than a hole where one used to be.
 
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 use std::fs;
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 use std::io::{Read, Seek, SeekFrom};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt as _;
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 use std::path::Component;
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::process::{Command, Stdio};
 
 use crate::error::Result;
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 use crate::error::UpdateError;
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 use crate::net::MAX_ARCHIVE_BYTES;
 
 /// Seconds the helper waits for diri to exit before giving up untouched.
 const EXIT_GRACE_SECONDS: u32 = 60;
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 const MAX_EXPANDED_BYTES: u64 = 1024 * 1024 * 1024;
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 const MAX_ARCHIVE_ENTRIES: u64 = 100_000;
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 const MAX_ZIP_COMMENT_BYTES: u64 = 65_535;
 
 /// Expands the downloaded zip and returns the `.app` inside it.
@@ -64,7 +64,7 @@ pub fn unpack(archive: &Path, into: &Path) -> Result<PathBuf> {
     find_app(into)
 }
 
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 fn validate_zip_limits(archive: &Path) -> Result<()> {
     const EOCD_SIGNATURE: [u8; 4] = *b"PK\x05\x06";
     const CENTRAL_SIGNATURE: [u8; 4] = *b"PK\x01\x02";
@@ -190,7 +190,7 @@ fn validate_zip_limits(archive: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 fn validate_zip_entry_name(name: &[u8]) -> Result<()> {
     let name = std::str::from_utf8(name)
         .map_err(|_| UpdateError::Integrity("archive path is not UTF-8".to_owned()))?;
@@ -210,7 +210,7 @@ fn validate_zip_entry_name(name: &[u8]) -> Result<()> {
     Ok(())
 }
 
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 fn validate_expanded_limits(root: &Path) -> Result<()> {
     let mut pending = vec![root.to_owned()];
     let mut entries = 0_u64;
@@ -244,7 +244,7 @@ fn validate_expanded_limits(root: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 fn zip_entry_is_symlink(central_header: &[u8]) -> bool {
     const UNIX_FILE_TYPE_MASK: u32 = 0o170000;
     const UNIX_SYMLINK: u32 = 0o120000;
@@ -252,12 +252,12 @@ fn zip_entry_is_symlink(central_header: &[u8]) -> bool {
     unix_mode & UNIX_FILE_TYPE_MASK == UNIX_SYMLINK
 }
 
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 fn le_u16(bytes: &[u8], offset: usize) -> u16 {
     u16::from_le_bytes([bytes[offset], bytes[offset + 1]])
 }
 
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 fn le_u32(bytes: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes([
         bytes[offset],
@@ -267,7 +267,7 @@ fn le_u32(bytes: &[u8], offset: usize) -> u32 {
     ])
 }
 
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 fn find_app(directory: &Path) -> Result<PathBuf> {
     let mut apps = fs::read_dir(directory)?
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
@@ -381,7 +381,16 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }
 
-#[cfg(test)]
+#[cfg(windows)]
+pub fn unpack(archive: &Path, into: &Path) -> Result<PathBuf> {
+    crate::windows::unpack(archive, into)
+}
+#[cfg(windows)]
+pub fn launch_installer(staged_app: &Path, target: &Path, _: &Path, relaunch: bool) -> Result<()> {
+    crate::windows::install(staged_app, target, relaunch)
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
@@ -461,6 +470,7 @@ mod tests {
         assert!(script.contains("target='/Applications/My Apps/diri.app'"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_generated_script_is_valid_shell() {
         let output = Command::new("/bin/sh")
@@ -569,6 +579,7 @@ mod tests {
         assert!(!directory.path().join("diri.app.diri-previous").exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_helper_leaves_the_app_alone_when_the_process_never_exits() {
         let directory = tempfile::tempdir().expect("temp dir");
@@ -642,13 +653,4 @@ mod tests {
             .expect_err("a bundle-less archive must be refused");
         assert!(matches!(error, UpdateError::Integrity(_)));
     }
-}
-
-#[cfg(windows)]
-pub fn unpack(archive: &Path, into: &Path) -> Result<PathBuf> {
-    crate::windows::unpack(archive, into)
-}
-#[cfg(windows)]
-pub fn launch_installer(staged_app: &Path, target: &Path, _: &Path, relaunch: bool) -> Result<()> {
-    crate::windows::install(staged_app, target, relaunch)
 }

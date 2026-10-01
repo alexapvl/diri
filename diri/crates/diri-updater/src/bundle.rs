@@ -75,6 +75,31 @@ fn directory_is_writable(directory: &Path) -> bool {
     }
 }
 
+#[cfg(windows)]
+pub fn system_version() -> Version {
+    // RtlGetVersion reports the OS build independently of compatibility mode.
+    #[repr(C)]
+    struct OsVersion {
+        size: u32,
+        major: u32,
+        minor: u32,
+        build: u32,
+        platform: u32,
+        service_pack: [u16; 128],
+    }
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn RtlGetVersion(version: *mut OsVersion) -> i32;
+    }
+    let mut version: OsVersion = unsafe { std::mem::zeroed() };
+    version.size = size_of::<OsVersion>() as u32;
+    if unsafe { RtlGetVersion(&mut version) } >= 0 {
+        Version::new(version.major, version.minor, version.build)
+    } else {
+        Version::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,30 +134,5 @@ mod tests {
         std::fs::create_dir(&bundle).expect("create bundle");
         assert!(ensure_writable(&bundle).is_ok());
         assert!(ensure_writable(Path::new("/usr/lib/dyld")).is_err());
-    }
-}
-
-#[cfg(windows)]
-pub fn system_version() -> Version {
-    // RtlGetVersion reports the OS build independently of compatibility mode.
-    #[repr(C)]
-    struct OsVersion {
-        size: u32,
-        major: u32,
-        minor: u32,
-        build: u32,
-        platform: u32,
-        service_pack: [u16; 128],
-    }
-    #[link(name = "ntdll")]
-    unsafe extern "system" {
-        fn RtlGetVersion(version: *mut OsVersion) -> i32;
-    }
-    let mut version: OsVersion = unsafe { std::mem::zeroed() };
-    version.size = size_of::<OsVersion>() as u32;
-    if unsafe { RtlGetVersion(&mut version) } >= 0 {
-        Version::new(version.major, version.minor, version.build)
-    } else {
-        Version::default()
     }
 }

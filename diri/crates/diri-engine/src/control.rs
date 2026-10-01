@@ -7569,6 +7569,7 @@ mod tests {
         assert_eq!(error.code, "not_found");
     }
 
+    #[cfg(unix)]
     #[test]
     fn codex_subagent_completion_does_not_finish_the_parent_turn() {
         let temp = tempfile::tempdir().unwrap();
@@ -7597,6 +7598,9 @@ mod tests {
             let mut registry = server.registry.lock().unwrap();
             let mut record = test_record("s_codex");
             record.kind = diri_proto::AgentKind::CODEX;
+            // Transcript acceptance compares cwd exactly. test_record uses the
+            // OS temp directory, which is not /tmp on macOS or Windows.
+            record.cwd = "/tmp".into();
             record.agent_session_id = Some("parent".into());
             record.account_profile = Some(diri_proto::AgentAccountProfile {
                 id: "test".into(),
@@ -7657,9 +7661,39 @@ mod tests {
                     "payload": {"type": "agent-turn-complete", "thread-id": thread}
                 })),
             ));
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !server.hook_reports.is_idle() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "hook queue did not drain"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
             let registry = server.registry.lock().unwrap();
             let session = registry.get("s_codex").unwrap();
-            session.feed_signal(crate::status::StatusSignal::Tick);
+            if !thread.contains("child") {
+                assert!(
+                    registry
+                        .record("s_codex")
+                        .unwrap()
+                        .transcript_path
+                        .is_some(),
+                    "parent transcript not accepted: {thread}"
+                );
+            }
+            // A strong idle hint settles on a later tick, after the reducer's
+            // confirmation delay. An immediate Tick is not that contract.
+            loop {
+                session.feed_signal(crate::status::StatusSignal::Tick);
+                if thread.contains("child") || session.status() == diri_proto::SessionStatus::Idle {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "parent completion did not settle"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
             assert_eq!(
                 session.status(),
                 if thread.contains("child") {

@@ -25,6 +25,8 @@ pub mod net;
 pub mod version;
 #[cfg(windows)]
 mod windows;
+#[cfg(any(windows, test))]
+mod windows_identity;
 
 use std::path::{Path, PathBuf};
 
@@ -320,6 +322,11 @@ fn verify_staged_version(app: &Path, release: &Release) -> Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
+fn verify_staged_version(app: &Path, release: &Release) -> Result<()> {
+    windows::verify_version(app, release)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -453,14 +460,14 @@ mod tests {
         assert_eq!(staged.release.version, release.version);
         for executable in ["dirijord-rs", "diri-holder"] {
             let path = staged.app.join("Contents/Resources/bin").join(executable);
-            let metadata = std::fs::metadata(&path).unwrap_or_else(|error| {
+            let _metadata = std::fs::metadata(&path).unwrap_or_else(|error| {
                 panic!("published bundle is missing {}: {error}", path.display())
             });
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt as _;
                 assert_ne!(
-                    metadata.permissions().mode() & 0o111,
+                    _metadata.permissions().mode() & 0o111,
                     0,
                     "published helper is not executable: {}",
                     path.display()
@@ -523,9 +530,4 @@ mod tests {
             "unrecognized entries are left alone"
         );
     }
-}
-
-#[cfg(windows)]
-fn verify_staged_version(app: &Path, release: &Release) -> Result<()> {
-    windows::verify_version(app, release)
 }

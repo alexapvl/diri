@@ -164,6 +164,15 @@ fn assess_with_gatekeeper(candidate: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
+pub fn signature_of(bundle: &Path) -> Result<SignatureInfo> {
+    crate::windows::signature_of(bundle)
+}
+#[cfg(windows)]
+pub fn verify_matches_installed(candidate: &Path, installed: &SignatureInfo) -> Result<()> {
+    crate::windows::verify(candidate, installed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,13 +260,4 @@ TeamIdentifier=not set
             check_identity(&apple_development, "AH8WARWU6L", Some("com.dirijor.diri")).is_err()
         );
     }
-}
-
-#[cfg(windows)]
-pub fn signature_of(bundle: &Path) -> Result<SignatureInfo> {
-    crate::windows::signature_of(bundle)
-}
-#[cfg(windows)]
-pub fn verify_matches_installed(candidate: &Path, installed: &SignatureInfo) -> Result<()> {
-    crate::windows::verify(candidate, installed)
 }

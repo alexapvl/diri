@@ -17,6 +17,8 @@ use std::{
 #[serde(rename_all = "PascalCase")]
 struct SignedImage {
     thumbprint: String,
+    subject: String,
+    ekus: Vec<String>,
     product: String,
     version: String,
 }
@@ -25,7 +27,7 @@ fn image(path: &Path) -> Result<SignedImage> {
     use std::{io::Read, os::windows::process::CommandExt};
     // The script is fixed. The filename is data in one environment value,
     // never interpolated into PowerShell source or a cmd.exe command line.
-    const SCRIPT: &str = "$ErrorActionPreference='Stop'; $s=Get-AuthenticodeSignature -LiteralPath $env:DIRI_VERIFY_IMAGE; if ($s.Status -ne 'Valid' -or $null -eq $s.SignerCertificate) { exit 2 }; $v=(Get-Item -LiteralPath $env:DIRI_VERIFY_IMAGE).VersionInfo; @{Thumbprint=$s.SignerCertificate.Thumbprint; Product=$v.ProductName; Version=$v.ProductVersion} | ConvertTo-Json -Compress";
+    const SCRIPT: &str = "$ErrorActionPreference='Stop'; $s=Get-AuthenticodeSignature -LiteralPath $env:DIRI_VERIFY_IMAGE; if ($s.Status -ne 'Valid' -or $null -eq $s.SignerCertificate) { exit 2 }; $v=(Get-Item -LiteralPath $env:DIRI_VERIFY_IMAGE).VersionInfo; @{Thumbprint=$s.SignerCertificate.Thumbprint; Subject=$s.SignerCertificate.Subject; Ekus=@($s.SignerCertificate.EnhancedKeyUsageList | ForEach-Object { $_.ObjectId.Value }); Product=$v.ProductName; Version=$v.ProductVersion} | ConvertTo-Json -Compress";
     let shell = std::env::var_os("SystemRoot")
         .map(PathBuf::from)
         .ok_or_else(|| UpdateError::Signature("Windows directory is unavailable".into()))?
@@ -89,9 +91,11 @@ fn image(path: &Path) -> Result<SignedImage> {
 
 pub fn signature_of(path: &Path) -> Result<SignatureInfo> {
     let image = image(path)?;
+    let identity =
+        crate::windows_identity::signer_identity(&image.thumbprint, &image.subject, &image.ekus)?;
     Ok(SignatureInfo {
         identifier: Some(image.product),
-        team_identifier: Some(image.thumbprint.to_ascii_uppercase()),
+        team_identifier: Some(identity),
         authorities: vec!["Authenticode".into()],
     })
 }

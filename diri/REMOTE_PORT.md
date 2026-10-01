@@ -423,7 +423,11 @@ architectures. The original no-test implementation instruction is historical,
 not the current verification policy. ConPTY/Holder lifecycle tests and WSL
 parsing/routing/command tests are automated; real WSL, Agent fidelity, installer
 signing/update, desktop interaction and latency evidence remain release gates
-in `WINDOWS.md`. ConPTY has no reliable POSIX foreground/cwd/canonical-line
+in `WINDOWS.md`. Optional main-only release signing signs payloads before
+installer assembly and validates the final signed installer/feed. Azure
+updater trust pins a validated publisher and stable Public Trust profile EKU,
+not a rotating leaf thumbprint; traditional certificates retain their exact
+thumbprint pin. ConPTY has no reliable POSIX foreground/cwd/canonical-line
 observation; native Windows keeps those newer shell facts unknown.
 
 Native Windows PTYs use ConPTY and an owned kill-on-close Job per session.

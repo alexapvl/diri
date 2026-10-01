@@ -5204,6 +5204,7 @@ mod tests {
 
     /// A `cd` is written to disk even when it does not rename the tab: a
     /// renamed terminal, or two directories with the same last component.
+    #[cfg(unix)]
     #[test]
     fn a_cd_reaches_the_state_file_without_a_new_title() {
         let temp = tempfile::tempdir().expect("temp");

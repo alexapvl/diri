@@ -61,9 +61,43 @@ jobs:
           path: diri/target/windows-helper
           if-no-files-found: error
 
+  windows-tests:
+    name: Native Windows tests ${{ matrix.architecture }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            architecture: x64
+          - runner: windows-11-arm
+            architecture: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
+    defaults:
+      run:
+        working-directory: diri
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            diri/target
+          key: windows-tests-${{ matrix.architecture }}-${{ hashFiles('diri/Cargo.lock', 'diri/rust-toolchain.toml') }}
+      - name: Portable and native lifecycle tests
+        env:
+          GIT_CONFIG_COUNT: '1'
+          GIT_CONFIG_KEY_0: core.fsmonitor
+          GIT_CONFIG_VALUE_0: 'false'
+        run: cargo test --locked -p diri-platform -p diri-pty -p diri-proto -p diri-client -p diri-terminal-state -p diri-notes -p diri-updater -p diri-engine --lib --tests
+      - name: Native test lints
+        run: cargo clippy --locked -p diri-platform -p diri-pty -p diri-proto -p diri-client -p diri-terminal-state -p diri-notes -p diri-updater -p diri-engine --lib --tests -- -D warnings
+
   windows:
     name: Native Windows ${{ matrix.architecture }}
-    needs: helpers
+    needs: [helpers, windows-tests]
     strategy:
       fail-fast: false
       matrix:
@@ -110,16 +144,8 @@ jobs:
           @{protocolMajor=1; buildId='${{ github.sha }}'; artifacts=$entries} | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8NoBOM (Join-Path $root 'manifest.json')
       - name: Format
         run: cargo fmt --all -- --check
-      - name: Portable and native lifecycle tests
-        env:
-          GIT_CONFIG_COUNT: '1'
-          GIT_CONFIG_KEY_0: core.fsmonitor
-          GIT_CONFIG_VALUE_0: 'false'
-        run: cargo test --locked -p diri-platform -p diri-pty -p diri-proto -p diri-client -p diri-terminal-state -p diri-notes -p diri-engine --lib --tests
       - name: Native Rust lints
         run: cargo clippy --locked -p diri-app -p diri-engine -p dirijor-mcp -p diri-platform -p diri-pty -p diri-updater -p diri-proto -p diri-client --lib --bins -- -D warnings
-      - name: Native test lints
-        run: cargo clippy --locked -p diri-platform -p diri-pty -p diri-proto -p diri-client -p diri-terminal-state -p diri-notes -p diri-engine --lib --tests -- -D warnings
       - name: Compile fidelity capture tool
         run: cargo check --locked -p diri-terminal-state --example pty_fidelity
       - name: Native build and unsigned review installer
@@ -127,5 +153,21 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: diri-windows-${{ matrix.architecture }}-unsigned
-          path: diri/dist/windows/${{ matrix.architecture }}/*-setup.exe
+          path: diri/dist/windows/${{ matrix.architecture }}/
           if-no-files-found: error
+
+  sign:
+    name: Release signatures
+    needs: windows
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && vars.DIRI_WINDOWS_SIGNING == 'artifact-signing'
+    strategy:
+      fail-fast: false
+      matrix:
+        architecture: [x64, arm64]
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    uses: ./.github/workflows/windows-sign.yml
+    with:
+      architecture: ${{ matrix.architecture }}

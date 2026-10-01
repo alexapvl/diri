@@ -55,19 +55,14 @@ try {
       if ($LASTEXITCODE -ne 0) { throw 'Binary signature verification failed' }
     }
   }
-  $compiler = (Get-Command ISCC.exe -ErrorAction SilentlyContinue).Source
-  if (!$compiler) { $compiler = "${env:ProgramFiles(x86)}/Inno Setup 6/ISCC.exe" }
-  if (!(Test-Path $compiler)) { throw 'Inno Setup 6 is required on the packaging builder' }
-  & $compiler "/DVersion=$version" "/DArchitecture=$Architecture" "/DPayload=$payload" "/O$OutputDirectory" assets/windows/installer.iss
-  if ($LASTEXITCODE -ne 0) { throw 'Installer compilation failed' }
+  & (Join-Path $PSScriptRoot 'assemble-windows-installer.ps1') -PayloadDirectory $payload -OutputDirectory $OutputDirectory -Architecture $Architecture -Version $version
   $installer = Join-Path $OutputDirectory "diri-$version-windows-$Architecture-setup.exe"
   if (!$Unsigned) {
     & $signTool.FullName sign /sha1 $CertificateThumbprint /fd SHA256 /tr $TimestampUrl /td SHA256 $installer
     if ($LASTEXITCODE -ne 0) { throw 'Installer signing failed' }
     & $signTool.FullName verify /pa $installer
     if ($LASTEXITCODE -ne 0) { throw 'Installer signature verification failed' }
-    $release = @{version=$version; url="https://github.com/cristicretu/diri/releases/download/v$version/$(Split-Path -Leaf $installer)"; size=(Get-Item $installer).Length; sha256=(Get-FileHash $installer -Algorithm SHA256).Hash.ToLowerInvariant(); minimum_system_version='10.0.22621'}
-    @{feed_version=1; releases=@($release)} | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8NoBOM (Join-Path $OutputDirectory "appcast-windows-$Architecture.json")
+    & (Join-Path $PSScriptRoot 'write-windows-appcast.ps1') -Installer $installer -Application (Join-Path $payload 'diri.exe') -Architecture $Architecture -Version $version
   }
   Write-Output "Windows package: $installer"
 } finally { Pop-Location }

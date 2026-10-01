@@ -23,7 +23,7 @@ Keep `diri.exe`, `dirijord-rs.exe`, `diri-holder.exe`, `diri-ssh-askpass.exe`, `
 ./scripts/package-windows.ps1 -Architecture arm64 -HelperCatalog target/remote-helpers/manifest.json -CertificateThumbprint <thumbprint>
 ```
 
-Inno Setup 6 and Windows SDK `signtool` are build-time requirements. The package verifies all three Helper hashes/lengths and at least 20 Agent manifests. No tool is installed on a user's remote host. Signed packaging emits the installer and architecture-specific appcast JSON; publish both with the matching GitHub release. The updater checks HTTPS, declared length/SHA-256, trusted Authenticode status, Diri product/version metadata, and the **same certificate thumbprint as the running app**. Certificate rotation requires a manually installed, trusted release. Unsigned development builds cannot enable the signed updater.
+Inno Setup 6 and Windows SDK `signtool` are build-time requirements. The package verifies all three Helper hashes/lengths and at least 20 Agent manifests. No tool is installed on a user's remote host. Signed packaging emits the installer and architecture-specific appcast JSON; publish both with the matching GitHub release. The updater checks HTTPS, declared length/SHA-256, trusted Authenticode status, Diri product/version metadata, and the running app's signer identity. For Azure Artifact Signing Public Trust, this is the same publisher subject and exact profile-specific EKU (never the shared Public Trust marker); daily leaf-certificate rotation is accepted. Other certificates retain an exact thumbprint pin. A publisher/profile change or a traditional certificate rotation requires a manually installed, trusted release. Unsigned development builds cannot enable the signed updater.
 
 Each version installs into its own `versions/<version>` directory. Updates wait for the GUI to exit and leave earlier directories intact, so running Holders retain their binaries. Uninstall only after stopping sessions; uninstall is not a session migration mechanism.
 
@@ -134,3 +134,38 @@ Native ConPTY does not expose POSIX foreground process groups, another process's
 working directory, or canonical-line wait state. The newer Unix shell job-name,
 `cd` tracking and line-wait observations remain unavailable on native Windows;
 unknown facts are not reported as successful probes. WSL uses the Linux behavior.
+
+
+## Release signing setup
+
+The Windows workflow packages unsigned review installers and their staged
+payloads on pull requests. On `main`, `.github/workflows/windows-sign.yml`
+can sign both architectures using Azure Artifact Signing and GitHub OIDC.
+It signs all six application executables, assembles the installer from that
+signed payload, signs and timestamps the installer, verifies signatures, then
+writes the appcast hash/length from the final signed bytes. It never accepts
+an arbitrary run ID or signs a pull-request artifact. The resulting
+`diri-windows-<architecture>-signed` artifact contains the installer and feed;
+publish both on the matching GitHub release.
+
+A maintainer must complete the external setup before enabling this job:
+
+1. Create an Azure Artifact Signing account, complete identity validation, and
+   create a **Public Trust certificate profile**.
+2. Create an Entra app with a federated credential for
+   `repo:cristicretu/diri:environment:windows-signing` and the Artifact Signing
+   Certificate Profile Signer role on that account.
+3. Create the GitHub `windows-signing` environment, restricted to `main`, with
+   `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, and `AZURE_SUBSCRIPTION_ID` secrets.
+4. Set repository variables `DIRI_ARTIFACT_SIGNING_ENDPOINT`,
+   `DIRI_ARTIFACT_SIGNING_ACCOUNT`, and `DIRI_ARTIFACT_SIGNING_PROFILE`.
+5. Set `DIRI_WINDOWS_SIGNING=artifact-signing`, then dispatch **Windows build
+   and package** on `main`. Validate a real signed install/update before release.
+
+No private key is stored in GitHub. The profile-specific EKU persists across
+leaf renewal; deleting/recreating a profile changes that identity. Microsoft's
+[certificate management documentation](https://learn.microsoft.com/en-us/azure/artifact-signing/concept-certificate-management)
+explains the daily renewal and stable profile EKU. Traditional certificate/HSM
+builders can still use `package-windows.ps1 -CertificateThumbprint ...`.
+Real signing remains unverified until the maintainer provisions the account;
+policy unit tests cannot prove certificate issuance or SmartScreen behavior.
