@@ -275,9 +275,13 @@ fn threads_and_descriptors_return_to_baseline_after_churn() {
         json!({ "proto": diri_proto::WIRE_VERSION, "build": "test" }),
     );
     let idle = spawn_painted(&mut control, "printf ready; while :; do sleep 5; done");
+    let busy_gate = temp.path().join("start-output");
+    let quoted_gate = busy_gate.to_string_lossy().replace('\'', "'\\''");
     let busy = spawn_painted(
         &mut control,
-        "printf ready; while :; do printf 'tick %s\\n' \"$$\"; sleep 0.02; done",
+        &format!(
+            "printf ready; while [ ! -f '{quoted_gate}' ]; do sleep 0.02; done; while :; do printf 'tick %s\\n' \"$$\"; sleep 0.02; done"
+        ),
     );
     let _cleanup = KillOnDrop {
         server: &server,
@@ -288,6 +292,13 @@ fn threads_and_descriptors_return_to_baseline_after_churn() {
     // manager connection, the persist flusher, the activity log) belong to
     // the baseline, not to growth.
     churn(&server, &mut control, &idle, &busy, 4);
+    // Both followers need an initially drained log to establish their output
+    // subscriptions. Continuous output from process startup can defer that
+    // subscription until after the baseline, counting one legitimate retained
+    // socket as a leak on Linux. Keep both children quiet through warm-up,
+    // then measure the same idle/busy workload before and after churn.
+    std::thread::sleep(Duration::from_millis(600));
+    std::fs::write(&busy_gate, b"start").expect("start busy output");
     std::thread::sleep(Duration::from_millis(600));
     let baseline = ProcessStats::current();
     let baseline_targets = descriptor_targets();

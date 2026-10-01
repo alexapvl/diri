@@ -7,12 +7,13 @@
 //! rewards an in-process client.
 
 use std::fs;
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use crate::error::{Result, UpdateError};
+use sha2::{Digest, Sha256};
 
 fn curl_path() -> std::path::PathBuf {
     #[cfg(windows)]
@@ -242,19 +243,23 @@ pub fn verify_sha256(path: &Path, expected: &str) -> Result<()> {
             "release checksum is not a SHA-256 digest".to_owned(),
         ));
     }
-    let output = Command::new("/usr/bin/shasum")
-        .arg("-a")
-        .arg("256")
-        .arg(path)
-        .output()?;
-    if !output.status.success() {
-        return Err(UpdateError::tool(
-            "shasum",
-            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-        ));
+    // The same bounded, in-process verification works on Windows, where
+    // /usr/bin/shasum does not exist. sha2 is already used by the workspace.
+    let mut file = fs::File::open(path)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let actual = stdout.split_whitespace().next().unwrap_or_default();
+    let actual: String = digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
     if !actual.eq_ignore_ascii_case(expected) {
         return Err(UpdateError::Integrity(format!(
             "sha256 {actual} does not match the feed's {expected}"

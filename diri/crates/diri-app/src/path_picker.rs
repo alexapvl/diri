@@ -627,6 +627,7 @@ mod tests {
         assert_eq!(relatives(&listing), ["node_modules", "src"]);
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_walk_skips_dependency_dirs_and_never_follows_symlinks() {
         let temp = tempfile::tempdir().unwrap();

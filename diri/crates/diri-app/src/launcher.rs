@@ -4519,7 +4519,6 @@ mod tests {
             updates: crate::updates::inert(),
             tokio,
             dev_build: None,
-            #[cfg(unix)]
             daemon_startup: None,
         })
     }
@@ -4850,7 +4849,6 @@ mod tests {
             updates: crate::updates::inert(),
             tokio,
             dev_build: None,
-            #[cfg(unix)]
             daemon_startup: None,
         });
         let (launcher, cx) =
@@ -4903,7 +4901,6 @@ mod tests {
             updates: crate::updates::inert(),
             tokio,
             dev_build: None,
-            #[cfg(unix)]
             daemon_startup: None,
         });
         let (launcher, cx) =
@@ -5781,7 +5778,6 @@ mod tests {
             updates: crate::updates::inert(),
             tokio,
             dev_build: None,
-            #[cfg(unix)]
             daemon_startup: None,
         });
         let window = cx
@@ -6069,7 +6065,6 @@ mod tests {
             updates: crate::updates::inert(),
             tokio,
             dev_build: None,
-            #[cfg(unix)]
             daemon_startup: None,
         });
         let (launcher, cx) =

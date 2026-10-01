@@ -273,10 +273,8 @@ mod tests {
         grid::{ChangedRow, GridCell, GridUpdate},
         preview_set::{PreviewMember, PreviewSetHeader},
     };
-    use tokio::{
-        io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-        net::UnixListener,
-    };
+    use diri_platform::ipc::asynchronous::UnixListener;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     fn target(id: &str) -> Target {
         let (state, _) = watch::channel(PreviewState::Loading);
         Target {

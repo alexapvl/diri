@@ -217,10 +217,8 @@ mod source_tests {
         sync::{Arc, RwLock},
         time::Duration,
     };
-    use tokio::{
-        io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-        net::UnixListener,
-    };
+    use diri_platform::ipc::asynchronous::UnixListener;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
     fn grid(full: bool, row: u16, ch: char) -> GridUpdate {
         GridUpdate {

@@ -2,7 +2,7 @@
 # integration binary through the existing local WMI process provider, outside
 # that Job. This is CI scaffolding, never an app launch fallback or service setup.
 $ErrorActionPreference = 'Stop'
-$artifacts = @(& cargo test --locked -p diri-engine --test holder_windows --no-run --message-format=json | ForEach-Object {
+$artifacts = @(& cargo test --locked -p diri-platform -p diri-pty -p diri-proto -p diri-client -p diri-terminal-state -p diri-notes -p diri-updater -p diri-engine --lib --tests --no-run --message-format=json | ForEach-Object {
   $message = $_ | ConvertFrom-Json
   if ($message.reason -eq 'compiler-artifact' -and $message.target.name -eq 'holder_windows' -and $message.executable) { $message.executable }
 })
@@ -11,13 +11,14 @@ function Quote([string]$Value) { return "'" + $Value.Replace("'", "''") + "'" }
 $directory = Join-Path $env:RUNNER_TEMP ("diri-holder-test-" + [guid]::NewGuid())
 New-Item -ItemType Directory -Path $directory | Out-Null
 $log = Join-Path $directory 'output.txt'
+$errors = Join-Path $directory 'errors.txt'
 $result = Join-Path $directory 'exit.txt'
 $body = @"
 `$ErrorActionPreference = 'Stop'
 Set-Location $(Quote $PWD.Path)
 try {
-  & $(Quote $artifacts[0]) --test-threads=1 *> $(Quote $log)
-  [IO.File]::WriteAllText($(Quote $result), [string]`$LASTEXITCODE)
+  `$test = Start-Process -FilePath $(Quote $artifacts[0]) -ArgumentList '--test-threads=1' -Wait -PassThru -RedirectStandardOutput $(Quote $log) -RedirectStandardError $(Quote $errors)
+  [IO.File]::WriteAllText($(Quote $result), [string]`$test.ExitCode)
 } catch {
   `$_ | Out-File -Append -FilePath $(Quote $log)
   [IO.File]::WriteAllText($(Quote $result), '1')
@@ -50,7 +51,8 @@ try {
     throw 'Standalone Holder tests timed out'
   }
   if (Test-Path -LiteralPath $log) { Get-Content -LiteralPath $log }
-  if (!(Test-Path -LiteralPath $result) -or (Get-Content -Raw -LiteralPath $result).Trim() -ne '0') {
+  if (Test-Path -LiteralPath $errors) { Get-Content -LiteralPath $errors }
+  if (!(Test-Path -LiteralPath $result) -or ([string](Get-Content -Raw -LiteralPath $result)).Trim() -ne '0') {
     throw 'Standalone Holder lifecycle tests failed'
   }
 } finally {

@@ -86,6 +86,7 @@ jobs:
             ~/.cargo/git
             diri/target
           key: windows-tests-${{ matrix.architecture }}-${{ hashFiles('diri/Cargo.lock', 'diri/rust-toolchain.toml') }}
+          restore-keys: windows-tests-${{ matrix.architecture }}-
       - name: Portable and native lifecycle tests
         env:
           GIT_CONFIG_COUNT: '1'
@@ -125,6 +126,7 @@ jobs:
             ~/.cargo/git
             diri/target
           key: windows-${{ matrix.architecture }}-${{ hashFiles('diri/Cargo.lock', 'diri/rust-toolchain.toml') }}
+          restore-keys: windows-${{ matrix.architecture }}-
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: windows-helper-*
@@ -150,6 +152,8 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Native Rust lints
         run: cargo clippy --locked -p diri-app -p diri-engine -p dirijor-mcp -p diri-platform -p diri-pty -p diri-updater -p diri-proto -p diri-client --lib --bins -- -D warnings
+      - name: Native app test lints
+        run: cargo clippy --locked -p diri-app --all-targets -- -D warnings
       - name: Compile fidelity capture tool
         run: cargo check --locked -p diri-terminal-state --example pty_fidelity
       - name: Native build and unsigned review installer

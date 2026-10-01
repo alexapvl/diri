@@ -117,36 +117,6 @@ fn terminal_fallbacks() -> Vec<String> {
     .collect()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{default_mono, default_ui, select_mono, select_ui};
-    use std::collections::HashSet;
-
-    #[test]
-    fn font_selection_uses_discovered_families_or_platform_fallbacks() {
-        assert_eq!(select_ui(&HashSet::new()), default_ui());
-        assert_eq!(select_mono(&HashSet::new()), default_mono());
-
-        #[cfg(target_os = "macos")]
-        assert_eq!(
-            select_mono(&HashSet::from(["SF Mono".to_owned()])),
-            "SF Mono"
-        );
-
-        #[cfg(all(unix, not(target_os = "macos")))]
-        {
-            assert_eq!(
-                select_ui(&HashSet::from(["Noto Sans".to_owned()])),
-                "Noto Sans"
-            );
-            assert_eq!(
-                select_mono(&HashSet::from(["DejaVu Sans Mono".to_owned()])),
-                "DejaVu Sans Mono"
-            );
-        }
-    }
-}
-
 #[cfg(windows)]
 fn default_ui() -> &'static str {
     "Segoe UI"
@@ -180,4 +150,34 @@ fn terminal_fallbacks() -> Vec<String> {
     .into_iter()
     .map(str::to_owned)
     .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{default_mono, default_ui, select_mono, select_ui};
+    use std::collections::HashSet;
+
+    #[test]
+    fn font_selection_uses_discovered_families_or_platform_fallbacks() {
+        assert_eq!(select_ui(&HashSet::new()), default_ui());
+        assert_eq!(select_mono(&HashSet::new()), default_mono());
+
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            select_mono(&HashSet::from(["SF Mono".to_owned()])),
+            "SF Mono"
+        );
+
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            assert_eq!(
+                select_ui(&HashSet::from(["Noto Sans".to_owned()])),
+                "Noto Sans"
+            );
+            assert_eq!(
+                select_mono(&HashSet::from(["DejaVu Sans Mono".to_owned()])),
+                "DejaVu Sans Mono"
+            );
+        }
+    }
 }

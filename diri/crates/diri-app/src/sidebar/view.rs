@@ -9701,7 +9701,16 @@ mod tests {
                 local.tm_hour = hour;
                 local.tm_min = minute;
                 local.tm_isdst = -1;
-                libc::mktime(&mut local)
+                #[cfg(unix)]
+                let seconds = libc::mktime(&mut local);
+                #[cfg(windows)]
+                let seconds = {
+                    unsafe extern "C" {
+                        fn _mktime64(local: *mut libc::tm) -> i64;
+                    }
+                    _mktime64(&mut local)
+                };
+                seconds
             };
             assert_ne!(seconds, -1);
             seconds as f64 * 1_000.0

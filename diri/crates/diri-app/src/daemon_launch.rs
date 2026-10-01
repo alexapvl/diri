@@ -295,7 +295,7 @@ fn ensure_daemon_running(socket_path: &Path, cancelled: &AtomicBool) -> StartupO
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn ensure_daemon_running_with(
     socket_path: &Path,
     daemon: Option<PathBuf>,
@@ -767,7 +767,7 @@ fn is_executable(path: &Path) -> bool {
     diri_platform::launch::is_executable(path)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use diri_platform::ipc::{UnixListener, UnixStream};
