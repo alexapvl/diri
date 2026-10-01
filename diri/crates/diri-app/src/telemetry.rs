@@ -450,7 +450,10 @@ impl FrameBreakdown {
             ("faults", Value::from(self.faults)),
             ("idle_ms", Value::from(self.idle)),
             ("active", Value::from(self.window_active)),
-            ("app_active", Value::from(APP_ACTIVE.load(Ordering::Relaxed))),
+            (
+                "app_active",
+                Value::from(APP_ACTIVE.load(Ordering::Relaxed)),
+            ),
             ("window", Value::from(window)),
             ("surface", Value::from(context.surface)),
             ("workspace", Value::from(context.workspace)),
