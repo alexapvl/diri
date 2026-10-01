@@ -47,8 +47,7 @@ pub(super) struct FrameQueue {
     changed: Condvar,
     /// Bytes that may wait before the pump has to.
     capacity: usize,
-    /// Every return from the reader's wait, so a test can prove an idle
-    /// subscriber stays parked.
+    /// Completed predicate waits, excluding spurious condvar wakeups.
     #[cfg(test)]
     pub(super) wakeups: std::sync::atomic::AtomicUsize,
 }
@@ -132,7 +131,10 @@ impl FrameQueue {
             if state.closed {
                 return None;
             }
-            state = self.changed.wait(state).expect("frame queue");
+            state = self
+                .changed
+                .wait_while(state, |state| state.frames.is_empty() && !state.closed)
+                .expect("frame queue");
             #[cfg(test)]
             self.wakeups
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -221,7 +223,13 @@ mod tests {
             std::thread::spawn(move || (queue.pop().map(|f| f.0), queue.pop().map(|f| f.0)))
         };
         // Longer than several of the old 100 ms idle ticks.
-        std::thread::sleep(Duration::from_millis(350));
+        // A notification is not a frame. Condvars may also wake spuriously;
+        // neither should count as a completed park in this regression check.
+        for _ in 0..7 {
+            std::thread::sleep(Duration::from_millis(50));
+            queue.changed.notify_all();
+        }
+        std::thread::sleep(Duration::from_millis(10));
         assert_eq!(queue.wakeups.load(std::sync::atomic::Ordering::SeqCst), 0);
 
         assert!(push(&queue, 7, Duration::from_millis(10)));

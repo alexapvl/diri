@@ -874,6 +874,11 @@ impl DaemonClient {
             .await
     }
 
+    pub async fn mark_unread(&self, session_id: &SessionId) -> Result<(), ClientError> {
+        self.empty(Method::SESSION_MARK_UNREAD, &session_params(session_id))
+            .await
+    }
+
     pub async fn read_diff(
         &self,
         session_id: &SessionId,
@@ -1725,6 +1730,8 @@ mod tests {
                     host: None,
                     account_profile_id: None,
                     same_repo_as: None,
+                    start_directory: None,
+                    note_id: None,
                 })
                 .await?;
 

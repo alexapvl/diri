@@ -110,9 +110,17 @@ jobs:
           @{protocolMajor=1; buildId='${{ github.sha }}'; artifacts=$entries} | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8NoBOM (Join-Path $root 'manifest.json')
       - name: Format
         run: cargo fmt --all -- --check
-      - name: Native Rust lints (no test execution)
+      - name: Portable and native lifecycle tests
+        env:
+          GIT_CONFIG_COUNT: '1'
+          GIT_CONFIG_KEY_0: core.fsmonitor
+          GIT_CONFIG_VALUE_0: 'false'
+        run: cargo test --locked -p diri-platform -p diri-pty -p diri-proto -p diri-client -p diri-terminal-state -p diri-notes -p diri-engine --lib --tests
+      - name: Native Rust lints
         run: cargo clippy --locked -p diri-app -p diri-engine -p dirijor-mcp -p diri-platform -p diri-pty -p diri-updater -p diri-proto -p diri-client --lib --bins -- -D warnings
-      - name: Compile fidelity capture tool (do not execute)
+      - name: Native test lints
+        run: cargo clippy --locked -p diri-platform -p diri-pty -p diri-proto -p diri-client -p diri-terminal-state -p diri-notes -p diri-engine --lib --tests -- -D warnings
+      - name: Compile fidelity capture tool
         run: cargo check --locked -p diri-terminal-state --example pty_fidelity
       - name: Native build and unsigned review installer
         run: ./scripts/package-windows.ps1 -Architecture '${{ matrix.architecture }}' -HelperCatalog target/remote-helpers/manifest.json -Unsigned

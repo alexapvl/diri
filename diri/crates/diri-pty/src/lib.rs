@@ -5,6 +5,10 @@
 
 pub mod checkpoint;
 #[cfg(unix)]
+pub mod foreground;
+#[cfg(unix)]
+pub mod line_wait;
+#[cfg(unix)]
 pub mod process_facts;
 #[cfg(windows)]
 #[path = "process_facts_windows.rs"]

@@ -189,6 +189,7 @@ fn run(spec: HolderLaunchSpec) -> io::Result<()> {
                             rows: Some(pty.size()?.1),
                             epoch_offset: Some(epoch),
                             secret_input: None,
+                            awaiting_line: None,
                         })),
                         _ if exit.is_some() => Err(io::Error::from(io::ErrorKind::BrokenPipe)),
                         HolderOperation::Write => {

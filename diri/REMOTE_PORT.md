@@ -169,12 +169,27 @@ host rather than repeatedly added. Failed refreshes retain the last successful
 host snapshot and expose its stale status; never-collected hosts are shown as
 unavailable. Removed hosts stop contributing. Local collection does not wait
 for SSH. Remote collection is paced independently of local transcript writes:
-two hosts at a time, every five minutes, with a 45-second scan RPC timeout after bounded
-bootstrap. Background SSH requires `BatchMode=yes` and strict host-key checking;
+two hosts at a time, with a 45-second scan RPC timeout after bounded
+bootstrap. Hosts are polled only while the Usage page is on screen: when it
+opens with data older than five minutes, then every five minutes while it
+stays open; a closed page issues no SSH command. Background SSH requires `BatchMode=yes` and strict host-key checking;
 users authenticate through existing Remote settings. The Helper reuses the
 shared incremental ledger in an owner-only `usage-v1` directory under its state
 root. A stable random usage-store identity deduplicates SSH aliases. The app
 persists the latest aggregate per configured destination for offline display.
+
+A poll of a host whose current Helper target is already known costs one SSH
+command: the fixed channel script runs the exact Build ID's `probe` (stdin
+closed) and, only when it exits successfully, `exec`s `usage` in the same
+channel. The Engine verifies the probe line exactly as the separate probe path
+does before accepting the response; a missing, failed or mismatched probe
+forgets the cached target and takes the full verified bootstrap path. Only
+read-only management commands may share a probe channel. The Helper keeps the
+login-environment values that select roots (`HOME`, `CLAUDE_CONFIG_DIR`,
+`CODEX_HOME`, never the full environment) in an owner-only
+`usage-v1/login-environment.json`, reused while the account shell, HOME, the
+stat stamps of the standard shell startup files and a one-hour age all still
+match; otherwise the two login-shell captures run again.
 
 A scan permits at most 100,000 filesystem entries, depth 48, 256 MiB of changed
 bytes per file and 1 GiB of changed bytes in total; preflight is bounded to 20
@@ -401,6 +416,15 @@ This authorizes implementation, not a claim that fidelity or performance gates
 passed. ConPTY fidelity, native agent compatibility and Windows lifecycle
 measurements remain unmeasured until captured on Windows. No fabricated result
 may select native-agent fidelity or a bundled OpenConsole version.
+
+The 2026-10-01 readiness review consolidates the foundation and runtime fixes
+into one PR against current main and enables native Windows tests on both
+architectures. The original no-test implementation instruction is historical,
+not the current verification policy. ConPTY/Holder lifecycle tests and WSL
+parsing/routing/command tests are automated; real WSL, Agent fidelity, installer
+signing/update, desktop interaction and latency evidence remain release gates
+in `WINDOWS.md`. ConPTY has no reliable POSIX foreground/cwd/canonical-line
+observation; native Windows keeps those newer shell facts unknown.
 
 Native Windows PTYs use ConPTY and an owned kill-on-close Job per session.
 Windows process exit codes preserve native DWORD bits in the existing i32 code

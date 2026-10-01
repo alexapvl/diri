@@ -15,7 +15,7 @@ cargo build --locked -p diri-app -p diri-engine -p dirijor-mcp
 
 Keep `diri.exe`, `dirijord-rs.exe`, `diri-holder.exe`, `diri-ssh-askpass.exe`, `dirijor.exe`, and `dirijor-mcp.exe` together. The manifest catalog and Helper bundle are required for packaged builds; a development build without the exact Helper catalog fails closed for SSH/WSL sessions.
 
-`windows.yml` builds all three Helper targets on native builders, combines their versioned manifests, builds the native Windows binaries on x64 and ARM64 runners, and packages both architectures. It does not execute tests. The existing Unix CI remains unchanged. To package manually, supply the complete output of `scripts/build-remote-helpers.sh`:
+`windows.yml` builds all three Helper targets on native builders, combines their versioned manifests, builds the native Windows binaries on x64 and ARM64 runners, and packages both architectures. It executes portable library tests, ConPTY interaction tests, and native Holder adoption/tree-cleanup tests on both architectures before packaging. It also lints those test targets. The existing Unix CI remains required. To package manually, supply the complete output of `scripts/build-remote-helpers.sh`:
 
 ```powershell
 ./scripts/package-windows.ps1 -Architecture x64 -HelperCatalog target/remote-helpers/manifest.json -Unsigned
@@ -85,7 +85,7 @@ Native Agent exit ends that native session; it does not inject a Unix login-shel
 
 ## Fidelity capture and outstanding evidence
 
-The user explicitly requested the entire implementation in one PR and **no tests**, overriding issue #552's stop-after-spike sequence. This change therefore does not claim a passing Phase 0 result, Windows runtime certification, before/after screenshots, logoff/sleep survival, or latency measurements. See `REMOTE_PORT.md` for the recorded decision. Compilation cannot prove any of these.
+The original implementation was supplied without test execution. The consolidated Windows PR now enables native test execution in CI and includes the subsequent Windows 11 x64 runtime fixes. The contributor reported interactive PowerShell, same-PID Engine-restart adoption, Job-tree termination, and GUI startup on build 26200. These observations do not certify all Agent TUIs, ARM64 runtime behavior, installer updates, or latency. See `REMOTE_PORT.md` for the recorded decision.
 
 The manual `pty_fidelity` example records raw bytes, the canonical encoded full grid (including style/link metadata), cursor, alternate screen, bracketed paste, mouse/keyboard modes, and OSC 52 clipboard observations at scripted checkpoints. It uses the production Unix PTY or ConPTY and the same `HeadlessScreen` parser. It is compiled, not executed, in the Windows build workflow.
 
@@ -104,4 +104,33 @@ Example scenario (replace the executable/cwd with absolute paths on each host):
 
 Steps may include `input` (JSON escapes preserve VT bytes) for bracketed paste, Alt/meta, mouse and Agent interactions. `--emit` supplies a bounded VT sample with truecolor, wide characters, links, clipboard and mode requests. Run the equivalent scenario on macOS with the Unix example binary; compare captures and inspect each differing field. Use disposable sessions: captures intentionally contain raw terminal output and may contain prompts or credentials. Captures are owner-only local files and are not telemetry; do not upload real-session captures unreviewed.
 
-No sequence is labeled passing or broken without captures. Passthrough availability and bundled OpenConsole remain unmeasured; neither is a runtime fallback. Before certifying a Windows release, collect native Claude/Codex and VT-stress captures, Engine-kill/reattach identity/grid evidence, Holder tree cleanup, WSL persistence outcomes, slow-client recovery, monitor-DPI/clipboard/drop screenshots, and the existing latency percentiles (snapshot p90 ≤100 ms, input p95 ≤10 ms, output p90 ≤50 ms). The user-requested no-test implementation does not waive terminal correctness as a release gate.
+No sequence is labeled passing or broken without captures. Passthrough availability and bundled OpenConsole remain unmeasured; neither is a runtime fallback. Before certifying a Windows release, collect native Claude/Codex and VT-stress captures, Engine-kill/reattach identity/grid evidence, Holder tree cleanup, WSL persistence outcomes, slow-client recovery, monitor-DPI/clipboard/drop screenshots, and the existing latency percentiles (snapshot p90 ≤100 ms, input p95 ≤10 ms, output p90 ≤50 ms). Terminal correctness remains a release gate.
+
+
+## Release readiness checklist
+
+All implementation and follow-up fixes belong to the consolidated Windows PR;
+there is no separate runtime-fixes PR to merge afterward. A green package build
+alone does not certify Windows support. Before announcing a supported release:
+
+- [ ] Pass native x64 and ARM64 tests/lints and the existing macOS/Linux gates
+      on the final merged source. Windows Git test execution disables inherited
+      `core.fsmonitor`; the queue test explicitly exercises redundant wakeups.
+- [ ] Capture native Claude/Codex and scripted VT fidelity against macOS,
+      including resize, paste, mouse/keyboard modes, hyperlinks and clipboard.
+- [ ] Verify real Engine termination/restart, slow-client recovery, and native
+      latency gates. Automated Session-detach/adoption and Holder-death tests
+      supplement, but do not replace, this end-to-end evidence.
+- [ ] Exercise installed WSL distro discovery, exact Helper bootstrap, input,
+      reattach and persistence reporting. Deterministic parsing/path/command
+      tests do not certify a real WSL lifecycle.
+- [ ] Test the installed GUI on x64/ARM64: mixed DPI, clipboard, Explorer drops,
+      native shortcuts/caption controls, notifications and SSH askpass.
+- [ ] Produce Authenticode-signed installers and verify fresh install, upgrade
+      with live sessions, signature rejection and uninstall. CI installers are
+      explicitly unsigned review artifacts until release signing is supplied.
+
+Native ConPTY does not expose POSIX foreground process groups, another process's
+working directory, or canonical-line wait state. The newer Unix shell job-name,
+`cd` tracking and line-wait observations remain unavailable on native Windows;
+unknown facts are not reported as successful probes. WSL uses the Linux behavior.

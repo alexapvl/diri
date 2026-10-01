@@ -15,6 +15,7 @@ mod workspaces;
 pub(crate) use titles::testing as title_clock_for_test;
 
 use std::cell::{Cell, RefCell};
+
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::{Arc, RwLock};
@@ -38,6 +39,8 @@ use gpui::{
     linear_color_stop, linear_gradient, point, prelude::*, px,
 };
 use tokio::sync::mpsc;
+
+use crate::tooltip_warmth::WarmTooltip;
 
 use crate::commands::{CommandId, OpenSettings, ToggleHistory};
 use crate::delegation::{HandoffProposal, handoff_proposal, sibling_proposal, validate_handoff};
@@ -79,7 +82,6 @@ const PREVIEW_USAGE: f64 = 4.82;
 // or disclosure control out from under the pointer.
 const SIDEBAR_NAV_ROW_HEIGHT: f32 = 30.0;
 const SIDEBAR_ROW_RADIUS: f32 = 10.0;
-const SIDEBAR_MENU_ROW_RADIUS: f32 = 12.0;
 const SIDEBAR_ACTION_SLOT: f32 = 24.0;
 /// How long a project section takes to slide into its new slot after a live
 /// reorder. Short enough that a fast drag never feels held back, long enough
@@ -88,6 +90,10 @@ const SECTION_SHIFT_TIME: Duration = Duration::from_millis(220);
 /// Vertical gap between project sections in the list, mirrored here because
 /// the slide animation reconstructs slot positions from section heights.
 const SECTION_GAP: f32 = 8.0;
+/// Backstop for a motion whose display-link frames stop arriving (a covered
+/// window, or a floating panel that closed while it painted the sidebar): two
+/// 60 Hz frames, so the motion never stalls for longer than a hitch.
+const MOTION_BACKSTOP: Duration = Duration::from_millis(33);
 /// Width of the trailing identity column shared by every row: a session's
 /// agent mark, and the ✕ that stands on that column when a session or
 /// project row is hovered. One width keeps them on a single vertical line.
@@ -206,6 +212,8 @@ pub(crate) enum SidebarEvent {
     /// A plain click (or shortcut) selected a session: hand keyboard focus
     /// to its terminal surface so the user can type immediately.
     SessionActivated,
+    /// The To-dos row: RootView shows every open to-do across notes.
+    OpenTodos,
     ProjectLayoutUnavailable,
     /// Escape left keyboard-navigation mode without changing the active
     /// session. Root owns the terminal entity, so it completes the handoff.
@@ -564,6 +572,10 @@ fn section_shift_deltas(
 }
 
 pub struct Sidebar {
+    /// Open to-dos across notes; set by RootView. The To-dos row appears
+    /// only while some note has one.
+    todos: Option<Entity<crate::notes::todos::TodosModel>>,
+    todos_active: bool,
     workspace_nav: workspaces::WorkspaceNavigation,
     project_picker: project_picker::ProjectPicker,
     strip_menu: tabs::StripMenu,
@@ -660,7 +672,6 @@ pub struct Sidebar {
     hover_keystrokes: Option<gpui::Subscription>,
     usage: Option<UsageSnapshot>,
     number_flows: crate::number_flow::Bank,
-    number_tick: Option<Task<()>>,
     accounts: accounts::MenuAccounts,
     update: UpdateState,
     /// When visibility last flipped, so a held ⌘B cannot outrun the slide.
@@ -697,14 +708,21 @@ pub struct Sidebar {
     archive_disclosures: HashMap<ProjectId, Disclosure>,
     recency_disclosure: Option<Disclosure>,
     disclosure_animating: bool,
-    disclosure_tick: Option<Task<()>>,
+    /// The last paint asked the display link for another frame of a row or
+    /// disclosure motion.
+    disclosure_tick: bool,
+    /// Keeps a finite sidebar motion moving if its display-link frames stop
+    /// arriving; see `request_motion_frame`.
+    motion_backstop: Option<Task<()>>,
     /// Titles an agent changed crossfade instead of snapping. Shared by the
     /// rows and the horizontal strip, which show the same sessions.
     title_settles: TitleSettles,
     title_clock: fn() -> Instant,
     /// The instant every title in this pass is sampled at.
     title_now: Instant,
-    title_tick: Option<Task<()>>,
+    /// The last paint asked the display link for another frame of a title
+    /// settle.
+    title_tick: bool,
     /// Sessions that arrive grow into the list and ones that leave collapse
     /// out of it, sampled on the title clock.
     row_motion: super::row_motion::RowMotion<SessionId, crate::store::SidebarRow>,
@@ -792,6 +810,8 @@ impl Sidebar {
         ui.visible = visible;
         let mut sidebar = Self {
             store,
+            todos: None,
+            todos_active: false,
             _preview_effects: preview_effects,
             _store_changes: store_changes,
             ui,
@@ -853,7 +873,6 @@ impl Sidebar {
             hover_keystrokes: None,
             usage: None,
             number_flows: crate::number_flow::Bank::default(),
-            number_tick: None,
             accounts: accounts::MenuAccounts::new(preview),
             update: UpdateState::default(),
             last_toggle: None,
@@ -867,11 +886,12 @@ impl Sidebar {
             archive_disclosures: HashMap::new(),
             recency_disclosure: None,
             disclosure_animating: false,
-            disclosure_tick: None,
+            disclosure_tick: false,
+            motion_backstop: None,
             title_settles: TitleSettles::default(),
             title_clock: Instant::now,
             title_now: Instant::now(),
-            title_tick: None,
+            title_tick: false,
             row_motion: Default::default(),
         };
         sidebar.ui.preview_account = preview;
@@ -1834,6 +1854,81 @@ impl Sidebar {
         )
         .absolute()
         .size_full()
+    }
+
+    pub(crate) fn set_todos(
+        &mut self,
+        model: Entity<crate::notes::todos::TodosModel>,
+        cx: &mut Context<Self>,
+    ) {
+        cx.observe(&model, |_, _, cx| cx.notify()).detach();
+        self.todos = Some(model);
+        cx.notify();
+    }
+
+    pub(crate) fn set_todos_active(&mut self, active: bool, cx: &mut Context<Self>) {
+        if self.todos_active != active {
+            self.todos_active = active;
+            cx.notify();
+        }
+    }
+
+    /// "To-dos" under New Agent: every open to-do across notes, shown while
+    /// at least one exists (or while its page is open).
+    fn todos_row(&mut self, colors: SemanticColors, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let model = self.todos.clone()?;
+        model.update(cx, |model, cx| model.sync(cx));
+        let count = model.read(cx).open_count();
+        if count == 0 && !self.todos_active {
+            return None;
+        }
+        let hovering = self.ui.hovered_control == Some("todos");
+        let active = self.todos_active;
+        Some(
+            div()
+                .id("todos-row")
+                .debug_selector(|| "todos-row".into())
+                .mx(px(Space::INSET))
+                .px(px(Space::ROW_H))
+                .h(px(SIDEBAR_NAV_ROW_HEIGHT))
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .rounded(px(SIDEBAR_ROW_RADIUS))
+                .when(active, |row| row.bg(Fill::selected(colors, true)))
+                .when(!active, |row| row.bg(Fill::hover(colors, hovering)))
+                .cursor_pointer()
+                .text_size(px(Typo::ROW.size))
+                .text_color(colors.text(diri_ui::TextTone::Label))
+                .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                    this.ui.hovered_control = hovered.then_some("todos");
+                    cx.notify();
+                }))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.commit_rename();
+                    cx.emit(SidebarEvent::OpenTodos);
+                }))
+                .child(
+                    div()
+                        .size(px(18.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(sf_symbol("checklist", 13.0, colors.secondary)),
+                )
+                .child(div().min_w(px(0.0)).flex_1().child("To-dos"))
+                .when(count > 0, |row| {
+                    row.child(
+                        div()
+                            .flex_none()
+                            .text_size(px(Typo::META.size))
+                            .text_color(colors.tertiary)
+                            .child(count.to_string()),
+                    )
+                })
+                .into_any_element(),
+        )
     }
 
     fn new_agent_row(
@@ -3344,6 +3439,32 @@ impl Sidebar {
         top_alpha.min(bottom_alpha)
     }
 
+    /// Asks for the next frame of a finite motion (rows, disclosures, title
+    /// settles, number flows). Each is sampled from elapsed time, so the
+    /// display link paces it: 120 Hz on ProMotion, where the 16 ms timers
+    /// this replaces beat against vsync and landed at 40 to 53 fps.
+    ///
+    /// The frame request belongs to the window that painted the sidebar,
+    /// which can be a floating panel that closes mid-motion, and a covered
+    /// window gets no display-link callbacks. So a slow one-shot timer also
+    /// notifies the entity, which reaches every window showing it, while the
+    /// motion still runs. When frames are flowing its notify lands in a frame
+    /// that was coming anyway, and it lapses with the motion.
+    fn request_motion_frame(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        Self::refresh_on_next_frame(&self.weak_self, window);
+        if self.motion_backstop.is_none() {
+            self.motion_backstop = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(MOTION_BACKSTOP).await;
+                let _ = this.update(cx, |this, cx| {
+                    this.motion_backstop = None;
+                    if this.disclosure_tick || this.title_tick || this.number_flows.running() {
+                        this.notify_without_staling_rows(cx);
+                    }
+                });
+            }));
+        }
+    }
+
     /// Row opacities come from the previous frame's bounds, so a frame whose
     /// prepaint moved a row schedules one more render to settle them.
     fn refresh_on_next_frame(weak: &WeakEntity<Self>, window: &mut Window) {
@@ -3501,6 +3622,7 @@ impl Sidebar {
             migrating,
             activity_state,
             activity_frame,
+            progress,
             marked,
             hovered,
             focused,
@@ -3607,7 +3729,12 @@ impl Sidebar {
                     }
                 }))
                 .children(indent_rails(row, colors))
-                .child(activity_mark(activity_state, activity_frame, colors))
+                .child(crate::progress_mark::leading_mark(
+                    activity_state,
+                    activity_frame,
+                    progress,
+                    colors,
+                ))
                 .child(
                     div()
                         .min_w(px(0.0))
@@ -3652,6 +3779,12 @@ impl Sidebar {
             .debug_selector({
                 let id = id.clone();
                 move || format!("SESSION_{}", id.0)
+            })
+            .when_some(crate::switcher::terminal_location(session), |row, place| {
+                row.warm_tooltip(move |_, cx| {
+                    cx.new(|_| crate::palette_chrome::PaletteTooltip(place.clone(), colors))
+                        .into()
+                })
             })
             // Account for the selection border when aligning with project icons.
             .pl(px(Space::ROW_H - 1.0))
@@ -3802,7 +3935,12 @@ impl Sidebar {
             // Activity shares the project's icon column. Leaf rows reserve
             // no empty disclosure column; only parents get a trailing fold.
             // Hover keeps activity visible and swaps identity for the close action.
-            .child(activity_mark(activity_state, activity_frame, colors))
+            .child(crate::progress_mark::leading_mark(
+                activity_state,
+                activity_frame,
+                progress,
+                colors,
+            ))
             .child(
                 if let Some(range) = super::filter::label_match(&title, filter) {
                     div()
@@ -4423,31 +4561,6 @@ impl Sidebar {
             ));
         }
         Some(pill.into_any_element())
-    }
-
-    /// Window-free for the same reason as `schedule_activity_tick`.
-    fn ensure_number_flow_tick(&mut self, cx: &mut Context<Self>) {
-        if self.number_tick.is_some() {
-            return;
-        }
-        self.number_tick = Some(cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(16))
-                    .await;
-                let done = this
-                    .update(cx, |this, cx| {
-                        // Footer numbers only: no row reads them.
-                        this.notify_without_staling_rows(cx);
-                        !this.number_flows.running()
-                    })
-                    .unwrap_or(true);
-                if done {
-                    let _ = this.update(cx, |this, _| this.number_tick = None);
-                    break;
-                }
-            }
-        }));
     }
 
     fn account_footer(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
@@ -5301,16 +5414,20 @@ impl Sidebar {
                 row.cursor_pointer()
                     .glass_menu_row(colors, false)
                     .on_click(cx.listener(move |this, _, _, cx| {
+                        // Notes live on this Mac: a remote target falls back
+                        // to the local project directory.
+                        let note = spawn_kind == ProtoAgentKind::NOTE;
+                        let remote = note && spawn_host.is_some();
                         this.store
                             .write()
                             .expect("session store lock poisoned")
                             .spawn_kind(
                                 spawn_kind.clone(),
                                 SpawnOptions {
-                                    cwd: Some(target.clone()),
-                                    host: spawn_host.clone(),
+                                    cwd: (!remote).then(|| target.clone()),
+                                    host: if note { None } else { spawn_host.clone() },
                                     account_profile_id: None,
-                                    same_repo_as: same_repo_as.clone(),
+                                    same_repo_as: if note { None } else { same_repo_as.clone() },
                                     ..SpawnOptions::default()
                                 },
                             );
@@ -6106,12 +6223,13 @@ impl Sidebar {
         colors: SemanticColors,
         cx: &mut Context<Self>,
     ) -> PopoverSpec {
-        let (session, pinned, bulk, hosts, migrating) = {
+        let (session, pinned, unread, bulk, hosts, migrating) = {
             let mut store = self.store.write().expect("session store lock poisoned");
             let Some(session) = store.sessions().get(&id).cloned() else {
                 return PopoverSpec::empty();
             };
             let pinned = store.preferences().sidebar_pinned_sessions.contains(&id);
+            let unread = store.notifications().session_unread(&id);
             // The whole multi-selection, when the right-clicked row is part
             // of one (Swift: bulk actions split archive/revive honestly).
             let bulk =
@@ -6122,7 +6240,7 @@ impl Sidebar {
                 };
             let hosts = store.hosts().to_vec();
             let migrating = store.migrating().contains(&id);
-            (session, pinned, bulk, hosts, migrating)
+            (session, pinned, unread, bulk, hosts, migrating)
         };
         let mut content = div().p(px(4.0)).flex().flex_col();
         if bulk.len() > 1 {
@@ -6202,6 +6320,22 @@ impl Sidebar {
                 .child(copy_session_id_row(id, colors, cx));
         } else {
             let running = !matches!(session.status, diri_proto::SessionStatus::Exited(_));
+            // A dev server opens where its tab says it is, as the links
+            // menu's Local preview row does, without opening that menu.
+            if running && let Some(port) = crate::switcher::served_port(&session) {
+                let url = format!("http://localhost:{port}");
+                content = content
+                    .child(menu_row(
+                        format!("Open localhost:{port}"),
+                        colors,
+                        cx.listener(move |this, _, _, cx| {
+                            cx.open_url(&url);
+                            this.ui.popover = None;
+                            cx.notify();
+                        }),
+                    ))
+                    .child(menu_divider(colors));
+            }
             if session.kind == ProtoAgentKind::CLAUDE_CODE
                 || (session.kind == ProtoAgentKind::CODEX && session.host.is_none())
             {
@@ -6223,8 +6357,14 @@ impl Sidebar {
                 ));
             }
             if !running && session.can_resume() {
+                // A local terminal comes back as a fresh shell where it was.
+                let label = if session.kind == ProtoAgentKind::SHELL && session.host.is_none() {
+                    "Restart"
+                } else {
+                    "Resume"
+                };
                 content = content.child(menu_row(
-                    "Resume",
+                    label,
                     colors,
                     cx.listener({
                         let id = id.clone();
@@ -6332,7 +6472,33 @@ impl Sidebar {
                             cx.notify();
                         }
                     }),
-                ))
+                ));
+            if let Some(read) = read_toggle(&session, unread) {
+                content = content.child(menu_row(
+                    if read {
+                        "Mark as Read"
+                    } else {
+                        "Mark as Unread"
+                    },
+                    colors,
+                    cx.listener({
+                        let id = id.clone();
+                        move |this, _, _, cx| {
+                            let mut store =
+                                this.store.write().expect("session store lock poisoned");
+                            if read {
+                                store.mark_session_read(id.clone());
+                            } else {
+                                store.mark_session_unread(id.clone());
+                            }
+                            drop(store);
+                            this.ui.popover = None;
+                            cx.notify();
+                        }
+                    }),
+                ));
+            }
+            content = content
                 .child(menu_row(
                     "Remove from Sidebar",
                     colors,
@@ -8122,25 +8288,13 @@ impl Sidebar {
         let mounted = std::mem::take(&mut self.mounted_row_ids);
         self.session_row_views.retain(|id, _| mounted.contains(id));
 
-        if !self.disclosure_animating {
-            self.disclosure_tick = None;
-        } else if self.disclosure_tick.is_none() {
-            // A covered native window can stop delivering display-link
-            // callbacks. Like the activity mark, explicitly invalidate the
-            // cached sidebar; this one-shot ends with the finite disclosure.
-            self.disclosure_tick = Some(cx.spawn(async move |this, cx| {
-                cx.background_executor()
-                    .timer(Duration::from_millis(16))
-                    .await;
-                let _ = this.update(cx, |this, cx| {
-                    this.disclosure_tick = None;
-                    // The disclosure moves and fades rows from outside them.
-                    this.notify_without_staling_rows(cx);
-                });
-            }));
-        }
+        // Row, disclosure and title motion ask the display link for frames.
+        self.disclosure_tick = self.disclosure_animating;
         self.schedule_activity_tick(cx);
-        self.schedule_title_tick(cx);
+        self.schedule_title_tick();
+        if self.disclosure_tick || self.title_tick {
+            self.request_motion_frame(window, cx);
+        }
 
         let mut root = div()
             .id("sidebar")
@@ -8203,7 +8357,8 @@ impl Sidebar {
                 .min_h(px(0.0))
                 .flex()
                 .flex_col()
-                .child(self.new_agent_row(crate::held_hints::opacity(window, cx), colors, cx));
+                .child(self.new_agent_row(crate::held_hints::opacity(window, cx), colors, cx))
+                .children(self.todos_row(colors, cx));
             if projection.projects.is_empty() && !self.filter_query.text().trim().is_empty() {
                 body = body.child(
                     div()
@@ -8268,7 +8423,7 @@ impl Sidebar {
         }
         root = root.child(self.account_footer(colors, cx));
         if self.number_flows.running() {
-            self.ensure_number_flow_tick(cx);
+            self.request_motion_frame(window, cx);
         }
         // Paint the edge without reducing the shared sidebar content width.
         root = root.when(!self.surface_in_parent, |root| {
@@ -9076,6 +9231,19 @@ fn agent_picker_options(
         setup_url: None,
         unavailable_detail: None,
     });
+    // A note sits beside agents and terminals in the sidebar, so it starts
+    // from the same menu.
+    options.push(AgentPickerOption {
+        title: "Note".to_owned(),
+        kind: ProtoAgentKind::NOTE,
+        shortcut: crate::commands::command(CommandId::NewNote)
+            .shortcut_label()
+            .unwrap_or_default(),
+        binary: "note".to_owned(),
+        available: true,
+        setup_url: None,
+        unavailable_detail: None,
+    });
     options
 }
 
@@ -9121,13 +9289,13 @@ struct WherePanel<'a> {
     syncing: &'a HashSet<String>,
 }
 
-/// One row shape for everything in the New Agent menu and its panels: the
-/// Agents, the location, Manage Agents, machines and folders all share it,
-/// so the menu reads as one column of rows rather than a form above a list.
-const MENU_ROW_HEIGHT: f32 = 32.0;
-const MENU_ROW_INSET: f32 = 10.0;
-const MENU_ROW_GAP: f32 = 10.0;
-const MENU_ROW_ICON_SLOT: f32 = 22.0;
+// One row shape for everything in the New Agent menu and its panels (the
+// Agents, the location, Manage Agents, machines and folders) and for every
+// other diri menu: see `crate::floating::MENU_ROW_HEIGHT`.
+use crate::floating::{
+    MENU_ROW_GAP, MENU_ROW_HEIGHT, MENU_ROW_ICON_SLOT, MENU_ROW_INSET,
+    MENU_ROW_RADIUS as SIDEBAR_MENU_ROW_RADIUS, menu_separator,
+};
 
 /// A secondary row of the menu: glyph in the icon slot, then whatever the
 /// caller adds (a label, a location, a trailing chevron).
@@ -9157,11 +9325,6 @@ fn menu_action_row(
                 .justify_center()
                 .child(sf_symbol(symbol, 13.0, colors.secondary)),
         )
-}
-
-/// Menu separator with the breathing room a native menu gives one.
-fn menu_separator(colors: SemanticColors) -> Div {
-    div().py(px(4.0)).child(HairlineDivider::horizontal(colors))
 }
 
 /// Secondary-panel header: a back chevron and the panel's title or path.
@@ -9322,6 +9485,18 @@ fn lineage_glyph(id: &SessionId, role: LineageRole, colors: SemanticColors) -> A
         .justify_center()
         .child(sf_symbol(symbol, 12.0, colors.secondary))
         .into_any_element()
+}
+
+/// The session menu's read toggle: `Some(true)` offers "Mark as Read" for a
+/// finished turn not yet looked at, `Some(false)` offers "Mark as Unread" for
+/// one already seen. Work in progress and input requests have nothing to read.
+fn read_toggle(session: &diri_proto::SessionRecord, notification_unread: bool) -> Option<bool> {
+    match session.attention() {
+        ProtoAttentionLevel::DoneUnseen => Some(true),
+        ProtoAttentionLevel::IdleSeen if notification_unread => Some(true),
+        ProtoAttentionLevel::IdleSeen => session.last_turn_completed_at.map(|_| false),
+        _ => None,
+    }
 }
 
 /// Unread inbox entries share the completion mark, while active work and
@@ -9951,6 +10126,36 @@ mod tests {
             sidebar.read_with(cx, |sidebar, _| sidebar.activity_frame),
             frame
         );
+    }
+
+    #[test]
+    fn read_toggle_offers_the_opposite_of_the_session_read_state() {
+        let fixture_session = || {
+            let mut session = SidebarPreviewFixture::make(PreviewScenario::Typical)
+                .list
+                .sessions
+                .into_iter()
+                .next()
+                .expect("fixture session");
+            session.kind = diri_proto::AgentKind::CLAUDE_CODE;
+            session.foreground_agent = None;
+            session.attention_state = None;
+            session.status = diri_proto::SessionStatus::Idle;
+            session
+        };
+        let mut done = fixture_session();
+        done.last_turn_completed_at = Some(diri_proto::DateMillis(50.0));
+        done.last_seen_at = Some(diri_proto::DateMillis(40.0));
+        assert_eq!(read_toggle(&done, false), Some(true));
+        done.last_seen_at = Some(diri_proto::DateMillis(60.0));
+        assert_eq!(read_toggle(&done, false), Some(false));
+        assert_eq!(read_toggle(&done, true), Some(true));
+
+        let mut fresh = fixture_session();
+        fresh.last_turn_completed_at = None;
+        assert_eq!(read_toggle(&fresh, false), None);
+        done.status = diri_proto::SessionStatus::Working;
+        assert_eq!(read_toggle(&done, false), None);
     }
 
     #[test]
@@ -11506,7 +11711,8 @@ mod tests {
     /// `DIRI_VISUAL_GROUPING=recency`, `DIRI_VISUAL_LIGHT=1`,
     /// `DIRI_VISUAL_THEME=<theme id>`, or
     /// `DIRI_VISUAL_POPOVER=none|project|session` to select the state to
-    /// capture (the default opens the grouping menu).
+    /// capture (the default opens the grouping menu), and
+    /// `DIRI_VISUAL_READ=seen|unseen` to finish that session's turn.
     /// `DIRI_VISUAL_BACKDROP=62616e` supplies a fixed RGB backdrop under glass;
     /// headless rendering cannot capture the native desktop blur.
     #[cfg(target_os = "macos")]
@@ -11531,6 +11737,11 @@ mod tests {
             }),
             "session" => Some(Popover::SessionActions {
                 id: SessionId::new("preview-codex"),
+                position: point(px(48.0), px(210.0)),
+            }),
+            // The fixture's dev-server terminal, which offers its address.
+            "server" => Some(Popover::SessionActions {
+                id: SessionId::new("preview-shell"),
                 position: point(px(48.0), px(210.0)),
             }),
             _ => Some(Popover::SidebarLayout),
@@ -11599,7 +11810,92 @@ mod tests {
                         {
                             session.host = Some("Forge".into());
                         }
+                        // `DIRI_VISUAL_READ=seen|unseen` finishes the menu's
+                        // session so its Mark as Unread/Read item renders.
+                        if let Ok(read) = std::env::var("DIRI_VISUAL_READ")
+                            && session.id == SessionId::new("preview-codex")
+                        {
+                            session.status = diri_proto::SessionStatus::Idle;
+                            session.attention_state = None;
+                            session.last_turn_completed_at = Some(diri_proto::DateMillis(now));
+                            session.last_seen_at =
+                                Some(diri_proto::DateMillis(if read == "seen" {
+                                    now + 1.0
+                                } else {
+                                    now - 1.0
+                                }));
+                        }
                         store.upsert_session(session);
+                    }
+                    // `DIRI_VISUAL_TERMINALS=1` adds terminals the Engine has
+                    // named: one at a prompt, one running a program, and one
+                    // running Claude Code typed at its prompt.
+                    if std::env::var_os("DIRI_VISUAL_TERMINALS").is_some() {
+                        let base = store
+                            .sessions()
+                            .get(&SessionId::new("preview-shell"))
+                            .map(|session| (**session).clone())
+                            .expect("fixture shell");
+                        let root = base.cwd.clone();
+                        for (id, title, folder, status, agent) in [
+                            (
+                                "preview-term-web",
+                                "web",
+                                "web",
+                                diri_proto::SessionStatus::Idle,
+                                None,
+                            ),
+                            (
+                                "preview-term-vim",
+                                "vim",
+                                "crates/diri-app",
+                                diri_proto::SessionStatus::Working,
+                                None,
+                            ),
+                            (
+                                "preview-term-claude",
+                                "Fix login redirect",
+                                "web",
+                                diri_proto::SessionStatus::Working,
+                                Some(ProtoAgentKind::CLAUDE_CODE),
+                            ),
+                        ] {
+                            let mut terminal = base.clone();
+                            terminal.id = SessionId::new(id);
+                            terminal.title = title.into();
+                            terminal.title_source = diri_proto::TitleSource::TerminalTitle;
+                            terminal.terminal_cwd = Some(format!("{root}/{folder}"));
+                            terminal.status = status;
+                            terminal.foreground_agent = agent;
+                            terminal.listening_ports = None;
+                            terminal.updated_at = diri_proto::DateMillis(now);
+                            store.upsert_session(terminal);
+                        }
+                        // And one whose script stopped at a question, which
+                        // the Engine flags as it flags an Agent's prompt.
+                        let mut asking = base.clone();
+                        asking.id = SessionId::new("preview-term-deploy");
+                        asking.title = "deploy".into();
+                        asking.title_source = diri_proto::TitleSource::TerminalTitle;
+                        asking.terminal_cwd = Some(format!("{root}/infra"));
+                        asking.status = diri_proto::SessionStatus::NeedsInput(
+                            diri_proto::NeedsInputKind::Question,
+                        );
+                        asking.needs_input = Some(diri_proto::NeedsInputDetail {
+                            kind: diri_proto::NeedsInputKind::Question,
+                            source: diri_proto::NeedsInputSource::TerminalLine,
+                            tool_name: None,
+                            summary: "Deploy to production? [y/N]".into(),
+                            prompt_excerpt: Some("Deploy to production? [y/N]".into()),
+                            options: None,
+                            risk_hint: diri_proto::RiskHint::Neutral,
+                            occurred_at: diri_proto::DateMillis(now),
+                            secret: false,
+                        });
+                        asking.foreground_agent = None;
+                        asking.listening_ports = None;
+                        asking.updated_at = diri_proto::DateMillis(now);
+                        store.upsert_session(asking);
                     }
                     store
                         .update_preferences(|prefs| {
@@ -11739,6 +12035,27 @@ mod tests {
             })
             .expect("hover menu row");
             cx.run_until_parked();
+        }
+        // `DIRI_VISUAL_POINTER=x,y` rests the pointer there long enough for
+        // a tooltip to open.
+        if let Some((x, y)) = std::env::var("DIRI_VISUAL_POINTER").ok().and_then(|value| {
+            let (x, y) = value.split_once(',')?;
+            Some((x.trim().parse::<f32>().ok()?, y.trim().parse::<f32>().ok()?))
+        }) {
+            cx.update_window(window.into(), |_, window, cx| {
+                window.simulate_mouse_move(point(px(x), px(y)), cx);
+            })
+            .expect("rest the pointer");
+            // Tooltip timers run on the test dispatcher's clock; wall time
+            // is only for anything that reads `Instant::now`.
+            for _ in 0..8 {
+                std::thread::sleep(Duration::from_millis(20));
+                cx.advance_clock(Duration::from_millis(120));
+                cx.run_until_parked();
+                cx.update_window(window.into(), |_, window, _| window.refresh())
+                    .expect("refresh sidebar window");
+                cx.run_until_parked();
+            }
         }
         if std::env::var_os("DIRI_VISUAL_BENCH").is_some() {
             // Force exactly the same work in before/after runs; warm all eight
@@ -12354,7 +12671,8 @@ mod tests {
             cx.update(|_, cx| cx.observe(&sidebar, move |_, _| observed.set(observed.get() + 1)));
         // Native display-link delivery may pause while a window is covered.
         // The finite disclosure must still invalidate its cached view.
-        cx.executor().advance_clock(Duration::from_millis(17));
+        cx.executor()
+            .advance_clock(MOTION_BACKSTOP + Duration::from_millis(1));
         cx.run_until_parked();
         assert!(paints.get() > 0, "disclosure froze after its first frame");
     }
@@ -12417,7 +12735,7 @@ mod tests {
                     .contains_key(&SessionId::new("preview-claude"))
             );
             assert!(
-                sidebar.disclosure_tick.is_none(),
+                !sidebar.disclosure_tick,
                 "settled disclosures must not schedule idle work"
             );
         });

@@ -158,6 +158,31 @@ impl SshTransport {
         })
     }
 
+    /// Probes the exact Helper and, only when that probe exits successfully,
+    /// runs one read-only management `command` in the same `ssh -T` channel.
+    /// Stdout is the probe line followed by the command's response, so a warm
+    /// cold-path RPC costs one SSH round trip instead of two. The probe never
+    /// reads stdin; the command's request is the channel's whole stdin.
+    pub fn helper_probe_then(
+        &self,
+        build_id: &str,
+        command: HelperCommand,
+    ) -> Result<CommandSpec, BootstrapError> {
+        validate_component("build id", build_id)?;
+        if !command.is_probe_fusable() {
+            return Err(BootstrapError::InvalidComponent {
+                field: "probe-fused command",
+                value: command.as_str().into(),
+            });
+        }
+        Ok(self.channel(&format!(
+            "set -eu; [ -d \"$HOME/.cache\" ] && [ ! -L \"$HOME/.cache\" ] || exit 73; h=\"$HOME/.cache/diri/bin/protocol-{}/{}/diri-remote\"; \"$h\" probe --format=json </dev/null; exec \"$h\" {}",
+            diri_proto::remote_pty::PROTOCOL_MAJOR,
+            build_id,
+            command.as_str()
+        )))
+    }
+
     /// Receives one artifact on stdin into a nonce-scoped owner-only path.
     #[must_use]
     pub fn upload(&self, layout: &RemoteInstallLayout) -> CommandSpec {
@@ -324,6 +349,12 @@ impl HelperCommand {
             Self::Persistence => "persistence",
         }
     }
+
+    /// Read-only management commands that may run behind a probe in one
+    /// channel. Session lifecycle and persistence keep their own channels.
+    const fn is_probe_fusable(self) -> bool {
+        matches!(self, Self::Usage)
+    }
 }
 
 fn push_control_path(arguments: &mut Vec<OsString>, path: &Path) {
@@ -370,6 +401,41 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn wsl_channels_keep_distribution_and_fixed_script_as_separate_arguments() {
+        let mut host = host();
+        let distribution = "Ubuntu dev 'quoted'";
+        host.transport = diri_proto::HostTransport::Wsl {
+            distribution: distribution.into(),
+        };
+        let transport = SshTransport::new(&host, "unused");
+        assert!(!transport.uses_control_master());
+        for spec in [
+            transport.platform_probe(),
+            transport
+                .helper_command("build-123", HelperCommand::Persistence)
+                .unwrap(),
+        ] {
+            assert_eq!(spec.program, "wsl.exe");
+            let args: Vec<_> = spec
+                .arguments
+                .iter()
+                .map(|arg| arg.to_str().unwrap())
+                .collect();
+            assert_eq!(
+                &args[..5],
+                &["--distribution", distribution, "--exec", "/bin/sh", "-c"]
+            );
+            assert_eq!(args.len(), 6);
+            assert!(!args[5].contains(distribution));
+        }
+        assert!(
+            transport
+                .helper_command("../other", HelperCommand::Persistence)
+                .is_err()
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn every_protocol_channel_disables_ssh_pty_allocation() {
@@ -404,6 +470,39 @@ mod tests {
         assert!(words.contains(&"ControlPath=none".to_string()));
         assert!(!words.contains(&"ControlMaster=auto".to_string()));
         assert!(!words.contains(&"ControlPath=/tmp/diri master/socket".to_string()));
+    }
+
+    #[test]
+    fn only_read_only_management_commands_share_a_probe_channel() {
+        let transport = SshTransport::new(&host(), "/tmp/diri master/socket");
+        let words = words(
+            &transport
+                .helper_probe_then("build-123", HelperCommand::Usage)
+                .expect("fused usage"),
+        );
+        let command = words.last().expect("command");
+        assert!(words.contains(&"-T".to_string()));
+        // The probe cannot consume the request, and the command only runs
+        // after the probe exited successfully (`set -e`).
+        assert!(command.contains("set -eu;"));
+        assert!(command.contains(
+            "/build-123/diri-remote\"; \"$h\" probe --format=json </dev/null; exec \"$h\" usage"
+        ));
+        for command in [
+            HelperCommand::Launch,
+            HelperCommand::Attach,
+            HelperCommand::Kill,
+            HelperCommand::Gc,
+            HelperCommand::Persistence,
+            HelperCommand::Environment,
+        ] {
+            assert!(transport.helper_probe_then("build-123", command).is_err());
+        }
+        assert!(
+            transport
+                .helper_probe_then("../x", HelperCommand::Usage)
+                .is_err()
+        );
     }
 
     #[test]

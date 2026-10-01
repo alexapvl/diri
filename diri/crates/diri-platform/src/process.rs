@@ -50,6 +50,25 @@ pub fn usage(pid: u32) -> io::Result<(u64, u64)> {
             .saturating_mul(100),
     ))
 }
+/// Page faults taken by this process, including soft faults.
+pub fn page_faults() -> io::Result<u64> {
+    // SAFETY: the current-process pseudo handle stays valid and the buffer
+    // carries the exact SDK structure size written by GetProcessMemoryInfo.
+    let mut counters: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+    counters.cb = size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    if unsafe {
+        GetProcessMemoryInfo(
+            GetCurrentProcess(),
+            &mut counters,
+            size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(u64::from(counters.PageFaultCount))
+}
+
 pub fn physical_memory() -> io::Result<u64> {
     let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
     status.dwLength = size_of::<MEMORYSTATUSEX>() as u32;

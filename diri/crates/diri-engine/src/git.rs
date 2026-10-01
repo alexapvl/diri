@@ -928,6 +928,7 @@ mod tests {
         let repo = temp.path().join("repo with 'quotes' and $dollars");
         std::fs::create_dir_all(repo.join("nested")).unwrap();
         run(&["init", "--initial-branch=main"], &repo).unwrap();
+        run(&["config", "core.fsmonitor", "false"], &repo).unwrap();
         run(
             &[
                 "-c",
@@ -1291,6 +1292,7 @@ mod tests {
         git(&["config", "commit.gpgsign", "false"], &target);
         // Git for Windows enables autocrlf system-wide; fixtures compare bytes.
         git(&["config", "core.autocrlf", "false"], &target);
+        git(&["config", "core.fsmonitor", "false"], &target);
         std::fs::write(target.join("shared.txt"), "base\n").unwrap();
         git(&["add", "."], &target);
         git(&["commit", "-m", "base"], &target);

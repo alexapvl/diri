@@ -557,6 +557,7 @@ mod tests {
             .join("repo");
         std::fs::create_dir(&root).unwrap();
         run(&root, &["init", "-b", "main"]);
+        run(&root, &["config", "core.fsmonitor", "false"]);
         run(&root, &["commit", "--allow-empty", "-m", "initial"]);
         let path = root.parent().unwrap().join("feature space");
         run(

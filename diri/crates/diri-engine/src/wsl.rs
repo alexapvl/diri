@@ -78,7 +78,7 @@ fn discovered() -> Vec<HostEntry> {
 
 /// wsl.exe uses UTF-16LE when redirected. Accept UTF-8 from newer versions
 /// too; reject malformed names instead of silently replacing code units.
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn parse_distributions(bytes: &[u8]) -> std::io::Result<Vec<String>> {
     let invalid = || {
         std::io::Error::new(
@@ -164,4 +164,54 @@ pub fn explorer_path(host: &HostEntry, linux: &str) -> std::io::Result<String> {
         distribution,
         linux.trim_start_matches('/').replace('/', "\\")
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redirected_distribution_lists_accept_utf16_and_utf8_without_replacements() {
+        let list = "Ubuntu\r\nDebian dev\r\nUbuntu\r\n";
+        let encoded: Vec<u8> = list.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        assert_eq!(
+            parse_distributions(&encoded).unwrap(),
+            ["Ubuntu", "Debian dev"]
+        );
+        let mut bom = vec![0xff, 0xfe];
+        bom.extend_from_slice(&encoded);
+        assert_eq!(parse_distributions(&bom).unwrap(), ["Ubuntu", "Debian dev"]);
+        assert_eq!(
+            parse_distributions(list.as_bytes()).unwrap(),
+            ["Ubuntu", "Debian dev"]
+        );
+        assert!(parse_distributions(&[0xff, 0xfe, 1]).is_err());
+        assert!(parse_distributions(&[0, 0xd8]).is_err());
+        assert!(parse_distributions(b"bad\x1bname").is_err());
+    }
+
+    #[test]
+    fn explorer_paths_route_only_to_the_registered_distro_without_traversal() {
+        let host = HostEntry {
+            id: "wsl-test".into(),
+            name: None,
+            ssh: String::new(),
+            default_cwd: None,
+            node: None,
+            transport: diri_proto::HostTransport::Wsl {
+                distribution: "Ubuntu dev".into(),
+            },
+        };
+        let mut catalog = HostsConfig::default();
+        catalog.hosts.push(host.clone());
+        let path = explorer_path(&host, "/home/me/project space").unwrap();
+        assert_eq!(
+            route_unc(&path, &catalog).unwrap(),
+            Some(("wsl-test".into(), "/home/me/project space".into()))
+        );
+        assert!(route_unc(r"\\wsl$\Missing\home", &catalog).is_err());
+        assert!(route_unc(r"\\wsl$\Ubuntu dev\..\other", &catalog).is_err());
+        assert!(explorer_path(&host, "/home/../other").is_err());
+        assert_eq!(route_unc(r"C:\project", &catalog).unwrap(), None);
+    }
 }

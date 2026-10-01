@@ -29,6 +29,15 @@ impl ProcessTable {
         Self(entries)
     }
 }
+/// Read-only child observation; process mutation remains Job-owned.
+pub fn has_children(pid: i32) -> bool {
+    pid > 1
+        && ProcessTable::capture()
+            .0
+            .iter()
+            .any(|(_, parent)| *parent == pid as u32)
+}
+
 pub fn enumerate(root: i32) -> Vec<HolderProcessSample> {
     enumerate_in(&ProcessTable::capture(), root)
 }
