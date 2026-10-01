@@ -91,7 +91,7 @@ jobs:
           GIT_CONFIG_COUNT: '1'
           GIT_CONFIG_KEY_0: core.fsmonitor
           GIT_CONFIG_VALUE_0: 'false'
-        run: cargo test --locked -p diri-platform -p diri-pty -p diri-proto -p diri-client -p diri-terminal-state -p diri-notes -p diri-updater -p diri-engine --lib --tests
+        run: cargo test --locked --no-fail-fast -p diri-platform -p diri-pty -p diri-proto -p diri-client -p diri-terminal-state -p diri-notes -p diri-updater -p diri-engine --lib --tests
       - name: Native test lints
         run: cargo clippy --locked -p diri-platform -p diri-pty -p diri-proto -p diri-client -p diri-terminal-state -p diri-notes -p diri-updater -p diri-engine --lib --tests -- -D warnings
 

@@ -77,10 +77,11 @@ pub fn current_user_sid() -> io::Result<String> {
 
 fn descriptor(directory: bool) -> io::Result<Local> {
     let flags = if directory { "OICI" } else { "" };
-    let sddl = wide(OsStr::new(&format!(
-        "D:P(A;{flags};FA;;;{})",
-        current_user_sid()?
-    )))?;
+    let sid = current_user_sid()?;
+    // An administrator token can default new objects to the Administrators
+    // group. Specify the individual owner as well as the private DACL so our
+    // own subsequent opens pass the same strict ownership check as other opens.
+    let sddl = wide(OsStr::new(&format!("O:{sid}D:P(A;{flags};FA;;;{sid})")))?;
     let mut descriptor = null_mut();
     // SAFETY: NUL-terminated SDDL input; API allocates descriptor freed by Local.
     if unsafe {
@@ -158,6 +159,7 @@ pub fn private_dir_all(path: &Path) -> io::Result<()> {
             "private directory changed during creation",
         ));
     }
+    validate_owner(&open_directory(path)?, false)?;
     owner_only(path, true)
 }
 
@@ -291,4 +293,33 @@ fn validate_owner(file: &std::fs::File, private: bool) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn private_objects_remain_owned_by_the_individual_user_on_reopen() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("diri-owner-{}-{nonce}", std::process::id()));
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(path.clone());
+        super::private_dir_all(&path).unwrap();
+        super::validate_directory(&path).unwrap();
+        super::private_dir_all(&path).unwrap();
+        let file = path.join("private");
+        drop(crate::security::create_private(&file).unwrap());
+        drop(crate::security::read_owned(&file, true).unwrap());
+        drop(crate::security::open_private_rw(&file).unwrap());
+        let created_on_open = path.join("created-on-open");
+        drop(crate::security::open_private_rw(&created_on_open).unwrap());
+        drop(crate::security::read_owned(&created_on_open, true).unwrap());
+    }
 }
