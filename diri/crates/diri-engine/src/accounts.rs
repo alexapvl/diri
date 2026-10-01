@@ -442,7 +442,7 @@ mod tests {
     #[test]
     fn corrupt_or_future_catalog_is_not_overwritten() {
         let root = tempfile::tempdir().unwrap();
-        let store = AccountStore::new(root.path().join("accounts.json"));
+        let store = AccountStore::new(root.path().join("private/accounts.json"));
         store.upsert(profile("work")).unwrap();
         for bytes in [b"broken".as_slice(), br#"{"version":2,"profiles":[]}"#] {
             fs::write(&store.path, bytes).unwrap();

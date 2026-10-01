@@ -219,6 +219,24 @@ fn settled(baseline: ProcessStats) -> ProcessStats {
     }
 }
 
+/// Preserve the identities behind a Linux count failure, so a single late
+/// worker/file can be distinguished from a leaked connection on CI.
+fn descriptor_targets() -> Vec<(String, std::path::PathBuf)> {
+    let Ok(entries) = std::fs::read_dir("/proc/self/fd") else {
+        return Vec::new();
+    };
+    let mut targets: Vec<_> = entries
+        .flatten()
+        .filter_map(|entry| {
+            std::fs::read_link(entry.path())
+                .ok()
+                .map(|target| (entry.file_name().to_string_lossy().into_owned(), target))
+        })
+        .collect();
+    targets.sort();
+    targets
+}
+
 /// Kills the long-lived sessions however the test ends, so a failure does
 /// not leave Holders and their children running.
 struct KillOnDrop<'a> {
@@ -272,6 +290,7 @@ fn threads_and_descriptors_return_to_baseline_after_churn() {
     churn(&server, &mut control, &idle, &busy, 4);
     std::thread::sleep(Duration::from_millis(600));
     let baseline = ProcessStats::current();
+    let baseline_targets = descriptor_targets();
 
     churn(&server, &mut control, &idle, &busy, CYCLES);
     let after = settled(baseline);
@@ -284,8 +303,9 @@ fn threads_and_descriptors_return_to_baseline_after_churn() {
     );
     assert!(
         after.open_fds <= baseline.open_fds,
-        "descriptors grew from {} to {} over {CYCLES} churn cycles",
+        "descriptors grew from {} to {} over {CYCLES} churn cycles; before: {baseline_targets:?}; after: {:?}",
         baseline.open_fds,
-        after.open_fds
+        after.open_fds,
+        descriptor_targets(),
     );
 }

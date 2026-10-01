@@ -91,7 +91,11 @@ jobs:
           GIT_CONFIG_COUNT: '1'
           GIT_CONFIG_KEY_0: core.fsmonitor
           GIT_CONFIG_VALUE_0: 'false'
-        run: cargo test --locked --no-fail-fast -p diri-platform -p diri-pty -p diri-proto -p diri-client -p diri-terminal-state -p diri-notes -p diri-updater -p diri-engine --lib --tests
+        # These two tests run in the next step outside the runner's restrictive Job.
+        run: cargo test --locked --no-fail-fast -p diri-platform -p diri-pty -p diri-proto -p diri-client -p diri-terminal-state -p diri-notes -p diri-updater -p diri-engine --lib --tests -- --skip a_native_session_is_adopted_with_the_same_identity_screen_and_input --skip holder_failure_kills_the_native_job_including_a_grandchild
+      - name: Detached Holder lifecycle
+        if: ${{ !cancelled() }}
+        run: ./scripts/test-windows-holder.ps1
       - name: Native test lints
         run: cargo clippy --locked -p diri-platform -p diri-pty -p diri-proto -p diri-client -p diri-terminal-state -p diri-notes -p diri-updater -p diri-engine --lib --tests -- -D warnings
 

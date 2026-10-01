@@ -434,7 +434,11 @@ Native Windows PTYs use ConPTY and an owned kill-on-close Job per session.
 Windows process exit codes preserve native DWORD bits in the existing i32 code
 field (interpretable as u32), and are never POSIX signals.
 Native persistence belongs to detached local Holders; killing the Engine must
-not close their ConPTY or Job handles. WSL persistence retains the existing
+not close their ConPTY or Job handles. An enclosing Job that prohibits breakaway
+causes an explicit launch failure; the app does not silently inherit its lifetime.
+Hosted CI runs only its detached-Holder test binary outside the runner Job via
+the already available WMI process provider, without service or host configuration.
+This is test scaffolding, not a product launch transport. WSL persistence retains the existing
 three outcomes and does not promise survival through `wsl --shutdown`.
 
 The platform seam is `diri-platform`, shared by the app, Engine, Holder and

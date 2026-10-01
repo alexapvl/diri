@@ -4547,8 +4547,8 @@ fn note_home(project: Option<&str>, requested: Option<&str>) -> Result<String, C
         .find(|path| Path::new(path).is_dir())
         .map(str::to_owned)
         .or_else(|| {
-            std::env::var_os("HOME")
-                .filter(|home| Path::new(home).is_dir())
+            diri_platform::home_dir()
+                .filter(|home| home.is_dir())
                 .map(|home| home.to_string_lossy().into_owned())
         })
         .ok_or_else(|| ControlError::internal("no folder to place the note in"))
@@ -6270,7 +6270,10 @@ mod tests {
         let by_note = |id: &str| notes.iter().find(|r| r.note_id.as_deref() == Some(id));
         assert_eq!(notes.len(), 3);
         assert_eq!(by_note(&offline).unwrap().cwd, project);
-        let home = std::env::var("HOME").unwrap();
+        let home = diri_platform::home_dir()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
         assert_eq!(
             by_note(&inbox).unwrap().cwd,
             home,
@@ -8485,6 +8488,7 @@ mod tests {
     #[test]
     fn host_initialization_fails_closed_without_the_remote_transport() {
         let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().join("private");
         diri_proto::HostsConfig {
             hosts: vec![diri_proto::HostEntry {
                 transport: Default::default(),
@@ -8495,9 +8499,9 @@ mod tests {
                 node: None,
             }],
         }
-        .save(temp.path().join("hosts.json"))
+        .save(root.join("hosts.json"))
         .expect("host catalog");
-        let server = server(temp.path());
+        let server = server(&root);
 
         let error = err_of(call(
             &server,

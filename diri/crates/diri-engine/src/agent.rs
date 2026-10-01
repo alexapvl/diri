@@ -1034,6 +1034,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn unknown_shells_run_the_wrapper_without_the_report() {
         assert_eq!(exit_status_parameter("/usr/bin/zsh"), Some("$?"));

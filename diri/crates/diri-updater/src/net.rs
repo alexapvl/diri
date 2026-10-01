@@ -331,14 +331,9 @@ mod tests {
         let expected = "8f9a2b0f8c9f2d5f24b3f2ca0d18b6f4b3f7f2e0f5d0b1b0d0f5c6b7a8d9e0f1";
         assert!(verify_sha256(&path, expected).is_err());
 
-        let output = Command::new("/usr/bin/shasum")
-            .arg("-a")
-            .arg("256")
-            .arg(&path)
-            .output()
-            .expect("shasum runs");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let actual = stdout.split_whitespace().next().expect("a digest");
+        // Independently computed SHA-256 of the fixed bytes above. Do not
+        // require a Unix shasum executable on the Windows updater path.
+        let actual = "4f3be1a92ededd90292e0eaf67448e820f49b55b45c9275991d824759d58da09";
         assert!(verify_sha256(&path, actual).is_ok());
         assert!(verify_sha256(&path, &actual.to_uppercase()).is_ok());
     }
