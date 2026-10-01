@@ -379,7 +379,10 @@ impl Sidebar {
             .min_w(px(0.0))
             .h(px(30.0))
             .overflow_x_scroll()
-            .track_scroll(&self.tab_scroll);
+            .track_scroll(&self.tab_scroll)
+            // The scroller's hitbox covers the gaps between tabs; those move
+            // the window like the rest of the strip.
+            .titlebar_drag_area();
         if self.last_tab_selection != selected || self.last_tab_available_width != available_width {
             if let Some(index) = tabs
                 .sessions
@@ -866,6 +869,7 @@ impl Sidebar {
             ))
             .role(Role::TabList)
             .aria_label("Project sessions")
+            .titlebar_drag_area()
             .flex_none()
             .h(px(TAB_STRIP_HEIGHT))
             .w_full()
@@ -874,12 +878,12 @@ impl Sidebar {
             .relative()
             .py(px(6.0))
             .gap(px(0.0))
-            .pl(px(if cfg!(target_os = "macos") && !self.ui.visible {
+            .pl(px(if crate::window_chrome::traffic_lights_visible() && !self.ui.visible {
                 92.0
             } else {
                 10.0
             }))
-            .pr(px(10.0))
+            .pr(px(10.0 + self.strip_caption_inset))
             .child(
                 div()
                     .absolute()

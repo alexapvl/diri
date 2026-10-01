@@ -582,7 +582,8 @@ impl Sidebar {
                 .flex_1()
                 .min_w(px(0.0))
                 .overflow_x_scroll()
-                .track_scroll(&self.workspace_nav.scroll);
+                .track_scroll(&self.workspace_nav.scroll)
+                .titlebar_drag_area();
         } else {
             rows = rows
                 .flex_col()
@@ -1398,6 +1399,7 @@ impl Sidebar {
                     this.track_lift_pointer(event.event.position, cx);
                 },
             ))
+            .titlebar_drag_area()
             .h(px(crate::tab_navigation::TAB_STRIP_HEIGHT))
             .w_full()
             .flex_none()
@@ -1406,12 +1408,12 @@ impl Sidebar {
             .relative()
             .py(px(6.0))
             .gap(px(0.0))
-            .pl(px(if cfg!(target_os = "macos") && !self.ui.visible {
+            .pl(px(if crate::window_chrome::traffic_lights_visible() && !self.ui.visible {
                 92.0
             } else {
                 10.0
             }))
-            .pr(px(10.0))
+            .pr(px(10.0 + self.strip_caption_inset))
             .child(
                 div()
                     .absolute()
