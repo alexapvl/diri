@@ -1048,8 +1048,18 @@ impl Sidebar {
         {
             cx.emit(SidebarEvent::RefreshUsageLimits);
         }
+        // Most refreshes only advance `updated_at`, which the sidebar does not
+        // show; redrawing for them costs a frame every few seconds.
+        let changed = self.usage.as_ref().is_none_or(|usage| {
+            UsageSnapshot {
+                updated_at: snapshot.updated_at,
+                ..usage.clone()
+            } != snapshot
+        });
         self.usage = Some(snapshot);
-        cx.notify();
+        if changed {
+            cx.notify();
+        }
     }
 
     pub fn pending_close_copy(&self) -> Option<(String, String)> {

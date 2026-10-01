@@ -2,7 +2,7 @@
 use super::usage_chart::{self, ChartSample};
 use super::usage_share;
 use super::*;
-use crate::usage::dashboard::{UsageHistory, UsageReport, date_label, hour_label};
+use crate::usage::dashboard::{UsageCompare, UsageHistory, UsageReport, date_label, hour_label};
 use crate::usage::{UsageFormat, UsageSnapshot};
 use diri_term::theme::{TermTheme, ThemeAppearance};
 use diri_ui::Ink;
@@ -10,6 +10,49 @@ use gpui::{ClipboardItem, CursorStyle, MouseMoveEvent, canvas, img, relative};
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::rc::Rc;
+
+/// What the Usage page derives from the snapshot, per selection. Cleared
+/// when the snapshot's page content changes ([`same_page`]); the source,
+/// range and metric are part of each key.
+#[derive(Default)]
+pub(super) struct UsageDerived {
+    history: Option<(Option<String>, Rc<UsageHistory>)>,
+    compare: Option<(Option<String>, usize, Rc<UsageCompare>)>,
+    /// Hourly provider samples, indexed by `tokens as usize`.
+    samples: [Option<(Option<String>, Rc<ProviderSamples>)>; 2],
+}
+
+type ProviderSamples = [Vec<ChartSample>; 3];
+
+/// Whether two snapshots draw the same Usage page. The refresh clock only
+/// matters when it crosses an hour: report windows and chart samples are
+/// hourly. Every other field is compared, so remote status, limits and
+/// history changes still redraw.
+fn same_page(a: &UsageSnapshot, b: &UsageSnapshot) -> bool {
+    (a.updated_at > 0) == (b.updated_at > 0)
+        && a.updated_at.div_euclid(3_600) == b.updated_at.div_euclid(3_600)
+        && UsageSnapshot {
+            updated_at: b.updated_at,
+            ..a.clone()
+        } == *b
+}
+
+fn chart_provider_samples(history: &UsageHistory, now: i64, tokens: bool) -> ProviderSamples {
+    let mut providers = [Vec::new(), Vec::new(), Vec::new()];
+    for (hour, details) in history.hourly_provider_totals(now, 90) {
+        for (index, detail) in details.into_iter().enumerate() {
+            providers[index].push(ChartSample {
+                time: hour,
+                value: if tokens {
+                    detail.totals().total_tokens() as f64
+                } else {
+                    detail.tokens.c
+                },
+            });
+        }
+    }
+    providers
+}
 
 const PROVIDERS: [&str; 3] = ["Claude Code", "Codex", "Cursor"];
 const SERIES_LABELS: [&str; 3] = ["Claude", "Codex", "Cursor"];
@@ -25,7 +68,9 @@ fn provider_color(provider: usize, colors: SemanticColors) -> Rgba {
 
 impl UtilitySurfaces {
     pub(crate) fn set_usage(&mut self, usage: UsageSnapshot, cx: &mut Context<Self>) {
-        let changed = self.usage != usage;
+        // Transcript writes refresh usage every few seconds while an agent
+        // works; most only advance the clock and must not redraw the page.
+        let changed = !same_page(&self.usage, &usage);
         if self
             .usage_host
             .as_deref()
@@ -34,6 +79,9 @@ impl UtilitySurfaces {
             self.usage_host = None;
         }
         self.usage = usage;
+        if changed {
+            *self.usage_derived.get_mut() = UsageDerived::default();
+        }
         if changed && let Some(preview) = self.usage_share.as_mut() {
             // Cached PNGs and the caption must describe the same report,
             // including variants revisited after a background usage refresh.
@@ -44,7 +92,7 @@ impl UtilitySurfaces {
             self.usage_share_theme_hover = None;
             self.rebuild_usage_share(options, cx);
         }
-        if self.surface == Surface::Settings && self.settings_tab == SettingsTab::Usage {
+        if changed && self.surface == Surface::Settings && self.settings_tab == SettingsTab::Usage {
             cx.notify();
         }
     }
@@ -56,16 +104,9 @@ impl UtilitySurfaces {
                 .child(label("Reading local usage…", 14.0, colors.primary))
                 .child(label("Preparing costs and token history from local Claude Code and Codex transcripts, plus billed Cursor usage when signed in.", 12.0, colors.secondary)), colors).into_any_element();
         }
-        let now = self
-            .usage
-            .remote
-            .iter()
-            .filter_map(|host| host.data.as_ref().map(|data| data.collected_at))
-            .fold(self.usage.updated_at, i64::max);
-        let history = self.usage.history_for_source(self.usage_host.as_deref());
-        let compare = history.compare(now, self.usage_days);
+        let compare = self.usage_compare();
         let report = &compare.current;
-        let chart_providers = self.chart_provider_samples(&history, now);
+        let chart_providers = self.usage_samples(self.usage_tokens);
         let total = report.total.totals();
         let loaded = self.usage.updated_at > 0;
         let mut ranges = div().flex().gap(px(3.0));
@@ -481,30 +522,48 @@ impl UtilitySurfaces {
             .fold(self.usage.updated_at, i64::max)
     }
 
-    fn chart_provider_samples(&self, history: &UsageHistory, now: i64) -> [Vec<ChartSample>; 3] {
-        self.chart_provider_samples_metric(history, now, self.usage_tokens)
+    fn usage_history(&self) -> Rc<UsageHistory> {
+        if let Some((host, history)) = &self.usage_derived.borrow().history
+            && *host == self.usage_host
+        {
+            return Rc::clone(history);
+        }
+        let history = Rc::new(self.usage.history_for_source(self.usage_host.as_deref()));
+        self.usage_derived.borrow_mut().history =
+            Some((self.usage_host.clone(), Rc::clone(&history)));
+        history
     }
 
-    fn chart_provider_samples_metric(
-        &self,
-        history: &UsageHistory,
-        now: i64,
-        tokens: bool,
-    ) -> [Vec<ChartSample>; 3] {
-        let mut providers = [Vec::new(), Vec::new(), Vec::new()];
-        for (hour, details) in history.hourly_provider_totals(now, 90) {
-            for (index, detail) in details.into_iter().enumerate() {
-                providers[index].push(ChartSample {
-                    time: hour,
-                    value: if tokens {
-                        detail.totals().total_tokens() as f64
-                    } else {
-                        detail.tokens.c
-                    },
-                });
-            }
+    pub(super) fn usage_compare(&self) -> Rc<UsageCompare> {
+        if let Some((host, days, compare)) = &self.usage_derived.borrow().compare
+            && *host == self.usage_host
+            && *days == self.usage_days
+        {
+            return Rc::clone(compare);
         }
-        providers
+        let compare = Rc::new(
+            self.usage_history()
+                .compare(self.usage_now(), self.usage_days),
+        );
+        self.usage_derived.borrow_mut().compare =
+            Some((self.usage_host.clone(), self.usage_days, Rc::clone(&compare)));
+        compare
+    }
+
+    fn usage_samples(&self, tokens: bool) -> Rc<ProviderSamples> {
+        if let Some((host, samples)) = &self.usage_derived.borrow().samples[usize::from(tokens)]
+            && *host == self.usage_host
+        {
+            return Rc::clone(samples);
+        }
+        let samples = Rc::new(chart_provider_samples(
+            &self.usage_history(),
+            self.usage_now(),
+            tokens,
+        ));
+        self.usage_derived.borrow_mut().samples[usize::from(tokens)] =
+            Some((self.usage_host.clone(), Rc::clone(&samples)));
+        samples
     }
 
     fn chart_visible_series(
@@ -587,8 +646,7 @@ impl UtilitySurfaces {
             return;
         }
         let reduce = cx.reduce_motion();
-        let history = self.usage.history_for_source(self.usage_host.as_deref());
-        let providers = self.chart_provider_samples(&history, self.usage_now());
+        let providers = self.usage_samples(self.usage_tokens);
         let end = providers[0].last().map(|sample| sample.time).unwrap_or(0);
         let current_days = self.usage_chart_window.displayed_days(reduce);
         let current_range =
@@ -611,8 +669,7 @@ impl UtilitySurfaces {
             return;
         }
         let reduce = cx.reduce_motion();
-        let history = self.usage.history_for_source(self.usage_host.as_deref());
-        let providers = self.chart_provider_samples(&history, self.usage_now());
+        let providers = self.usage_samples(self.usage_tokens);
         let end = providers[0].last().map(|sample| sample.time).unwrap_or(0);
         let current_days = self.usage_chart_window.displayed_days(reduce);
         let current_range =
@@ -637,8 +694,7 @@ impl UtilitySurfaces {
         cx: &mut Context<Self>,
     ) {
         let reduce = cx.reduce_motion();
-        let history = self.usage.history_for_source(self.usage_host.as_deref());
-        let providers = self.chart_provider_samples(&history, self.usage_now());
+        let providers = self.usage_samples(self.usage_tokens);
         let end = providers[0].last().map(|sample| sample.time).unwrap_or(0);
         let current_days = self.usage_chart_window.displayed_days(reduce);
         let current_range =
@@ -677,8 +733,7 @@ impl UtilitySurfaces {
             return;
         }
         let reduce = cx.reduce_motion();
-        let history = self.usage.history_for_source(self.usage_host.as_deref());
-        let providers = self.chart_provider_samples(&history, self.usage_now());
+        let providers = self.usage_samples(self.usage_tokens);
         let end = providers[0].last().map(|sample| sample.time).unwrap_or(0);
         let current_days = self.usage_chart_window.displayed_days(reduce);
         self.retarget_chart_range(&providers, current_days, days as f32, end, window, cx);
@@ -717,10 +772,9 @@ impl UtilitySurfaces {
     }
 
     fn usage_share_graph(&self, tokens: bool, individual: bool) -> Vec<usage_share::ShareSeries> {
-        let history = self.usage.history_for_source(self.usage_host.as_deref());
-        let now = self.usage_now();
-        let report = history.compare(now, self.usage_days).current;
-        let providers = self.chart_provider_samples_metric(&history, now, tokens);
+        let compare = self.usage_compare();
+        let report = &compare.current;
+        let providers = self.usage_samples(tokens);
         let days = self.usage_days as f32;
         let end = providers[0].last().map(|sample| sample.time).unwrap_or(0);
         let active = |index: usize| {
@@ -768,10 +822,9 @@ impl UtilitySurfaces {
     }
 
     fn usage_share_card(&self, options: &usage_share::ShareOptions) -> usage_share::ShareCard {
-        let history = self.usage.history_for_source(self.usage_host.as_deref());
-        let report = history.compare(self.usage_now(), self.usage_days).current;
+        let compare = self.usage_compare();
         usage_share::ShareCard::from_report(
-            &report,
+            &compare.current,
             self.usage_days,
             self.usage_share_host(),
             options,
@@ -1609,8 +1662,13 @@ impl UtilitySurfaces {
                     let height = f32::from(bounds.size.height).max(1.0);
                     let t = ((f32::from(event.position.x) - f32::from(bounds.origin.x)) / width)
                         .clamp(0.0, 1.0);
-                    this.usage_scrub = Some((t, width, height));
-                    cx.notify();
+                    // Each redraw lays out the whole page; skip moves that
+                    // leave the readout where it is.
+                    let scrub = Some((t, width, height));
+                    if this.usage_scrub != scrub {
+                        this.usage_scrub = scrub;
+                        cx.notify();
+                    }
                 }
             }))
             .on_hover(cx.listener(|this, hovered: &bool, _, cx| {

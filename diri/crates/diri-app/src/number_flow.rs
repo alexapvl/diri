@@ -2,7 +2,9 @@
 #[cfg(test)]
 use crate::usage::UsageFormat;
 use gpui::{
-    AnyElement, FontFeatures, FontWeight, IntoElement, Rgba, SharedString, div, prelude::*, px,
+    AnyElement, App, Bounds, ContentMask, Element, ElementId, FontFeatures, FontWeight,
+    GlobalElementId, InspectorElementId, IntoElement, LayoutId, Pixels, Rgba, ShapedLine,
+    SharedString, Style, TextAlign, TextStyle, Window, point, px, size,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -88,11 +90,9 @@ impl Bank {
             slot.start = None;
         }
         drop(slots);
-        let mut row = flow_row(&from_text, &to_text, t, dir, size, color, weight);
-        if let Some(family) = font {
-            row = row.font_family(family);
-        }
-        row.into_any_element()
+        NumberText::new(flow_cells(&from_text, &to_text, t, dir), size, color, weight)
+            .font(font)
+            .into_any_element()
     }
 
     pub fn running(&self) -> bool {
@@ -272,77 +272,274 @@ fn snapshot(from: &str, to: &str, dir: i8, t: f32) -> String {
     out
 }
 
-fn flow_row(
-    from: &str,
-    to: &str,
-    t: f32,
-    dir: i8,
+/// One piece of a number: a digit in its own fixed-width cell, or other
+/// text at its natural width. A digit's `value` is its reel position, so
+/// `4.25` shows 4 rolling a quarter of the way toward 5.
+#[derive(Clone, Debug, PartialEq)]
+enum Cell {
+    Digit { value: f32, scale: f32, alpha: f32 },
+    Text { text: SharedString, alpha: f32 },
+}
+
+/// A number drawn as one element. Every digit keeps its own `DIGIT_EM`
+/// cell, so the width only changes when a digit is added or removed; a
+/// rolling digit is two glyphs clipped to its cell. One layout node of
+/// definite size replaces a flex row holding a box per character, whose
+/// layout dominated every frame of a page full of numbers.
+pub(crate) struct NumberText {
+    cells: Vec<Cell>,
     size: f32,
     color: Rgba,
     weight: FontWeight,
-) -> gpui::Div {
+    font: Option<SharedString>,
+}
+
+pub(crate) struct NumberTextLayout {
+    style: TextStyle,
+    line_height: Pixels,
+    /// The `Text` cells, shaped at full opacity, in order.
+    texts: Vec<ShapedLine>,
+}
+
+impl NumberText {
+    fn new(cells: Vec<Cell>, size: f32, color: Rgba, weight: FontWeight) -> Self {
+        Self {
+            cells,
+            size,
+            color,
+            weight,
+            font: None,
+        }
+    }
+
+    pub(crate) fn font(mut self, font: Option<SharedString>) -> Self {
+        self.font = font;
+        self
+    }
+}
+
+fn shape(window: &mut Window, text: SharedString, style: &TextStyle, size: f32) -> ShapedLine {
+    let run = style.to_run(text.len());
+    window
+        .text_system()
+        .shape_line(text, px(size), &[run], None)
+}
+
+impl IntoElement for NumberText {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for NumberText {
+    type RequestLayoutState = NumberTextLayout;
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let mut style = window.text_style();
+        style.font_size = px(self.size).into();
+        style.font_weight = self.weight;
+        style.font_features = FontFeatures(Arc::new(vec![("tnum".into(), 1)]));
+        style.color = self.color.into();
+        if let Some(family) = &self.font {
+            style.font_family = family.clone();
+        }
+        let line_height = window.pixel_snap(px(self.size));
+        let digit_w = self.size * DIGIT_EM;
+        let mut width = 0.0;
+        let mut texts = Vec::new();
+        for cell in &self.cells {
+            match cell {
+                Cell::Digit { scale, .. } => width += digit_w * scale,
+                Cell::Text { text, .. } => {
+                    let line = shape(window, text.clone(), &style, self.size);
+                    // A text element measures to its shaped width, rounded up.
+                    width += f32::from(line.width.ceil());
+                    texts.push(line);
+                }
+            }
+        }
+        let layout = Style {
+            size: size(px(width).into(), line_height.into()),
+            flex_shrink: 0.0,
+            ..Style::default()
+        };
+        (
+            window.request_layout(layout, None, cx),
+            NumberTextLayout {
+                style,
+                line_height,
+                texts,
+            },
+        )
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut Self::RequestLayoutState,
+        _: &mut Window,
+        _: &mut App,
+    ) {
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        layout: &mut Self::RequestLayoutState,
+        _: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let digit_w = self.size * DIGIT_EM;
+        let line_height = layout.line_height;
+        let top = bounds.origin.y;
+        let mut x = f32::from(bounds.origin.x);
+        let mut texts = layout.texts.iter();
+        let faded = |alpha: f32| {
+            let mut style = layout.style.clone();
+            style.color = Rgba {
+                a: self.color.a * alpha.clamp(0.0, 1.0),
+                ..self.color
+            }
+            .into();
+            style
+        };
+        for cell in &self.cells {
+            match cell {
+                Cell::Text { text, alpha } => {
+                    let Some(line) = texts.next() else {
+                        continue;
+                    };
+                    let origin = point(px(x), top);
+                    if *alpha >= 1.0 {
+                        let _ = line.paint(origin, line_height, TextAlign::Left, None, window, cx);
+                    } else if *alpha > 0.0 {
+                        let line = shape(window, text.clone(), &faded(*alpha), self.size);
+                        let _ = line.paint(origin, line_height, TextAlign::Left, None, window, cx);
+                    }
+                    x += f32::from(line.width.ceil());
+                }
+                Cell::Digit {
+                    value,
+                    scale,
+                    alpha,
+                } => {
+                    let cell_w = digit_w * scale;
+                    if *scale > 0.0 && *alpha > 0.0 {
+                        let style = faded(*alpha);
+                        let below = value.floor();
+                        let frac = value - below;
+                        // Each glyph is centred in the cell, as the flex cell
+                        // centred it, and offset vertically while it rolls.
+                        let mut glyph_at = |n: f32, dy: f32, window: &mut Window| {
+                            let line = shape(
+                                window,
+                                SharedString::from(glyph(n).to_string()),
+                                &style,
+                                self.size,
+                            );
+                            let gx = x + (cell_w - f32::from(line.width)) * 0.5;
+                            let _ = line.paint(
+                                point(px(gx), top + px(dy)),
+                                line_height,
+                                TextAlign::Left,
+                                None,
+                                window,
+                                cx,
+                            );
+                        };
+                        if frac <= 0.0 && *scale >= 1.0 {
+                            glyph_at(below, 0.0, window);
+                        } else {
+                            let cell = Bounds::new(point(px(x), top), size(px(cell_w), line_height));
+                            window.with_content_mask(Some(ContentMask { bounds: cell }), |window| {
+                                glyph_at(below, -frac * self.size, window);
+                                if frac > 0.0 {
+                                    glyph_at(below + 1.0, (1.0 - frac) * self.size, window);
+                                }
+                            });
+                        }
+                    }
+                    x += cell_w;
+                }
+            }
+        }
+    }
+}
+
+/// The cells of a number rolling from `from` to `to`, `t` of the way.
+fn flow_cells(from: &str, to: &str, t: f32, dir: i8) -> Vec<Cell> {
     if t >= 1.0 || from == to {
-        return tabular(to, size, color, weight);
+        return tabular_cells(to);
     }
     let a = split_format(from);
     let b = split_format(to);
-    let digit_w = px(size * DIGIT_EM);
-    let mut row = div()
-        .flex()
-        .items_baseline()
-        .text_size(px(size))
-        .text_color(color)
-        .font_weight(weight)
-        .line_height(px(size))
-        .font_features(FontFeatures(Arc::new(vec![("tnum".into(), 1)])));
-    row = push_symbol(row, a.prefix, b.prefix, t);
+    let mut cells = Vec::new();
+    push_symbol(&mut cells, a.prefix, b.prefix, t);
     let int_w = a.integer.len().max(b.integer.len());
     for i in 0..int_w {
-        row = row.child(digit_cell(
+        push_digit(
+            &mut cells,
             int_digit(a.integer, int_w, i),
             int_digit(b.integer, int_w, i),
             dir,
             t,
-            size,
-            digit_w,
-        ));
+        );
     }
     if a.dot || b.dot {
-        row = row.child(".");
+        cells.push(Cell::Text {
+            text: ".".into(),
+            alpha: 1.0,
+        });
     }
     let frac_w = a.fraction.len().max(b.fraction.len());
     for i in 0..frac_w {
-        row = row.child(digit_cell(
+        push_digit(
+            &mut cells,
             frac_digit(a.fraction, frac_w, i),
             frac_digit(b.fraction, frac_w, i),
             dir,
             t,
-            size,
-            digit_w,
-        ));
+        );
     }
-    push_symbol(row, a.suffix, b.suffix, t)
+    push_symbol(&mut cells, a.suffix, b.suffix, t);
+    cells
 }
 
-fn push_symbol(row: gpui::Div, from: &str, to: &str, t: f32) -> gpui::Div {
-    if from == to {
-        if from.is_empty() {
-            row
-        } else {
-            row.child(SharedString::from(from.to_owned()))
-        }
+fn push_symbol(cells: &mut Vec<Cell>, from: &str, to: &str, t: f32) {
+    let (text, alpha) = if from == to {
+        (from, 1.0)
     } else if to.is_empty() {
-        row.child(
-            div()
-                .opacity((1.0 - t).clamp(0.0, 1.0))
-                .child(SharedString::from(from.to_owned())),
-        )
+        (from, 1.0 - t)
     } else {
-        row.child(
-            div()
-                .opacity(t.clamp(0.0, 1.0))
-                .child(SharedString::from(to.to_owned())),
-        )
+        (to, t)
+    };
+    if !text.is_empty() {
+        cells.push(Cell::Text {
+            text: SharedString::from(text.to_owned()),
+            alpha: alpha.clamp(0.0, 1.0),
+        });
     }
 }
 
@@ -355,55 +552,40 @@ fn cell_scale(from: Option<u8>, to: Option<u8>, t: f32) -> f32 {
     }
 }
 
-fn digit_cell(
-    from: Option<u8>,
-    to: Option<u8>,
-    dir: i8,
-    t: f32,
-    size: f32,
-    digit_w: gpui::Pixels,
-) -> gpui::Div {
+fn push_digit(cells: &mut Vec<Cell>, from: Option<u8>, to: Option<u8>, dir: i8, t: f32) {
     let scale = cell_scale(from, to, t);
     if scale <= 0.0 {
-        return div().w(px(0.0));
+        return;
     }
-    let (a, b, fade) = match (from, to) {
-        (None, None) => return div().w(px(0.0)),
+    let (a, b, alpha) = match (from, to) {
+        (None, None) => return,
         (Some(a), Some(b)) => (a, b, 1.0),
         (None, Some(b)) => (0, b, t),
         (Some(a), None) => (a, 0, 1.0 - t),
     };
-    let width = px(f32::from(digit_w) * scale);
-    reel(a, b, dir, t, size, width).opacity(fade.clamp(0.0, 1.0))
+    cells.push(Cell::Digit {
+        value: f32::from(a) + digit_delta(a, b, dir) as f32 * t,
+        scale,
+        alpha: alpha.clamp(0.0, 1.0),
+    });
 }
 
-fn reel(from: u8, to: u8, dir: i8, t: f32, size: f32, digit_w: gpui::Pixels) -> gpui::Div {
-    let c = f32::from(from) + digit_delta(from, to, dir) as f32 * t;
-    let n0 = c.floor();
-    let frac = c - n0;
-    div()
-        .relative()
-        .overflow_hidden()
-        .w(digit_w)
-        .h(px(size))
-        .child(reel_glyph(glyph(n0), -frac * size, size, digit_w))
-        .child(reel_glyph(
-            glyph(n0 + 1.0),
-            (1.0 - frac) * size,
-            size,
-            digit_w,
-        ))
-}
-
-fn reel_glyph(ch: char, top: f32, size: f32, digit_w: gpui::Pixels) -> gpui::Div {
-    div()
-        .absolute()
-        .top(px(top))
-        .w(digit_w)
-        .h(px(size))
-        .flex()
-        .justify_center()
-        .child(SharedString::from(ch.to_string()))
+/// Digits in fixed cells, everything else one character at a time at its
+/// own width.
+fn tabular_cells(text: &str) -> Vec<Cell> {
+    text.chars()
+        .map(|ch| match ch.to_digit(10) {
+            Some(digit) => Cell::Digit {
+                value: digit as f32,
+                scale: 1.0,
+                alpha: 1.0,
+            },
+            None => Cell::Text {
+                text: SharedString::from(ch.to_string()),
+                alpha: 1.0,
+            },
+        })
+        .collect()
 }
 
 pub(crate) fn tabular(
@@ -411,30 +593,8 @@ pub(crate) fn tabular(
     size: f32,
     color: Rgba,
     weight: FontWeight,
-) -> gpui::Div {
-    let digit_w = px(size * DIGIT_EM);
-    let mut row = div()
-        .flex()
-        .items_baseline()
-        .text_size(px(size))
-        .text_color(color)
-        .font_weight(weight)
-        .line_height(px(size))
-        .font_features(FontFeatures(Arc::new(vec![("tnum".into(), 1)])));
-    for ch in text.as_ref().chars() {
-        if ch.is_ascii_digit() {
-            row = row.child(
-                div()
-                    .w(digit_w)
-                    .flex()
-                    .justify_center()
-                    .child(SharedString::from(ch.to_string())),
-            );
-        } else {
-            row = row.child(SharedString::from(ch.to_string()));
-        }
-    }
-    row
+) -> NumberText {
+    NumberText::new(tabular_cells(text.as_ref()), size, color, weight)
 }
 
 pub(crate) fn tabular_width(text: &str, size: f32) -> f32 {
@@ -505,6 +665,45 @@ mod tests {
         assert!(cell_scale(Some(1), None, 1.0) < 0.001);
         assert!((cell_scale(None, Some(1), 0.5) - 0.5).abs() < 0.001);
         assert!((cell_scale(Some(4), Some(2), 0.3) - 1.0).abs() < 0.001);
+    }
+
+    fn digit_space(cells: &[Cell]) -> f32 {
+        cells
+            .iter()
+            .map(|cell| match cell {
+                Cell::Digit { scale, .. } => *scale,
+                Cell::Text { .. } => 0.0,
+            })
+            .sum()
+    }
+
+    #[test]
+    fn every_digit_keeps_its_own_cell() {
+        let cells = tabular_cells("$44.50");
+        assert_eq!(
+            cells,
+            vec![
+                Cell::Text { text: "$".into(), alpha: 1.0 },
+                Cell::Digit { value: 4.0, scale: 1.0, alpha: 1.0 },
+                Cell::Digit { value: 4.0, scale: 1.0, alpha: 1.0 },
+                Cell::Text { text: ".".into(), alpha: 1.0 },
+                Cell::Digit { value: 5.0, scale: 1.0, alpha: 1.0 },
+                Cell::Digit { value: 0.0, scale: 1.0, alpha: 1.0 },
+            ]
+        );
+        // Mid-roll, the same four cells hold the reels: nothing shifts.
+        for t in [0.0, 0.3, 0.5, 0.9] {
+            let rolling = flow_cells("$44.10", "$45.10", t, 1);
+            assert_eq!(digit_space(&rolling), 4.0, "t={t}");
+            assert_eq!(rolling.len(), cells.len(), "t={t}");
+        }
+        let Cell::Digit { value, .. } = flow_cells("$44.10", "$45.10", 0.5, 1)[2] else {
+            panic!("second integer digit is a reel");
+        };
+        assert!((value - 4.5).abs() < 0.001, "{value}");
+        // A new digit's cell opens as it rolls in, then holds a full cell.
+        assert_eq!(digit_space(&flow_cells("$999.00", "$1000.00", 0.5, 1)), 5.5);
+        assert_eq!(digit_space(&flow_cells("$999.00", "$1000.00", 1.0, 1)), 6.0);
     }
 
     #[test]

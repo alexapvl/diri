@@ -789,7 +789,45 @@ fn local_window_starts(now: i64) -> (i64, i64) {
     (today, month)
 }
 
-#[cfg(not(all(unix, target_pointer_width = "64")))]
+#[cfg(windows)]
+fn local_window_starts(now: i64) -> (i64, i64) {
+    unsafe extern "C" {
+        // The UCRT's 64-bit `mktime`; the `libc` crate binds no `mktime` on
+        // Windows.
+        #[link_name = "_mktime64"]
+        fn mktime64(value: *mut libc::tm) -> i64;
+    }
+
+    let mut local = std::mem::MaybeUninit::<libc::tm>::uninit();
+    // SAFETY: `now` and `local` are valid pointers for the duration of the
+    // call; `localtime_s` writes only to `local` and reports failure with a
+    // nonzero errno.
+    if unsafe { libc::localtime_s(local.as_mut_ptr(), &raw const now) } != 0 {
+        return utc_window_starts(now);
+    }
+    // SAFETY: `localtime_s` succeeded and initialized `local`.
+    let local = unsafe { local.assume_init() };
+
+    let mut today = local;
+    today.tm_hour = 0;
+    today.tm_min = 0;
+    today.tm_sec = 0;
+    today.tm_isdst = -1;
+
+    let mut month = today;
+    month.tm_mday = 1;
+    // SAFETY: both values originated from `localtime_s`; the edited fields are
+    // valid civil times and `_mktime64` normalizes timezone/DST details.
+    let today_start = unsafe { mktime64(&raw mut today) };
+    // SAFETY: same reasoning as the preceding `_mktime64` call.
+    let month_start = unsafe { mktime64(&raw mut month) };
+    if today_start < 0 || month_start < 0 {
+        return utc_window_starts(now);
+    }
+    (today_start, month_start)
+}
+
+#[cfg(not(any(all(unix, target_pointer_width = "64"), windows)))]
 fn local_window_starts(now: i64) -> (i64, i64) {
     utc_window_starts(now)
 }
@@ -872,4 +910,50 @@ fn check_remote_tree(
             .map_err(|_| io::Error::other("remote usage transcript is unreadable"))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod window_start_tests {
+    use super::local_window_starts;
+
+    fn local(time: i64) -> libc::tm {
+        let timestamp = time as libc::time_t;
+        // SAFETY: both pointers are valid for the call, which writes only to
+        // the provided `tm`.
+        unsafe {
+            let mut local = std::mem::zeroed::<libc::tm>();
+            #[cfg(unix)]
+            assert!(!libc::localtime_r(&timestamp, &mut local).is_null());
+            #[cfg(windows)]
+            assert_eq!(libc::localtime_s(&mut local, &timestamp), 0);
+            local
+        }
+    }
+
+    #[test]
+    fn today_and_month_start_at_local_midnight() {
+        // Late evening, just after midnight and mid-month, in any timezone the
+        // machine is set to.
+        for now in [1_790_884_800, 1_790_809_200, 1_789_000_000] {
+            let (today, month) = local_window_starts(now);
+            let (now_local, today_local, month_local) = (local(now), local(today), local(month));
+            assert!(today <= now && now - today < 25 * 3_600, "{now}: {today}");
+            assert_eq!(
+                (today_local.tm_hour, today_local.tm_min, today_local.tm_sec),
+                (0, 0, 0)
+            );
+            assert_eq!(
+                (today_local.tm_year, today_local.tm_yday),
+                (now_local.tm_year, now_local.tm_yday)
+            );
+            assert_eq!(
+                (month_local.tm_mday, month_local.tm_hour, month_local.tm_min),
+                (1, 0, 0)
+            );
+            assert_eq!(
+                (month_local.tm_year, month_local.tm_mon),
+                (now_local.tm_year, now_local.tm_mon)
+            );
+        }
+    }
 }
