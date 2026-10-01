@@ -432,7 +432,10 @@ impl Render for SkillsPage {
             div()
                 .text_size(px(13.0))
                 .text_color(colors.secondary)
-                .child("Browse skills on this Mac and in the current local project."),
+                .child(format!(
+                    "Browse skills on {} and in the current local project.",
+                    crate::platform::local_machine_label_lowercase()
+                )),
         );
         let search_label = if self.query.is_empty() && self.keyboard_target != 0 {
             div()

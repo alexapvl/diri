@@ -2673,7 +2673,7 @@ impl UtilitySurfaces {
             .when(self.phone_loading, |view| view.child("Checking your Mac…"))
             .when(!self.phone_loading && self.phone_access.is_none() && matches!(self.phone_setup, Some(TailscaleSetup::Ready(_))), |view| {
                 view.child(setting_section("2. Connect your iPhone", div().flex().flex_col().gap(px(10.0))
-                    .child("Open Diri on your iPhone. Its setup guide links to Tailscale in the App Store. Sign in there with the same account as this Mac and allow the VPN connection.")
+                    .child(format!("Open Diri on your iPhone. Its setup guide links to Tailscale in the App Store. Sign in there with the same account as {} and allow the VPN connection.", crate::platform::local_machine_label_lowercase()))
                     .child("No exit node, Tailscale SSH, port forwarding or other advanced settings are needed.")
                     .child(settings_primary_button("Enable phone access & show code", "phone-enable", Some("iphone"), cx, |this, _, cx| {
                     this.phone_loading = true;
@@ -4562,7 +4562,7 @@ impl UtilitySurfaces {
                             this.update_prefs(move |prefs| prefs.terminal_copy_on_select = enabled); cx.notify();
                         }))
                         .child(appearance_divider(colors))
-                        .child(toggle_row("Open links with a click", "Click a link to open it. When off, use ⌘-click.", self.prefs.terminal_open_links_on_click, "terminal_open_links_on_click", colors, cx, |this,cx| {
+                        .child(toggle_row("Open links with a click", if cfg!(target_os = "macos") { "Click a link to open it. When off, use ⌘-click." } else { "Click a link to open it. When off, use Ctrl+click." }, self.prefs.terminal_open_links_on_click, "terminal_open_links_on_click", colors, cx, |this,cx| {
                             let enabled = !this.prefs.terminal_open_links_on_click;
                             this.update_prefs(move |prefs| prefs.terminal_open_links_on_click = enabled); cx.notify();
                         }))

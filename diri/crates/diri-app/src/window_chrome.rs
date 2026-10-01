@@ -231,6 +231,20 @@ pub(crate) fn caption_inset(top: f32, right_gap: f32) -> f32 {
     }
 }
 
+/// How opaque the title row's controls and text are. Windows dims an inactive
+/// window's whole title bar ("all title bar elements should be
+/// semi-transparent when the window is inactive"); toolbar backgrounds keep
+/// their color, only what sits on them fades.
+pub(crate) fn title_row_opacity(window: &Window) -> f32 {
+    if draws_caption_buttons() && !window.is_window_active() {
+        INACTIVE_TITLE_ROW_OPACITY
+    } else {
+        1.0
+    }
+}
+
+const INACTIVE_TITLE_ROW_OPACITY: f32 = 0.5;
+
 pub(crate) trait TitlebarDragArea: InteractiveElement + Sized {
     /// Marks this title-row toolbar as somewhere the window can be dragged
     /// from. Its buttons stay buttons.

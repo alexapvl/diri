@@ -895,7 +895,16 @@ impl Sidebar {
             )
             .bg(colors.sidebar_surface())
             .text_color(colors.primary)
-            .child(self.project_control(colors, cx))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    // Content only: the strip's own fill keeps its color.
+                    .opacity(self.title_opacity)
+                    .child(self.project_control(colors, cx))
             .child(rows)
             .child(crate::held_hints::below(
                 div()
@@ -956,7 +965,7 @@ impl Sidebar {
                         .items_center()
                         .child(trailing),
                 )
-            })
+            }))
             .into_any_element()
     }
 }

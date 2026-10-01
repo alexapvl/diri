@@ -985,6 +985,15 @@ impl RootView {
                 .write()
                 .expect("session store lock poisoned")
                 .set_active(window.is_window_active());
+            // Windows dims the whole title row of an inactive window; the
+            // cached views that paint it repaint for the change.
+            if crate::window_chrome::draws_caption_buttons() {
+                this.sidebar.update(cx, |_, cx| cx.notify());
+                if let Some(inspector) = &this.inspector {
+                    inspector.update(cx, |_, cx| cx.notify());
+                }
+                cx.notify();
+            }
         });
         // Every key in this window, before any binding runs: a key while ⌘ is
         // held is a shortcut, so hold-⌘ hints must stand down for it.
@@ -3613,6 +3622,7 @@ impl RootView {
                 });
             let strip = self.sidebar.update(cx, |sidebar, cx| {
                 sidebar.strip_held_hint = held_hint;
+                sidebar.title_opacity = crate::window_chrome::title_row_opacity(window);
                 sidebar.strip_caption_inset = crate::window_chrome::caption_inset(
                     0.0,
                     f32::from(viewport_size.width) - (sidebar_width + card_width),
@@ -9137,15 +9147,17 @@ mod tests {
             crate::fonts::init(cx);
             cx.set_reduce_motion(true);
         });
-        // name, horizontal, light, sidebar, inspector
-        for (name, horizontal, light, sidebar, inspector) in [
-            ("vertical-dark", false, false, true, false),
-            ("vertical-light", false, true, true, false),
-            ("vertical-no-sidebar-dark", false, false, false, false),
-            ("vertical-inspector-dark", false, false, true, true),
-            ("horizontal-dark", true, false, false, false),
-            ("horizontal-light", true, true, false, false),
-            ("horizontal-inspector-dark", true, false, false, true),
+        // name, horizontal, light, sidebar, inspector, active
+        for (name, horizontal, light, sidebar, inspector, active) in [
+            ("vertical-dark", false, false, true, false, true),
+            ("vertical-light", false, true, true, false, true),
+            ("vertical-no-sidebar-dark", false, false, false, false, true),
+            ("vertical-inspector-dark", false, false, true, true, true),
+            ("horizontal-dark", true, false, false, false, true),
+            ("horizontal-light", true, true, false, false, true),
+            ("horizontal-inspector-dark", true, false, false, true, true),
+            ("vertical-dark-inactive", false, false, true, false, false),
+            ("horizontal-dark-inactive", true, false, false, false, false),
         ] {
             let services = test_services();
             let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
@@ -9190,8 +9202,10 @@ mod tests {
                         root.run_command(CommandId::ToggleSidebar, window, cx);
                     }
                 });
-                // The caption dims its glyphs for an inactive window.
-                window.activate_window();
+                // An inactive window dims its title row.
+                if active {
+                    window.activate_window();
+                }
             })
             .unwrap();
             cx.run_until_parked();

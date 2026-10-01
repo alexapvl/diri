@@ -950,6 +950,7 @@ impl Render for WorkspaceWorkbench {
                     (Metrics::TITLE_BAR - Metrics::TOOLBAR_CONTROL_SIZE) / 2.0
                 ))
                 .right(px(Metrics::TOOLBAR_EDGE_INSET + caption_inset))
+                .opacity(crate::window_chrome::title_row_opacity(window))
                 .flex()
                 .gap(px(4.0))
                 .when(multiple_panes, |controls| {

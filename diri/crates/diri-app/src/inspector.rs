@@ -372,6 +372,8 @@ pub struct WorkbenchInspector {
     refresh_task: Option<Task<()>>,
     poll_task: Option<Task<()>>,
     _store_changes: Task<()>,
+    /// This frame's title-row opacity (`window_chrome::title_row_opacity`).
+    title_opacity: f32,
 }
 
 impl EventEmitter<InspectorEvent> for WorkbenchInspector {}
@@ -507,6 +509,7 @@ impl WorkbenchInspector {
             refresh_task: None,
             poll_task: None,
             _store_changes: store_changes,
+            title_opacity: 1.0,
         }
     }
 
@@ -1759,6 +1762,7 @@ impl WorkbenchInspector {
         // bar makes room for the caption buttons where diri draws them.
         div()
             .titlebar_drag_area()
+            .opacity(self.title_opacity)
             .h(px(Metrics::TITLE_BAR))
             .flex_none()
             .pl(px(8.0))
@@ -2040,6 +2044,7 @@ impl WorkbenchInspector {
         let mut header = div()
             .id("workspace-surface-header")
             .titlebar_drag_area()
+            .opacity(self.title_opacity)
             .relative()
             .h(px(Metrics::TITLE_BAR))
             .flex_none()
@@ -4727,6 +4732,7 @@ fn should_show_blocking_git_loading(context_changed: bool, state: &LoadState) ->
 
 impl Render for WorkbenchInspector {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.title_opacity = crate::window_chrome::title_row_opacity(window);
         let colors = {
             let store = self
                 .runtime

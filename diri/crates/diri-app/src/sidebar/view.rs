@@ -671,6 +671,9 @@ pub struct Sidebar {
     /// Room the horizontal strip leaves at its trailing edge for the window's
     /// caption buttons, set by RootView, which paints the strip inline.
     pub(crate) strip_caption_inset: f32,
+    /// The title row's opacity this frame (`window_chrome::title_row_opacity`),
+    /// set by whoever renders the sidebar's title-row chrome.
+    pub(crate) title_opacity: f32,
     preview: bool,
     /// Which face the New Agent menu shows. The remote directory listing
     /// itself lives in the Store so the daemon adapter can complete it
@@ -843,6 +846,7 @@ impl Sidebar {
             shortcut_ranks: HashMap::new(),
             strip_held_hint: 0.0,
             strip_caption_inset: 0.0,
+            title_opacity: 1.0,
             lineage_roles: HashMap::new(),
             focus_handle: cx.focus_handle(),
             hover_task: None,
@@ -1988,6 +1992,7 @@ impl Sidebar {
         };
         div()
             .titlebar_drag_area()
+            .opacity(self.title_opacity)
             .h(px(Metrics::TITLE_BAR))
             .flex_none()
             .flex()
@@ -3690,11 +3695,11 @@ impl Sidebar {
                         .sidebar_click(
                             row_session.id.clone(),
                             ClickModifiers {
-                                command: modifiers.platform,
+                                command: crate::platform::shortcut_modifier(&modifiers),
                                 shift: modifiers.shift,
                             },
                         );
-                    if !modifiers.platform && !modifiers.shift {
+                    if !crate::platform::shortcut_modifier(&modifiers) && !modifiers.shift {
                         cx.emit(SidebarEvent::SessionActivated);
                     }
                     cx.notify();
@@ -4205,11 +4210,11 @@ impl Sidebar {
                     .sidebar_click(
                         row_session.id.clone(),
                         ClickModifiers {
-                            command: modifiers.platform,
+                            command: crate::platform::shortcut_modifier(&modifiers),
                             shift: modifiers.shift,
                         },
                     );
-                if !modifiers.platform && !modifiers.shift {
+                if !crate::platform::shortcut_modifier(&modifiers) && !modifiers.shift {
                     cx.emit(SidebarEvent::SessionActivated);
                 }
                 cx.notify();
@@ -6961,7 +6966,7 @@ impl Sidebar {
                     // The press was a click until the pointer wandered past
                     // the threshold. Finish it as one: select, activate.
                     let modifiers = window.modifiers();
-                    if !modifiers.platform && !modifiers.shift {
+                    if !crate::platform::shortcut_modifier(&modifiers) && !modifiers.shift {
                         self.ui.focus_cursor = Some(target.clone());
                         self.store
                             .write()
@@ -8185,7 +8190,10 @@ impl Sidebar {
                     cx.notify();
                 }
             }))
-            .child(self.top_bar(crate::held_hints::opacity(window, cx), colors, cx));
+            .child({
+                self.title_opacity = crate::window_chrome::title_row_opacity(window);
+                self.top_bar(crate::held_hints::opacity(window, cx), colors, cx)
+            });
         if let Some(nav) = self.settings_nav.clone() {
             root = root.child(self.settings_body(&nav, colors, cx));
         } else {

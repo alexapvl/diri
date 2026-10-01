@@ -718,6 +718,8 @@ pub struct TerminalPane {
     header_trailing_inset: f32,
     /// This frame's hold-⌘ hint opacity, sampled at render.
     held_hint: f32,
+    /// This frame's title-row opacity (`window_chrome::title_row_opacity`).
+    title_opacity: f32,
     /// The workbench hosts this pane's title-bar actions elsewhere (the
     /// horizontal tab strip), so the pane paints no title bar of its own and
     /// the grid takes the reclaimed height.
@@ -864,6 +866,10 @@ impl TerminalPane {
             if this.reconcile_secure_input(window) {
                 cx.notify();
             }
+            // The title bar dims with the window on Windows.
+            if crate::window_chrome::draws_caption_buttons() {
+                cx.notify();
+            }
             if window.is_window_active() && this.focus.is_focused(window) {
                 this.claim_selected_control();
                 cx.notify();
@@ -969,6 +975,7 @@ impl TerminalPane {
             inspector_open: false,
             header_trailing_inset: 0.0,
             held_hint: 0.0,
+            title_opacity: 1.0,
             header_hidden: false,
             navigation: None,
             utility_surfaces: None,
@@ -3839,6 +3846,7 @@ impl TerminalPane {
                     .items_center()
                     .gap(px(Metrics::TOOLBAR_ITEM_GAP))
                     .overflow_hidden()
+                    .opacity(self.title_opacity)
                     .when_some(sidebar_reveal, |title, control| title.child(control))
                     .when_some(glyph.filter(|_| header_width >= 280.0), |title, glyph| {
                         title.child(
@@ -3873,6 +3881,7 @@ impl TerminalPane {
                     .flex()
                     .items_center()
                     .gap(px(Metrics::TOOLBAR_ITEM_GAP))
+                    .opacity(self.title_opacity)
                     .when(shell_controls, |trailing| {
                         trailing
                             .child(self.render_inspector_toggle(colors, self.held_hint, cx))
@@ -4657,6 +4666,7 @@ impl Render for TerminalPane {
         self.update_selected_geometry(window, cx);
         self.main_viewport = window.viewport_size();
         self.held_hint = crate::held_hints::opacity(window, cx);
+        self.title_opacity = crate::window_chrome::title_row_opacity(window);
 
         let selected = self.selected_session();
 
@@ -4721,7 +4731,7 @@ impl Render for TerminalPane {
                             .flex()
                             .items_center()
                             .bg(colors.work_surface_nested())
-                            .child(control),
+                            .child(div().opacity(self.title_opacity).child(control)),
                     )
                 })
                 .child(self.render_empty_workbench(colors))

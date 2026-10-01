@@ -2593,7 +2593,10 @@ impl SessionStore {
         {
             let target = target_host
                 .as_deref()
-                .map_or_else(|| "this Mac".to_owned(), |id| self.host_display_name(id));
+                .map_or_else(
+                    || crate::platform::local_machine_label_lowercase().to_owned(),
+                    |id| self.host_display_name(id),
+                );
             // A recorded failure suppresses passive requests, so a shortcut
             // press — an explicit user action — retries the way Settings'
             // Refresh does. Otherwise it just joins the in-flight scan.

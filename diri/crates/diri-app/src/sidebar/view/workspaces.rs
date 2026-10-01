@@ -1424,7 +1424,16 @@ impl Sidebar {
                     .bg(colors.primary.alpha(0.07)),
             )
             .bg(colors.sidebar_surface())
-            .child(self.project_control(colors, cx))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    // Content only: the strip's own fill keeps its color.
+                    .opacity(self.title_opacity)
+                    .child(self.project_control(colors, cx))
             .child(self.workspace_rows(true, colors, cx))
             .child(
                 div()
@@ -1442,6 +1451,7 @@ impl Sidebar {
                         this.open_header_new_agent(event.position(), window, cx);
                         cx.stop_propagation();
                     })),
+            )
             )
             .into_any_element()
     }
