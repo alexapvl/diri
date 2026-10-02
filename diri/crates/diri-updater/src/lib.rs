@@ -45,14 +45,13 @@ pub const RELEASES_HOST: &str = "github.com";
 pub const DEFAULT_FEED_URL: &str =
     "https://github.com/cristicretu/diri/releases/latest/download/appcast.json";
 /// Canonical release metadata. The update feed deliberately stays small and
-/// archive-focused; GitHub owns the human-written release bodies shown by the
+/// archive-focused; GitHub owns the human-written release body shown by the
 /// app's What's New page.
-pub const RELEASES_URL: &str = "https://api.github.com/repos/cristicretu/diri/releases";
-/// Each release carries ~15 KiB of asset metadata, so 30 a page keeps every
-/// response well under the fetch cap in [`net`] as releases accumulate.
-const RELEASES_PER_PAGE: usize = 30;
-/// A runaway-pagination stop, far beyond any plausible release count.
-const MAX_RELEASE_PAGES: usize = 40;
+pub const LATEST_RELEASE_URL: &str =
+    "https://api.github.com/repos/cristicretu/diri/releases/latest";
+/// Every release's notes, for readers who want more than the latest.
+pub const RELEASES_PAGE_URL: &str = "https://github.com/cristicretu/diri/releases";
+const MAX_RELEASE_METADATA_BYTES: usize = 512 * 1024;
 
 /// Set to `1` to let an unsigned local build run the whole flow. Only useful
 /// for exercising the updater against a test feed; the signature check still
@@ -65,77 +64,34 @@ pub const FEED_URL_ENV: &str = "DIRI_UPDATE_FEED";
 pub struct ReleaseNotes {
     pub tag_name: String,
     pub name: Option<String>,
-    /// GitHub reports a release published without notes as `null`.
-    #[serde(default, deserialize_with = "null_as_empty")]
+    #[serde(default)]
     pub body: String,
     pub published_at: Option<String>,
 }
 
-fn null_as_empty<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    <Option<String> as serde::Deserialize>::deserialize(deserializer).map(Option::unwrap_or_default)
-}
-
-/// One release as GitHub's list endpoint reports it. Drafts never reach an
-/// unauthenticated client, but the flag is checked so a token never changes
-/// what the page shows.
-#[derive(serde::Deserialize)]
-struct ReleaseEntry {
-    #[serde(flatten)]
-    notes: ReleaseNotes,
-    #[serde(default)]
-    draft: bool,
-}
-
-/// Fetches every public GitHub release and its Markdown notes, newest first.
+/// Fetches the latest public GitHub release and its Markdown notes.
 ///
 /// This is separate from update eligibility: an up-to-date install should
-/// still be able to read the notes for the version it is already running, and
-/// for every version before it.
-pub fn fetch_release_notes() -> Result<Vec<ReleaseNotes>> {
-    let http = Http::new();
-    let mut releases = Vec::new();
-    for page in 1..=MAX_RELEASE_PAGES {
-        let body = http.fetch_text(&format!(
-            "{RELEASES_URL}?per_page={RELEASES_PER_PAGE}&page={page}"
-        ))?;
-        let (entries, complete) = parse_release_page(&body)?;
-        releases.extend(entries);
-        if complete {
-            break;
-        }
-    }
-    order_release_notes(releases)
+/// still be able to read the notes for the version it is already running.
+pub fn fetch_latest_release_notes() -> Result<ReleaseNotes> {
+    let body = Http::new().fetch_text(LATEST_RELEASE_URL)?;
+    parse_release_notes(&body)
 }
 
-/// One page of releases, and whether it was the last.
-fn parse_release_page(body: &str) -> Result<(Vec<ReleaseNotes>, bool)> {
-    let entries: Vec<ReleaseEntry> =
-        serde_json::from_str(body).map_err(|error| UpdateError::Feed(error.to_string()))?;
-    let complete = entries.len() < RELEASES_PER_PAGE;
-    let releases = entries
-        .into_iter()
-        .filter(|entry| !entry.draft && !entry.notes.tag_name.trim().is_empty())
-        .map(|entry| entry.notes)
-        .collect();
-    Ok((releases, complete))
-}
-
-/// Newest first by publication, one entry per tag: a release published while
-/// the pages were being read shifts the next page by one.
-fn order_release_notes(mut releases: Vec<ReleaseNotes>) -> Result<Vec<ReleaseNotes>> {
-    let mut seen = std::collections::HashSet::new();
-    releases.retain(|release| seen.insert(release.tag_name.clone()));
-    // RFC 3339 timestamps in UTC order lexically; undated releases go last.
-    releases.sort_by(|a, b| b.published_at.cmp(&a.published_at));
-    if releases.is_empty() {
+fn parse_release_notes(body: &str) -> Result<ReleaseNotes> {
+    if body.len() > MAX_RELEASE_METADATA_BYTES {
         return Err(UpdateError::Feed(
-            "no releases have been published".to_owned(),
+            "latest release metadata is unexpectedly large".to_owned(),
         ));
     }
-    Ok(releases)
+    let release: ReleaseNotes =
+        serde_json::from_str(body).map_err(|error| UpdateError::Feed(error.to_string()))?;
+    if release.tag_name.trim().is_empty() || release.body.trim().is_empty() {
+        return Err(UpdateError::Feed(
+            "latest release has no version or release notes".to_owned(),
+        ));
+    }
+    Ok(release)
 }
 
 #[derive(Clone, Debug)]
@@ -371,81 +327,38 @@ mod tests {
     }
 
     #[test]
-    fn release_list_keeps_every_published_markdown_body_newest_first() {
-        let (releases, complete) = parse_release_page(
-            r###"[
-                {
-                    "tag_name": "v0.8.11",
-                    "name": "diri 0.8.11",
-                    "body": "- Quieter reconnects",
-                    "published_at": "2026-09-30T20:58:40Z",
-                    "draft": false,
-                    "assets": [{"name": "appcast.json"}]
-                },
-                {
-                    "tag_name": "v0.9.0",
-                    "name": "diri 0.9.0",
-                    "body": "## Highlights\n\n- Notes",
-                    "published_at": "2026-10-01T12:45:33Z"
-                },
-                {"tag_name": "v1.0.0", "body": "unreleased", "draft": true},
-                {"tag_name": "v0.4.1", "body": null, "published_at": "2026-08-05T09:00:17Z"}
-            ]"###,
+    fn latest_release_metadata_keeps_the_canonical_markdown_body() {
+        let release = parse_release_notes(
+            r###"{
+                "tag_name": "v0.6.0",
+                "name": "diri 0.6.0",
+                "body": "## Highlights\n\n- Faster sessions",
+                "published_at": "2026-09-05T12:17:55Z"
+            }"###,
         )
-        .expect("release page");
-        assert!(complete, "a short page is the last one");
+        .expect("release metadata");
 
-        let releases = order_release_notes(releases).expect("release list");
-        let tags: Vec<_> = releases.iter().map(|r| r.tag_name.as_str()).collect();
-        assert_eq!(tags, ["v0.9.0", "v0.8.11", "v0.4.1"]);
-        assert_eq!(releases[0].body, "## Highlights\n\n- Notes");
+        assert_eq!(release.tag_name, "v0.6.0");
+        assert_eq!(release.body, "## Highlights\n\n- Faster sessions");
         assert_eq!(
-            releases[2].body, "",
-            "a release without notes is still listed"
+            release.published_at.as_deref(),
+            Some("2026-09-05T12:17:55Z")
         );
     }
 
     #[test]
-    fn release_list_asks_for_the_next_page_only_after_a_full_one() {
-        let entry = r#"{"tag_name":"v0.1.0","body":"x"}"#;
-        let full = format!("[{}]", vec![entry; RELEASES_PER_PAGE].join(","));
-        let (_, complete) = parse_release_page(&full).expect("full page");
-        assert!(!complete);
-    }
-
-    #[test]
-    fn release_list_drops_a_release_repeated_across_pages() {
-        let release = |tag: &str, at: &str| ReleaseNotes {
-            tag_name: tag.into(),
-            published_at: Some(at.into()),
-            ..ReleaseNotes::default()
-        };
-        let releases = order_release_notes(vec![
-            release("v0.2.0", "2026-08-02T00:00:00Z"),
-            release("v0.1.0", "2026-08-01T00:00:00Z"),
-            release("v0.1.0", "2026-08-01T00:00:00Z"),
-        ])
-        .expect("release list");
-        assert_eq!(releases.len(), 2);
-    }
-
-    #[test]
-    fn an_empty_release_list_is_an_error() {
-        let error = order_release_notes(Vec::new())
-            .expect_err("no releases must not render as an empty success");
+    fn latest_release_metadata_requires_notes() {
+        let error = parse_release_notes(r#"{"tag_name":"v0.6.0","body":""}"#)
+            .expect_err("empty notes must not render as a successful release");
         assert!(matches!(error, UpdateError::Feed(_)));
     }
 
     #[test]
     #[ignore = "requires network access to GitHub's releases API"]
-    fn every_release_is_reachable() {
-        let releases = fetch_release_notes().expect("release notes");
-        assert!(
-            releases.len() > RELEASES_PER_PAGE,
-            "pagination reached page two"
-        );
-        assert!(releases[0].tag_name.starts_with('v'));
-        assert!(!releases[0].body.trim().is_empty());
+    fn the_latest_release_notes_are_reachable() {
+        let release = fetch_latest_release_notes().expect("latest release notes");
+        assert!(release.tag_name.starts_with('v'));
+        assert!(!release.body.trim().is_empty());
     }
 
     #[test]
