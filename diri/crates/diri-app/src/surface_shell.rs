@@ -164,12 +164,33 @@ enum ReleaseNotesState {
     #[default]
     Idle,
     Loading,
+    /// Every published release, newest first, fetched once per open page so
+    /// moving through the list never refetches.
     Loaded {
-        release: diri_updater::ReleaseNotes,
-        document: Arc<crate::markdown::MarkdownDocument>,
+        releases: Vec<PublishedRelease>,
+        selected: usize,
     },
     Failed(String),
 }
+
+struct PublishedRelease {
+    notes: diri_updater::ReleaseNotes,
+    document: Arc<crate::markdown::MarkdownDocument>,
+}
+
+impl PublishedRelease {
+    fn new(notes: diri_updater::ReleaseNotes) -> Self {
+        let document = Arc::new(crate::markdown::MarkdownDocument::parse(&notes.body));
+        Self { notes, document }
+    }
+
+    fn version(&self) -> &str {
+        self.notes.tag_name.trim_start_matches('v')
+    }
+}
+
+/// Width of the What's New release list, beside the release it shows.
+const RELEASE_LIST_WIDTH: f32 = 188.0;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum HostFormField {
@@ -436,6 +457,8 @@ pub struct UtilitySurfaces {
     )>,
     settings_scroll: ScrollHandle,
     settings_scroller: diri_ui::ScrollerState,
+    release_list_scroll: ScrollHandle,
+    release_list_scroller: diri_ui::ScrollerState,
     settings_search: QueryEditor,
     settings_search_active: bool,
     shortcut_search: QueryEditor,
@@ -663,6 +686,8 @@ impl UtilitySurfaces {
             whats_new_posters: None,
             settings_scroll: ScrollHandle::new(),
             settings_scroller: diri_ui::ScrollerState::new(),
+            release_list_scroll: ScrollHandle::new(),
+            release_list_scroller: diri_ui::ScrollerState::new(),
             settings_search: QueryEditor::default(),
             settings_search_active: false,
             shortcut_search: QueryEditor::default(),
@@ -820,37 +845,60 @@ impl UtilitySurfaces {
         .detach();
     }
 
+    /// Runs when the page opens: the list is fetched once, and reopening the
+    /// page shows the latest release again without refetching.
     fn refresh_release_notes(&mut self, cx: &mut Context<Self>) {
-        if matches!(
-            self.release_notes,
-            ReleaseNotesState::Loading | ReleaseNotesState::Loaded { .. }
-        ) {
-            return;
+        match &mut self.release_notes {
+            ReleaseNotesState::Loading => return,
+            ReleaseNotesState::Loaded { selected, .. } => {
+                *selected = 0;
+                self.release_list_scroll.set_offset(point(px(0.0), px(0.0)));
+                return;
+            }
+            ReleaseNotesState::Idle | ReleaseNotesState::Failed(_) => {}
         }
         self.release_notes = ReleaseNotesState::Loading;
         cx.notify();
 
         let runtime = Arc::clone(&self.runtime);
         cx.spawn(async move |this, cx| {
-            let task = runtime.spawn_blocking(diri_updater::fetch_latest_release_notes);
+            let task = runtime.spawn_blocking(|| {
+                diri_updater::fetch_release_notes().map(|releases| {
+                    releases
+                        .into_iter()
+                        .map(PublishedRelease::new)
+                        .collect::<Vec<_>>()
+                })
+            });
             let result = match task.await {
-                Ok(Ok(release)) => Ok(release),
+                Ok(Ok(releases)) => Ok(releases),
                 Ok(Err(error)) => Err(error.to_string()),
                 Err(error) => Err(error.to_string()),
             };
             let _ = this.update(cx, |this, cx| {
                 this.release_notes = match result {
-                    Ok(release) => {
-                        let document =
-                            Arc::new(crate::markdown::MarkdownDocument::parse(&release.body));
-                        ReleaseNotesState::Loaded { release, document }
-                    }
+                    Ok(releases) => ReleaseNotesState::Loaded {
+                        releases,
+                        selected: 0,
+                    },
                     Err(error) => ReleaseNotesState::Failed(error),
                 };
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    fn select_release(&mut self, index: usize, cx: &mut Context<Self>) {
+        let ReleaseNotesState::Loaded { releases, selected } = &mut self.release_notes else {
+            return;
+        };
+        if index >= releases.len() || *selected == index {
+            return;
+        }
+        *selected = index;
+        self.settings_scroll.set_offset(point(px(0.0), px(0.0)));
+        cx.notify();
     }
 
     fn confirm_cleanup(&mut self, cx: &mut Context<Self>) {
@@ -2628,67 +2676,61 @@ impl UtilitySurfaces {
             .notifications()
             .unread_count();
         let generation = self.settings_transition_generation;
-        let pane = match self.settings_tab {
-            SettingsTab::General => self.general_settings(cx).into_any_element(),
-            SettingsTab::WhatsNew => self.whats_new_settings(cx).into_any_element(),
-            SettingsTab::Agents => self.agents_settings(cx).into_any_element(),
-            SettingsTab::Skills => self.skills.clone().into_any_element(),
-            SettingsTab::Schedules => self.schedules.clone().into_any_element(),
-            SettingsTab::Accounts => self.accounts_settings(cx).into_any_element(),
-            SettingsTab::Shortcuts => self.shortcuts_settings(cx).into_any_element(),
-            SettingsTab::Terminal => self.terminal_settings(cx).into_any_element(),
-            SettingsTab::Worktrees => self.worktree_settings(cx).into_any_element(),
-            SettingsTab::Resources => self.resource_settings(cx).into_any_element(),
-            SettingsTab::Remote => self.remote_settings(cx).into_any_element(),
-            SettingsTab::Phone => self.phone_settings(cx).into_any_element(),
-            SettingsTab::Usage => self.usage_settings(cx).into_any_element(),
-        };
-        let pane = div()
-            .id("settings-pane")
-            .debug_selector(|| "settings-pane".into())
-            .relative()
-            .track_scroll(&self.settings_scroll)
-            .size_full()
-            .overflow_y_scroll()
-            .bg(colors.background)
-            .child(
-                div()
-                    .w_full()
-                    .max_w(px(
-                        if matches!(
-                            self.settings_tab,
-                            SettingsTab::Usage | SettingsTab::Worktrees
-                        ) {
-                            1040.0
-                        } else {
-                            SETTINGS_CONTENT_MAX_WIDTH
-                        },
-                    ))
-                    .mx_auto()
-                    .child(pane),
-            );
-        let pane = if cx.reduce_motion() {
-            pane.into_any_element()
+        let pane = if self.settings_tab == SettingsTab::WhatsNew {
+            // What's New lays out its own release list beside a document that
+            // scrolls on its own, so the list stays put while reading.
+            settings_canvas_enter(self.whats_new_settings(cx), generation, cx)
         } else {
-            pane.with_animation(
-                SharedString::from(format!("settings-canvas-enter-{generation}")),
-                Animation::new(SETTINGS_TRANSITION_DURATION).with_easing(ease_out_quint()),
-                |pane, delta| {
-                    pane.left(px((1.0 - delta) * 12.0))
-                        .opacity(0.64 + 0.36 * delta)
-                },
+            let pane = match self.settings_tab {
+                SettingsTab::General => self.general_settings(cx).into_any_element(),
+                SettingsTab::WhatsNew => unreachable!("What's New owns its canvas"),
+                SettingsTab::Agents => self.agents_settings(cx).into_any_element(),
+                SettingsTab::Skills => self.skills.clone().into_any_element(),
+                SettingsTab::Schedules => self.schedules.clone().into_any_element(),
+                SettingsTab::Accounts => self.accounts_settings(cx).into_any_element(),
+                SettingsTab::Shortcuts => self.shortcuts_settings(cx).into_any_element(),
+                SettingsTab::Terminal => self.terminal_settings(cx).into_any_element(),
+                SettingsTab::Worktrees => self.worktree_settings(cx).into_any_element(),
+                SettingsTab::Resources => self.resource_settings(cx).into_any_element(),
+                SettingsTab::Remote => self.remote_settings(cx).into_any_element(),
+                SettingsTab::Phone => self.phone_settings(cx).into_any_element(),
+                SettingsTab::Usage => self.usage_settings(cx).into_any_element(),
+            };
+            let pane = div()
+                .id("settings-pane")
+                .debug_selector(|| "settings-pane".into())
+                .relative()
+                .track_scroll(&self.settings_scroll)
+                .size_full()
+                .overflow_y_scroll()
+                .bg(colors.background)
+                .child(
+                    div()
+                        .w_full()
+                        .max_w(px(
+                            if matches!(
+                                self.settings_tab,
+                                SettingsTab::Usage | SettingsTab::Worktrees
+                            ) {
+                                1040.0
+                            } else {
+                                SETTINGS_CONTENT_MAX_WIDTH
+                            },
+                        ))
+                        .mx_auto()
+                        .child(pane),
+                );
+            diri_ui::scroll_area(
+                &self.settings_scroller,
+                self.settings_scroll.clone(),
+                colors,
+                settings_canvas_enter(pane, generation, cx),
             )
+            .flex_1()
+            .min_w(px(0.0))
+            .h_full()
             .into_any_element()
         };
-        let pane = diri_ui::scroll_area(
-            &self.settings_scroller,
-            self.settings_scroll.clone(),
-            colors,
-            pane,
-        )
-        .flex_1()
-        .min_w(px(0.0))
-        .h_full();
 
         div()
             .id("settings-shell")
@@ -2891,11 +2933,14 @@ impl UtilitySurfaces {
         self.whats_new_posters = Some((appearance, posters));
     }
 
-    /// The newest release's highlights as thumbnails; each opens the sheet on
-    /// its clip.
-    fn whats_new_highlights(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    /// The curated highlights for `version`, as thumbnails that each open the
+    /// sheet on their clip. Only the newest curated release has clips.
+    fn whats_new_highlights(&self, version: &str, cx: &mut Context<Self>) -> Option<AnyElement> {
         let colors = self.settings_colors();
         let release = *crate::whats_new::latest(&crate::whats_new::current_version()).first()?;
+        if release.version != version {
+            return None;
+        }
         let posters = self
             .whats_new_posters
             .as_ref()
@@ -2940,43 +2985,21 @@ impl UtilitySurfaces {
             .collect::<Vec<_>>();
         Some(
             div()
-                .p(px(16.0))
                 .flex()
-                .flex_col()
+                .flex_wrap()
                 .gap(px(12.0))
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .gap(px(12.0))
-                        .child(
-                            div()
-                                .text_size(px(Typo::TITLE.size))
-                                .font_weight(Typo::TITLE.weight)
-                                .text_color(colors.primary)
-                                .child(format!("New in diri {}", release.version)),
-                        )
-                        .child(surface_button(
-                            "Watch",
-                            "whats-new-watch",
-                            colors,
-                            cx,
-                            |_, cx| cx.emit(UtilitySurfacesEvent::ShowWhatsNew(0)),
-                        )),
-                )
-                .child(div().flex().flex_wrap().gap(px(12.0)).children(cards))
+                .children(cards)
                 .into_any_element(),
         )
     }
 
-    fn whats_new_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// Loading and failure take the whole page: there is no list to show yet.
+    fn whats_new_status(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let colors = self.settings_colors();
-        let highlights = self.whats_new_highlights(cx);
-        let content = match &self.release_notes {
+        let row = match &self.release_notes {
+            ReleaseNotesState::Loaded { .. } => return None,
             ReleaseNotesState::Idle | ReleaseNotesState::Loading => div()
                 .id("release-notes-loading")
-                .p(px(16.0))
                 .flex()
                 .items_center()
                 .gap(px(9.0))
@@ -2987,11 +3010,10 @@ impl UtilitySurfaces {
                     14.0,
                     colors.tertiary,
                 ))
-                .child("Loading the latest release notes…")
+                .child("Loading release notes…")
                 .into_any_element(),
             ReleaseNotesState::Failed(error) => div()
                 .id("release-notes-error")
-                .p(px(16.0))
                 .flex()
                 .items_center()
                 .justify_between()
@@ -3027,63 +3049,239 @@ impl UtilitySurfaces {
                     |this, cx| this.refresh_release_notes(cx),
                 ))
                 .into_any_element(),
-            ReleaseNotesState::Loaded { release, document } => {
-                let version = release.tag_name.trim_start_matches('v');
-                let published = release
-                    .published_at
-                    .as_deref()
-                    .and_then(|date| date.split('T').next())
-                    .unwrap_or("Publication date unavailable");
-                div()
-                    .id("release-notes-content")
-                    .debug_selector(|| "release-notes-content".into())
-                    .p(px(16.0))
-                    .flex()
-                    .flex_col()
-                    .gap(px(14.0))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .gap(px(12.0))
-                            .child(
-                                div()
-                                    .text_size(px(Typo::TITLE.size))
-                                    .font_weight(Typo::TITLE.weight)
-                                    .text_color(colors.primary)
-                                    .child(
-                                        release
-                                            .name
-                                            .clone()
-                                            .unwrap_or_else(|| format!("diri {version}")),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .text_size(px(Typo::META.size))
-                                    .text_color(colors.tertiary)
-                                    .child(format!("Released {published}")),
-                            ),
-                    )
-                    .child(HairlineDivider::horizontal(colors))
-                    .child(crate::markdown_view::render_markdown(document, colors))
-                    .into_any_element()
-            }
         };
+        Some(row)
+    }
 
-        settings_page(
-            "What's New",
+    fn release_list(
+        &self,
+        releases: &[PublishedRelease],
+        selected: usize,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let colors = self.settings_colors();
+        let newest_year = releases
+            .first()
+            .and_then(|release| release.notes.published_at.as_deref())
+            .and_then(|date| date.split('-').next());
+        let rows = releases.iter().enumerate().map(|(index, release)| {
+            let is_selected = index == selected;
+            let date = release
+                .notes
+                .published_at
+                .as_deref()
+                .map(|date| release_date(date, newest_year));
             div()
+                .id(("release-row", index))
+                .debug_selector(move || format!("release-row-{index}"))
+                .h(px(Metrics::ROW_HEIGHT))
+                .flex_none()
+                .px(px(8.0))
+                .rounded(px(Radius::ROW))
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(8.0))
+                .bg(Fill::selected(colors, is_selected))
+                .when(!is_selected, |row| {
+                    row.cursor_pointer()
+                        .hover(move |row| row.bg(Fill::hover(colors, true)))
+                })
+                .on_click(cx.listener(move |this, _, _, cx| this.select_release(index, cx)))
+                .child(
+                    div()
+                        .min_w(px(0.0))
+                        .truncate()
+                        .text_size(px(Typo::ROW.size))
+                        .when(is_selected, |label| {
+                            label.font_weight(Typo::ROW_EMPHASIZED.weight)
+                        })
+                        .text_color(if is_selected {
+                            colors.primary
+                        } else {
+                            colors.secondary
+                        })
+                        .child(release.version().to_owned()),
+                )
+                .children(date.map(|date| {
+                    div()
+                        .flex_none()
+                        .text_size(px(Typo::META.size))
+                        .text_color(colors.tertiary)
+                        .child(date)
+                }))
+        });
+        diri_ui::scroll_area(
+            &self.release_list_scroller,
+            self.release_list_scroll.clone(),
+            colors,
+            div()
+                .id("release-list")
+                .debug_selector(|| "release-list".into())
+                .track_scroll(&self.release_list_scroll)
+                .size_full()
+                .overflow_y_scroll()
+                .px(px(10.0))
+                .pb(px(16.0))
                 .flex()
                 .flex_col()
-                .gap(px(SETTINGS_SECTION_GAP))
-                .when_some(highlights, |page, highlights| {
-                    page.child(setting_section("HIGHLIGHTS", highlights, colors))
-                })
-                .child(setting_section("LATEST RELEASE", content, colors)),
-            colors,
+                .gap(px(1.0))
+                .children(rows),
+        )
+        .flex_1()
+        .min_h(px(0.0))
+    }
+
+    /// The selected release as a document on the settings canvas: its name
+    /// and date, the curated clips when it has them, then GitHub's notes.
+    fn release_document(&self, release: &PublishedRelease, cx: &mut Context<Self>) -> AnyElement {
+        let colors = self.settings_colors();
+        let title = release
+            .notes
+            .name
+            .clone()
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| format!("diri {}", release.version()));
+        let published = release
+            .notes
+            .published_at
+            .as_deref()
+            .map(|date| format!("Released {}", release_date(date, None)));
+        let highlights = self.whats_new_highlights(release.version(), cx);
+        let has_highlights = highlights.is_some();
+        let body = if release.document.blocks.is_empty() {
+            div()
+                .text_size(px(Typo::ROW.size))
+                .text_color(colors.tertiary)
+                .child("No notes were published for this release.")
+                .into_any_element()
+        } else {
+            crate::markdown_view::render_markdown_with(
+                &release.document,
+                colors,
+                crate::markdown_view::MarkdownLook::READING,
+            )
+        };
+        div()
+            .id("release-notes-content")
+            .debug_selector(|| "release-notes-content".into())
+            .w_full()
+            .max_w(px(crate::notes::editor_view::MEASURE))
+            .flex()
+            .flex_col()
+            .gap(px(20.0))
+            .child(
+                div()
+                    .flex()
+                    .items_start()
+                    .justify_between()
+                    .gap(px(16.0))
+                    .child(
+                        div()
+                            .min_w(px(0.0))
+                            .flex()
+                            .flex_col()
+                            .gap(px(4.0))
+                            .child(
+                                div()
+                                    .text_size(px(22.0))
+                                    .line_height(px(28.0))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(colors.primary)
+                                    .child(title),
+                            )
+                            .children(published.map(|published| {
+                                div()
+                                    .text_size(px(Typo::META.size))
+                                    .text_color(colors.tertiary)
+                                    .child(published)
+                            })),
+                    )
+                    .when(has_highlights, |header| {
+                        header.child(div().flex_none().child(surface_button(
+                            "Watch",
+                            "whats-new-watch",
+                            colors,
+                            cx,
+                            |_, cx| cx.emit(UtilitySurfacesEvent::ShowWhatsNew(0)),
+                        )))
+                    }),
+            )
+            .children(highlights)
+            .child(body)
+            .into_any_element()
+    }
+
+    fn whats_new_settings(&self, cx: &mut Context<Self>) -> impl Styled + IntoElement + 'static {
+        let colors = self.settings_colors();
+        let page = div()
+            .id("whats-new")
+            .debug_selector(|| "whats-new".into())
+            .relative()
+            .flex_1()
+            .min_w(px(0.0))
+            .h_full()
+            .flex()
+            .bg(colors.background);
+        if let Some(status) = self.whats_new_status(cx) {
+            return page.child(
+                div()
+                    .w_full()
+                    .max_w(px(SETTINGS_CONTENT_MAX_WIDTH))
+                    .mx_auto()
+                    .child(settings_page("What's New", status, colors)),
+            );
+        }
+        let ReleaseNotesState::Loaded { releases, selected } = &self.release_notes else {
+            unreachable!("only a loaded list has no status row");
+        };
+        let selected = (*selected).min(releases.len().saturating_sub(1));
+        let document = releases
+            .get(selected)
+            .map(|release| self.release_document(release, cx));
+        page.child(
+            div()
+                .w(px(RELEASE_LIST_WIDTH))
+                .flex_none()
+                .h_full()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .flex_none()
+                        .px(px(20.0))
+                        .pt(px(13.0))
+                        .pb(px(12.0))
+                        .h(px(22.0 + 13.0 + 12.0))
+                        .text_size(px(Typo::DISPLAY_TITLE.size))
+                        .font_weight(Typo::DISPLAY_TITLE.weight)
+                        .text_color(colors.primary)
+                        .child("What's New"),
+                )
+                .child(self.release_list(releases, selected, cx)),
+        )
+        .child(HairlineDivider::vertical(colors))
+        .child(
+            diri_ui::scroll_area(
+                &self.settings_scroller,
+                self.settings_scroll.clone(),
+                colors,
+                div()
+                    .id("settings-pane")
+                    .debug_selector(|| "settings-pane".into())
+                    .track_scroll(&self.settings_scroll)
+                    .size_full()
+                    .overflow_y_scroll()
+                    .px(px(40.0))
+                    .pt(px(34.0))
+                    .pb(px(48.0))
+                    .flex()
+                    .justify_center()
+                    .children(document),
+            )
+            .flex_1()
+            .min_w(px(0.0))
+            .h_full(),
         )
     }
 
@@ -6952,6 +7150,54 @@ fn spaced_shortcut_label(label: &str) -> String {
     parts.join("\u{2009}")
 }
 
+/// The settings canvas follows the navigation in from 12px right; reduced
+/// motion mounts it settled.
+fn settings_canvas_enter(
+    pane: impl Styled + IntoElement + 'static,
+    generation: u64,
+    cx: &App,
+) -> AnyElement {
+    if cx.reduce_motion() {
+        return pane.into_any_element();
+    }
+    pane.with_animation(
+        SharedString::from(format!("settings-canvas-enter-{generation}")),
+        Animation::new(SETTINGS_TRANSITION_DURATION).with_easing(ease_out_quint()),
+        |pane, delta| {
+            pane.left(px((1.0 - delta) * 12.0))
+                .opacity(0.64 + 0.36 * delta)
+        },
+    )
+    .into_any_element()
+}
+
+/// `2026-10-01T12:45:33Z` as "Oct 1, 2026", or "Oct 1" when its year is
+/// `omit_year`. Anything unreadable comes back as written.
+fn release_date(published: &str, omit_year: Option<&str>) -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let date = published.split('T').next().unwrap_or(published);
+    let mut parts = date.split('-');
+    let (Some(year), Some(month), Some(day)) = (parts.next(), parts.next(), parts.next()) else {
+        return date.to_owned();
+    };
+    let (Some(month), Ok(day)) = (
+        month
+            .parse::<usize>()
+            .ok()
+            .and_then(|month| MONTHS.get(month.wrapping_sub(1))),
+        day.parse::<u32>(),
+    ) else {
+        return date.to_owned();
+    };
+    if omit_year == Some(year) {
+        format!("{month} {day}")
+    } else {
+        format!("{month} {day}, {year}")
+    }
+}
+
 fn settings_page(
     title: &'static str,
     content: impl IntoElement,
@@ -8068,19 +8314,28 @@ mod tests {
             .expect("save usage share screenshot");
     }
 
+    fn sample_release(tag: &str, body: &str, published: &str) -> PublishedRelease {
+        PublishedRelease::new(diri_updater::ReleaseNotes {
+            tag_name: tag.into(),
+            name: Some(format!("diri {}", tag.trim_start_matches('v'))),
+            body: body.into(),
+            published_at: Some(published.into()),
+        })
+    }
+
     #[gpui::test]
     fn whats_new_is_searchable_and_renders_release_markdown(cx: &mut TestAppContext) {
         let (harness, cx) = open_settings_workbench(cx);
         let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
         surfaces.update(cx, |surfaces, cx| {
-            let release = diri_updater::ReleaseNotes {
-                tag_name: "v0.6.0".into(),
-                name: Some("diri 0.6.0".into()),
-                body: "## Highlights\n\n- Faster sessions".into(),
-                published_at: Some("2026-09-05T12:17:55Z".into()),
+            surfaces.release_notes = ReleaseNotesState::Loaded {
+                releases: vec![sample_release(
+                    "v0.6.0",
+                    "## Highlights\n\n- Faster sessions",
+                    "2026-09-05T12:17:55Z",
+                )],
+                selected: 0,
             };
-            let document = Arc::new(crate::markdown::MarkdownDocument::parse(&release.body));
-            surfaces.release_notes = ReleaseNotesState::Loaded { release, document };
             surfaces.settings_tab = SettingsTab::WhatsNew;
             cx.notify();
         });
@@ -8092,6 +8347,65 @@ mod tests {
             SettingsTab::WhatsNew,
             "latest changes"
         ));
+    }
+
+    #[gpui::test]
+    fn whats_new_lists_every_release_and_shows_the_selected_one(cx: &mut TestAppContext) {
+        let (harness, cx) = open_settings_workbench(cx);
+        let surfaces = harness.read_with(cx, |harness, _| harness.surfaces.clone());
+        surfaces.update(cx, |surfaces, cx| {
+            surfaces.release_notes = ReleaseNotesState::Loaded {
+                releases: vec![
+                    sample_release("v0.9.0", "Notes arrive.", "2026-10-01T12:45:33Z"),
+                    sample_release("v0.8.11", "Quieter reconnects.", "2026-09-30T20:58:40Z"),
+                    sample_release("v0.4.1", "", "2025-08-05T09:00:17Z"),
+                ],
+                selected: 0,
+            };
+            surfaces.settings_tab = SettingsTab::WhatsNew;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        for row in ["release-row-0", "release-row-1", "release-row-2"] {
+            assert!(cx.debug_bounds(row).is_some(), "{row} is listed");
+        }
+        let list = cx.debug_bounds("release-list").expect("release list");
+        let document = cx
+            .debug_bounds("release-notes-content")
+            .expect("release document");
+        assert!(
+            list.right() <= document.left(),
+            "the list sits left of the release"
+        );
+
+        let row = cx.debug_bounds("release-row-1").expect("second row");
+        cx.simulate_click(row.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        surfaces.read_with(cx, |surfaces, _| {
+            let ReleaseNotesState::Loaded { releases, selected } = &surfaces.release_notes else {
+                panic!("selecting a release must keep the fetched list, not refetch");
+            };
+            assert_eq!(*selected, 1);
+            assert_eq!(releases.len(), 3);
+        });
+        surfaces.update(cx, |surfaces, cx| surfaces.refresh_release_notes(cx));
+        surfaces.read_with(cx, |surfaces, _| {
+            assert!(
+                matches!(
+                    surfaces.release_notes,
+                    ReleaseNotesState::Loaded { selected: 0, .. }
+                ),
+                "reopening the page shows the latest release from the cached list"
+            );
+        });
+
+        assert_eq!(release_date("2026-10-01T12:45:33Z", Some("2026")), "Oct 1");
+        assert_eq!(
+            release_date("2025-08-05T09:00:17Z", Some("2026")),
+            "Aug 5, 2025"
+        );
+        assert_eq!(release_date("soon", None), "soon");
     }
 
     #[gpui::test]
@@ -8854,15 +9168,25 @@ mod tests {
                 surfaces.open_settings(cx);
                 surfaces.settings_tab = tab;
                 if tab == SettingsTab::WhatsNew {
-                    let release = diri_updater::ReleaseNotes {
-                        tag_name: "v0.6.0".into(),
-                        name: Some("diri 0.6.0 — Your agent workspace".into()),
-                        body: "## Everything in one place\n\n- Open browser and shell tabs beside a session.\n- Search conversation history and resume previous work.\n\n### Polish and reliability\n\nSettings, navigation, and session recovery now feel more at home on macOS."
-                            .into(),
-                        published_at: Some("2026-09-05T12:17:55Z".into()),
+                    // `DIRI_VISUAL_RELEASES=<path>` seeds the list from a saved
+                    // page of GitHub's releases API instead of the sample.
+                    let releases = match std::env::var_os("DIRI_VISUAL_RELEASES") {
+                        Some(path) => serde_json::from_str::<Vec<diri_updater::ReleaseNotes>>(
+                            &std::fs::read_to_string(path).expect("read releases fixture"),
+                        )
+                        .expect("parse releases fixture"),
+                        None => vec![diri_updater::ReleaseNotes {
+                            tag_name: "v0.6.0".into(),
+                            name: Some("diri 0.6.0".into()),
+                            body: "## Everything in one place\n\n- Open browser and shell tabs beside a session.\n- Search conversation history and resume previous work.\n\n### Polish and reliability\n\nSettings, navigation, and session recovery now feel more at home on macOS."
+                                .into(),
+                            published_at: Some("2026-09-05T12:17:55Z".into()),
+                        }],
                     };
-                    let document = Arc::new(crate::markdown::MarkdownDocument::parse(&release.body));
-                    surfaces.release_notes = ReleaseNotesState::Loaded { release, document };
+                    surfaces.release_notes = ReleaseNotesState::Loaded {
+                        releases: releases.into_iter().map(PublishedRelease::new).collect(),
+                        selected: 0,
+                    };
                     surfaces.load_whats_new_posters(cx);
                 }
                 if tab == SettingsTab::Worktrees {
