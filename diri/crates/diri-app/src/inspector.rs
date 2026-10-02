@@ -2546,18 +2546,11 @@ impl WorkbenchInspector {
                     ),
             );
 
-        let mut content = div()
-            .id("inspector-info-scroll")
-            .size_full()
-            .min_h(px(0.0))
-            .px(px(12.0))
-            .pt(px(8.0))
-            .pb(px(18.0))
-            .flex()
-            .flex_col()
-            .gap(px(14.0))
-            .overflow_y_scroll()
-            .child(hero);
+        // The stack sits inside a non-flex scroll view so its cards keep
+        // their content height; as direct flex children of the bounded scroll
+        // view, `overflow_hidden` cards shrank to nothing once the Info
+        // content outgrew the panel.
+        let mut content = div().flex().flex_col().gap(px(14.0)).child(hero);
 
         content = content.child(self.render_status_evidence(session, colors, cx));
 
@@ -2697,9 +2690,19 @@ impl WorkbenchInspector {
         if let Some(bytes) = session.memory_bytes {
             details = details.child(detail_row("Memory", format_bytes(bytes), false, colors));
         }
-        content
-            .child(section_label("Details", colors))
-            .child(details)
+        div()
+            .id("inspector-info-scroll")
+            .size_full()
+            .min_h(px(0.0))
+            .px(px(12.0))
+            .pt(px(8.0))
+            .pb(px(18.0))
+            .overflow_y_scroll()
+            .child(
+                content
+                    .child(section_label("Details", colors))
+                    .child(details),
+            )
             .into_any_element()
     }
 
@@ -7740,29 +7743,19 @@ mod tests {
         cx.run_until_parked();
     }
 
-    /// Long paths, URLs, and code lines must wrap or clip inside the turn
-    /// card; their unbreakable width must never widen the card past the
-    /// inspector.
-    #[gpui::test]
-    fn transcript_turns_stay_inside_the_inspector_width(cx: &mut TestAppContext) {
-        let transcript_home = tempfile::tempdir().expect("transcript home");
+    /// Opens the Info surface on a Claude session whose transcript is
+    /// `jsonl`, at the 300 px harness width, and waits for it to load.
+    fn open_transcript_info<'a>(
+        cx: &'a mut TestAppContext,
+        transcript_home: &Path,
+        jsonl: &str,
+    ) -> (Entity<WorkbenchInspector>, &'a mut gpui::VisualTestContext) {
         let agent_id = "88888888-8888-4888-8888-888888888888";
         let transcript_path = transcript_home
-            .path()
             .join(".claude/projects/-tmp-project")
             .join(format!("{agent_id}.jsonl"));
         std::fs::create_dir_all(transcript_path.parent().unwrap()).unwrap();
-        let long_token = "crates/diri-app/src/".repeat(20);
-        let text = format!(
-            "Edited {long_token} and more prose that should wrap normally.\\n\\n```rust\\nlet path = \\\"{long_token}\\\";\\n```"
-        );
-        std::fs::write(
-            &transcript_path,
-            format!(
-                "{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"{text}\"}}]}}}}\n"
-            ),
-        )
-        .expect("transcript");
+        std::fs::write(&transcript_path, jsonl).expect("transcript");
 
         let runtime = Arc::new(StoreRuntime::inert());
         let mut fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
@@ -7791,21 +7784,54 @@ mod tests {
                 .build()
                 .expect("test runtime"),
         );
-        let inspector_runtime = Arc::clone(&runtime);
         let (harness, cx) = cx.add_window_view(move |_window, cx| {
-            let inspector = cx.new(|cx| WorkbenchInspector::new(inspector_runtime, tokio, cx));
+            let inspector = cx.new(|cx| WorkbenchInspector::new(runtime, tokio, cx));
             InspectorHarness { inspector }
         });
         let inspector = harness.read_with(cx, |harness, _| harness.inspector.clone());
+        let transcript_home = transcript_home.to_path_buf();
         inspector.update(cx, |inspector, cx| {
             let context = inspector.selected_context().expect("selected context");
             inspector.visible = true;
             inspector.context = Some(context.clone());
-            inspector.transcript_home = transcript_home.path().to_path_buf();
+            inspector.transcript_home = transcript_home;
             inspector.refresh_transcript(&context, false, cx);
             cx.notify();
         });
         cx.run_until_parked();
+        (inspector, cx)
+    }
+
+    fn release_inspector_tasks(
+        inspector: &Entity<WorkbenchInspector>,
+        cx: &mut gpui::VisualTestContext,
+    ) {
+        inspector.update(cx, |inspector, _| {
+            inspector.refresh_task = None;
+            inspector.review_task = None;
+            inspector.transcript_task = None;
+            inspector.poll_task = None;
+        });
+        cx.run_until_parked();
+    }
+
+    /// Long paths, URLs, and code lines must wrap or clip inside the turn
+    /// card; their unbreakable width must never widen the card past the
+    /// inspector.
+    #[gpui::test]
+    fn transcript_turns_stay_inside_the_inspector_width(cx: &mut TestAppContext) {
+        let transcript_home = tempfile::tempdir().expect("transcript home");
+        let long_token = "crates/diri-app/src/".repeat(20);
+        let text = format!(
+            "Edited {long_token} and more prose that should wrap normally.\\n\\n```rust\\nlet path = \\\"{long_token}\\\";\\n```"
+        );
+        let (inspector, cx) = open_transcript_info(
+            cx,
+            transcript_home.path(),
+            &format!(
+                "{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"{text}\"}}]}}}}\n"
+            ),
+        );
 
         let turn = cx
             .debug_bounds("INSPECTOR_TRANSCRIPT_TURN_0")
@@ -7825,13 +7851,36 @@ mod tests {
             "transcript prose {prose:?} does not wrap inside its turn {turn:?}"
         );
 
-        inspector.update(cx, |inspector, _| {
-            inspector.refresh_task = None;
-            inspector.review_task = None;
-            inspector.transcript_task = None;
-            inspector.poll_task = None;
-        });
-        cx.run_until_parked();
+        release_inspector_tasks(&inspector, cx);
+    }
+
+    /// A long conversation makes the Info content taller than the panel; it
+    /// must scroll rather than squash the clipped cards above and below it.
+    #[gpui::test]
+    fn tall_info_content_scrolls_instead_of_squashing_cards(cx: &mut TestAppContext) {
+        let transcript_home = tempfile::tempdir().expect("transcript home");
+        let paragraph =
+            "The holder keeps draining the PTY while no client is attached. ".repeat(30);
+        let jsonl: String = (0..8)
+            .map(|turn| {
+                let role = if turn % 2 == 0 { "user" } else { "assistant" };
+                format!("{{\"type\":\"{role}\",\"message\":{{\"content\":\"{paragraph}\"}}}}\n")
+            })
+            .collect();
+        let (inspector, cx) = open_transcript_info(cx, transcript_home.path(), &jsonl);
+
+        let evidence = cx
+            .debug_bounds("STATUS_EVIDENCE_TOGGLE")
+            .expect("status evidence row");
+        let first_turn = cx
+            .debug_bounds("INSPECTOR_TRANSCRIPT_TURN_0")
+            .expect("first transcript turn");
+        assert!(
+            first_turn.top() >= evidence.bottom(),
+            "status evidence card {evidence:?} was squashed under the conversation {first_turn:?}"
+        );
+
+        release_inspector_tasks(&inspector, cx);
     }
 
     #[test]
