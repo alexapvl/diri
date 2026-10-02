@@ -7740,6 +7740,100 @@ mod tests {
         cx.run_until_parked();
     }
 
+    /// Long paths, URLs, and code lines must wrap or clip inside the turn
+    /// card; their unbreakable width must never widen the card past the
+    /// inspector.
+    #[gpui::test]
+    fn transcript_turns_stay_inside_the_inspector_width(cx: &mut TestAppContext) {
+        let transcript_home = tempfile::tempdir().expect("transcript home");
+        let agent_id = "88888888-8888-4888-8888-888888888888";
+        let transcript_path = transcript_home
+            .path()
+            .join(".claude/projects/-tmp-project")
+            .join(format!("{agent_id}.jsonl"));
+        std::fs::create_dir_all(transcript_path.parent().unwrap()).unwrap();
+        let long_token = "crates/diri-app/src/".repeat(20);
+        let text = format!(
+            "Edited {long_token} and more prose that should wrap normally.\\n\\n```rust\\nlet path = \\\"{long_token}\\\";\\n```"
+        );
+        std::fs::write(
+            &transcript_path,
+            format!(
+                "{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"{text}\"}}]}}}}\n"
+            ),
+        )
+        .expect("transcript");
+
+        let runtime = Arc::new(StoreRuntime::inert());
+        let mut fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+        let selected = fixture
+            .selected_session_id
+            .clone()
+            .expect("selected session");
+        let session = fixture
+            .list
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == selected)
+            .expect("selected record");
+        session.kind = ProtoAgentKind::CLAUDE_CODE;
+        session.foreground_agent = None;
+        session.agent_session_id = Some(agent_id.to_owned());
+        session.transcript_path = Some(transcript_path.to_string_lossy().into_owned());
+        {
+            let mut store = runtime.store.write().expect("session store lock poisoned");
+            store.hydrate(fixture.list);
+            store.select(selected);
+        }
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime"),
+        );
+        let inspector_runtime = Arc::clone(&runtime);
+        let (harness, cx) = cx.add_window_view(move |_window, cx| {
+            let inspector = cx.new(|cx| WorkbenchInspector::new(inspector_runtime, tokio, cx));
+            InspectorHarness { inspector }
+        });
+        let inspector = harness.read_with(cx, |harness, _| harness.inspector.clone());
+        inspector.update(cx, |inspector, cx| {
+            let context = inspector.selected_context().expect("selected context");
+            inspector.visible = true;
+            inspector.context = Some(context.clone());
+            inspector.transcript_home = transcript_home.path().to_path_buf();
+            inspector.refresh_transcript(&context, false, cx);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let turn = cx
+            .debug_bounds("INSPECTOR_TRANSCRIPT_TURN_0")
+            .expect("assistant transcript turn");
+        let evidence = cx
+            .debug_bounds("STATUS_EVIDENCE_TOGGLE")
+            .expect("status evidence card");
+        assert!(
+            turn.right() <= evidence.right() + px(1.0),
+            "transcript turn {turn:?} overflows the inspector cards {evidence:?}"
+        );
+        let prose = cx
+            .debug_bounds("MARKDOWN_INLINE_SPAN")
+            .expect("transcript prose");
+        assert!(
+            prose.right() <= turn.right() && prose.size.height > px(18.0),
+            "transcript prose {prose:?} does not wrap inside its turn {turn:?}"
+        );
+
+        inspector.update(cx, |inspector, _| {
+            inspector.refresh_task = None;
+            inspector.review_task = None;
+            inspector.transcript_task = None;
+            inspector.poll_task = None;
+        });
+        cx.run_until_parked();
+    }
+
     #[test]
     fn artifact_titles_extract_the_useful_destination() {
         let pull_request = SessionArtifact {
