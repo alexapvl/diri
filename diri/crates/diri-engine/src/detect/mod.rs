@@ -1794,8 +1794,8 @@ mod tests {
         }
     }
 
-    /// Real 100x30 screens from cursor-agent 2026.09.28-64d2043 through
-    /// tests/cursor_real.rs, default zen UI (OSC status indicators off).
+    /// Screens from cursor-agent 2026.10.01-14929f9, default zen UI (OSC
+    /// status indicators off). Trust keeps the composer painted underneath.
     #[test]
     fn cursor_rules_match_the_screens_cursor_cli_draws() {
         let engine = engine();
@@ -1825,7 +1825,6 @@ mod tests {
                 ManifestState::BlockedPermission,
                 "confirm-dialog",
             ),
-            // The accepted trust dialog stays above this composer; it must not stick.
             (
                 include_str!("../../tests/fixtures/cursor_screens/idle.txt"),
                 ManifestState::Idle,
@@ -1895,6 +1894,32 @@ mod tests {
         let observation = engine.evaluate(&idle_prompt, "cursor").expect("match");
         assert_eq!(observation.state, ManifestState::Idle);
         assert_eq!(observation.matched_rule_id, "idle-prompt-arrow");
+    }
+
+    #[test]
+    fn cursor_permission_prompts_from_2026_10_01_still_block() {
+        let engine = engine();
+        for prompt in [
+            "Run this command?",
+            "Run this command outside the sandbox?",
+            "Read this file?",
+            "Allow this web search?",
+            "Allow this web fetch?",
+            "Proceed with this edit?",
+        ] {
+            let observation = engine
+                .evaluate(
+                    &cursor_snapshot(&[prompt, "→ Run (once) (y)"], None),
+                    "cursor",
+                )
+                .expect(prompt);
+            assert_eq!(
+                observation.state,
+                ManifestState::BlockedPermission,
+                "{prompt}"
+            );
+            assert_eq!(observation.matched_rule_id, "confirm-dialog", "{prompt}");
+        }
     }
 
     #[test]

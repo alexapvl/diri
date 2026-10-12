@@ -213,6 +213,13 @@ struct InternalState {
     /// the transcript shows work again — cursor-agent does not update the
     /// title to Ready at end of turn.
     hold_idle_against_screen: bool,
+    /// After a Cursor submit, the composer can still show the previous
+    /// follow-up arrow until Generating/Thinking paints. That chrome is not
+    /// a new completion.
+    ignore_cursor_idle_chrome: bool,
+    /// The transcript tail can still be the previous turn right after submit.
+    /// Ignore that idle until this turn shows up in the file or on screen.
+    ignore_cursor_transcript_idle: bool,
     /// The last output or keystroke on a shell's terminal, which a line
     /// read must outlast by [`ReducerTiming::line_prompt_settle`].
     terminal_active_at: SystemTime,
@@ -242,6 +249,8 @@ impl InternalState {
             responding_since: None,
             pending_needs_input: None,
             hold_idle_against_screen: false,
+            ignore_cursor_idle_chrome: false,
+            ignore_cursor_transcript_idle: false,
             terminal_active_at: spawned_at,
         }
     }
@@ -690,6 +699,16 @@ impl StatusReducer {
             StatusSignal::UserKeystroke | StatusSignal::UserSubmission => {
                 self.state.last_signal_at = now;
                 self.state.hold_idle_against_screen = false;
+                if matches!(signal, StatusSignal::UserSubmission)
+                    && self.manifest_id.as_deref() == Some("cursor")
+                {
+                    // The previous turn's idle confirmation and transcript tail
+                    // are still in flight. A follow-up arrow that has not yet
+                    // been replaced by Generating/Thinking must not finish it.
+                    self.cancel_idle_candidacy();
+                    self.state.ignore_cursor_idle_chrome = true;
+                    self.state.ignore_cursor_transcript_idle = true;
+                }
                 if matches!(self.status, SessionStatus::NeedsInput(_)) {
                     self.state.responding_since = Some(now);
                 }
@@ -704,6 +723,7 @@ impl StatusReducer {
                 self.handle_strong_idle(now, &mut outcome);
             }
             StatusSignal::CursorTranscriptWorking => {
+                self.state.ignore_cursor_transcript_idle = false;
                 if matches!(self.status, SessionStatus::NeedsInput(_)) {
                     return outcome;
                 }
@@ -711,15 +731,20 @@ impl StatusReducer {
             }
             StatusSignal::CursorTranscriptIdle => {
                 self.state.last_signal_at = now;
-                // The poll can still see the preceding turn's transcript while
-                // Cursor streams the next one. Its live spinner is stronger
-                // evidence than that tail. Keep the transcript fallback for OSC
-                // titles, which older Cursor versions can leave stale.
-                let live_spinner = self.state.screen_belief == Some(ManifestState::Working)
-                    && self.state.last_matched_rule_id.as_deref() == Some("working-status-line");
-                if self.status == SessionStatus::Working && !live_spinner {
-                    self.state.hold_idle_against_screen = true;
-                    self.handle_strong_idle(now, &mut outcome);
+                // A submit can race the previous turn's tail. That idle belongs
+                // to the turn that just ended, not the one that just started.
+                if !self.state.ignore_cursor_transcript_idle {
+                    // The poll can still see the preceding turn's transcript while
+                    // Cursor streams the next one. Its live spinner is stronger
+                    // evidence than that tail. Keep the transcript fallback for OSC
+                    // titles, which older Cursor versions can leave stale.
+                    let live_spinner = self.state.screen_belief == Some(ManifestState::Working)
+                        && self.state.last_matched_rule_id.as_deref()
+                            == Some("working-status-line");
+                    if self.status == SessionStatus::Working && !live_spinner {
+                        self.state.hold_idle_against_screen = true;
+                        self.handle_strong_idle(now, &mut outcome);
+                    }
                 }
             }
             StatusSignal::Screen(observation) => self.handle_screen(observation, now, &mut outcome),
@@ -1560,9 +1585,29 @@ impl StatusReducer {
                 if self.state.hold_idle_against_screen {
                     return;
                 }
+                // The zen status line means Generating/Thinking has painted.
+                // A stale Working OSC title does not: the follow-up arrow can
+                // still be the previous turn.
+                if self.state.last_matched_rule_id.as_deref() == Some("working-status-line") {
+                    self.state.ignore_cursor_idle_chrome = false;
+                    self.state.ignore_cursor_transcript_idle = false;
+                }
                 self.go_working(now, false, outcome);
             }
             ManifestState::Idle => {
+                if self.state.ignore_cursor_idle_chrome
+                    && matches!(
+                        self.state.last_matched_rule_id.as_deref(),
+                        Some("idle-prompt-arrow" | "idle-follow-up-placeholder")
+                    )
+                {
+                    return;
+                }
+                if self.state.ignore_cursor_idle_chrome {
+                    // A Ready OSC title is the turn actually ending.
+                    self.state.ignore_cursor_idle_chrome = false;
+                    self.state.ignore_cursor_transcript_idle = false;
+                }
                 if self.status == SessionStatus::Working {
                     self.confirm_idle(now, outcome);
                 } else if self.status == SessionStatus::Starting {

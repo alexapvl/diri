@@ -32,7 +32,7 @@
       "style": "flag",
       "token": "resume"
     },
-    "_resumeNotice": "Verified with cursor-agent 2026.09.28-64d2043: positional initial prompts are supported, resume selects the latest chat, and --resume <chatId> restores an exact chat. Diri discovers native ids from Cursor transcripts; never append an id to the resume subcommand.",
+    "_resumeNotice": "Verified with cursor-agent 2026.10.01-14929f9: positional initial prompts are supported, resume selects the latest chat, and --resume <chatId> restores an exact chat. Diri discovers native ids from Cursor transcripts; never append an id to the resume subcommand.",
     "envScrubPrefixes": [
       "DIRI_",
       "DIRIJOR_"
@@ -100,7 +100,8 @@
       "state": "blockedQuestion",
       "priority": 1350,
       "region": "bottom_non_empty_lines",
-      "regionLines": 8,
+      "regionLines": 24,
+      "_notice": "cursor-agent 2026.10.01-14929f9 drops the arrow-key footer, paints the composer under the dialog, and shows Trusting workspace... while the selector is submitting. A working status line means that box is scrollback.",
       "when": {
         "all": [
           {
@@ -110,7 +111,9 @@
             "contains": "[q] quit"
           },
           {
-            "contains": "use arrow keys to navigate, enter to select, or press the key shown"
+            "not": {
+              "lineRegex": "^\\s*[⠀-⣿]*\\s*(Composing|Generating|Thinking|Responding|Working|Grep|Read |Read file|Edit |Delete |List |Glob |Search |Web search|Fetch |Web fetch|Subagent|Running |Shell command|Codebase search)"
+            }
           }
         ]
       },
@@ -196,7 +199,19 @@
             "contains": "write to this file?"
           },
           {
+            "contains": "run this command outside the sandbox?"
+          },
+          {
             "contains": "proceed with this http request?"
+          },
+          {
+            "contains": "read this file?"
+          },
+          {
+            "contains": "allow this web search?"
+          },
+          {
+            "contains": "allow this web fetch?"
           },
           {
             "contains": "proceed with this edit?"
