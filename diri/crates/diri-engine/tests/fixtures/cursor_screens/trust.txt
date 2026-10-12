@@ -1,4 +1,3 @@
-Tip: You can start the Cursor CLI with `agent` (same as `cursor-agent`).
   ╭──────────────────────────────────────────────────────────────────────────────────────────────╮
   │                                                                                              │
   │  ⚠ Workspace Trust Required                                                                  │
@@ -7,12 +6,16 @@ Tip: You can start the Cursor CLI with `agent` (same as `cursor-agent`).
   │                                                                                              │
   │  Do you trust the contents of this directory?                                                │
   │                                                                                              │
-  │    /private/tmp/cursor-fixture/project                                                           │
-  │                                                                                              │
+  │    /private/tmp/cursor-fixture/project                                                       │
   │                                                                                              │
   │  ▶ [a] Trust this workspace                                                                  │
   │    [q] Quit                                                                                  │
   │                                                                                              │
-  │  Use arrow keys to navigate, Enter to select, or press the key shown                         │
+  │  ⏳ Trusting workspace...                                                                    │
   │                                                                                              │
   ╰──────────────────────────────────────────────────────────────────────────────────────────────╯
+  Cursor Agent
+  v2026.10.01-14929f9
+  → Plan, search, build anything
+  Diri Fake
+  /private/tmp/cursor-fixture/project

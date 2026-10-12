@@ -6384,7 +6384,7 @@ fn prepare_cursor_input(
         if exited {
             return Err(InitialPromptFailure::SessionEnded);
         }
-        if is_cursor_workspace_trust_screen(&lines) {
+        if cursor_trust_selector_waiting(&lines) {
             if !accepted {
                 with_session(registry, session_id, |session| {
                     session.send_text("a", false)
@@ -6393,14 +6393,9 @@ fn prepare_cursor_input(
                 .map_err(|_| InitialPromptFailure::InputFailed)?;
                 accepted = true;
             }
-        } else if crate::detect::bottom_non_empty(&lines, 8)
-            .iter()
-            .any(|line| {
-                let line = line.trim();
-                line.starts_with("→ Plan, search, build anything")
-                    || line.starts_with("→ Add a follow-up")
-            })
-        {
+        } else if cursor_composer_ready(&lines) {
+            // False while the trust dialog is up, including "Trusting
+            // workspace...". The composer painted underneath is not the target.
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -6408,11 +6403,64 @@ fn prepare_cursor_input(
     Err(InitialPromptFailure::SubmissionUnconfirmed)
 }
 
+fn cursor_composer_ready(lines: &[String]) -> bool {
+    !is_cursor_workspace_trust_screen(lines)
+        && crate::detect::bottom_non_empty(lines, 8)
+            .iter()
+            .any(|line| {
+                let line = line.trim();
+                line.starts_with("→ Plan, search, build anything")
+                    || line.starts_with("→ Add a follow-up")
+            })
+}
+
+/// cursor-agent 2026.10.01-14929f9 draws the composer under the trust dialog
+/// and replaces the old arrow-key footer with `Trusting workspace...` once
+/// the selector submits. The dialog is that exact box, never login.
 fn is_cursor_workspace_trust_screen(lines: &[String]) -> bool {
-    let bottom = crate::detect::bottom_non_empty(lines, 8).join("\n");
-    bottom.contains("[a] Trust this workspace")
-        && bottom.contains("[q] Quit")
-        && bottom.contains("Use arrow keys to navigate, Enter to select, or press the key shown")
+    let has_selector = lines
+        .iter()
+        .any(|line| line.contains("[a] Trust this workspace"))
+        && lines.iter().any(|line| line.contains("[q] Quit"));
+    has_selector && !lines.iter().any(|line| cursor_working_status_line(line))
+}
+
+/// `a` only while the selector is waiting. Once "Trusting workspace..." is
+/// showing, the key would be typed into the composer.
+fn cursor_trust_selector_waiting(lines: &[String]) -> bool {
+    is_cursor_workspace_trust_screen(lines)
+        && !lines.iter().any(|line| line.contains("Trusting workspace"))
+}
+
+fn cursor_working_status_line(line: &str) -> bool {
+    let rest = line
+        .trim()
+        .trim_start_matches(|c: char| ('\u{2800}'..='\u{28FF}').contains(&c))
+        .trim_start();
+    [
+        "Composing",
+        "Generating",
+        "Thinking",
+        "Responding",
+        "Working",
+        "Grep",
+        "Read file",
+        "Read ",
+        "Edit ",
+        "Delete ",
+        "List ",
+        "Glob",
+        "Search ",
+        "Web search",
+        "Fetch ",
+        "Web fetch",
+        "Subagent",
+        "Running ",
+        "Shell command",
+        "Codebase search",
+    ]
+    .iter()
+    .any(|verb| rest.starts_with(verb))
 }
 
 /// Types and submits an initial prompt at most once. Screen observations can
@@ -10020,14 +10068,31 @@ mod tests {
     #[test]
     fn cursor_trust_requires_the_live_selector() {
         let lines = |screen: &str| screen.lines().map(str::to_owned).collect::<Vec<_>>();
-        assert!(is_cursor_workspace_trust_screen(&lines(include_str!(
-            "../tests/fixtures/cursor_screens/trust.txt"
-        ))));
-        assert!(!is_cursor_workspace_trust_screen(&lines(include_str!(
+        let trust = include_str!("../tests/fixtures/cursor_screens/trust.txt");
+        let trusting = lines(trust);
+        assert!(is_cursor_workspace_trust_screen(&trusting));
+        assert!(
+            !cursor_trust_selector_waiting(&trusting),
+            "Trusting workspace... must not take another a"
+        );
+        assert!(
+            !cursor_composer_ready(&trusting),
+            "the composer under the dialog is not the input target"
+        );
+        let waiting = lines(&trust.replace("⏳ Trusting workspace...", ""));
+        assert!(cursor_trust_selector_waiting(&waiting));
+        assert!(!cursor_composer_ready(&waiting));
+        for other in [
+            include_str!("../tests/fixtures/cursor_screens/idle.txt"),
+            include_str!("../tests/fixtures/cursor_screens/login.txt"),
+            include_str!("../tests/fixtures/cursor_screens/browser-login.txt"),
+            include_str!("../tests/fixtures/cursor_screens/working.txt"),
+        ] {
+            let screen = lines(other);
+            assert!(!is_cursor_workspace_trust_screen(&screen), "{other}");
+        }
+        assert!(cursor_composer_ready(&lines(include_str!(
             "../tests/fixtures/cursor_screens/idle.txt"
-        ))));
-        assert!(!is_cursor_workspace_trust_screen(&lines(include_str!(
-            "../tests/fixtures/cursor_screens/login.txt"
         ))));
     }
 
