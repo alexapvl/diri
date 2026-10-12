@@ -6366,6 +6366,14 @@ fn is_copilot_folder_trust_screen(lines: &[String]) -> bool {
             .any(|line| line.contains("enter to select") && line.contains("esc to cancel"))
 }
 
+/// How long "Trusting workspace..." may sit before the first PTY resize.
+/// cursor-agent 2026.10.01 leaves that frame up until it observes a resize.
+const CURSOR_TRUST_REDRAW_AFTER: Duration = Duration::from_millis(400);
+
+/// Repeat the resize while the dialog stays. One early `SIGWINCH` is easy to
+/// miss: the process is still inside the trust submit and does not handle it.
+const CURSOR_TRUST_REDRAW_EVERY: Duration = Duration::from_secs(1);
+
 /// Cursor asks for workspace trust before creating its composer. Pasting into
 /// that selector drops the prompt, and the injector's later Enter accepts trust.
 /// Answer that specific selector first, with the same workspace-trust tradeoff
@@ -6376,6 +6384,10 @@ fn prepare_cursor_input(
     session_id: &str,
 ) -> Result<(), InitialPromptFailure> {
     let mut accepted = false;
+    let mut trusting_since: Option<Instant> = None;
+    let mut last_nudge: Option<Instant> = None;
+    let mut nudge_wide = false;
+    let mut nudge_base: Option<(u16, u16)> = None;
     for _ in 0..200 {
         let (exited, lines) = with_session(registry, session_id, |session| {
             (session.view().exited, session.screen_lines())
@@ -6383,6 +6395,26 @@ fn prepare_cursor_input(
         .ok_or(InitialPromptFailure::SessionEnded)?;
         if exited {
             return Err(InitialPromptFailure::SessionEnded);
+        }
+        let trusting = is_cursor_workspace_trust_screen(&lines)
+            && lines.iter().any(|line| line.contains("Trusting workspace"));
+        if !trusting {
+            trusting_since = None;
+        }
+        let settled_for = trusting_since.map(|since| since.elapsed());
+        let since_nudge = last_nudge.map(|at| at.elapsed());
+        if trust_nudge_due(last_nudge.is_some(), trusting, settled_for, since_nudge) {
+            if nudge_base.is_none() {
+                let (cols, rows) =
+                    with_session(registry, session_id, |session| session.screen_size())
+                        .ok_or(InitialPromptFailure::SessionEnded)?;
+                nudge_base = Some((pty_dimension(cols), pty_dimension(rows)));
+            }
+            let (cols, rows) = nudge_base.expect("set above");
+            nudge_wide = !nudge_wide;
+            let (next_cols, next_rows) = cursor_trust_nudge_size(cols, rows, nudge_wide);
+            resize_session_pty(registry, session_id, next_cols, next_rows)?;
+            last_nudge = Some(Instant::now());
         }
         if cursor_trust_selector_waiting(&lines) {
             if !accepted {
@@ -6393,6 +6425,8 @@ fn prepare_cursor_input(
                 .map_err(|_| InitialPromptFailure::InputFailed)?;
                 accepted = true;
             }
+        } else if trusting {
+            trusting_since.get_or_insert_with(Instant::now);
         } else if cursor_composer_ready(&lines) {
             // False while the trust dialog is up, including "Trusting
             // workspace...". The composer painted underneath is not the target.
@@ -6401,6 +6435,60 @@ fn prepare_cursor_input(
         std::thread::sleep(Duration::from_millis(100));
     }
     Err(InitialPromptFailure::SubmissionUnconfirmed)
+}
+
+/// Repeat while the dialog is still up. The first signal often lands while
+/// Cursor is inside the trust submit and is never handled.
+fn trust_nudge_due(
+    nudged: bool,
+    trusting: bool,
+    settled_for: Option<Duration>,
+    since_nudge: Option<Duration>,
+) -> bool {
+    if !trusting {
+        return false;
+    }
+    if !nudged {
+        return settled_for.unwrap_or_default() >= CURSOR_TRUST_REDRAW_AFTER;
+    }
+    since_nudge.unwrap_or_default() >= CURSOR_TRUST_REDRAW_EVERY
+}
+
+/// Two sizes that both differ from the launch size and from each other.
+/// 100×32 is a size that actually makes this Cursor build leave the dialog.
+fn cursor_trust_nudge_size(cols: u16, rows: u16, wide: bool) -> (u16, u16) {
+    if wide {
+        (
+            cols.saturating_add(20).max(100),
+            rows.saturating_add(8).max(32),
+        )
+    } else {
+        (
+            cols.saturating_add(8).max(90),
+            rows.saturating_add(4).max(28),
+        )
+    }
+}
+
+fn resize_session_pty(
+    registry: &Arc<Mutex<Registry>>,
+    session_id: &str,
+    cols: u16,
+    rows: u16,
+) -> Result<(), InitialPromptFailure> {
+    let reflow = with_session(registry, session_id, |session| {
+        session.resize_pty(cols, rows)
+    })
+    .ok_or(InitialPromptFailure::SessionEnded)?
+    .map_err(|_| InitialPromptFailure::InputFailed)?;
+    if let Some(reflow) = reflow {
+        reflow.apply();
+    }
+    Ok(())
+}
+
+fn pty_dimension(value: usize) -> u16 {
+    u16::try_from(value).unwrap_or(u16::MAX).max(2)
 }
 
 fn cursor_composer_ready(lines: &[String]) -> bool {
@@ -10094,6 +10182,42 @@ mod tests {
         assert!(cursor_composer_ready(&lines(include_str!(
             "../tests/fixtures/cursor_screens/idle.txt"
         ))));
+    }
+
+    #[test]
+    fn cursor_trust_redraw_repeats_until_the_dialog_leaves() {
+        assert!(!trust_nudge_due(
+            false,
+            true,
+            Some(Duration::from_millis(100)),
+            None
+        ));
+        assert!(trust_nudge_due(
+            false,
+            true,
+            Some(CURSOR_TRUST_REDRAW_AFTER),
+            None
+        ));
+        assert!(!trust_nudge_due(
+            true,
+            true,
+            Some(CURSOR_TRUST_REDRAW_AFTER),
+            Some(Duration::from_millis(200))
+        ));
+        assert!(trust_nudge_due(
+            true,
+            true,
+            Some(Duration::from_secs(5)),
+            Some(CURSOR_TRUST_REDRAW_EVERY)
+        ));
+        assert!(!trust_nudge_due(
+            true,
+            false,
+            Some(Duration::from_secs(5)),
+            Some(CURSOR_TRUST_REDRAW_EVERY)
+        ));
+        assert_eq!(cursor_trust_nudge_size(80, 24, true), (100, 32));
+        assert_eq!(cursor_trust_nudge_size(80, 24, false), (90, 28));
     }
 
     #[test]
