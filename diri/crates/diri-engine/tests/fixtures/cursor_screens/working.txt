@@ -1,9 +1,15 @@
+  │    [a] Trust this workspace                                                                  │
+  │    [q] Quit                                                                                  │
+  │                                                                                              │
+  │  ⏳ Trusting workspace...                                                                    │
+  │                                                                                              │
+  ╰──────────────────────────────────────────────────────────────────────────────────────────────╯
   Cursor Agent
   v2026.10.01-14929f9
   PINEAPPLE first
   PINEAPPLE
   SLOW second
-  ⠠⠜ Working
+ ⠠⠜ Working
   → Add a follow-up                                                                 ctrl+c to stop
   Diri Fake
   /private/tmp/cursor-fixture/project

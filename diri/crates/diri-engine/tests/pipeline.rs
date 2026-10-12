@@ -160,6 +160,8 @@ sleep 30
                 content_seq: snapshot.content_seq + step,
                 prompt_excerpt: None,
                 options: None,
+                stale_after_submit: false,
+                turn_started: false,
             }),
         };
         if let Some(change) = reducer

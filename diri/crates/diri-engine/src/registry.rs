@@ -152,7 +152,7 @@ pub(crate) struct CursorRefreshRequest {
 pub(crate) struct CursorRefreshResult {
     request: CursorRefreshRequest,
     conversation: Option<crate::history::CursorConversation>,
-    turn: Option<CursorTranscriptTurn>,
+    turn: Option<(CursorTranscriptTurn, u64)>,
 }
 
 /// Immutable input for a local provider-title refresh. Like Cursor metadata,
@@ -1338,11 +1338,12 @@ impl Registry {
                     outcome.status_change.is_some() || outcome.turn_completed
                 };
                 status_changed = match turn {
-                    CursorTranscriptTurn::Working => {
-                        changed(session.feed_signal(StatusSignal::CursorTranscriptWorking))
-                    }
-                    CursorTranscriptTurn::Idle => {
-                        let idle = session.feed_signal(StatusSignal::CursorTranscriptIdle);
+                    (CursorTranscriptTurn::Working, bytes) => changed(
+                        session.feed_signal(StatusSignal::CursorTranscriptWorking { bytes }),
+                    ),
+                    (CursorTranscriptTurn::Idle, bytes) => {
+                        let idle =
+                            session.feed_signal(StatusSignal::CursorTranscriptIdle { bytes });
                         let tick = session.feed_signal(StatusSignal::Tick);
                         changed(idle) || changed(tick)
                     }

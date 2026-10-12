@@ -6366,14 +6366,6 @@ fn is_copilot_folder_trust_screen(lines: &[String]) -> bool {
             .any(|line| line.contains("enter to select") && line.contains("esc to cancel"))
 }
 
-/// How long "Trusting workspace..." may sit before the first PTY resize.
-/// cursor-agent 2026.10.01 leaves that frame up until it observes a resize.
-const CURSOR_TRUST_REDRAW_AFTER: Duration = Duration::from_millis(400);
-
-/// Repeat the resize while the dialog stays. One early `SIGWINCH` is easy to
-/// miss: the process is still inside the trust submit and does not handle it.
-const CURSOR_TRUST_REDRAW_EVERY: Duration = Duration::from_secs(1);
-
 /// Cursor asks for workspace trust before creating its composer. Pasting into
 /// that selector drops the prompt, and the injector's later Enter accepts trust.
 /// Answer that specific selector first, with the same workspace-trust tradeoff
@@ -6384,10 +6376,6 @@ fn prepare_cursor_input(
     session_id: &str,
 ) -> Result<(), InitialPromptFailure> {
     let mut accepted = false;
-    let mut trusting_since: Option<Instant> = None;
-    let mut last_nudge: Option<Instant> = None;
-    let mut nudge_wide = false;
-    let mut nudge_base: Option<(u16, u16)> = None;
     for _ in 0..200 {
         let (exited, lines) = with_session(registry, session_id, |session| {
             (session.view().exited, session.screen_lines())
@@ -6396,27 +6384,7 @@ fn prepare_cursor_input(
         if exited {
             return Err(InitialPromptFailure::SessionEnded);
         }
-        let trusting = is_cursor_workspace_trust_screen(&lines)
-            && lines.iter().any(|line| line.contains("Trusting workspace"));
-        if !trusting {
-            trusting_since = None;
-        }
-        let settled_for = trusting_since.map(|since| since.elapsed());
-        let since_nudge = last_nudge.map(|at| at.elapsed());
-        if trust_nudge_due(last_nudge.is_some(), trusting, settled_for, since_nudge) {
-            if nudge_base.is_none() {
-                let (cols, rows) =
-                    with_session(registry, session_id, |session| session.screen_size())
-                        .ok_or(InitialPromptFailure::SessionEnded)?;
-                nudge_base = Some((pty_dimension(cols), pty_dimension(rows)));
-            }
-            let (cols, rows) = nudge_base.expect("set above");
-            nudge_wide = !nudge_wide;
-            let (next_cols, next_rows) = cursor_trust_nudge_size(cols, rows, nudge_wide);
-            resize_session_pty(registry, session_id, next_cols, next_rows)?;
-            last_nudge = Some(Instant::now());
-        }
-        if cursor_trust_selector_waiting(&lines) {
+        if is_cursor_workspace_trust_screen(&lines) {
             if !accepted {
                 with_session(registry, session_id, |session| {
                     session.send_text("a", false)
@@ -6425,70 +6393,12 @@ fn prepare_cursor_input(
                 .map_err(|_| InitialPromptFailure::InputFailed)?;
                 accepted = true;
             }
-        } else if trusting {
-            trusting_since.get_or_insert_with(Instant::now);
         } else if cursor_composer_ready(&lines) {
-            // False while the trust dialog is up, including "Trusting
-            // workspace...". The composer painted underneath is not the target.
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(100));
     }
     Err(InitialPromptFailure::SubmissionUnconfirmed)
-}
-
-/// Repeat while the dialog is still up. The first signal often lands while
-/// Cursor is inside the trust submit and is never handled.
-fn trust_nudge_due(
-    nudged: bool,
-    trusting: bool,
-    settled_for: Option<Duration>,
-    since_nudge: Option<Duration>,
-) -> bool {
-    if !trusting {
-        return false;
-    }
-    if !nudged {
-        return settled_for.unwrap_or_default() >= CURSOR_TRUST_REDRAW_AFTER;
-    }
-    since_nudge.unwrap_or_default() >= CURSOR_TRUST_REDRAW_EVERY
-}
-
-/// Two sizes that both differ from the launch size and from each other.
-/// 100×32 is a size that actually makes this Cursor build leave the dialog.
-fn cursor_trust_nudge_size(cols: u16, rows: u16, wide: bool) -> (u16, u16) {
-    if wide {
-        (
-            cols.saturating_add(20).max(100),
-            rows.saturating_add(8).max(32),
-        )
-    } else {
-        (
-            cols.saturating_add(8).max(90),
-            rows.saturating_add(4).max(28),
-        )
-    }
-}
-
-fn resize_session_pty(
-    registry: &Arc<Mutex<Registry>>,
-    session_id: &str,
-    cols: u16,
-    rows: u16,
-) -> Result<(), InitialPromptFailure> {
-    let reflow = with_session(registry, session_id, |session| {
-        session.resize_pty(cols, rows)
-    })
-    .ok_or(InitialPromptFailure::SessionEnded)?
-    .map_err(|_| InitialPromptFailure::InputFailed)?;
-    if let Some(reflow) = reflow {
-        reflow.apply();
-    }
-    Ok(())
-}
-
-fn pty_dimension(value: usize) -> u16 {
-    u16::try_from(value).unwrap_or(u16::MAX).max(2)
 }
 
 fn cursor_composer_ready(lines: &[String]) -> bool {
@@ -6502,53 +6412,17 @@ fn cursor_composer_ready(lines: &[String]) -> bool {
             })
 }
 
-/// cursor-agent 2026.10.01-14929f9 draws the composer under the trust dialog
-/// and replaces the old arrow-key footer with `Trusting workspace...` once
-/// the selector submits. The dialog is that exact box, never login.
+/// The selector is live only while an option carries the `▶` marker. Once
+/// answered, cursor-agent 2026.10.01-14929f9 repaints the box without it and
+/// with `Trusting workspace...`, then leaves that box above the composer as
+/// stale paint. The footer is not required: a composer painted under the
+/// dialog can push it out of view.
 fn is_cursor_workspace_trust_screen(lines: &[String]) -> bool {
-    let has_selector = lines
-        .iter()
-        .any(|line| line.contains("[a] Trust this workspace"))
-        && lines.iter().any(|line| line.contains("[q] Quit"));
-    has_selector && !lines.iter().any(|line| cursor_working_status_line(line))
-}
-
-/// `a` only while the selector is waiting. Once "Trusting workspace..." is
-/// showing, the key would be typed into the composer.
-fn cursor_trust_selector_waiting(lines: &[String]) -> bool {
-    is_cursor_workspace_trust_screen(lines)
-        && !lines.iter().any(|line| line.contains("Trusting workspace"))
-}
-
-fn cursor_working_status_line(line: &str) -> bool {
-    let rest = line
-        .trim()
-        .trim_start_matches(|c: char| ('\u{2800}'..='\u{28FF}').contains(&c))
-        .trim_start();
-    [
-        "Composing",
-        "Generating",
-        "Thinking",
-        "Responding",
-        "Working",
-        "Grep",
-        "Read file",
-        "Read ",
-        "Edit ",
-        "Delete ",
-        "List ",
-        "Glob",
-        "Search ",
-        "Web search",
-        "Fetch ",
-        "Web fetch",
-        "Subagent",
-        "Running ",
-        "Shell command",
-        "Codebase search",
-    ]
-    .iter()
-    .any(|verb| rest.starts_with(verb))
+    let has = |needle: &str| lines.iter().any(|line| line.contains(needle));
+    has("[a] Trust this workspace")
+        && has("[q] Quit")
+        && (has("▶ [a] Trust this workspace") || has("▶ [q] Quit"))
+        && !has("Trusting workspace")
 }
 
 /// Types and submits an initial prompt at most once. Screen observations can
@@ -9201,6 +9075,8 @@ mod tests {
                             content_seq: 1,
                             prompt_excerpt: None,
                             options: None,
+                            stale_after_submit: false,
+                            turn_started: false,
                         },
                     ));
             }
@@ -10156,20 +10032,24 @@ mod tests {
     #[test]
     fn cursor_trust_requires_the_live_selector() {
         let lines = |screen: &str| screen.lines().map(str::to_owned).collect::<Vec<_>>();
-        let trust = include_str!("../tests/fixtures/cursor_screens/trust.txt");
-        let trusting = lines(trust);
-        assert!(is_cursor_workspace_trust_screen(&trusting));
+        let waiting = lines(include_str!("../tests/fixtures/cursor_screens/trust.txt"));
+        assert!(is_cursor_workspace_trust_screen(&waiting));
+        assert!(!cursor_composer_ready(&waiting));
+        // A build that paints the composer under the dialog and no footer.
+        let footerless = include_str!("../tests/fixtures/cursor_screens/trust.txt").replace(
+            "Use arrow keys to navigate, Enter to select, or press the key shown",
+            "",
+        ) + "  Cursor Agent\n  → Plan, search, build anything\n  Diri Fake\n";
+        let footerless = lines(&footerless);
+        assert!(is_cursor_workspace_trust_screen(&footerless));
         assert!(
-            !cursor_trust_selector_waiting(&trusting),
-            "Trusting workspace... must not take another a"
-        );
-        assert!(
-            !cursor_composer_ready(&trusting),
+            !cursor_composer_ready(&footerless),
             "the composer under the dialog is not the input target"
         );
-        let waiting = lines(&trust.replace("⏳ Trusting workspace...", ""));
-        assert!(cursor_trust_selector_waiting(&waiting));
-        assert!(!cursor_composer_ready(&waiting));
+        // After `a` the box stays as stale paint above a composer that works.
+        let answered = lines(include_str!("../tests/fixtures/cursor_screens/trusted.txt"));
+        assert!(!is_cursor_workspace_trust_screen(&answered));
+        assert!(cursor_composer_ready(&answered));
         for other in [
             include_str!("../tests/fixtures/cursor_screens/idle.txt"),
             include_str!("../tests/fixtures/cursor_screens/login.txt"),
@@ -10182,42 +10062,6 @@ mod tests {
         assert!(cursor_composer_ready(&lines(include_str!(
             "../tests/fixtures/cursor_screens/idle.txt"
         ))));
-    }
-
-    #[test]
-    fn cursor_trust_redraw_repeats_until_the_dialog_leaves() {
-        assert!(!trust_nudge_due(
-            false,
-            true,
-            Some(Duration::from_millis(100)),
-            None
-        ));
-        assert!(trust_nudge_due(
-            false,
-            true,
-            Some(CURSOR_TRUST_REDRAW_AFTER),
-            None
-        ));
-        assert!(!trust_nudge_due(
-            true,
-            true,
-            Some(CURSOR_TRUST_REDRAW_AFTER),
-            Some(Duration::from_millis(200))
-        ));
-        assert!(trust_nudge_due(
-            true,
-            true,
-            Some(Duration::from_secs(5)),
-            Some(CURSOR_TRUST_REDRAW_EVERY)
-        ));
-        assert!(!trust_nudge_due(
-            true,
-            false,
-            Some(Duration::from_secs(5)),
-            Some(CURSOR_TRUST_REDRAW_EVERY)
-        ));
-        assert_eq!(cursor_trust_nudge_size(80, 24, true), (100, 32));
-        assert_eq!(cursor_trust_nudge_size(80, 24, false), (90, 28));
     }
 
     #[test]

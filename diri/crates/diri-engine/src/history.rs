@@ -736,9 +736,11 @@ pub(crate) enum CursorTranscriptTurn {
 /// Cursor writes `tool_use` while a turn is in flight and a text-only
 /// assistant line (or `turn_ended`) when it is done. The tail can still belong
 /// to the preceding turn while a new response streams; it must not override
-/// a live working spinner.
-pub(crate) fn cursor_transcript_turn(path: &Path) -> Option<CursorTranscriptTurn> {
-    classify_cursor_transcript_object(&last_jsonl_object(path)?)
+/// a live working spinner, so the file's size comes back with it: an
+/// unchanged size is the same tail.
+pub(crate) fn cursor_transcript_turn(path: &Path) -> Option<(CursorTranscriptTurn, u64)> {
+    let (object, bytes) = last_jsonl_object(path)?;
+    Some((classify_cursor_transcript_object(&object)?, bytes))
 }
 
 fn classify_cursor_transcript_object(object: &Value) -> Option<CursorTranscriptTurn> {
@@ -768,7 +770,7 @@ fn assistant_uses_tool(object: &Value) -> bool {
         })
 }
 
-fn last_jsonl_object(path: &Path) -> Option<Value> {
+fn last_jsonl_object(path: &Path) -> Option<(Value, u64)> {
     let mut handle = open_regular_readonly(path)?;
     let end = handle.seek(SeekFrom::End(0)).ok()?;
     if end == 0 {
@@ -792,7 +794,7 @@ fn last_jsonl_object(path: &Path) -> Option<Value> {
             newest = Some(value);
         }
     }
-    newest
+    Some((newest?, end))
 }
 
 /// Cursor's workspace-paths.js replaces every run of non-ASCII-alphanumeric
@@ -2319,7 +2321,7 @@ mod tests {
 "#,
         );
         assert_eq!(
-            cursor_transcript_turn(&path),
+            cursor_transcript_turn(&path).map(|(turn, _)| turn),
             Some(CursorTranscriptTurn::Working)
         );
 
@@ -2330,7 +2332,7 @@ mod tests {
 "#,
         );
         assert_eq!(
-            cursor_transcript_turn(&path),
+            cursor_transcript_turn(&path).map(|(turn, _)| turn),
             Some(CursorTranscriptTurn::Working)
         );
 
@@ -2341,7 +2343,7 @@ mod tests {
 "#,
         );
         assert_eq!(
-            cursor_transcript_turn(&path),
+            cursor_transcript_turn(&path).map(|(turn, _)| turn),
             Some(CursorTranscriptTurn::Idle)
         );
 
@@ -2352,7 +2354,7 @@ mod tests {
 "#,
         );
         assert_eq!(
-            cursor_transcript_turn(&path),
+            cursor_transcript_turn(&path).map(|(turn, _)| turn),
             Some(CursorTranscriptTurn::Idle)
         );
     }

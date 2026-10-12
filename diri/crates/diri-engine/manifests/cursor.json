@@ -101,7 +101,7 @@
       "priority": 1350,
       "region": "bottom_non_empty_lines",
       "regionLines": 24,
-      "_notice": "cursor-agent 2026.10.01-14929f9 drops the arrow-key footer, paints the composer under the dialog, and shows Trusting workspace... while the selector is submitting. A working status line means that box is scrollback.",
+      "_notice": "Live only while an option carries the selection marker. Once answered, cursor-agent 2026.10.01-14929f9 repaints the box without the marker and with Trusting workspace..., then leaves it above the composer as stale paint. The footer is not required: the composer can push it out of the region.",
       "when": {
         "all": [
           {
@@ -111,8 +111,11 @@
             "contains": "[q] quit"
           },
           {
+            "lineRegex": "▶ \\[[aq]\\] (Trust this workspace|Quit)"
+          },
+          {
             "not": {
-              "lineRegex": "^\\s*[⠀-⣿]*\\s*(Composing|Generating|Thinking|Responding|Working|Grep|Read |Read file|Edit |Delete |List |Glob |Search |Web search|Fetch |Web fetch|Subagent|Running |Shell command|Codebase search)"
+              "contains": "trusting workspace"
             }
           }
         ]
@@ -199,19 +202,10 @@
             "contains": "write to this file?"
           },
           {
-            "contains": "run this command outside the sandbox?"
-          },
-          {
             "contains": "proceed with this http request?"
           },
           {
-            "contains": "read this file?"
-          },
-          {
-            "contains": "allow this web search?"
-          },
-          {
-            "contains": "allow this web fetch?"
+            "lineRegex": "^\\s*(Run this command outside the sandbox|Read this file|Allow this web search|Allow this web fetch)\\?\\s*$"
           },
           {
             "contains": "proceed with this edit?"
@@ -253,7 +247,10 @@
       "when": {
         "lineRegex": "^\\s*[⠀-⣿]*\\s*(Composing|Generating|Thinking|Responding|Working|Grep|Read |Read file|Edit |Delete |List |Glob |Search |Web search|Fetch |Web fetch|Subagent|Running |Shell command|Codebase search)"
       },
-      "_notice": "Default zen UI disables OSC status titles, prefixes Working with braille frames, and can add task rows below the composer."
+      "_notice": "Default zen UI disables OSC status titles, prefixes Working with braille frames, and can add task rows below the composer.",
+      "flags": [
+        "turn_started"
+      ]
     },
     {
       "id": "idle-prompt-arrow",
@@ -263,7 +260,11 @@
       "regionLines": 8,
       "when": {
         "lineRegex": "^\\s*\u2192\\s*Add a follow-up"
-      }
+      },
+      "_notice": "cursor-agent 2026.10.01-14929f9 keeps the previous follow-up arrow after Enter until Generating/Thinking paints.",
+      "flags": [
+        "stale_after_submit"
+      ]
     },
     {
       "id": "idle-follow-up-placeholder",
@@ -279,7 +280,10 @@
             "contains": "plan, search, build anything"
           }
         ]
-      }
+      },
+      "flags": [
+        "stale_after_submit"
+      ]
     }
   ]
 }

@@ -25,6 +25,8 @@ fn observation(state: ManifestState, seq: u64) -> ScreenObservation {
         content_seq: seq,
         prompt_excerpt: None,
         options: None,
+        stale_after_submit: false,
+        turn_started: false,
     }
 }
 
@@ -125,6 +127,8 @@ fn blocker(seq: u64, excerpt: &str) -> ScreenObservation {
         content_seq: seq,
         prompt_excerpt: Some(excerpt.into()),
         options: Some(vec!["Yes".into(), "No".into()]),
+        stale_after_submit: false,
+        turn_started: false,
     }
 }
 
@@ -1091,7 +1095,7 @@ fn cursor_transcript_idle_commits_even_when_the_osc_still_says_working() {
         now,
     );
     now += Duration::from_millis(100);
-    reducer.reduce(StatusSignal::CursorTranscriptIdle, now);
+    reducer.reduce(StatusSignal::CursorTranscriptIdle { bytes: 100 }, now);
     now += Duration::from_millis(100);
     let still_working = reducer.reduce(
         StatusSignal::Screen(observation(ManifestState::Working, 2)),
@@ -1114,7 +1118,7 @@ fn cursor_transcript_idle_commits_even_when_the_osc_still_says_working() {
     assert_eq!(*reducer.status(), SessionStatus::Idle);
 
     now += Duration::from_millis(100);
-    reducer.reduce(StatusSignal::CursorTranscriptWorking, now);
+    reducer.reduce(StatusSignal::CursorTranscriptWorking { bytes: 200 }, now);
     assert_eq!(*reducer.status(), SessionStatus::Working);
 }
 
@@ -1406,34 +1410,57 @@ fn a_reappearing_blocker_cancels_the_quiet_idle_frame() {
     assert!(matches!(reducer.status(), SessionStatus::NeedsInput(_)));
 }
 
+/// Cursor's composer after Enter: the previous turn's follow-up arrow.
+fn submit_chrome(seq: u64) -> ScreenObservation {
+    ScreenObservation {
+        matched_rule_id: "idle-prompt-arrow".into(),
+        stale_after_submit: true,
+        ..observation(ManifestState::Idle, seq)
+    }
+}
+
+/// Cursor's Generating/Thinking line.
+fn turn_started(seq: u64) -> ScreenObservation {
+    ScreenObservation {
+        matched_rule_id: "working-status-line".into(),
+        turn_started: true,
+        ..observation(ManifestState::Working, seq)
+    }
+}
+
+/// A Cursor reducer that has finished one turn (transcript at 100 bytes) and
+/// just had the next prompt submitted at the returned time.
+fn cursor_submitted() -> (StatusReducer, SystemTime) {
+    let mut reducer = StatusReducer::new(Authority::ScreenPrimary, t0())
+        .with_manifest("cursor", Some("2026.10.01"));
+    let now = settled(&mut reducer, t0());
+    reducer.reduce(StatusSignal::Screen(turn_started(1)), now);
+    reducer.reduce(
+        StatusSignal::CursorTranscriptWorking { bytes: 100 },
+        now + Duration::from_millis(10),
+    );
+    assert_eq!(reducer.status(), &SessionStatus::Working);
+    let submitted = now + Duration::from_millis(50);
+    reducer.reduce(StatusSignal::UserSubmission, submitted);
+    (reducer, submitted)
+}
+
 /// Submitting and leaving Diri used to post "Cursor finished" or "needs you"
 /// while the agent was still working. cursor-agent 2026.10.01-14929f9 keeps
 /// the follow-up arrow up until Generating/Thinking paints, and the transcript
 /// tail can still be the previous turn.
 #[test]
 fn cursor_follow_up_arrow_after_submit_does_not_finish_or_ask() {
-    let mut reducer = StatusReducer::new(Authority::ScreenPrimary, t0())
-        .with_manifest("cursor", Some("2026.10.01"));
-    let now = settled(&mut reducer, t0());
-    reducer.reduce(
-        StatusSignal::Screen(observation(ManifestState::Working, 1)),
-        now,
-    );
-    assert_eq!(reducer.status(), &SessionStatus::Working);
+    let (mut reducer, submitted) = cursor_submitted();
 
-    let submitted = now + Duration::from_millis(50);
-    reducer.reduce(StatusSignal::UserSubmission, submitted);
-
-    let mut arrow = observation(ManifestState::Idle, 2);
-    arrow.matched_rule_id = "idle-prompt-arrow".into();
     let arrow_at = submitted + Duration::from_millis(20);
-    let outcome = reducer.reduce(StatusSignal::Screen(arrow), arrow_at);
+    let outcome = reducer.reduce(StatusSignal::Screen(submit_chrome(2)), arrow_at);
     assert!(outcome.needs_input.is_none());
     assert!(!outcome.turn_completed);
     assert_eq!(reducer.status(), &SessionStatus::Working);
 
     let stale = reducer.reduce(
-        StatusSignal::CursorTranscriptIdle,
+        StatusSignal::CursorTranscriptIdle { bytes: 100 },
         arrow_at + Duration::from_millis(10),
     );
     assert!(!stale.turn_completed);
@@ -1450,96 +1477,133 @@ fn cursor_follow_up_arrow_after_submit_does_not_finish_or_ask() {
 
 #[test]
 fn cursor_ready_title_blocker_and_later_idle_still_notify_after_submit() {
-    let mut ready = StatusReducer::new(Authority::ScreenPrimary, t0())
-        .with_manifest("cursor", Some("2026.10.01"));
-    let now = settled(&mut ready, t0());
+    // A Ready title is not composer chrome.
+    let (mut ready, at) = cursor_submitted();
     ready.reduce(
-        StatusSignal::Screen(observation(ManifestState::Working, 1)),
-        now,
+        StatusSignal::Screen(submit_chrome(2)),
+        at + Duration::from_millis(10),
     );
-    ready.reduce(
-        StatusSignal::UserSubmission,
-        now + Duration::from_millis(10),
-    );
-    let mut arrow = observation(ManifestState::Idle, 2);
-    arrow.matched_rule_id = "idle-prompt-arrow".into();
-    ready.reduce(StatusSignal::Screen(arrow), now + Duration::from_millis(20));
-    let mut title = observation(ManifestState::Idle, 3);
-    title.matched_rule_id = "idle-osc-title".into();
-    ready.reduce(StatusSignal::Screen(title), now + Duration::from_millis(30));
-    let finished = ready.reduce(StatusSignal::Tick, now + Duration::from_millis(800));
+    let title = ScreenObservation {
+        matched_rule_id: "idle-osc-title".into(),
+        ..observation(ManifestState::Idle, 3)
+    };
+    ready.reduce(StatusSignal::Screen(title), at + Duration::from_millis(20));
+    let finished = ready.reduce(StatusSignal::Tick, at + Duration::from_millis(800));
     assert_eq!(ready.status(), &SessionStatus::Idle);
     assert!(finished.turn_completed);
 
-    let mut blocked = StatusReducer::new(Authority::ScreenPrimary, t0())
-        .with_manifest("cursor", Some("2026.10.01"));
-    let now = settled(&mut blocked, t0());
-    blocked.reduce(
-        StatusSignal::Screen(observation(ManifestState::Working, 1)),
-        now,
+    let (mut blocked, at) = cursor_submitted();
+    let outcome = blocked.reduce(
+        StatusSignal::Screen(blocker(2, "Run this command?")),
+        at + Duration::from_millis(10),
     );
-    blocked.reduce(
-        StatusSignal::UserSubmission,
-        now + Duration::from_millis(10),
-    );
-    let outcome = blocked.reduce(StatusSignal::Screen(blocker(2, "Run this command?")), now);
     assert!(matches!(
         outcome.status_change,
         Some(SessionStatus::NeedsInput(_))
     ));
     assert!(outcome.needs_input.is_some());
 
-    let mut transcript = StatusReducer::new(Authority::ScreenPrimary, t0())
-        .with_manifest("cursor", Some("2026.10.01"));
-    let now = settled(&mut transcript, t0());
+    // The transcript grew past the submit: this turn's own end.
+    let (mut transcript, at) = cursor_submitted();
     transcript.reduce(
-        StatusSignal::Screen(observation(ManifestState::Working, 1)),
-        now,
-    );
-    transcript.reduce(
-        StatusSignal::UserSubmission,
-        now + Duration::from_millis(10),
-    );
-    transcript.reduce(
-        StatusSignal::CursorTranscriptIdle,
-        now + Duration::from_millis(20),
+        StatusSignal::CursorTranscriptIdle { bytes: 100 },
+        at + Duration::from_millis(10),
     );
     assert_eq!(transcript.status(), &SessionStatus::Working);
     transcript.reduce(
-        StatusSignal::CursorTranscriptWorking,
-        now + Duration::from_millis(30),
+        StatusSignal::Screen(submit_chrome(2)),
+        at + Duration::from_millis(20),
     );
-    transcript.reduce(
-        StatusSignal::CursorTranscriptIdle,
-        now + Duration::from_millis(40),
+    let ended = transcript.reduce(
+        StatusSignal::CursorTranscriptIdle { bytes: 180 },
+        at + Duration::from_millis(30),
     );
-    let finished = transcript.reduce(StatusSignal::Tick, now + Duration::from_millis(140));
+    let finished = transcript.reduce(StatusSignal::Tick, at + Duration::from_millis(140));
     assert_eq!(transcript.status(), &SessionStatus::Idle);
-    assert!(finished.turn_completed);
+    assert!(ended.turn_completed || finished.turn_completed);
 
-    let mut later = StatusReducer::new(Authority::ScreenPrimary, t0())
-        .with_manifest("cursor", Some("2026.10.01"));
-    let now = settled(&mut later, t0());
+    let (mut later, at) = cursor_submitted();
     later.reduce(
+        StatusSignal::Screen(turn_started(2)),
+        at + Duration::from_millis(10),
+    );
+    later.reduce(
+        StatusSignal::Screen(submit_chrome(3)),
+        at + Duration::from_millis(20),
+    );
+    let finished = later.reduce(StatusSignal::Tick, at + Duration::from_millis(800));
+    assert_eq!(later.status(), &SessionStatus::Idle);
+    assert!(finished.turn_completed);
+}
+
+/// Rejecting a permission prompt raised before any Generating frame returns
+/// to the follow-up arrow. That must clear the blocker, not hold it forever.
+#[test]
+fn cursor_blocker_dismissed_after_submit_returns_to_idle() {
+    let (mut reducer, at) = cursor_submitted();
+    reducer.reduce(
+        StatusSignal::Screen(blocker(2, "Run this command?")),
+        at + Duration::from_millis(10),
+    );
+    assert!(matches!(reducer.status(), SessionStatus::NeedsInput(_)));
+    reducer.reduce(
+        StatusSignal::Screen(submit_chrome(3)),
+        at + Duration::from_millis(20),
+    );
+    reducer.reduce(
+        StatusSignal::Screen(submit_chrome(4)),
+        at + Duration::from_millis(30),
+    );
+    assert_eq!(reducer.status(), &SessionStatus::Idle);
+}
+
+/// A reply too quick to show Generating or a working transcript still ends,
+/// once the submit hold runs out, from the arrow it leaves on screen.
+#[test]
+fn cursor_turn_without_working_evidence_ends_after_the_submit_hold() {
+    let (mut reducer, at) = cursor_submitted();
+    reducer.reduce(
+        StatusSignal::Screen(submit_chrome(2)),
+        at + Duration::from_millis(10),
+    );
+    let hold = ReducerTiming::default().submit_chrome_hold;
+    let mut now = at + Duration::from_millis(20);
+    while now < at + hold {
+        let outcome = reducer.reduce(StatusSignal::Tick, now);
+        assert!(!outcome.turn_completed);
+        now += Duration::from_millis(500);
+    }
+    assert_eq!(reducer.status(), &SessionStatus::Working);
+    let mut completed = false;
+    for _ in 0..4 {
+        completed |= reducer.reduce(StatusSignal::Tick, now).turn_completed;
+        now += Duration::from_millis(500);
+    }
+    assert_eq!(reducer.status(), &SessionStatus::Idle);
+    assert!(completed);
+}
+
+/// Agents whose rules carry no `stale_after_submit` flag are unaffected.
+#[test]
+fn submit_chrome_hold_needs_the_rule_flag() {
+    let mut reducer =
+        StatusReducer::new(Authority::ScreenPrimary, t0()).with_manifest("codex", Some("8"));
+    let now = settled(&mut reducer, t0());
+    reducer.reduce(
         StatusSignal::Screen(observation(ManifestState::Working, 1)),
         now,
     );
-    later.reduce(
+    reducer.reduce(
         StatusSignal::UserSubmission,
         now + Duration::from_millis(10),
     );
-    let mut spinner = observation(ManifestState::Working, 2);
-    spinner.matched_rule_id = "working-status-line".into();
-    later.reduce(
-        StatusSignal::Screen(spinner),
+    reducer.reduce(
+        StatusSignal::Screen(observation(ManifestState::Idle, 2)),
         now + Duration::from_millis(20),
     );
-    let mut arrow = observation(ManifestState::Idle, 3);
-    arrow.matched_rule_id = "idle-prompt-arrow".into();
-    later.reduce(StatusSignal::Screen(arrow), now + Duration::from_millis(30));
-    let finished = later.reduce(StatusSignal::Tick, now + Duration::from_millis(800));
-    assert_eq!(later.status(), &SessionStatus::Idle);
-    assert!(finished.turn_completed);
+    let outcome = reducer.reduce(StatusSignal::Tick, now + Duration::from_millis(800));
+    assert_eq!(reducer.status(), &SessionStatus::Idle);
+    assert!(outcome.turn_completed);
 }
 
 #[test]
@@ -1547,10 +1611,10 @@ fn cursor_transcript_cannot_finish_a_live_spinner() {
     let mut reducer = StatusReducer::new(Authority::ScreenPrimary, t0());
     let now = settled(&mut reducer, t0());
     let mut working = observation(ManifestState::Working, 1);
-    working.matched_rule_id = "working-status-line".into();
+    working.turn_started = true;
     reducer.reduce(StatusSignal::Screen(working), now);
     reducer.reduce(
-        StatusSignal::CursorTranscriptIdle,
+        StatusSignal::CursorTranscriptIdle { bytes: 100 },
         now + Duration::from_millis(100),
     );
     let outcome = reducer.reduce(StatusSignal::Tick, now + Duration::from_secs(1));
