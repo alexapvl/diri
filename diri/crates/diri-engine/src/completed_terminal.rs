@@ -219,7 +219,7 @@ struct Admission;
 impl Admission {
     fn acquire() -> Result<Self> {
         ACTIVE
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                 (n < 2).then_some(n + 1)
             })
             .map(|_| Self)
@@ -784,9 +784,11 @@ mod tests {
             listening_ports: None,
             foreground_agent: None,
             terminal_cwd: None,
+            agent_workspace: None,
             note_id: None,
             foreground_ports: None,
             terminal_progress: None,
+            scheduled_run: None,
         }
     }
 
@@ -796,6 +798,8 @@ mod tests {
             reason: ExitReason::Exited,
             code: Some(code),
             signal: None,
+            system_restart: false,
+            interrupted: false,
         }
     }
 
@@ -1116,6 +1120,8 @@ mod tests {
             reason: ExitReason::DaemonRestart,
             code: None,
             signal: None,
+            system_restart: false,
+            interrupted: false,
         };
         assert!(
             matches!(
@@ -1133,6 +1139,8 @@ mod tests {
             reason: ExitReason::Exited,
             code: Some(0),
             signal: Some(9),
+            system_restart: false,
+            interrupted: false,
         };
         assert!(matches!(
             store.publish(
@@ -1167,6 +1175,8 @@ mod tests {
             reason: ExitReason::Signaled,
             code: None,
             signal: Some(15),
+            system_restart: false,
+            interrupted: false,
         };
         store
             .publish(

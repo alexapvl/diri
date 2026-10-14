@@ -11,15 +11,12 @@ setInputMethod('pointer');
 document.addEventListener('pointerdown', () => setInputMethod('pointer'), true);
 document.addEventListener('keydown', () => setInputMethod('keyboard'), true);
 const icon = name => `<span class="icon" data-icon="${name}" aria-hidden="true"></span>`;
+// Icon images come from style.css ([data-icon] / [data-agent] rules); this only keeps them out of the accessibility tree.
 function paintIcons(root = document) {
-  $$('[data-icon], [data-agent]', root).forEach(el => {
-    const folder = el.dataset.agent ? 'brand' : 'icons';
-    el.style.setProperty('--icon', `url("assets/${folder}/${el.dataset.agent || el.dataset.icon}.svg")`);
-    el.setAttribute('aria-hidden', 'true');
-  });
+  $$('[data-icon], [data-agent]', root).forEach(el => el.setAttribute('aria-hidden', 'true'));
 }
 const chats = {
-  release: { title: 'Ship the 0.9 release', agent: 'claude', name: 'Claude Code', view: 'swarm', prompt: 'Ship 0.9. Split the work across agents, verify each part, and report back.' },
+  release: { title: 'Ship the 0.9 release', agent: 'claude', name: 'Claude Code', view: 'swarm', prompt: 'Use diri to ship 0.9: split the work across agents and report back.' },
   website: { title: 'Build the Diri website', agent: 'codex', name: 'Codex', prompt: 'Make a website for Diri using the app’s design system.' },
   notes: { title: 'Weekly plan', agent: 'claude', name: 'Claude Code', prompt: 'Create a weekly plan from these notes.' },
   details: { title: 'Keyboard navigation', agent: 'cursor', name: 'Cursor', prompt: 'Fix keyboard navigation in the command menu.' },
@@ -45,11 +42,13 @@ function selectChat(id) {
   const preview = agentPreviews[chat.view || chat.agent].render(chat, notesAnswer);
   $('.terminal-body').dataset.cli = chat.agent;
   $('#terminal-content').innerHTML = `<div class="terminal-scene">${preview.html}</div>`;
+  $('#terminal-content').classList.toggle('tail', Boolean(preview.tail));
   $('.terminal-composer').innerHTML = preview.composer;
   $('.terminal-footer').innerHTML = preview.footer;
   $('.changes-content').innerHTML = preview.changes;
   $('.diff-count').textContent = `+${$$('.changes-content .added').length}`;
   $$('.agent-switch').forEach(button => button.setAttribute('aria-pressed', String(button.dataset.chat === id)));
+  swarmScene.shown(id === 'release');
   const newAgent = $('.new-chat-agent');
   newAgent.dataset.agent = chat.agent;
   newAgent.className = `agent-logo new-chat-agent ${chat.agent}`;
@@ -158,7 +157,6 @@ document.addEventListener('keydown', event => {
   }
   if (event.key === 'Escape' && overlay) { event.preventDefault(); closeOverlay(); }
 });
-selectChat(currentChat);
 
 function toggleChanges() {
   const hidden = $('#demo-window').classList.toggle('changes-hidden');
@@ -183,3 +181,73 @@ const masthead = $('.site-header');
 const syncMasthead = () => masthead.classList.toggle('scrolled', scrollY > 8);
 addEventListener('scroll', syncMasthead, { passive: true });
 syncMasthead();
+
+// The swarm demo: the first frame is already mid-run (three helpers working), so the window is never empty.
+// When the window scrolls into view the helpers finish one by one, then it rests on its final state.
+const swarmScene = (() => {
+  const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const steps = ['prompt', 'plan', 'spawn', 'notes', 'done'];
+  let state = 'idle';
+  let timers = [];
+  const later = (ms, fn) => timers.push(setTimeout(fn, ms));
+  const setRow = (row, status) => {
+    const cell = $('.chat-state', row);
+    if (!cell) return;
+    cell.className = `chat-state ${status === 'done' ? 'completed' : 'working'}`;
+    cell.setAttribute('aria-label', status === 'done' ? 'Completed' : 'Working');
+    $('.icon', cell).dataset.icon = status === 'done' ? 'check' : 'working-0';
+    paintIcons(row);
+  };
+  const setChild = (n, status) => {
+    const line = $(`.swarm-child[data-child="${n}"] .swarm-state`);
+    if (line) { line.className = `swarm-state ${status === 'done' ? 'done' : 'run'}`; line.textContent = status === 'done' ? '✓' : '◌'; }
+    const row = $$('[data-child-row]')[n - 1];
+    if (row) setRow(row, status);
+  };
+  const reveal = step => {
+    const line = $(`[data-step="${step}"]`);
+    if (!line?.classList.contains('scene-hidden')) return;
+    line.classList.remove('scene-hidden');
+    if (state === 'playing') line.classList.add('scene-in');
+  };
+  const footer = text => { const f = $('.swarm-footer'); if (f) f.textContent = text; };
+  function finish() {
+    timers.forEach(clearTimeout); timers = [];
+    state = 'done';
+    $('.product').classList.remove('scene-running');
+    steps.forEach(reveal);
+    [1, 2, 3].forEach(n => setChild(n, 'done'));
+    setRow($('.chat-row[data-chat="release"]'), 'done');
+    footer('3 agents finished');
+  }
+  function prepare() {
+    ['notes', 'done'].forEach(step => $(`[data-step="${step}"]`)?.classList.add('scene-hidden'));
+    [1, 2, 3].forEach(n => setChild(n, 'run'));
+    setRow($('.chat-row[data-chat="release"]'), 'run');
+    footer('3 agents running');
+  }
+  function play() {
+    state = 'playing';
+    $('.product').classList.add('scene-running');
+    let t = 1400;
+    later(t, () => { setChild(1, 'done'); footer('2 agents running'); });
+    later(t += 700, () => reveal('notes'));
+    later(t += 1500, () => { setChild(2, 'done'); footer('1 agent running'); });
+    later(t += 1300, () => { setChild(3, 'done'); reveal('done'); footer('3 agents finished'); });
+    later(t += 400, finish);
+  }
+  let visible = false;
+  const observer = new IntersectionObserver(entries => {
+    visible = entries.some(entry => entry.isIntersecting);
+    if (visible && state === 'armed') play();
+  }, { threshold: 0.3 });
+  observer.observe($('#demo-window'));
+  return {
+    shown(isSwarm) {
+      if (!isSwarm) { if (state === 'playing' || state === 'armed') state = 'done'; timers.forEach(clearTimeout); timers = []; $('.product').classList.remove('scene-running'); return; }
+      if (state === 'idle' && !reduced) { state = 'armed'; prepare(); if (visible) play(); }
+      else finish();
+    }
+  };
+})();
+selectChat(currentChat);

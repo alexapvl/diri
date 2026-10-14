@@ -328,6 +328,7 @@ string_enum! {
         CodexNotify => "codexNotify",
         ScreenScrape => "screenScrape",
         TerminalLine => "terminalLine",
+        ProgramStatus => "programStatus",
     }
 }
 
@@ -344,6 +345,7 @@ string_enum! {
         ProcessLiveness => "processLiveness",
         Staleness => "staleness",
         Transport => "transport",
+        ProgramStatus => "programStatus",
     }
 }
 
@@ -422,6 +424,50 @@ pub struct ExitInfo {
     pub code: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signal: Option<i32>,
+    /// With [`ExitReason::DaemonRestart`]: the session's process belonged to
+    /// an earlier boot, so the computer restarting ended it, not Diri. A
+    /// field rather than a reason so older peers, which decode an unknown
+    /// reason as `Unknown`, still treat the session as restart-ended and
+    /// offer to resume it.
+    #[serde(
+        rename = "systemRestart",
+        default,
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub system_restart: bool,
+    /// Something outside the Agent and the person ended it, and Diri did not
+    /// ask: its Holder vanished without reporting an exit, or the Agent was
+    /// killed by a termination signal (macOS force-quitting an app the Agent
+    /// launched takes its whole process coalition down this way). A field so
+    /// older peers keep reading the plain exit.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub interrupted: bool,
+}
+
+impl ExitInfo {
+    /// A session whose holder an Engine restart found gone: `system_restart`
+    /// when the machine rebooted under it.
+    pub fn restart(system_restart: bool) -> Self {
+        Self {
+            reason: ExitReason::DaemonRestart,
+            code: None,
+            signal: None,
+            system_restart,
+            interrupted: false,
+        }
+    }
+
+    /// Ended by a Diri or computer restart, so resuming it continues the
+    /// work rather than repeating a choice the user made.
+    pub fn ended_by_restart(&self) -> bool {
+        self.reason == ExitReason::DaemonRestart
+    }
+
+    /// Ended by a restart or an outside kill rather than by the Agent or the
+    /// person, so Diri brings it back the way it does after a restart.
+    pub fn ended_by_interruption(&self) -> bool {
+        self.ended_by_restart() || self.interrupted
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -605,7 +651,7 @@ mod swift_int_keyed_map {
                     ));
                 }
                 let mut map = BTreeMap::new();
-                for pair in flat.chunks_exact(2) {
+                for pair in flat.as_chunks::<2>().0 {
                     let key = i32::try_from(pair[0])
                         .map_err(|_| D::Error::custom("int-keyed map key out of i32 range"))?;
                     map.insert(key, pair[1]);
@@ -710,6 +756,39 @@ pub struct PullRequestStatus {
 pub struct PortInfo {
     pub port: i64,
     pub process_name: String,
+}
+
+/// Where a local Agent reports working, folded from its hooks. `cwd` on the
+/// record stays the launch directory, which owns the Session's project; this
+/// lets a client follow an Agent that moved into, or edits files in, another
+/// checkout (a `git worktree`) of the same repository.
+///
+/// Additive and optional: older Engines never write it, and clients fall back
+/// to the launch directory.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentWorkspace {
+    /// The directory the Agent last reported working in, and when it first
+    /// reported that directory (not the latest report, so an edit elsewhere
+    /// after the move still reads as newer).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<AgentPlace>,
+    /// Files the Agent (or one of its subagents) recently edited, most recent
+    /// first, distinct, bounded by [`AgentWorkspace::MAX_EDITS`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub edits: Vec<AgentPlace>,
+}
+
+impl AgentWorkspace {
+    pub const MAX_EDITS: usize = 12;
+}
+
+/// An absolute path and when the Agent was last seen there.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentPlace {
+    pub path: String,
+    pub at: DateMillis,
 }
 
 /// What a program reported with `OSC 9;4` (ConEmu's progress sequence, which
@@ -863,6 +942,9 @@ pub struct SessionRecord {
     /// the launch directory, which owns the Session's project and worktree.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_cwd: Option<String>,
+    /// Where a local Agent's hooks report it working; see [`AgentWorkspace`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_workspace: Option<AgentWorkspace>,
     /// For a note Session (`kind` = [`AgentKind::NOTE_ID`]): the id of its
     /// Markdown file in the notes store.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -876,6 +958,9 @@ pub struct SessionRecord {
     /// still stands. Live state: it is cleared on load and when the job ends.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_progress: Option<TerminalProgress>,
+    /// Present when a Diri schedule opened this session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduled_run: Option<crate::schedules::ScheduledRunInfo>,
 }
 
 impl SessionRecord {

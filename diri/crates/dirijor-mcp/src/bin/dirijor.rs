@@ -2,6 +2,8 @@
 mod notes;
 #[path = "dirijor/organization.rs"]
 mod organization;
+#[path = "dirijor/script.rs"]
+mod script;
 
 use std::collections::BTreeMap;
 #[cfg(not(unix))]
@@ -18,6 +20,7 @@ const EXIT_FAILURE: i32 = 1;
 const EXIT_TIMEOUT: i32 = 2;
 const EXIT_NOT_FOUND: i32 = 3;
 const EXIT_UNREACHABLE: i32 = 4;
+const EXIT_AMBIGUOUS: i32 = 5;
 
 fn main() {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
@@ -71,6 +74,11 @@ fn run(arguments: &[String]) -> Result<(), CliError> {
         "mcp-tools" => mcp_tools(),
         "mcp-call" => mcp_call(arguments.get(1..).unwrap_or_default()),
         "status" => session_list(arguments.get(1..).unwrap_or_default(), true),
+        "list" | "ls" => script::list(arguments.get(1..).unwrap_or_default()),
+        "new" => script::new(arguments.get(1..).unwrap_or_default()),
+        "send" => script::send(arguments.get(1..).unwrap_or_default()),
+        "capture" => script::capture(arguments.get(1..).unwrap_or_default()),
+        "run" => script::run(arguments.get(1..).unwrap_or_default()),
         "activity" => activity(arguments.get(1..).unwrap_or_default()),
         "session" => session(arguments.get(1..).unwrap_or_default()),
         "worktree" => worktree(arguments.get(1..).unwrap_or_default()),
@@ -109,7 +117,9 @@ fn print_help() {
          dirijor session reset-terminal ID\n  \
          Resets the emulator (screen, history, modes, title) without touching the process.\n\n\
          Deferred on Linux: companion forwarding (dirijor forward).\n\n\
+         {}\n\n\
          Notes (Markdown files; new notes appear in the sidebar when Diri is running):\n  {}",
+        script::HELP,
         notes::HELP
     );
 }
@@ -231,16 +241,35 @@ fn notify(arguments: &[String]) -> Result<(), CliError> {
 }
 
 /// The Engine reads `tool_input` only to summarize a permission request and
-/// never reads `tool_response`; every other hook sends neither, so a large
+/// to learn which file an applied edit changed, and never reads
+/// `tool_response`; every other hook sends neither, so a large
 /// Read/Write/Bash payload is not re-encoded, sent and parsed per callback.
+/// An edit keeps only its path: a Write's content never leaves the hook.
 fn forwarded_hook_payload(event: &str, mut payload: Value) -> Value {
     if let Some(object) = payload.as_object_mut() {
         object.remove("tool_response");
         if event != "PermissionRequest" {
+            let edited = (event == "PostToolUse")
+                .then(|| edited_file_input(object))
+                .flatten();
             object.remove("tool_input");
+            if let Some(edited) = edited {
+                object.insert("tool_input".into(), edited);
+            }
         }
     }
     payload
+}
+
+/// `{ "<key>": path }` for Claude's file-editing tools, else `None`.
+fn edited_file_input(object: &serde_json::Map<String, Value>) -> Option<Value> {
+    let key = match object.get("tool_name").and_then(Value::as_str)? {
+        "Edit" | "MultiEdit" | "Write" => "file_path",
+        "NotebookEdit" => "notebook_path",
+        _ => return None,
+    };
+    let path = object.get("tool_input")?.get(key)?.as_str()?;
+    (path.len() <= 4096).then(|| json!({ key: path }))
 }
 
 /// Records only lifecycle and identity fields before attempting delivery.
@@ -1545,13 +1574,19 @@ fn resolve_session<'a>(
     if let Some(exact) = sessions.iter().find(|record| record.id.0 == needle) {
         return Ok(exact);
     }
-    let mut prefixes = sessions
+    let prefixes: Vec<_> = sessions
         .iter()
-        .filter(|record| record.id.0.starts_with(needle));
-    if let Some(first) = prefixes.next()
-        && prefixes.next().is_none()
-    {
-        return Ok(first);
+        .filter(|record| record.id.0.starts_with(needle))
+        .collect();
+    match prefixes.as_slice() {
+        [record] => return Ok(record),
+        [] => {}
+        _ => {
+            return Err(CliError {
+                code: EXIT_AMBIGUOUS,
+                message: format!("session id prefix {needle:?} is ambiguous"),
+            });
+        }
     }
     let needle = needle.to_ascii_lowercase();
     let matches: Vec<_> = sessions
@@ -1563,9 +1598,10 @@ fn resolve_session<'a>(
         [] => Err(CliError::not_found(format!(
             "no session matches {needle:?}"
         ))),
-        _ => Err(CliError::failure(format!(
-            "session target {needle:?} is ambiguous"
-        ))),
+        _ => Err(CliError {
+            code: EXIT_AMBIGUOUS,
+            message: format!("session target {needle:?} is ambiguous"),
+        }),
     }
 }
 
@@ -1770,6 +1806,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn hooks_forward_only_an_edits_path() {
+        let forwarded = forwarded_hook_payload(
+            "PostToolUse",
+            json!({
+                "cwd": "/repo",
+                "tool_name": "Write",
+                "tool_input": { "file_path": "/repo/a.rs", "content": "secret body" },
+                "tool_response": { "ok": true },
+            }),
+        );
+        assert_eq!(
+            forwarded["tool_input"],
+            json!({ "file_path": "/repo/a.rs" })
+        );
+        assert!(forwarded.get("tool_response").is_none());
+        let bash = forwarded_hook_payload(
+            "PostToolUse",
+            json!({ "tool_name": "Bash", "tool_input": { "command": "ls" } }),
+        );
+        assert!(bash.get("tool_input").is_none());
+        let pending = forwarded_hook_payload(
+            "PreToolUse",
+            json!({ "tool_name": "Edit", "tool_input": { "file_path": "/repo/a.rs" } }),
+        );
+        assert!(pending.get("tool_input").is_none());
+    }
+
+    #[test]
     fn run_keeps_every_argument_after_separator_literal() {
         let args = [
             "--cwd",
@@ -1867,9 +1931,11 @@ mod tests {
             listening_ports: None,
             foreground_agent: None,
             terminal_cwd: None,
+            agent_workspace: None,
             note_id: None,
             foreground_ports: None,
             terminal_progress: None,
+            scheduled_run: None,
         }
     }
 

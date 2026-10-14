@@ -9,7 +9,7 @@
   directory; line/column suffixes are removed before opening the file.
   Cmd-Shift-D continues to open the code sidebar explicitly.
 - Right-click for Open/Copy Link, Copy Selection, Find Selection, Paste,
-  Keyboard Copy Mode, Open Scrollback in Editor, and shell prompt navigation.
+  Keyboard Copy Mode, Open Scrollback in Editor, and message/prompt navigation.
   In mouse-aware terminal applications, Option-right-click opens Diri's menu.
 - Double-click then drag selects whole words. Triple-click then drag selects
   complete lines. Option-Shift-drag selects a rectangular column. Option-drag
@@ -26,10 +26,46 @@
   temporary file is owned by the app until the session view is released; save
   it from the editor to keep a permanent copy. Output changing across pages
   produces a retry message rather than mixing revisions.
-- Cmd-Shift-Up/Down jumps between retained shell prompt marks. Your shell must
-  emit OSC 133 A (for example through its terminal integration). No shell
-  configuration is changed. Older live Helpers and full-screen TUIs may have
-  no prompt marks available.
+- Cmd-Shift-Up/Down jumps between the messages you sent to an Agent; the
+  terminal menu offers **Previous message** and **Next message**. The message
+  lands at the top of the view and is marked briefly. Previous starts from the
+  top of what is on screen, so a message you can already see is skipped. Past
+  the newest message, Next returns to the latest output. The view stays an
+  ordinary terminal: scroll, select or type at any time. Any of these ends a
+  jump in progress, and typing returns to the composer as usual.
+  Full-screen Agents (Claude Code, Codex and OpenCode, which keep their
+  transcript on the alternate screen) are moved to the message with the
+  wheel input a trackpad sends, and with PageUp/PageDown in Claude Code,
+  while the pane keeps showing the screen until the message is in place:
+  the jump appears as one cut. Inline Agents are found in Diri's retained
+  scrollback. Claude Code, Codex, OpenCode,
+  Copilot, Kimi and Gemini gutters are recognized; other Agents can use
+  explicit `You:` or `User:` labels. Composers and drafts, numbered choosers,
+  pinned headers, tool output and soft-wrap continuations are not stops.
+  In shells the same shortcuts jump between retained prompt marks (OSC 133
+  A; see shell integration below). A shell running a recognized foreground
+  Agent uses message navigation. An inline session with no message that way
+  (a generic command, or an Agent that exited to its shell) falls back to
+  its prompt marks.
+- Shells that report command boundaries with OSC 133 (A prompt, B input,
+  C output, D end with exit status) get a short mark in the left margin of each
+  finished command's prompt: green when it exited 0, red otherwise. Running
+  commands and ends without a status stay unmarked. Right-click a finished
+  command's prompt, command line or output for **Copy command output** and
+  **Select command output**; Cmd-Option-O copies the output of the last
+  finished command in retained history. fish 4 emits these marks by default.
+  Local zsh and bash terminals get them from Diri's shell integration with no
+  setup and no change to the user's files: zsh starts with `ZDOTDIR` pointing
+  at a `.zshenv` shim that puts `ZDOTDIR` back before any of the user's files
+  run; bash starts as the same `bash -l` with a one-shot `PROMPT_COMMAND` that
+  loads the hooks at the first prompt, after every startup file. Both chain
+  around prompt frameworks (oh-my-zsh, powerlevel10k, starship,
+  bash-preexec, a user's own DEBUG trap) and keep `$?` for them. Settings →
+  Appearance → Shell integration turns it off for terminals opened afterwards.
+  Agents' login-shell wrappers and remote shells are not changed; remote
+  shells need their own terminal integration. Marks work in remote sessions
+  whose Helper was installed by this version; older live Helpers show no
+  marks until the session restarts.
 
 Settings → Terminal contains Copy on Selection (off by default), Hide Pointer
 While Typing (on), and Review Command Pastes (off by default). Paste review applies to
@@ -39,6 +75,8 @@ remain immediate. A reconnect or terminal mode change invalidates a pending
 paste review, so the user must paste again into the current terminal.
 
 All history features operate on retained output, not an unlimited session log.
+Message navigation in inline Agents reads retained history in bounded pages,
+including messages older than the recent Find capture.
 Oversized link annotations remain plain text. Existing live Helpers remain
 attachable after an upgrade; annotations become available in new Helpers.
 
@@ -47,13 +85,16 @@ and [Herdr source at bafbc09](https://github.com/herdrdev/herdr/tree/bafbc0949dd
 Diri implements these behaviors in its Rust Engine, shared parser and GPUI client.
 
 Visual fixtures: [link hover](screenshots/terminal-qol/hover.png),
-[terminal menu](screenshots/terminal-qol/menu.png), and paste review in
+[terminal menu](screenshots/terminal-qol/menu.png), command marks
+([gutter](screenshots/terminal-qol/commands.png),
+[menu](screenshots/terminal-qol/commands-menu.png),
+[selection](screenshots/terminal-qol/commands-select.png)), and paste review in
 [dark](screenshots/paste-review/dark.png) and
 [narrow light](screenshots/paste-review/light-narrow.png) appearances.
 To regenerate a scene on macOS,
 run the ignored `terminal_pane::tests::render_terminal_qol_screenshot` test with
 `DIRI_QOL_SCREENSHOT` set to an output PNG and `DIRI_QOL_SCENE` set to `hover`,
-`menu`, `paste`, or `copy`. For paste review, the fixture explicitly enables the
+`menu`, `paste`, `copy`, `commands`, `commands-menu` or `commands-select`. For paste review, the fixture explicitly enables the
 opt-in setting. `DIRI_QOL_THEME`, `DIRI_QOL_WIDTH`, `DIRI_QOL_HEIGHT`, and
 `DIRI_QOL_PASTE` override the theme, window size, and clipboard text.
 

@@ -216,14 +216,14 @@ impl OverviewLane {
     ];
 
     #[must_use]
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Running => "Running",
-            Self::NeedsInput => "Needs Input",
-            Self::Done => "Done",
-            Self::Asleep => "Asleep",
-            Self::Ended => "Ended",
-        }
+    pub fn label(self) -> &'static str {
+        crate::i18n::t(match self {
+            Self::Running => "nav.lane.running",
+            Self::NeedsInput => "nav.lane.needs_input",
+            Self::Done => "nav.lane.done",
+            Self::Asleep => "nav.lane.asleep",
+            Self::Ended => "nav.lane.ended",
+        })
     }
 
     #[must_use]
@@ -529,13 +529,13 @@ pub fn display_title(session: &SessionRecord) -> String {
 pub fn display_title_str(session: &SessionRecord) -> &str {
     if session.title_source == TitleSource::Placeholder {
         if matches!(session.status, SessionStatus::Exited(_)) {
-            "Ended"
+            crate::i18n::t("nav.title.ended")
         } else if session.kind == diri_proto::AgentKind::SHELL {
             // Until the Engine names it after its program or folder, and for
             // a remote shell, which reports neither.
-            "Terminal"
+            crate::i18n::t("nav.title.terminal")
         } else {
-            "Untitled"
+            crate::i18n::t("nav.title.untitled")
         }
     } else {
         &session.title
@@ -633,9 +633,11 @@ mod tests {
             listening_ports: None,
             foreground_agent: None,
             terminal_cwd: None,
+            agent_workspace: None,
             note_id: None,
             foreground_ports: None,
             terminal_progress: None,
+            scheduled_run: None,
         }
     }
 
@@ -736,6 +738,8 @@ mod tests {
                 reason: ExitReason::Exited,
                 code: Some(0),
                 signal: None,
+                system_restart: false,
+                interrupted: false,
             }),
         );
         let mut asleep = session("asleep", SessionStatus::Working);
@@ -818,6 +822,8 @@ mod tests {
                     reason: ExitReason::Exited,
                     code: Some(0),
                     signal: None,
+                    system_restart: false,
+                    interrupted: false,
                 }),
             ),
         ];

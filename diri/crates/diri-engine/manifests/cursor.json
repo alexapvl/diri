@@ -32,7 +32,7 @@
       "style": "flag",
       "token": "resume"
     },
-    "_resumeNotice": "Verified with cursor-agent 2026.09.28-64d2043: positional initial prompts are supported, resume selects the latest chat, and --resume <chatId> restores an exact chat. Diri discovers native ids from Cursor transcripts; never append an id to the resume subcommand.",
+    "_resumeNotice": "Verified with cursor-agent 2026.10.01-14929f9: positional initial prompts are supported, resume selects the latest chat, and --resume <chatId> restores an exact chat. Diri discovers native ids from Cursor transcripts; never append an id to the resume subcommand.",
     "envScrubPrefixes": [
       "DIRI_",
       "DIRIJOR_"
@@ -100,7 +100,8 @@
       "state": "blockedQuestion",
       "priority": 1350,
       "region": "bottom_non_empty_lines",
-      "regionLines": 8,
+      "regionLines": 24,
+      "_notice": "Live only while an option carries the selection marker. Once answered, cursor-agent 2026.10.01-14929f9 repaints the box without the marker and with Trusting workspace..., then leaves it above the composer as stale paint. The footer is not required: the composer can push it out of the region.",
       "when": {
         "all": [
           {
@@ -110,7 +111,12 @@
             "contains": "[q] quit"
           },
           {
-            "contains": "use arrow keys to navigate, enter to select, or press the key shown"
+            "lineRegex": "▶ \\[[aq]\\] (Trust this workspace|Quit)"
+          },
+          {
+            "not": {
+              "contains": "trusting workspace"
+            }
           }
         ]
       },
@@ -199,6 +205,9 @@
             "contains": "proceed with this http request?"
           },
           {
+            "lineRegex": "^\\s*(Run this command outside the sandbox|Read this file|Allow this web search|Allow this web fetch)\\?\\s*$"
+          },
+          {
             "contains": "proceed with this edit?"
           }
         ]
@@ -238,7 +247,10 @@
       "when": {
         "lineRegex": "^\\s*[⠀-⣿]*\\s*(Composing|Generating|Thinking|Responding|Working|Grep|Read |Read file|Edit |Delete |List |Glob |Search |Web search|Fetch |Web fetch|Subagent|Running |Shell command|Codebase search)"
       },
-      "_notice": "Default zen UI disables OSC status titles, prefixes Working with braille frames, and can add task rows below the composer."
+      "_notice": "Default zen UI disables OSC status titles, prefixes Working with braille frames, and can add task rows below the composer.",
+      "flags": [
+        "turn_started"
+      ]
     },
     {
       "id": "idle-prompt-arrow",
@@ -248,7 +260,11 @@
       "regionLines": 8,
       "when": {
         "lineRegex": "^\\s*\u2192\\s*Add a follow-up"
-      }
+      },
+      "_notice": "cursor-agent 2026.10.01-14929f9 keeps the previous follow-up arrow after Enter until Generating/Thinking paints.",
+      "flags": [
+        "stale_after_submit"
+      ]
     },
     {
       "id": "idle-follow-up-placeholder",
@@ -264,7 +280,10 @@
             "contains": "plan, search, build anything"
           }
         ]
-      }
+      },
+      "flags": [
+        "stale_after_submit"
+      ]
     }
   ]
 }

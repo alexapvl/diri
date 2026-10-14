@@ -15,17 +15,28 @@ const agentPreviews = (() => {
   const esc = value => value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
   const mark = name => `<span class="agent-logo ${name}" data-agent="${name}" aria-hidden="true"></span>`;
   const tool = (name, file, detail) => `<div class="claude-tool"><span class="claude-bullet">●</span><div><strong>${name}</strong><span>(${file})</span><small>└ ${detail}</small></div></div>`;
-  const changes = (file, lines) => `<div class="diff-file"><span class="icon" data-icon="code"></span>${file}</div><div class="diff-lines">${lines.map((line, i) => `<div class="${line.startsWith('+') ? 'added' : ''}"><span>${line.startsWith('+') ? '+' : i + 1}</span><code>${esc(line.replace(/^\+/, ''))}</code></div>`).join('')}</div>`;
+  const changes = (file, lines, stat = '') => `<div class="diff-file"><span class="icon" data-icon="code"></span>${file}${stat ? `<span class="diff-stat">${stat}</span>` : ''}</div><div class="diff-lines">${lines.map((line, i) => { const kind = line[0] === '+' ? 'added' : line[0] === '-' ? 'removed' : ''; return `<div class="${kind}"><span>${kind === 'added' ? '+' : kind === 'removed' ? '−' : i + 1}</span><code>${esc(kind ? line.slice(1) : line)}</code></div>`; }).join('')}</div>`;
   const command = (symbol, placeholder) => `<span class="composer-prefix">${symbol}</span><span>${placeholder}</span><span class="terminal-cursor" aria-hidden="true"></span>`;
   return {
     swarm: {
+      // A long-running session, scrolled to its end: earlier work above, the swarm at the bottom.
+      // app.js opens it mid-run (helpers working) and finishes it on a timeline.
       render(chat) {
-        const child = (state, title, agent) => `<div class="swarm-child"><span class="swarm-state ${state}">${state === 'done' ? '✓' : '◌'}</span><span>${title}</span>${mark(agent)}</div>`;
+        const child = (n, title, agent, time) => `<div class="swarm-child" data-child="${n}"><span class="swarm-state done">✓</span><span>${title}</span>${mark(agent)}<small>${time}</small></div>`;
+        const answer = (step, text) => `<div class="claude-answer"${step ? ` data-step="${step}"` : ''}><span class="claude-bullet">●</span><div><p>${text}</p></div></div>`;
+        const user = text => `<div class="claude-user">❯ ${text}</div>`;
+        const worked = text => `<div class="claude-worked">✻ ${text}</div>`;
         return {
-          html: `<div class="claude-welcome"><pre class="claude-mascot" aria-hidden="true"> ▐▛███▜▌\n▝▜█████▛▘\n  ▘▘ ▝▝</pre><div><strong>Claude Code</strong><span>Opus</span><small>~/fun/diri</small></div></div><div class="claude-user">❯ ${chat.prompt}</div><div class="claude-answer"><span class="claude-bullet">●</span><div><p>Three independent pieces. I’ll give each its own agent and worktree.</p></div></div><div class="claude-tool"><span class="claude-bullet">●</span><div><strong>diri</strong><span> - spawn_agents (3 agents)</span><div class="swarm-list">${child('done', 'Write the release notes', 'codex')}${child('run', 'Verify the Linux build', 'claude')}${child('run', 'Test the updater', 'gemini')}</div></div></div><div class="claude-answer"><span class="claude-bullet">●</span><div><p>Release notes are in. Reviewing the diff while the other two finish.</p></div></div>`,
-          composer: command('❯', 'Waiting for 2 agents'),
-          footer: '<span>2 agents running</span><span>Opus</span>',
-          changes: changes('RELEASE_NOTES.md', ['+## 0.9', '+', '+- Agents can start other agents', '+- Faster session restore', '+- Linux: Wayland fixes'])
+          tail: true,
+          html: `${user('What’s still open for the 0.9 milestone?')}${tool('Bash', 'gh issue list --milestone 0.9 --state open', '7 open issues')}${tool('Read', 'ROADMAP.md', 'Read 64 lines')}${answer('', 'Seven left. Four are polish; three block the release: the Linux updater, Markdown export for notes, and the Wayland clipboard.')}${user('Fix the three blockers. I’ll review.')}${tool('Update', 'src/updater/linux.rs', 'Updated with 18 additions and 6 removals')}${tool('Update', 'src/notes/export.rs', 'Updated with 9 additions and 2 removals')}${tool('Update', 'src/platform/wayland.rs', 'Updated with 12 additions and 4 removals')}${tool('Bash', 'cargo test --workspace', '1,642 passed, 0 failed, 45 ignored')}${answer('', 'All three blockers are fixed and covered by tests. The diff is in Changes.')}${worked('Worked for 14m 32s')}<div class="claude-user" data-step="prompt">❯ ${chat.prompt}</div>${tool('Bash', 'git log v0.8.0..HEAD --oneline', '212 commits since 0.8.0')}${answer('plan', 'Three independent pieces. I’ll give each its own agent and worktree.')}<div class="claude-tool" data-step="spawn"><span class="claude-bullet">●</span><div><strong>diri</strong><span> - spawn_agents (3 agents)</span><div class="swarm-list">${child(1, 'Write the release notes', 'codex', '2m 10s')}${child(2, 'Verify the Linux build', 'claude', '6m 48s')}${child(3, 'Test the updater', 'gemini', '9m 02s')}</div></div></div>${answer('notes', 'Release notes are in. Reviewing the diff while the other two finish.')}${answer('done', 'All three are done: notes written, Linux build verified, updater tested. Ready to tag 0.9.')}`,
+          composer: command('❯', 'Ask a follow-up'),
+          footer: '<span class="swarm-footer">3 agents finished</span><span>Opus</span>',
+          changes: `<div class="changes-summary"><span>6 files changed</span><span class="added-text">+71</span><span class="removed-text">−14</span></div>`
+            + changes('src/updater/linux.rs', ['fn swap_bundle(new: &Path) -> Result<()> {', '-    fs::rename(new, &current)?;', '+    let staged = current.with_extension("staged");', '+    fs::rename(new, &staged)?;', '+    verify_bundle(&staged)?;', '+    fs::rename(&staged, &current)?;', '     Ok(())', '}'], '+18 −6')
+            + changes('src/notes/export.rs', ['pub fn to_markdown(note: &Note) -> String {', '-    note.body.clone()', '+    let mut out = format!("# {}\\n\\n", note.title);', '+    out.push_str(&note.body);', '+    out', '}'], '+9 −2')
+            + changes('src/platform/wayland.rs', ['match clipboard.read() {', '-    Err(_) => None,', '+    Err(e) if e.is_transient() => retry(clipboard),', '+    Err(_) => None,', '     Ok(text) => Some(text),', '}'], '+12 −4')
+            + changes('RELEASE_NOTES.md', ['+## 0.9', '+', '+- Notes, and to-dos that start agents', '+- Agents can start other agents', '+- Faster session restore', '+- Linux: Wayland clipboard fixes'], '+24')
+            + changes('diri/Cargo.toml', ['[workspace.package]', '-version = "0.8.4"', '+version = "0.9.0"', 'edition = "2024"'], '+1 −1')
         };
       }
     },

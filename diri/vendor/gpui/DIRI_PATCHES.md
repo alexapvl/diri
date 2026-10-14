@@ -148,6 +148,29 @@ and the new `Window::window_control_area_at` share
 is the frontmost one there. Test in `crates/diri-app/src/root.rs`:
 `windows_caption_buttons_sit_in_the_toolbar_for_both_tab_orientations`.
 
+## 5. Scene region capture (`Window::capture_region`)
+
+Upstream can only read a rendered frame back in test builds
+(`render_to_image`, behind `test-support`), and only as a whole-window RGBA
+image. The overview zoom needs a bitmap of one pane, as the last frame drew
+it, in the release app, at the start of a pinch.
+
+`Window::capture_region(bounds, levels)` hands the last frame's scene to a new
+`PlatformWindow::capture_scene_region(scene, region, levels)` and wraps each
+returned level as a `RenderImage` ready for `paint_image`. The default
+implementation bails, so platforms without it fall back (the zoom
+cross-fades). `SceneCapture` is one BGRA level; `SceneCapture::from_rgba_frame`
+crops and box-filters a full frame on the CPU. `PlatformHeadlessRenderer`
+gains a defaulted `capture_scene_region` built on that, and `TestWindow`
+routes the call to its headless renderer, so headless tests exercise the
+real Metal path (`vendor/gpui_macos/README.diri.md`). The images belong to the
+caller, who must `drop_image` them when they stop being painted.
+
+Cost (headless Metal, 1200 x 662 pt pane at 2x, 4 levels, M-series, debug
+build on a loaded machine): about 3.5 to 6 ms per capture, about 15 ms for the
+first capture in a process. Capturing never presents or disturbs the next
+frame.
+
 ## Re-applying on a GPUI bump
 
 1. Replace `src/` (and `build.rs`, `README.md`, `resources/`) with the new
@@ -163,8 +186,10 @@ is the frontmost one there. Test in `crates/diri-app/src/root.rs`:
    bases, `insert_debug_bounds`, `debug_bounds_history` replay, the
    `exempt_from_inactive_throttle` frame-rate exemption, and the window
    control hitbox reuse and `window_control_area_for`),
-   `text_system/line_layout.rs` (`LineLayoutIndex` arithmetic) and
-   `elements/div.rs` (prepaint opacity, `insert_debug_bounds`).
+   `text_system/line_layout.rs` (`LineLayoutIndex` arithmetic),
+   `elements/div.rs` (prepaint opacity, `insert_debug_bounds`), and the scene
+   capture: `platform.rs` (`capture_scene_region`, `SceneCapture`),
+   `window.rs` (`capture_region`), `platform/test/window.rs`.
 4. If upstream added a new per-frame collection to `PrepaintStateIndex` or
    `PaintIndex`, extend `relative_to`/`rebased_on`, and confirm its reuse
    copies element for element.
@@ -234,3 +259,40 @@ Draw order, and therefore pixels, are unchanged. Test:
 `the_sprite_sort_matches_a_stable_sort_by_key` in
 `crates/diri-app/src/gpui_view_cache_tests.rs`. Re-apply on a GPUI bump by
 replacing the three sprite `sort_by_key` calls in `Scene::finish`.
+
+## Frame-swapped sprite animation (`Window::paint_animated_svg`)
+
+A looping mark (the sidebar's working spinner: eight SVG frames, one per
+125 ms) needed a notify per frame, and a notify marks every ancestor view
+dirty. Even with cached rows, each step re-rendered the sidebar and re-ran
+taffy layout over its whole tree: about 14 sidebar renders a second and
+15-20% of a core in the installed app with two agents working.
+
+`Window::paint_animated_svg(bounds, frames, interval, color, cx)` rasterizes
+every frame once, under its own atlas key (`<path>#diri-animated`, so a
+static use of the same SVG never animates), and paints the current one. The
+window keeps a registry from each frame's tile to its animation
+(`src/window/sprite_animation.rs`). After every draw it records which
+monochrome sprites in the finished scene carry an animated tile and brings
+them to the current step. Cached views replay whatever frame they last
+painted; the registry recognizes any frame's tile, so replayed marks keep
+animating. When nothing is dirty, the request-frame callback calls
+`Window::advance_sprite_animations`: on a step boundary it rewrites those
+sprites' tiles in the rendered scene and presents it again, with no render,
+layout, prepaint or paint. Frames may land in different atlas textures; the
+scene groups sprites into per-texture batches only when it is presented.
+The clock is the executor's (`now()`), so tests drive it with
+`advance_clock`. On GPU device recovery (`force_render`) the registry is
+cleared with the atlas and refilled by the redraw.
+
+Test support: `Window::animated_sprite_tiles`,
+`Window::refresh_sprite_animations_for_test` and
+`App::set_asset_source_for_test` (a test app starts with no assets, so no SVG
+reaches the scene). Tests: `working_marks_advance_without_rendering_anything`
+in `crates/diri-app/src/sidebar/view.rs`;
+`swapped_working_mark_frames_paint_like_a_full_render` (headless Metal pixels)
+and `working_mark_step_cost` in `crates/diri-app/src/root.rs`. Files:
+`src/window.rs` (DIRI PATCH (sprite animation)), `src/window/sprite_animation.rs`,
+`src/svg_renderer.rs` (`load_asset`), `src/app.rs`. Re-apply on a GPUI bump by
+re-adding the window field, the post-swap `collect` in `Window::draw`, the
+idle branch of the request-frame callback, and `paint_animated_svg`.

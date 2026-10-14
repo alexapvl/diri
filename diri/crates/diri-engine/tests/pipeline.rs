@@ -160,6 +160,8 @@ sleep 30
                 content_seq: snapshot.content_seq + step,
                 prompt_excerpt: None,
                 options: None,
+                stale_after_submit: false,
+                turn_started: false,
             }),
         };
         if let Some(change) = reducer
@@ -229,6 +231,7 @@ fn a_process_only_agent_reports_working_then_its_exit_code() {
                 diri_engine::Exit::Signal(signal) => Some(signal),
                 diri_engine::Exit::Code(_) => None,
             },
+            interrupted: false,
         },
         SystemTime::now(),
     );

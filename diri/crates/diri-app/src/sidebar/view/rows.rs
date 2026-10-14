@@ -2,13 +2,17 @@
 //!
 //! The sidebar re-renders whenever any of its rows or chrome changes. Before
 //! this, it rebuilt, laid out and painted every row each time, and a working
-//! row's 8 Hz activity mark alone did that constantly. Each row is now a cached
+//! row's 8 Hz activity mark alone did that constantly. (Working marks no
+//! longer notify at all: the window swaps their pre-rasterized frames in the
+//! drawn scene, see `diri_ui::FrameLoop`.) Each row is now a cached
 //! view (`SessionRowView`) that renders from a [`SessionRowProps`] snapshot
 //! the sidebar computes while it renders. A row re-renders only when:
 //!
 //! - its props changed;
 //! - it is renaming, its title is settling, or it is growing in or collapsing
 //!   out (`row_motion`);
+//! - it is fading out of hover (`hover_linger`, a prop that changes each
+//!   frame of the fade);
 //! - it was notified itself (the activity tick notifies only working rows);
 //! - the sidebar was notified for anything other than a store publication or
 //!   one of its own animation ticks (`rows_stale`, a safety net for inputs the
@@ -21,6 +25,10 @@
 //! Every other row is reused by the vendored GPUI's nested view cache (see
 //! `vendor/gpui/DIRI_PATCHES.md`), including the opacity the list wraps
 //! around it.
+//!
+//! Rows far from the viewport are not mounted at all: the list walks them
+//! and lays out a spacer in their place (`row_window.rs`). Their views are
+//! kept while they stay in the list, so scrolling back reuses them.
 
 use super::*;
 
@@ -39,8 +47,8 @@ pub(in crate::sidebar) struct SessionRowProps {
     pub(super) drag_selection: Option<Vec<SessionId>>,
     pub(super) migrating: bool,
     pub(super) activity_state: StatusState,
-    /// The activity mark's frame, or zero for a mark that does not animate.
-    pub(super) activity_frame: usize,
+    /// Panes in this row's tab, when it is split.
+    pub(super) panes: usize,
     /// Terminal progress, when the session reports any.
     pub(super) progress: Option<crate::progress_mark::ProgressFace>,
     pub(super) marked: bool,
@@ -53,6 +61,9 @@ pub(in crate::sidebar) struct SessionRowProps {
     pub(super) settling: bool,
     /// The held-⌘ shortcut hint's opacity, for rows that have a shortcut.
     pub(super) held_hint: f32,
+    /// How much of the hover fill a row the pointer just left still wears.
+    /// It changes every frame of the fade, so only fading rows re-render.
+    pub(super) hover_linger: f32,
 }
 
 pub(in crate::sidebar) struct SessionRowView {
@@ -71,6 +82,7 @@ impl SessionRowView {
 
 impl Render for SessionRowView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::perf_overlay::rendered("sidebar row");
         #[cfg(all(test, target_os = "macos"))]
         {
             self.renders += 1;
@@ -98,7 +110,7 @@ impl Sidebar {
     ) -> SessionRowProps {
         let session = &row.session;
         let id = &session.id;
-        let (selected, multi, drag_selection, migrating, unread) = {
+        let (selected, multi, drag_selection, migrating, unread, pane_group) = {
             let mut store = self.store.write().expect("session store lock poisoned");
             (
                 // While the To-dos page covers the workbench, no row is the
@@ -108,9 +120,15 @@ impl Sidebar {
                 (store.sidebar_selection().len() > 1).then(|| store.sidebar_selection_ordered()),
                 store.migrating().contains(id),
                 store.notifications().session_unread(id),
+                store.pane_group(id),
             )
         };
-        let activity_state = sidebar_activity_state(status_state(session, migrating), unread);
+        let (panes, shells) = pane_group.unwrap_or_default();
+        // One row per tab: it shows its most urgent pane.
+        let activity_state = shells.iter().fold(
+            sidebar_activity_state(status_state(session, migrating), unread),
+            |state, shell| most_urgent(state, status_state(shell, false)),
+        );
         SessionRowProps {
             row: row.clone(),
             shortcut,
@@ -122,11 +140,7 @@ impl Sidebar {
             drag_selection,
             migrating,
             activity_state,
-            activity_frame: if activity_state == StatusState::Working {
-                self.activity_frame
-            } else {
-                0
-            },
+            panes,
             progress: crate::progress_mark::face(session, self.activity_frame, reduce_motion),
             marked: self.ui.delegation_mark.as_ref() == Some(id),
             hovered: self.ui.hovered_session.as_ref() == Some(id),
@@ -143,6 +157,7 @@ impl Sidebar {
             } else {
                 0.0
             },
+            hover_linger: self.session_hover_linger(id),
         }
     }
 
@@ -169,9 +184,9 @@ impl Sidebar {
             cx.reduce_motion(),
             window,
         );
-        // An indeterminate progress sweep rides the working marks' tick.
-        let working = props.activity_state == StatusState::Working
-            || props.progress.is_some_and(|face| face.animates());
+        // An indeterminate progress sweep rides the sidebar's tick. A working
+        // mark needs no tick: the window advances its frames by itself.
+        let working = props.progress.is_some_and(|face| face.animates());
         self.working_row_rendered |= working;
         // A row growing in or collapsing out renders every frame of its
         // motion, like a settling title.
@@ -214,9 +229,10 @@ impl Sidebar {
         .into_any_element()
     }
 
-    /// Advances working marks. While session rows are on screen, only the
-    /// working rows are notified: the sidebar re-renders as their ancestor,
-    /// hands them their next frame, and reuses every other row. The
+    /// Advances indeterminate progress sweeps. While session rows are on
+    /// screen, only the sweeping rows are notified: the sidebar re-renders as
+    /// their ancestor, hands them their next frame, and reuses every other
+    /// row. The
     /// horizontal strip, painted by `RootView`, still needs the sidebar
     /// notified; its tabs take the new frame through their props, so the
     /// notify does not stale them.
@@ -248,5 +264,44 @@ impl Sidebar {
         }
         self.rows_stale = true;
         self.tabs_stale = true;
+    }
+}
+
+/// The state a split tab's row shows: needs you, then working, then
+/// finished-unseen; otherwise the row's own.
+pub(super) fn most_urgent(row: StatusState, pane: StatusState) -> StatusState {
+    fn rank(state: StatusState) -> u8 {
+        match state {
+            StatusState::NeedsInput { .. } => 3,
+            StatusState::Working => 2,
+            StatusState::DoneUnseen => 1,
+            _ => 0,
+        }
+    }
+    if rank(pane) > rank(row) { pane } else { row }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_split_row_shows_its_most_urgent_pane() {
+        let ask = StatusState::NeedsInput { destructive: false };
+        assert_eq!(most_urgent(StatusState::Working, ask), ask);
+        assert_eq!(
+            most_urgent(StatusState::IdleSeen, StatusState::Working),
+            StatusState::Working
+        );
+        assert_eq!(most_urgent(ask, StatusState::Working), ask);
+        // A quiet shell never hides the row's own state.
+        assert_eq!(
+            most_urgent(StatusState::DoneUnseen, StatusState::None),
+            StatusState::DoneUnseen
+        );
+        assert_eq!(
+            most_urgent(StatusState::Hibernated, StatusState::IdleSeen),
+            StatusState::Hibernated
+        );
     }
 }

@@ -26,6 +26,12 @@ impl Method {
     pub const TASK_ANSWER: &'static str = "task.answer";
     pub const TASK_CANCEL: &'static str = "task.cancel";
     pub const TASK_LIST: &'static str = "task.list";
+    pub const SCHEDULE_CREATE: &'static str = "schedule.create";
+    pub const SCHEDULE_UPDATE: &'static str = "schedule.update";
+    pub const SCHEDULE_DELETE: &'static str = "schedule.delete";
+    pub const SCHEDULE_LIST: &'static str = "schedule.list";
+    /// Starts one run now without moving the schedule's next due time.
+    pub const SCHEDULE_RUN_NOW: &'static str = "schedule.run_now";
     pub const SESSION_SPAWN: &'static str = "session.spawn";
     pub const SESSION_LIST: &'static str = "session.list";
     pub const SESSION_KILL: &'static str = "session.kill";
@@ -48,6 +54,10 @@ impl Method {
     pub const SESSION_READ_SCROLLBACK: &'static str = "session.read_scrollback";
     pub const SESSION_READ_SCROLLBACK_CELLS: &'static str = "session.read_scrollback_cells";
     pub const SESSION_READ_DIFF: &'static str = "session.read_diff";
+    /// One chunk of an inline image a terminal placed. A remote session's is
+    /// read from its Holder (`inline-images-v1`) in smaller chunks; unknown
+    /// keys, evicted images and older Holders answer `image_not_found`.
+    pub const SESSION_READ_IMAGE: &'static str = "session.read_image";
     pub const SESSION_READ_TRANSCRIPT: &'static str = "session.read_transcript";
     pub const SESSION_MARK_SEEN: &'static str = "session.mark_seen";
     /// Returns a completed turn to "done · unseen", like marking a chat
@@ -61,6 +71,10 @@ impl Method {
     /// Asks the app to select and show a Session (`SessionIdParams`); the
     /// Engine re-publishes it as the `session.reveal` event.
     pub const SESSION_REVEAL: &'static str = "session.reveal";
+    /// Asks the app to open an HTTP request in a Session's API tab
+    /// (`SessionOpenApiRequestParams`); the Engine re-publishes it as the
+    /// `session.api_request` event. Nothing is sent by the Engine.
+    pub const SESSION_OPEN_API_REQUEST: &'static str = "session.open_api_request";
     pub const SESSION_MIGRATE: &'static str = "session.migrate";
     pub const SESSION_REPARENT_WORKTREE: &'static str = "session.reparent_worktree";
     pub const HOST_SYNC_PREFS: &'static str = "host.sync_prefs";
@@ -82,6 +96,7 @@ impl Method {
     pub const PROJECT_ADD: &'static str = "project.add";
     pub const CLIENT_SET_ACTIVE: &'static str = "client.set_active";
     pub const GOVERNOR_CONFIGURE: &'static str = "governor.configure";
+    pub const TERMINAL_CONFIGURE: &'static str = "terminal.configure";
     pub const AGENT_READINESS: &'static str = "agent.readiness";
     pub const AGENT_CONFIGURE: &'static str = "agent.configure";
     pub const ACCOUNT_PROFILES_LIST: &'static str = "account.profiles.list";
@@ -92,6 +107,9 @@ impl Method {
     pub const ACCOUNT_CLAUDE_LOGIN: &'static str = "account.claude.login";
     pub const ACCOUNT_CLAUDE_CAPTURE: &'static str = "account.claude.capture";
     pub const ACCOUNT_SWITCH_ALL: &'static str = "account.switch_all";
+    pub const ACCOUNT_OVERVIEW: &'static str = "account.overview";
+    pub const ACCOUNT_ADOPT: &'static str = "account.adopt";
+    pub const ACCOUNT_ADD: &'static str = "account.add";
     pub const SESSION_CONTINUE_ACCOUNT: &'static str = "session.continue_with_account";
     pub const EVENTS_SUBSCRIBE: &'static str = "events.subscribe";
     pub const EVENTS_WAIT: &'static str = "events.wait";
@@ -118,11 +136,17 @@ impl EventName {
     pub const EVENTS_DROPPED: &'static str = "events.dropped";
     pub const SESSION_RESOURCES: &'static str = "session.resources";
     pub const SESSION_REMOVED: &'static str = "session.removed";
+    /// A schedule was created, changed, ran, or was deleted. Carries `id`.
+    pub const SCHEDULE_UPDATED: &'static str = "schedule.updated";
     pub const PROJECT_UPDATED: &'static str = "project.updated";
     /// A client asked for this Session to be shown (`{"sessionID"}`), e.g.
     /// an agent that just wrote a note. The app selects it without taking
     /// focus from another app.
     pub const SESSION_REVEAL: &'static str = "session.reveal";
+    /// An agent asked for a request to be opened in its Session's API tab
+    /// (`SessionOpenApiRequestParams`). The app prefills the tab; it sends
+    /// only a `GET` marked `autoSend`, anything else waits for Send.
+    pub const SESSION_API_REQUEST: &'static str = "session.api_request";
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -349,6 +373,9 @@ pub struct AgentReadinessItem {
     pub path_source: Option<AgentPathSource>,
     #[serde(default = "default_true")]
     pub show_in_quick_create: bool,
+    /// User-configured arguments appended to every launch on this target.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub launch_args: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     /// The agent's manifest descriptor. This is how the AGENT CATALOG reaches
@@ -357,6 +384,12 @@ pub struct AgentReadinessItem {
     /// must not invent additional supported or installed Agents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub descriptor: Option<AgentDescriptor>,
+    /// Whether the installed Agent already has a login on this machine, read
+    /// from the CLI's own credential stores without touching a secret.
+    /// `None` means Diri cannot tell (unsupported Agent, remote host, or no
+    /// executable); clients must not ask anyone to sign in on `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed_in: Option<bool>,
 }
 
 fn serialize_agent_kind_id<S>(kind: &AgentKind, serializer: S) -> Result<S::Ok, S::Error>
@@ -440,6 +473,12 @@ pub struct AgentConfigureParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executable_path: Option<String>,
     pub show_in_quick_create: bool,
+    /// Extra arguments for every launch of this Agent on this target, e.g.
+    /// `--dangerously-skip-permissions`. Absent keeps the stored arguments,
+    /// so clients that only edit the path never clear them; an empty list
+    /// clears them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_args: Option<Vec<String>>,
 }
 
 pub type AgentConfigureResult = AgentReadinessResult;
@@ -489,6 +528,26 @@ pub struct SessionSpawnParams {
     /// it already has one. The file keeps its id and created date.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note_id: Option<String>,
+    /// Whether the window the Session opens in is light or dark. An Agent's
+    /// first-run "pick a text style" question is answered from this, since
+    /// Diri's terminal cannot report its background color itself. Absent
+    /// leaves that question to the user.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub appearance: Option<TerminalAppearance>,
+    /// What a binary-free kind (a `shell` terminal) runs instead of the login
+    /// shell: one structured argv, exec'd directly in the PTY, never joined
+    /// into a shell command. The Engine validates it before any side effect.
+    /// Absent keeps the manifest's launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub argv: Option<Vec<String>>,
+}
+
+/// The light or dark family of the terminal theme a Session is shown in.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TerminalAppearance {
+    Light,
+    Dark,
 }
 
 pub type SessionSpawnResult = SessionRecord;
@@ -1234,6 +1293,19 @@ pub struct HookReportParams {
 pub type HookReportResult = EmptyResult;
 pub type GovernorConfigureParams = GovernorSettingsParams;
 pub type GovernorConfigureResult = EmptyResult;
+
+/// Engine-side terminal settings the app owns. The Engine keeps the last
+/// value it was sent, so terminals it restarts before the app connects follow
+/// it too.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalConfigureParams {
+    /// Whether new zsh and bash terminals get Diri's OSC 133 prompt and
+    /// command marks without any setup.
+    pub shell_integration: bool,
+}
+
+pub type TerminalConfigureResult = EmptyResult;
 pub type ClientSetActiveResult = EmptyResult;
 pub type DaemonPrepareShutdownParams = EmptyParams;
 pub type DaemonPrepareShutdownResult = EmptyResult;
@@ -1261,6 +1333,33 @@ pub struct ForwardRequest {
     pub forward: u16,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionReadImageParams {
+    #[serde(rename = "sessionID")]
+    pub session_id: SessionId,
+    /// The key of an [`crate::inline_image::ImageAnchor`].
+    pub key: String,
+    #[serde(default)]
+    pub offset: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionReadImageResult {
+    pub format: crate::inline_image::InlineImageFormat,
+    /// Raw formats are zlib-compressed (Kitty `o=z`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub compressed: bool,
+    pub width: u32,
+    pub height: u32,
+    /// Length of the whole stored image; read on while `offset + data` is short.
+    pub total: u64,
+    pub offset: u64,
+    #[serde(with = "base64_bytes")]
+    pub data: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -1314,7 +1413,7 @@ mod base64_bytes {
             return Err("base64 length must be a multiple of four");
         }
         let mut decoded = Vec::with_capacity(bytes.len() / 4 * 3);
-        for (index, chunk) in bytes.chunks_exact(4).enumerate() {
+        for (index, chunk) in bytes.as_chunks::<4>().0.iter().enumerate() {
             let last = index + 1 == bytes.len() / 4;
             let a = value(chunk[0]).ok_or("invalid base64 character")?;
             let b = value(chunk[1]).ok_or("invalid base64 character")?;

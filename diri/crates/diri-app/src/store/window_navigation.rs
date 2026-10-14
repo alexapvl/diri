@@ -771,7 +771,9 @@ impl WindowWrite<'_> {
     }
 
     pub fn select(&mut self, id: SessionId) {
-        if !self.sessions.contains_key(&id) {
+        // A closing row is already hidden; selecting it would mark a session
+        // the Engine is removing as seen.
+        if !self.canonical.is_open(&id) {
             return;
         }
         self.navigation.sidebar_selection.clear();
@@ -1298,6 +1300,23 @@ mod tests {
     }
 
     #[test]
+    fn a_window_cannot_select_a_closing_session() {
+        let (first, _, ids) = windows();
+        first.write().unwrap().set_active(true);
+        first.write().unwrap().select(ids[1].clone());
+        first.write().unwrap().remove_sessions(vec![ids[1].clone()]);
+        let selected = first.read().unwrap().selected_session_id().cloned();
+
+        first.write().unwrap().select(ids[1].clone());
+
+        assert_eq!(
+            first.read().unwrap().selected_session_id(),
+            selected.as_ref()
+        );
+        assert_ne!(selected.as_ref(), Some(&ids[1]));
+    }
+
+    #[test]
     fn close_returns_to_window_mru_instead_of_sidebar_neighbor() {
         let (first, second, ids) = windows();
         first.write().unwrap().select(ids[2].clone());
@@ -1351,6 +1370,51 @@ mod tests {
         assert_ne!(first.owner(), second.owner());
     }
 
+    /// Window navigation is the real app's mode, and there the canonical
+    /// selection goes stale, which is why `auto_resume_if_needed` stands
+    /// down. Each window resumes what it shows instead: selecting a session
+    /// a restart ended — the computer's or Diri's — brings it back, once,
+    /// and the one only the stale canonical selection points at stays put.
+    #[test]
+    fn a_window_auto_resumes_the_restart_ended_session_it_selects() {
+        let (first, second, ids) = windows();
+        {
+            let mut canonical = first.canonical.write().unwrap();
+            for (index, id) in ids.iter().enumerate() {
+                let mut record = (**canonical.sessions().get(id).unwrap()).clone();
+                record.status = SessionStatus::Exited(diri_proto::ExitInfo::restart(index != 2));
+                record.resumability = diri_proto::Resumability::Resumable;
+                record.capabilities = None;
+                canonical.upsert_session(record);
+            }
+            assert!(canonical.window_navigation_enabled);
+            assert!(!canonical.auto_resume_if_needed(&ids[0]));
+        }
+
+        first.write().unwrap().select(ids[1].clone());
+        second.write().unwrap().select(ids[2].clone());
+        let canonical = first.canonical.read().unwrap();
+        assert!(canonical.auto_resuming().contains(&ids[1]), "rebooted");
+        assert!(canonical.auto_resuming().contains(&ids[2]), "daemon");
+        drop(canonical);
+
+        // Reselecting does not resume a second time.
+        first.write().unwrap().select(ids[2].clone());
+        let mut canonical = first.canonical.write().unwrap();
+        canonical.finish_auto_resume(&ids[2]);
+        drop(canonical);
+        first.write().unwrap().select(ids[1].clone());
+        first.write().unwrap().select(ids[2].clone());
+        assert!(
+            !first
+                .canonical
+                .read()
+                .unwrap()
+                .auto_resuming()
+                .contains(&ids[2])
+        );
+    }
+
     #[test]
     fn closing_an_exited_parent_confirms_for_its_running_auxiliary_terminal() {
         let (first, _, ids) = windows();
@@ -1359,6 +1423,8 @@ mod tests {
                 reason: diri_proto::ExitReason::Exited,
                 code: Some(1),
                 signal: None,
+                system_restart: false,
+                interrupted: false,
             });
         };
         let terminal_id = SessionId::new("auxiliary-terminal");

@@ -40,6 +40,8 @@ impl LifecyclePlan {
                         reason: ExitReason::Archived,
                         code: None,
                         signal: None,
+                        system_restart: false,
+                        interrupted: false,
                     });
                 }
                 replacement.needs_input = None;
@@ -114,9 +116,11 @@ mod tests {
             listening_ports: None,
             foreground_agent: None,
             terminal_cwd: None,
+            agent_workspace: None,
             note_id: None,
             foreground_ports: None,
             terminal_progress: None,
+            scheduled_run: None,
         }
     }
 
@@ -159,6 +163,8 @@ mod tests {
             reason: ExitReason::Signaled,
             code: None,
             signal: Some(9),
+            system_restart: false,
+            interrupted: false,
         });
 
         let archived =

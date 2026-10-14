@@ -1,4 +1,5 @@
 //! Shared incremental transcript accounting. Contains no UI or provider credentials.
+pub mod activity;
 mod cache;
 pub mod dashboard;
 mod model;
@@ -15,8 +16,6 @@ pub use store::{
 };
 #[cfg(test)]
 mod tests;
-
-pub use crate::PRICING_ENTRY_COUNT;
 
 pub mod cursor;
 pub use cache::CursorFetchWindow;

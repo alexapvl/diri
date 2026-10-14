@@ -96,7 +96,13 @@ fn main() {
         "engine.start",
         build = diri_telemetry::id(diri_engine::telemetry::build_id()),
         fd_soft = fd_limit.as_ref().map(|limit| limit.soft),
-        exit_when_orphaned = std::env::args().any(|arg| arg == EXIT_WHEN_ORPHANED_FLAG),
+        exit_when_orphaned = std::env::args().any(|arg| arg == EXIT_WHEN_ORPHANED_FLAG)
+            || diri_engine::dev_build::is_development_build(),
+        cgroup = cfg!(target_os = "linux").then(|| {
+            std::fs::read_to_string("/proc/self/cgroup").map_or("unknown", |text| {
+                diri_engine::telemetry::cgroup_class(&text)
+            })
+        }),
     );
     diri_telemetry::event!(
         "engine.login_path",
@@ -131,6 +137,22 @@ fn main() {
         std::process::exit(0);
     }
     std::mem::forget(lock);
+
+    // Under the lock, before any store opens: earlier Linux builds kept
+    // configuration and remote bindings in the runtime tmpfs.
+    let moved =
+        diri_engine::layout_migration::adopt_runtime_files(&runtime_dir, &config_dir, &state_dir);
+    if moved != Default::default() {
+        eprintln!(
+            "dirijord-rs: moved {} file(s) out of the runtime directory ({} failed)",
+            moved.files, moved.failed
+        );
+        diri_telemetry::event!(
+            "engine.layout_migrated",
+            files = moved.files,
+            failed = moved.failed,
+        );
+    }
 
     let manifest_overrides = DirijorPaths::manifest_overrides_dir(&home);
     let (engine, failed) = load_manifests(&exe_dir, &manifest_overrides);
@@ -209,6 +231,12 @@ fn main() {
         "dirijord-rs: adopted {} live holder session(s): {adopted:?}",
         adopted.len()
     );
+    // Check in with a manager this Engine adopted sessions from, so one that
+    // retires abandoned sessions (development builds) knows they are not.
+    let _ = diri_engine::holder::HolderManagerClient::new(
+        diri_engine::holder::HolderManagerPaths::new(&holder.holders_dir).socket(),
+    )
+    .ping();
     let registry = Arc::new(Mutex::new(registry));
     register_gauges(&registry);
 
@@ -219,6 +247,8 @@ fn main() {
     let cli_path = install_cli_helpers(&exe_dir, &app_support);
     let mut server = ControlServer::new(Arc::clone(&registry), DirijorPaths::socket(&home))
         .with_logs_dir(&logs_dir)
+        .with_config_dir(&config_dir)
+        .with_remote_bindings_dir(&state_dir)
         .with_notes_dir(app_support.join("notes"))
         .with_holder(holder)
         .with_injection(InjectionConfig {
@@ -228,6 +258,7 @@ fn main() {
     if let Some(remote) = remote_manager(&exe_dir, &app_support) {
         server = server.with_remote(remote);
     }
+    server.adopt_pane_shells();
     let server = Arc::new(server);
     {
         let server = Arc::clone(&server);
@@ -262,6 +293,23 @@ fn main() {
         }
     };
 
+    // Agents whose CLI speaks MCP over HTTP call this Engine directly instead
+    // of each starting a `dirijor-mcp` process. Needs the bound socket (the
+    // endpoint bridges to it); on failure every Agent keeps the stdio server.
+    // `DIRI_MCP_TRANSPORT=stdio` keeps the old per-session processes.
+    if std::env::var("DIRI_MCP_TRANSPORT").as_deref() != Ok("stdio") {
+        match server.start_mcp_http() {
+            Ok(url) => eprintln!("dirijord-rs: MCP endpoint {url}"),
+            Err(error) => {
+                eprintln!("dirijord-rs: MCP endpoint unavailable, Agents use stdio: {error}");
+                diri_telemetry::event!(
+                    "engine.mcp_http_unavailable",
+                    io = diri_telemetry::io_error(&error),
+                );
+            }
+        }
+    }
+
     // Only once the socket is accepting: remote adoption is SSH-bound and must
     // never be what a client waits behind.
     server.spawn_remote_restore();
@@ -269,6 +317,15 @@ fn main() {
     // their sidebar Session. Only this singleton, now bound, may adopt.
     server.spawn_note_adoption();
     server.spawn_agent_relaunch();
+    server.spawn_scheduler();
+
+    // Agents a killed Holder left stopped and parentless: once now, then
+    // after each session that ends interrupted (see `holder::frozen_orphans`).
+    #[cfg(unix)]
+    {
+        diri_engine::holder::frozen_orphans::configure(server.socket_path().to_path_buf());
+        diri_engine::holder::frozen_orphans::request_sweep(Arc::clone(&registry));
+    }
 
     // One-shot, off the accept path: reclaim per-session files no record,
     // holder, or remote binding stands behind. Never repeated while idle.
@@ -276,10 +333,7 @@ fn main() {
         let registry = Arc::clone(&registry);
         let logs_dir = logs_dir.clone();
         let holders_dir = app_support.join("holders");
-        let bindings_dir = DirijorPaths::socket(&home).parent().map_or_else(
-            || PathBuf::from("remote-bindings"),
-            |dir| dir.join("remote-bindings"),
-        );
+        let bindings_dir = state_dir.join(diri_engine::layout_migration::REMOTE_BINDINGS_DIR_NAME);
         let _ = std::thread::Builder::new()
             .name("diri-orphan-sweep".into())
             .spawn(move || {
@@ -336,8 +390,14 @@ fn main() {
     // Opt-in from the launcher. A desktop App spawns us detached and asks us
     // to go when it quits; one that was killed never asks. An Engine kept up
     // by a service manager is not given the flag and stays up while idle.
-    if std::env::args().any(|arg| arg == EXIT_WHEN_ORPHANED_FLAG) {
-        server.spawn_orphan_watch(ORPHAN_GRACE, ORPHAN_WATCH_TICK);
+    //
+    // A development build (one cargo left in `target/`) always retires, and
+    // its sessions do not keep it up: agents start these for tests and demos
+    // and never stop them. Its Holder manager then ends those sessions once
+    // no Engine returns (see `holder::manager`).
+    let development = diri_engine::dev_build::is_development_build();
+    if development || std::env::args().any(|arg| arg == EXIT_WHEN_ORPHANED_FLAG) {
+        server.spawn_orphan_watch(ORPHAN_GRACE, ORPHAN_WATCH_TICK, !development);
     }
 
     eprintln!("dirijord-rs: serving {}", server.socket_path().display());
@@ -372,6 +432,9 @@ fn start_telemetry(home: &Path, state_dir: &Path, exe_dir: &Path) {
         return;
     }
     diri_telemetry::install_panic_hook();
+    // Before the Engine loads or writes its session table, which is part of
+    // the evidence that this install predates activation tracking.
+    diri_telemetry::activation::init_origin(Some(home));
     diri_telemetry::start_health_sampler(std::time::Duration::from_secs(60));
     diri_engine::telemetry::set_holder_state_dir(state_dir);
     if let Some(endpoint) = diri_telemetry::upload::endpoint() {

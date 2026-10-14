@@ -55,17 +55,20 @@ impl From<&StatusSignal> for Evidence {
                 StatusSignal::ClaudeHook {
                     hook: ClaudeHook::PreToolUse | ClaudeHook::PostToolUse,
                     ..
-                } | StatusSignal::CursorTranscriptWorking
+                } | StatusSignal::CursorTranscriptWorking { .. }
             ),
             completion: matches!(
                 signal,
                 StatusSignal::CodexTurnComplete
-                    | StatusSignal::CursorTranscriptIdle
+                    | StatusSignal::CursorTranscriptIdle { .. }
                     | StatusSignal::ClaudeHook {
                         hook: ClaudeHook::Stop,
                         pending_work: None | Some(false),
                         ..
                     }
+            ) || matches!(
+                signal,
+                StatusSignal::ProgramStatus(Some(record)) if !record.state.is_transient()
             ),
             queued: matches!(signal, StatusSignal::Screen(observation) if observation.matched_rule_id == "queued-follow-up-question"),
             subagent: matches!(

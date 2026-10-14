@@ -27,20 +27,14 @@ impl ToolDefinition {
     }
 }
 
-/// How agents keep a Diri note current. It is part of the MCP server's
-/// instructions and the note tools point at it, so every agent learns the
-/// same short contract. People who are not developers read these notes.
-pub const NOTES_CONTRACT: &str = "Diri Notes are the person's plans, briefs, and to-do lists. People who are not developers read them, so write plainly.\n\
-- If whoami shows origin_note, you were started from a note: read it first with read_note {\"note\":\"origin\"}. It is your brief.\n\
-- As you find important things (a decision, a finding, a blocker, a result, a link), add one short entry with write_note {\"note\":\"origin\",\"entry\":\"...\"}: one or two plain sentences, no progress chatter, no logs or code dumps. It is filed under your to-do, or in the note's Updates.\n\
-- Prefer adding. Change or remove existing text only when the person asks for it, or to keep your own entries current (tick a row, change \"Fix\" to \"Done\"): use edit_note, which works like editing a file (exact old text, new text), or replace_section for everything under a heading. Never silently delete the person's writing; every version is kept and the person can restore one.\n\
-- Tick your own sub-tasks as you finish them (write_note with todo and checked:true). Leave the to-do you were started from unticked: the person reviews your work and ticks it.\n\
-- Finish with a one-paragraph result: report_to_parent {\"status\":\"done\",\"summary\":\"...\"} is added to the note.\n\
-- To explain something or hand over a longer write-up, use create_note: it makes a new note under you in the sidebar, and open:true shows it to the person.";
-
 pub fn tool_definitions_for(kinds: &[String]) -> Vec<ToolDefinition> {
     let kind_enum: Vec<Value> = kinds.iter().map(|kind| json!(kind)).collect();
     let mut tools = vec![
+        ToolDefinition::new(
+            "get_skill",
+            "Read one of Diri's skills: the detailed rules for a Diri capability, as Markdown. Read the matching skill before acting: scheduling (run anything later, at a time, or repeatedly; waking the Mac), notes (work started from or written to a Diri note), orchestration (parallel agents, tasks, waiting, retries), api (HTTP APIs and dev servers: show endpoints in the API tab). Claude Code sessions also have them as skills named diri:<name>.",
+            json!({"type":"object","properties":{"name":{"type":"string","enum":["scheduling","notes","orchestration","api"]}},"required":["name"]}),
+        ),
         ToolDefinition::new(
             "submit_task",
             "Assign a tracked task to an authorized Agent. Returns a durable task_id and delivery receipt, and tells the Agent to acknowledge and report that exact task. Reuse request_id on retries. Identical target/text defaults to one task; use a new request_id only for intentional additional work. Unknown delivery never permits a fresh copy. Pass result_schema to require a JSON result of that shape. Await it with wait_any (several tasks) or wait_for_task.",
@@ -97,7 +91,7 @@ pub fn tool_definitions_for(kinds: &[String]) -> Vec<ToolDefinition> {
         ),
         ToolDefinition::new(
             "spawn_agent",
-            "Open a new Diri session running an agent or shell, locally or on a configured remote host. Use this whenever the user asks to spawn another agent, session, or terminal. Identical arguments are deduplicated for this caller; reuse operation_id on retries and supply a new operation_id only for an intentional additional session. Inspect spawn_receipt: unknown/failed must never be retried under a new identity blindly.",
+            "Open a new Diri session running an agent or shell, locally or on a configured remote host. Use this whenever the user asks to spawn another agent, session, or terminal. Pass split to open it as a pane beside your own (or beside_session_id's) instead of a separate tab: good for a dev server, test watcher, or log tail you want in view, or a child agent the user should watch work; leave it out for background work. Identical arguments are deduplicated for this caller; reuse operation_id on retries and supply a new operation_id only for an intentional additional session. Inspect spawn_receipt: unknown/failed must never be retried under a new identity blindly.",
             json!({
                 "type": "object",
                 "properties": {
@@ -111,14 +105,49 @@ pub fn tool_definitions_for(kinds: &[String]) -> Vec<ToolDefinition> {
                     "name": {"type": "string"},
                     "operation_id": message_id_schema(),
                     "task": {"type": "boolean", "description": "Deliver prompt as a tracked Diri task instead of an untracked initial prompt. The result then includes task.task_id for wait_any or wait_for_task."},
-                    "result_schema": result_schema()
+                    "result_schema": result_schema(),
+                    "split": split_schema(),
+                    "beside_session_id": beside_schema()
                 },
                 "required": ["kind", "cwd"]
             }),
         ),
         ToolDefinition::new(
+            "schedule_agent",
+            "Schedule an agent run owned by Diri, not by this session: it survives this session closing and Diri restarting. Use it whenever the user wants something done later, at a time, or repeatedly, instead of your own cron/loop tools. How runs work: at each due time Diri opens a NEW top-level session of `kind` in `cwd` and sends `prompt`. That session cannot see this conversation, so write a self-contained prompt: the goal, the repo and relevant context, what to produce, and where the result goes (open a PR, write a file, post a summary). For code changes pass worktree:true and base \"origin/main\" so each run starts clean. Give a short `name`. When: exactly one of cron (five fields, the Mac's local time, e.g. \"0 9 * * 1-5\" weekdays 09:00), in_minutes (relative one-off), or at_ms (epoch ms). Missed runs: if the Mac was asleep or Diri was closed, the newest missed run fires once when it is back, within catch_up_hours (default 12); older ones are recorded as missed. wake_mac:true (use when the user wants it to run even if the Mac is asleep): Diri wakes the Mac 2 minutes early (lid must be open), keeps it awake while the agent works, then puts it back to sleep if nobody used it. It needs the one-time \"Allow diri to wake the Mac\" approval in Settings > Schedules; if list_schedules reports wakeHelperError, tell the user to turn it on. After creating, confirm in words from the returned nextDue, e.g. \"weekdays at 09:00, next run Monday; it will wake the Mac\".",
+            json!({
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string", "enum": kind_enum},
+                    "cwd": {"type": "string"},
+                    "prompt": {"type": "string", "minLength": 1, "maxLength": 1048576},
+                    "name": {"type": "string", "maxLength": 200},
+                    "cron": {"type": "string"},
+                    "at_ms": {"type": "number"},
+                    "in_minutes": {"type": "number", "minimum": 0},
+                    "worktree": {"type": "boolean", "description": "Start each run in a fresh worktree."},
+                    "branch": {"type": "string"},
+                    "base": {"type": "string", "description": "Starting ref for each run's worktree, e.g. origin/main."},
+                    "catch_up_hours": {"type": "number", "minimum": 0, "maximum": 168, "description": "A run missed by up to this long still fires late; 0 never catches up. Default 12."},
+                    "keep_awake": {"type": "boolean", "description": "Keep an awake Mac from idle-sleeping shortly before each run and while it works. Cannot wake a sleeping Mac."},
+                    "wake_mac": {"type": "boolean", "description": "Wake a sleeping Mac (lid open) 2 minutes before each run, keep it awake while the run works, then let it sleep again. Needs the one-time wake approval in Settings > Schedules; list_schedules reports if it is missing."}
+                },
+                "required": ["kind", "cwd", "prompt"]
+            }),
+        ),
+        ToolDefinition::new(
+            "list_schedules",
+            "List every Diri schedule with its next due time and recent runs (onTime, late with lateReason asleep/notRunning, missed, failed, manual) and the session each run opened.",
+            json!({"type":"object","properties":{}}),
+        ),
+        ToolDefinition::new(
+            "delete_schedule",
+            "Delete a Diri schedule. Sessions its earlier runs opened are left alone.",
+            json!({"type":"object","properties":{"schedule_id":{"type":"string","minLength":1}},"required":["schedule_id"]}),
+        ),
+        ToolDefinition::new(
             "spawn_agents",
-            "Fan out: open several sessions in one call (at most 8), concurrently. Each entry takes the same fields as spawn_agent (kind, cwd, worktree, branch, base, host, prompt, name, operation_id, task, result_schema) and is deduplicated the same way. Use worktree:true per entry for parallel edits. Returns one result per entry in order, plus the session_ids and task_ids to pass to wait_any.",
+            "Fan out: open several sessions in one call (at most 8), concurrently. Each entry takes the same fields as spawn_agent (kind, cwd, worktree, branch, base, host, prompt, name, operation_id, task, result_schema, split, beside_session_id) and is deduplicated the same way. Use worktree:true per entry for parallel edits. Returns one result per entry in order, plus the session_ids and task_ids to pass to wait_any.",
             json!({"type":"object","properties":{"agents":{"type":"array","items":spawn_entry_schema()}},"required":["agents"]}),
         ),
         ToolDefinition::new(
@@ -292,6 +321,26 @@ pub fn tool_definitions_for(kinds: &[String]) -> Vec<ToolDefinition> {
             browser_schema(),
         ),
         ToolDefinition::new(
+            "open_api_request",
+            "Open an HTTP request in the API tab of YOUR session's right panel in Diri, prefilled, so the person can inspect, edit and send it. Use it whenever you build, run or debug an HTTP API: after starting a dev server, open the endpoint you just added or changed (e.g. GET http://localhost:3000/api/health) instead of only pasting a curl command. Put {{name}} placeholders in url/headers/body and pass their values in variables (marking tokens in secrets so they are masked); they land in the project's environment (environment names it, default the active one or \"Local\"). json sets a JSON body and its Content-Type; body sends text as written. auto_send:true sends a GET immediately and shows the response; any other method is never sent until the person presses Send. The call returns once the tab is open, without the response.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "method": {"type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"], "default": "GET"},
+                    "url": {"type": "string", "minLength": 1, "maxLength": 8192, "description": "http(s) URL; may use {{variables}}. No scheme means http:// for localhost."},
+                    "headers": {"type": "object", "description": "Header name to value, e.g. {\"Authorization\": \"Bearer {{token}}\"}."},
+                    "body": {"type": "string", "maxLength": 1048576, "description": "Raw body text."},
+                    "json": {"description": "A JSON value sent as the body, indented, with Content-Type: application/json."},
+                    "name": {"type": "string", "maxLength": 200, "description": "Tab and saved-request title."},
+                    "variables": {"type": "object", "description": "Variable name to value for {{name}} placeholders."},
+                    "secrets": {"type": "array", "items": {"type": "string"}, "description": "Names in variables to mask as secrets."},
+                    "environment": {"type": "string", "maxLength": 200, "description": "Environment the variables go into (created if missing)."},
+                    "auto_send": {"type": "boolean", "default": false, "description": "Send right away. Honoured for GET only."}
+                },
+                "required": ["url"]
+            }),
+        ),
+        ToolDefinition::new(
             "quick_open_include",
             "Read or change ~/.diri-include, the gitignore-style extra folders Quick Open (Cmd+P) indexes even when hidden or skipped. action get returns the path, text, and patterns; add appends unique patterns (e.g. **/.worktrees/); set replaces the whole file with text (empty clears it).",
             json!({
@@ -313,23 +362,47 @@ pub fn tool_definitions_for(kinds: &[String]) -> Vec<ToolDefinition> {
             json!({"type": "object", "properties": {}}),
         ),
         ToolDefinition::new(
+            "get_layout",
+            "Show the split-pane layout of the tab(s) that show a session (default yours): which sessions share the tab, side_by_side or stacked splits, the focused and zoomed session. Read it before manage_layout, or to check what the user sees beside you.",
+            json!({"type": "object", "properties": {"session_id": {"type": "string", "minLength": 1}}}),
+        ),
+        ToolDefinition::new(
+            "manage_layout",
+            "Arrange split panes by session id; panes are views, so nothing is started or stopped. split: move session_id's pane beside beside_session_id's (default yours), e.g. bring a child agent or a running server into view next to you. unsplit: give session_id its own tab again. close: take its pane off the tab (the session keeps running and stays in the sidebar). focus, zoom/unzoom (fill the tab with one pane), equalize (even out the tab's splits). session_id defaults to you. Split only when the user benefits from seeing both at once; do not rearrange panes the user did not ask about.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["split", "unsplit", "close", "focus", "zoom", "unzoom", "equalize"]},
+                    "session_id": {"type": "string", "minLength": 1, "description": "The session whose pane to act on; defaults to the calling session."},
+                    "beside_session_id": {"type": "string", "minLength": 1, "description": "split only: the session to dock beside; defaults to the calling session."},
+                    "split": {"type": "string", "enum": ["right", "down", "left", "up"], "description": "split only: which side of beside_session_id's pane; default right."}
+                },
+                "required": ["action"]
+            }),
+        ),
+        ToolDefinition::new(
             "list_notes",
-            "Find the person's Diri Notes (briefs, plans, to-do lists). Notes are kept by Diri, not in the project folder, so use this rather than searching files. Defaults to notes for your project; project:\"all\" lists every note, or pass a project folder. mentions:\"me\" returns notes that @-mention you or an ancestor that started you (mentioned_via says which). query filters title and body. session_id is the note's sidebar Session.",
-            json!({"type":"object","properties":{"project":{"type":"string","minLength":1},"mentions":{"type":"string","minLength":1},"query":{"type":"string","minLength":1},"include_archived":{"type":"boolean"},"limit":{"type":"integer","minimum":1,"maximum":200}}}),
+            "Find the person's Diri Notes (briefs, plans, to-do lists). Notes are kept by Diri, not in the project folder, so use this rather than searching files. Defaults to notes for your project; project:\"all\" lists every note, or pass a project folder. mentions:\"me\" returns notes that @-mention you or an ancestor that started you (mentioned_via says which). query filters title and body. links_to (a note's id or title) returns the notes that link to that note. session_id is the note's sidebar Session.",
+            json!({"type":"object","properties":{"project":{"type":"string","minLength":1},"mentions":{"type":"string","minLength":1},"query":{"type":"string","minLength":1},"links_to":{"type":"string","minLength":1},"include_archived":{"type":"boolean"},"limit":{"type":"integer","minimum":1,"maximum":200}}}),
         ),
         ToolDefinition::new(
             "read_note",
-            "Read one Diri note as Markdown. If you were started from a note, read note \"origin\" first: it is your brief. markdown is the note's canonical text (title first as a # line, tidy tables, normalised list markers): exactly what edit_note matches, so copy old_string from it. path is the note's .md file, which you may also edit with your own file tools; Diri keeps the change, a version before it, and the note's identity. Returns the text, its to-dos (block index, checked, linked sessions and their live status) and its @-mentions resolved to sessions or notes. Mentioned sessions may be working on related things: inspect them with read_output/get_diff or wait on them with wait_for_agent. note is an id, a title, part of a title, a note Session id, or \"origin\": the note you were started from (whoami shows it as origin_note).",
+            "Read one Diri note as Markdown. If you were started from a note, read note \"origin\" first: it is your brief. markdown is the note's canonical text (title first as a # line, tidy tables, normalised list markers): exactly what edit_note matches, so copy old_string from it. path is the note's .md file, which you may also edit with your own file tools; Diri keeps the change, a version before it, and the note's identity. Returns the text, its to-dos (block index, checked, linked sessions and their live status), its @-mentions resolved to sessions or notes, and its backlinks: other notes that link to this one, with the words around each link. Linked notes and backlinks are often the background a note was written against; read the relevant ones, and use note_links for the full picture. Mentioned sessions may be working on related things: inspect them with read_output/get_diff or wait on them with wait_for_agent. note is an id, a title, part of a title, a note Session id, or \"origin\": the note you were started from (whoami shows it as origin_note).",
             json!({"type":"object","properties":{"note":{"type":"string","minLength":1}},"required":["note"]}),
         ),
         ToolDefinition::new(
+            "note_links",
+            "How one Diri note connects to the others. links: the notes it links to. backlinks: every note linking to it, with the words around each link (backlinks_total counts them). unlinked_mentions: notes that write its title without linking it (unlinked:false skips them). depth (1-3) adds graph: the notes within that many links, either direction, and the links between them. Check backlinks before changing a note others depend on, and to find the plans, briefs and findings a note belongs to. note is an id, a title, part of a title, a note Session id, or \"origin\".",
+            json!({"type":"object","properties":{"note":{"type":"string","minLength":1},"unlinked":{"type":"boolean"},"depth":{"type":"integer","minimum":1,"maximum":3}},"required":["note"]}),
+        ),
+        ToolDefinition::new(
             "write_note",
-            "Add to a Diri note without rewriting it; never deletes the person's text. entry: one short line when something matters (a decision, a finding, a blocker, a result, a link), filed under your to-do (or the one you name) or in the note's Updates; keep entries sparing, no progress chatter. checked: tick a to-do, e.g. your own sub-tasks as you finish them (the to-do you were started from is the person's to tick). link_session: put a session's chip on a to-do. append: longer Markdown at the end, rarely needed. Pick the to-do by todo (its text or part of it) or todo_index (from read_note). Delegated agents may write only to the note they were started from or notes that mention them.",
+            "Add to a Diri note without rewriting it; never deletes the person's text. entry: one short line when something matters (a decision, a finding, a blocker, a result, a link), filed under your to-do (or the one you name) or in the note's Updates; keep entries sparing, no progress chatter. checked: tick a to-do, e.g. your own sub-tasks as you finish them (the to-do you were started from is the person's to tick). link_session: put a session's chip on a to-do. append: longer Markdown at the end, rarely needed. Pick the to-do by todo (its text or part of it) or todo_index (from read_note). Write [[Note title]] to link another note; it becomes a link by the note's id, so it survives renames. Delegated agents may write only to the note they were started from or notes that mention them.",
             json!({"type":"object","properties":{"note":{"type":"string","minLength":1},"entry":{"type":"string","minLength":1},"append":{"type":"string","minLength":1,"maxLength":65536},"todo":{"type":"string","minLength":1},"todo_index":{"type":"integer","minimum":0},"checked":{"type":"boolean"},"link_session":{"type":"string","minLength":1}},"required":["note"]}),
         ),
         ToolDefinition::new(
             "edit_note",
-            "Change a Diri note in place, like editing a Markdown file: old_string is exact text from read_note's markdown (title line included), new_string replaces it; an empty new_string deletes it. old_string must appear once unless replace_all. Use it when the person asks for a change, or to keep your own entries current (tick a table row, change \"Fix\" to \"Done\"); otherwise prefer write_note. Every version is kept, so the person can restore one. Returns the changed lines and the new version. Diri tidies the text after each change (tables are re-aligned); a table row still matches if only its spacing differs, and the reply says so. For anything else, copy the next old_string from the changed lines or a fresh read_note.",
+            "Change a Diri note in place, like editing a Markdown file: old_string is exact text from read_note's markdown (title line included), new_string replaces it; an empty new_string deletes it. old_string must appear once unless replace_all. Use it when the person asks for a change, or to keep your own entries current (tick a table row, change \"Fix\" to \"Done\"); otherwise prefer write_note. Every version is kept, so the person can restore one. Returns the changed lines and the new version. Diri tidies the text after each change (tables are re-aligned); a table row still matches if only its spacing differs, and the reply says so. For anything else, copy the next old_string from the changed lines or a fresh read_note. [[Note title]] in new_string links that note.",
             json!({"type":"object","properties":{"note":{"type":"string","minLength":1},"old_string":{"type":"string","minLength":1},"new_string":{"type":"string"},"replace_all":{"type":"boolean"}},"required":["note","old_string","new_string"]}),
         ),
         ToolDefinition::new(
@@ -339,7 +412,7 @@ pub fn tool_definitions_for(kinds: &[String]) -> Vec<ToolDefinition> {
         ),
         ToolDefinition::new(
             "create_note",
-            "Write a new Diri note for the person, e.g. an explanation (\"how sign-in works\") or a write-up. markdown is rich Markdown: headings, lists, to-dos, links, quotes, code. It appears under you in the sidebar, in your project (or project, a folder); open:true shows it to the person right away. Use this for anything longer than a write_note entry.",
+            "Write a new Diri note for the person, e.g. an explanation (\"how sign-in works\") or a write-up. markdown is rich Markdown: headings, lists, to-dos, links, quotes, code. Link the notes it builds on or relates to by writing [[Note title]]: each becomes a link to that note (linked_notes lists them; unlinked_titles matched no single note), and the linked note shows this one among its backlinks. It appears under you in the sidebar, in your project (or project, a folder); open:true shows it to the person right away. Use this for anything longer than a write_note entry.",
             json!({"type":"object","properties":{"title":{"type":"string","minLength":1,"maxLength":200},"markdown":{"type":"string","maxLength":65536},"project":{"type":"string","minLength":1},"open":{"type":"boolean"}},"required":["title"]}),
         ),
         ToolDefinition::new(
@@ -451,7 +524,7 @@ pub(crate) fn validate_arguments(tool: &str, arguments: &Value) -> Result<(), St
         .ok_or_else(|| format!("unknown or unavailable tool: {tool}"))?;
     // Kind aliases/custom commands are resolved against the live catalog by
     // spawn; the static validator must not use an empty discovery enum.
-    if tool == "spawn_agent" {
+    if tool == "spawn_agent" || tool == "schedule_agent" {
         definition.input_schema["properties"]["kind"]
             .as_object_mut()
             .unwrap()
@@ -581,11 +654,23 @@ fn spawn_entry_schema() -> Value {
             "name": {"type": "string", "minLength": 1},
             "operation_id": message_id_schema(),
             "task": {"type": "boolean"},
-            "result_schema": result_schema()
+            "result_schema": result_schema(),
+            "split": split_schema(),
+            "beside_session_id": beside_schema()
         },
         "required": ["kind", "cwd"],
         "additionalProperties": false
     })
+}
+
+fn split_schema() -> Value {
+    json!({"type": "string", "enum": ["right", "down", "left", "up"],
+        "description": "Open as a split pane on this side of beside_session_id's pane (default your own) instead of a new tab. A tab holds at most 8 panes."})
+}
+
+fn beside_schema() -> Value {
+    json!({"type": "string", "minLength": 1,
+        "description": "Session whose pane to split; defaults to the calling session. Implies split right when split is omitted."})
 }
 
 fn message_id_schema() -> Value {
@@ -632,6 +717,8 @@ mod tests {
             "integrate",
             "fork_agent",
             "manage_agent",
+            "get_layout",
+            "manage_layout",
         ] {
             assert!(names.contains(&name.to_owned()), "{name}");
         }
@@ -686,6 +773,41 @@ mod tests {
     }
 
     #[test]
+    fn split_placement_is_validated_on_spawns_and_layout_calls() {
+        assert!(
+            validate_arguments(
+                "spawn_agent",
+                &json!({"kind": "shell", "cwd": "/tmp", "split": "down"})
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_arguments(
+                "spawn_agent",
+                &json!({"kind": "shell", "cwd": "/tmp", "split": "sideways"})
+            )
+            .is_err()
+        );
+        assert!(
+            validate_arguments(
+                "spawn_agents",
+                &json!({"agents": [{"kind": "codex", "cwd": "/tmp", "split": "right", "beside_session_id": "s1"}]})
+            )
+            .is_ok()
+        );
+        assert!(validate_arguments("manage_layout", &json!({})).is_err());
+        assert!(
+            validate_arguments(
+                "manage_layout",
+                &json!({"action": "split", "session_id": "s2", "split": "up"})
+            )
+            .is_ok()
+        );
+        assert!(validate_arguments("manage_layout", &json!({"action": "shuffle"})).is_err());
+        assert!(validate_arguments("get_layout", &json!({})).is_ok());
+    }
+
+    #[test]
     fn spawn_agents_come_from_the_runtime_catalog() {
         let tools = tool_definitions_for(&["opencode".into(), "shell".into()]);
         let spawn = tools
@@ -722,6 +844,12 @@ mod tests {
         assert!(describe("report_to_parent").contains("one-paragraph result"));
         assert!(describe("create_note").contains("open:true"));
         assert!(describe("note_history").contains("only the person restores"));
+        // Agents link related notes and read backlinks for context.
+        assert!(describe("create_note").contains("[[Note title]]"));
+        assert!(describe("write_note").contains("[[Note title]]"));
+        assert!(describe("read_note").contains("backlinks"));
+        assert!(describe("note_links").contains("Check backlinks"));
+        assert!(describe("list_notes").contains("links_to"));
         // Plain language for people who are not developers.
         for name in [
             "list_notes",
@@ -731,6 +859,7 @@ mod tests {
             "note_history",
             "edit_note",
             "replace_section",
+            "note_links",
         ] {
             let text = describe(name).to_lowercase();
             for jargon in ["repo", "worktree", "branch", "commit"] {

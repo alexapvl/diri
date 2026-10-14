@@ -1,7 +1,7 @@
 use diri_proto::{
     AgentDescriptor, AgentKind, AgentReadinessResult, AttachRequest, ClientRole, ControlMessage,
-    DateMillis, EventName, EventsSubscribeParams, ExitReason, HostInitializeParams, Method,
-    ReadScrollbackCellsResult, SessionDiffBase, SessionId, SessionListResult,
+    DateMillis, EventName, EventsSubscribeParams, ExitInfo, ExitReason, HostInitializeParams,
+    Method, ReadScrollbackCellsResult, SessionDiffBase, SessionId, SessionListResult,
     SessionReadDiffParams, SessionReadDiffResult, SessionStatus, StateSnapshotResult,
     WorktreeListResult,
 };
@@ -106,6 +106,58 @@ fn swift_associated_value_shapes_match_real_data() {
         serde_json::to_value(exited).unwrap(),
         json!({"exited": {"_0": {"reason": "daemonRestart"}}})
     );
+
+    // A reboot rides on the restart reason as an additive flag: an older peer
+    // ignores the field and still reads a restart-ended, resumable session.
+    let rebooted = SessionStatus::Exited(ExitInfo::restart(true));
+    let wire = serde_json::to_value(&rebooted).unwrap();
+    assert_eq!(
+        wire,
+        json!({"exited": {"_0": {"reason": "daemonRestart", "systemRestart": true}}})
+    );
+    assert_eq!(
+        serde_json::from_value::<SessionStatus>(wire.clone()).unwrap(),
+        rebooted
+    );
+    #[derive(serde::Deserialize)]
+    struct OlderExitInfo {
+        reason: ExitReason,
+    }
+    let older: OlderExitInfo = serde_json::from_value(wire["exited"]["_0"].clone()).unwrap();
+    assert_eq!(older.reason, ExitReason::DaemonRestart);
+}
+
+#[test]
+fn an_interrupted_exit_is_additive_and_resumable() {
+    let killed = SessionStatus::Exited(ExitInfo {
+        reason: ExitReason::Signaled,
+        code: None,
+        signal: Some(15),
+        system_restart: false,
+        interrupted: true,
+    });
+    let wire = serde_json::to_value(&killed).unwrap();
+    assert_eq!(
+        wire,
+        json!({"exited": {"_0": {"reason": "signaled", "signal": 15, "interrupted": true}}})
+    );
+    assert_eq!(
+        serde_json::from_value::<SessionStatus>(wire).unwrap(),
+        killed
+    );
+    let SessionStatus::Exited(info) = killed else {
+        unreachable!()
+    };
+    assert!(info.ended_by_interruption());
+    assert!(!info.ended_by_restart());
+
+    // A plain exit stays a plain exit on the wire and is not brought back.
+    let plain: SessionStatus =
+        serde_json::from_value(json!({"exited": {"_0": {"reason": "exited", "code": 0}}})).unwrap();
+    let SessionStatus::Exited(info) = plain else {
+        unreachable!()
+    };
+    assert!(!info.interrupted && !info.ended_by_interruption());
 }
 
 #[test]
@@ -329,12 +381,36 @@ fn spawn_params_host_field_is_wire_compatible() {
     assert!(encoded.get("host").is_none());
 
     let remote = diri_proto::SessionSpawnParams {
+        appearance: None,
         host: Some("forge".into()),
         ..legacy
     };
     let encoded = serde_json::to_value(&remote).unwrap();
     assert_eq!(encoded["host"], json!("forge"));
     typed_round_trip(&remote);
+}
+
+#[test]
+fn spawn_params_argv_is_additive_and_structured() {
+    let legacy: diri_proto::SessionSpawnParams =
+        serde_json::from_value(json!({"kind": {"shell": {}}, "cwd": "/tmp"})).unwrap();
+    assert_eq!(legacy.argv, None);
+    assert!(serde_json::to_value(&legacy).unwrap().get("argv").is_none());
+
+    let ssh = diri_proto::SessionSpawnParams {
+        argv: Some(vec![
+            "/usr/bin/ssh".into(),
+            "--".into(),
+            "host; rm -rf ~".into(),
+        ]),
+        ..legacy
+    };
+    let encoded = serde_json::to_value(&ssh).unwrap();
+    assert_eq!(
+        encoded["argv"],
+        json!(["/usr/bin/ssh", "--", "host; rm -rf ~"])
+    );
+    typed_round_trip(&ssh);
 }
 
 #[test]
@@ -391,6 +467,7 @@ fn migration_and_host_methods_use_the_swift_wire_names() {
         serde_json::from_value(json!({"kind": {"shell": {}}, "cwd": "/tmp"})).unwrap();
     assert_eq!(legacy.same_repo_as, None);
     let preserving = diri_proto::SessionSpawnParams {
+        appearance: None,
         account_profile_id: None,
         same_repo_as: Some(diri_proto::SessionId::new("s_ref")),
         ..legacy

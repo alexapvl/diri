@@ -30,11 +30,18 @@ static WINDOWS_OPENED: AtomicU64 = AtomicU64::new(0);
 /// Set when the app is frontmost; the stall watchdog paces itself on it.
 static APP_ACTIVE: AtomicBool = AtomicBool::new(true);
 static LAUNCH_RECORDED: AtomicBool = AtomicBool::new(false);
+/// This process is the install's first launch (`activation.first_launch`).
+static FIRST_LAUNCH: AtomicBool = AtomicBool::new(false);
+/// A local agent catalog arrived in this process before.
+static LOCAL_CATALOG_SEEN: AtomicBool = AtomicBool::new(false);
 
 /// A frame longer than this records `ui.slow_frame`.
 const SLOW_FRAME: Duration = Duration::from_millis(50);
 /// Main-thread unresponsiveness recorded as `ui.stall`.
 const STALL: Duration = Duration::from_secs(1);
+/// A ping unanswered this long has the main thread's stack sampled once,
+/// so the `ui.stall` it becomes names the code it was stuck in.
+const STALL_SAMPLE_AFTER: Duration = Duration::from_secs(2);
 /// A stall this long is something the user noticed: an incident.
 const STALL_INCIDENT: Duration = Duration::from_secs(3);
 /// A stall still going after this long is recorded (and flushed) before it
@@ -60,6 +67,14 @@ pub(crate) fn start(preview: bool) {
         return;
     }
     diri_telemetry::install_panic_hook();
+    // Before the first-run privacy notice or anything else writes settings:
+    // existing settings mean this Mac used Diri before activation tracking.
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    diri_telemetry::activation::init_origin(home.as_deref());
+    FIRST_LAUNCH.store(
+        diri_telemetry::activation::app_launched(),
+        Ordering::Relaxed,
+    );
     diri_telemetry::register_gauge("windows_main", || gauge(&MAIN_WINDOWS));
     diri_telemetry::register_gauge("windows_floating", || gauge(&FLOATING_WINDOWS));
     diri_telemetry::register_gauge("windows_opened", || gauge(&WINDOWS_OPENED));
@@ -95,6 +110,77 @@ pub(crate) fn install(cx: &mut App) {
         }
     })
     .detach();
+}
+
+/// `activation.agent_ready`, once per install: the first local agent
+/// catalog with a launchable agent. `installing` is the agent the welcome's
+/// one-click install is waiting for.
+pub(crate) fn agent_catalog_seen(
+    installing: Option<&diri_proto::AgentKind>,
+    catalog: &diri_proto::AgentReadinessResult,
+) {
+    let first_catalog = !LOCAL_CATALOG_SEEN.swap(true, Ordering::Relaxed);
+    use diri_telemetry::activation::{self, Milestone};
+    if activation::is_reached(Milestone::AgentReady) {
+        return;
+    }
+    let Some(ready) = agent_ready(
+        installing,
+        catalog,
+        first_catalog && FIRST_LAUNCH.load(Ordering::Relaxed),
+    ) else {
+        return;
+    };
+    activation::reach(
+        Milestone::AgentReady,
+        vec![
+            ("agent", Value::from(id(ready.agent.id()))),
+            ("source", Value::from(ready.source)),
+            ("agents", Value::from(ready.agents)),
+        ],
+    );
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct AgentReady {
+    agent: diri_proto::AgentKind,
+    /// `onboarding_install`: the agent Diri's one-click install was waiting
+    /// for. `preexisting`: already launchable in the first catalog of the
+    /// install's first launch. `manual`: became launchable later, installed
+    /// outside Diri.
+    source: &'static str,
+    /// Launchable agents in the catalog.
+    agents: usize,
+}
+
+fn agent_ready(
+    installing: Option<&diri_proto::AgentKind>,
+    catalog: &diri_proto::AgentReadinessResult,
+    first_catalog_of_first_launch: bool,
+) -> Option<AgentReady> {
+    let ready: Vec<_> = crate::agent_catalog::agent_options(catalog)
+        .into_iter()
+        .filter(|option| option.available && option.kind.id() != diri_proto::AgentKind::NOTE_ID)
+        .map(|option| option.kind)
+        .collect();
+    let agents = ready.len();
+    if let Some(kind) = installing.filter(|kind| ready.contains(kind)) {
+        return Some(AgentReady {
+            agent: kind.clone(),
+            source: "onboarding_install",
+            agents,
+        });
+    }
+    let agent = ready.into_iter().next()?;
+    Some(AgentReady {
+        agent,
+        source: if first_catalog_of_first_launch {
+            "preexisting"
+        } else {
+            "manual"
+        },
+        agents,
+    })
 }
 
 /// A named action run from somewhere other than a key binding.
@@ -142,7 +228,19 @@ fn finished_since(last: Option<(&'static str, u64)>, since: u64) -> Option<&'sta
 #[cfg(target_os = "macos")]
 static MAIN_THREAD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// The main thread, for the stall watchdog's stack sample.
+static MAIN_STACK: OnceLock<crate::stall_stack::SampledThread> = OnceLock::new();
+/// The main thread's stack sampled during the outstanding stall, keyed by
+/// that stall's ping ([`Sent::at`]).
+static STALL_STACK: Mutex<Option<(u64, Vec<String>)>> = Mutex::new(None);
+/// The surface the last main-window frame showed (`ui.slow_frame`'s
+/// `surface`), for `ui.stall`.
+static LAST_SURFACE: Mutex<&'static str> = Mutex::new("none");
+
 fn remember_main_thread() {
+    if let Some(thread) = crate::stall_stack::SampledThread::current() {
+        let _ = MAIN_STACK.set(thread);
+    }
     #[cfg(target_os = "macos")]
     {
         // SAFETY: returns the calling thread's port without taking a
@@ -307,6 +405,7 @@ impl Drop for WindowGuard {
         let lived_s = self.opened.elapsed().as_secs();
         if self.kind == "main" {
             LAST_FRAME_END.with(|ends| ends.borrow_mut().remove(&self.window));
+            crate::perf_overlay::forget_window(self.window);
             event!(
                 "window.close",
                 kind = self.kind,
@@ -481,8 +580,26 @@ pub(crate) fn frame_probe(started: FrameStart, context: FrameContext) -> impl In
     canvas(
         |_, _, _| {},
         move |_, _, window, cx| {
+            if crate::perf_overlay::overlay_enabled() {
+                let gpui = window.frame_stats_so_far();
+                crate::perf_overlay::record_frame(
+                    window.window_handle().window_id().as_u64(),
+                    crate::perf_overlay::FrameSample {
+                        end: cx.background_executor().now(),
+                        cost: started.at.elapsed(),
+                        views_rendered: gpui.views_rendered,
+                        views_reused: gpui.views_reused,
+                        terminal_paints: diri_term::element::PaintTotals::now()
+                            .since(started.paints)
+                            .paints,
+                    },
+                );
+            }
             if !diri_telemetry::is_enabled() {
                 return;
+            }
+            if let Ok(mut surface) = LAST_SURFACE.lock() {
+                *surface = context.surface;
             }
             let window_id = window.window_handle().window_id().as_u64();
             let previous_end =
@@ -504,11 +621,17 @@ pub(crate) fn frame_probe(started: FrameStart, context: FrameContext) -> impl In
             };
             breakdown.observe();
             if !LAUNCH_RECORDED.swap(true, Ordering::Relaxed) {
+                let platform = LaunchPlatform::current(cx.compositor_name(), window.gpu_specs());
                 event!(
                     "app.launch",
                     ms = process_started().elapsed(),
                     version = crate::updates::CURRENT_VERSION,
-                    windows = MAIN_WINDOWS.load(Ordering::Relaxed)
+                    windows = MAIN_WINDOWS.load(Ordering::Relaxed),
+                    display = platform.display,
+                    desktop = platform.desktop,
+                    package = platform.package,
+                    gpu = platform.gpu,
+                    gpu_software = platform.gpu_software
                 );
             }
             if breakdown.total >= SLOW_FRAME {
@@ -528,6 +651,130 @@ pub(crate) fn frame_probe(started: FrameStart, context: FrameContext) -> impl In
     )
     .absolute()
     .size_0()
+}
+
+/// Linux display facts for `app.launch`, as closed classes: which display
+/// server, desktop, package and GPU driver a launch or rendering report came
+/// from. All `None` on macOS. Never a device name, driver version or path.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct LaunchPlatform {
+    display: Option<&'static str>,
+    desktop: Option<&'static str>,
+    package: Option<&'static str>,
+    gpu: Option<&'static str>,
+    gpu_software: Option<bool>,
+}
+
+impl LaunchPlatform {
+    fn current(compositor: &'static str, gpu: Option<gpui::GpuSpecs>) -> Self {
+        if !cfg!(target_os = "linux") {
+            return Self::default();
+        }
+        let executable = std::env::current_exe().ok();
+        Self {
+            display: display_class(compositor),
+            desktop: std::env::var("XDG_CURRENT_DESKTOP")
+                .ok()
+                .map(|desktop| desktop_class(&desktop)),
+            package: Some(package_class(
+                std::env::var_os("APPIMAGE").is_some(),
+                executable.as_deref(),
+            )),
+            gpu: gpu
+                .as_ref()
+                .map(|gpu| gpu_class(&gpu.driver_name, &gpu.device_name)),
+            gpu_software: gpu.map(|gpu| gpu.is_software_emulated),
+        }
+    }
+}
+
+fn display_class(compositor: &str) -> Option<&'static str> {
+    match compositor {
+        "Wayland" => Some("wayland"),
+        "X11" => Some("x11"),
+        "" => None,
+        _ => Some("other"),
+    }
+}
+
+/// `XDG_CURRENT_DESKTOP` is a colon-separated list, most specific first
+/// (`ubuntu:GNOME`, `Budgie:GNOME`).
+fn desktop_class(value: &str) -> &'static str {
+    const KNOWN: [&str; 21] = [
+        "gnome",
+        "kde",
+        "xfce",
+        "cinnamon",
+        "mate",
+        "lxqt",
+        "lxde",
+        "budgie",
+        "pantheon",
+        "cosmic",
+        "unity",
+        "deepin",
+        "sway",
+        "hyprland",
+        "niri",
+        "river",
+        "wayfire",
+        "i3",
+        "labwc",
+        "enlightenment",
+        "gamescope",
+    ];
+    for part in value.split(':') {
+        let part = part.trim().to_ascii_lowercase();
+        let part = part.strip_prefix("x-").unwrap_or(&part);
+        if part == "ubuntu" || part == "pop" || part == "zorin" {
+            continue;
+        }
+        if let Some(known) = KNOWN.iter().find(|known| part.starts_with(*known)) {
+            return known;
+        }
+    }
+    if value.trim().is_empty() {
+        "none"
+    } else {
+        "other"
+    }
+}
+
+/// `appimage`, `system` (a distro package: `<prefix>/bin` beside
+/// `<prefix>/lib/diri`) or `source` (a cargo build).
+fn package_class(appimage: bool, executable: Option<&std::path::Path>) -> &'static str {
+    if appimage {
+        return "appimage";
+    }
+    let packaged = executable
+        .and_then(std::path::Path::parent)
+        .filter(|dir| dir.file_name().is_some_and(|name| name == "bin"))
+        .and_then(std::path::Path::parent)
+        .is_some_and(|prefix| prefix.join("lib/diri").is_dir());
+    if packaged { "system" } else { "source" }
+}
+
+/// The Vulkan driver family from wgpu's adapter info.
+fn gpu_class(driver: &str, device: &str) -> &'static str {
+    let text = format!("{driver} {device}").to_ascii_lowercase();
+    const CLASSES: [(&str, &[&str]); 9] = [
+        (
+            "software",
+            &["llvmpipe", "lavapipe", "softpipe", "swiftshader"],
+        ),
+        ("nouveau", &["nvk", "nouveau"]),
+        ("nvidia", &["nvidia"]),
+        ("amd", &["radv", "amd", "radeon"]),
+        ("intel", &["intel", "anv"]),
+        ("asahi", &["honeykrisp", "asahi", "apple"]),
+        ("adreno", &["turnip", "freedreno", "adreno"]),
+        ("mali", &["panvk", "panfrost", "mali"]),
+        ("virtual", &["venus", "virtio", "vmware", "virgl"]),
+    ];
+    CLASSES
+        .iter()
+        .find(|(_, needles)| needles.iter().any(|needle| text.contains(needle)))
+        .map_or("other", |(class, _)| class)
 }
 
 /// One sampled over-budget frame per [`OVER_BUDGET_SAMPLE_EVERY`].
@@ -586,6 +833,9 @@ fn start_stall_watchdog(cx: &mut App) {
                     continue;
                 };
                 let stalled = Duration::from_millis(mono_ms().saturating_sub(sent.at));
+                if stalled >= STALL_SAMPLE_AFTER {
+                    sample_stall_stack(sent.at);
+                }
                 if stalled >= STALL_ONGOING && !reported_ongoing {
                     reported_ongoing = true;
                     record_stall(stalled, true, &sent);
@@ -654,15 +904,60 @@ impl Ping {
     }
 }
 
+/// Samples the main thread's stack once per stall, from the watchdog
+/// thread while the main thread is still stuck.
+fn sample_stall_stack(ping_at: u64) {
+    let Some(thread) = MAIN_STACK.get().copied() else {
+        return;
+    };
+    if STALL_STACK
+        .lock()
+        .is_ok_and(|stack| stack.as_ref().is_some_and(|(at, _)| *at == ping_at))
+    {
+        return;
+    }
+    let frames = thread.sample();
+    if let Ok(mut stack) = STALL_STACK.lock() {
+        *stack = Some((ping_at, frames));
+    }
+}
+
+/// The stack sampled during the stall that began with `ping_at`; an ended
+/// stall takes it, an ongoing one leaves it for the final record.
+fn stall_stack(ping_at: u64, ongoing: bool) -> Option<Value> {
+    let mut stack = STALL_STACK.lock().ok()?;
+    if stack.as_ref().is_none_or(|(at, _)| *at != ping_at) {
+        return None;
+    }
+    let frames = if ongoing {
+        stack.as_ref().map(|(_, frames)| frames.clone())?
+    } else {
+        stack.take().map(|(_, frames)| frames)?
+    };
+    Some(Value::List(
+        frames
+            .iter()
+            .map(|frame| Value::from(diri_telemetry::text(frame)))
+            .collect(),
+    ))
+}
+
+fn last_surface() -> &'static str {
+    LAST_SURFACE.lock().map_or("none", |surface| *surface)
+}
+
 /// `was_active` is whether diri was frontmost when the stall began, `active`
 /// whether it is now; `cpu_ms` is the main thread's own CPU time over the
 /// stall (≈ `ms`: busy; ≈ 0: blocked or not scheduled), `faults` the
-/// process's page faults, and `action` a named action that finished inside
-/// it.
+/// process's page faults, `action` a named action that finished inside it,
+/// `surface` what the last frame before it showed, and `stack` the main
+/// thread's call stack sampled 2 s in (macOS; innermost first).
 fn record_stall(duration: Duration, ongoing: bool, sent: &Sent) {
     let active = APP_ACTIVE.load(Ordering::Relaxed);
     let (cpu, faults) = sent.usage.since();
     let action = action_since(sent.at);
+    let surface = last_surface();
+    let stack = stall_stack(sent.at, ongoing);
     if duration >= STALL_INCIDENT {
         incident!(
             "ui.stall",
@@ -672,7 +967,9 @@ fn record_stall(duration: Duration, ongoing: bool, sent: &Sent) {
             was_active = sent.active,
             cpu_ms = cpu,
             faults = faults,
-            action = action
+            action = action,
+            surface = surface,
+            stack = stack
         );
     } else {
         diri_telemetry::warn_event!(
@@ -683,7 +980,9 @@ fn record_stall(duration: Duration, ongoing: bool, sent: &Sent) {
             was_active = sent.active,
             cpu_ms = cpu,
             faults = faults,
-            action = action
+            action = action,
+            surface = surface,
+            stack = stack
         );
     }
 }
@@ -873,10 +1172,15 @@ pub(crate) struct TransportTrace {
     live_at: Option<Instant>,
     grids: u64,
     snapshots: u64,
+    /// Attaches in a row that ended before their first grid.
+    empty: u32,
 }
 
 /// Failed attaches in a row before the pane is recorded as failing.
 const ATTACH_FAILING_AFTER: u32 = 3;
+/// Empty attaches in a row after which one `pane.attach_flapping` stands in
+/// for the per-attempt attach/detach events until a grid arrives.
+const ATTACH_FLAPPING_AFTER: u32 = 3;
 
 impl TransportTrace {
     pub(crate) fn new(session: &diri_proto::SessionId) -> Self {
@@ -890,7 +1194,13 @@ impl TransportTrace {
             live_at: None,
             grids: 0,
             snapshots: 0,
+            empty: 0,
         }
+    }
+
+    /// Per-attempt events are muted while the pane is flapping.
+    fn flapping(&self) -> bool {
+        self.empty >= ATTACH_FLAPPING_AFTER
     }
 
     pub(crate) fn connecting(&mut self) {
@@ -914,14 +1224,16 @@ impl TransportTrace {
     pub(crate) fn live(&mut self) {
         let connect = self.attempt_at.elapsed();
         diri_telemetry::observe("pane.attach", connect);
-        event!(
-            "pane.attached",
-            session = self.session.clone(),
-            reconnect = self.attaches > 0,
-            attempts = self.failures + 1,
-            connect_ms = connect,
-            since_mount_ms = self.mounted_at.elapsed()
-        );
+        if !self.flapping() {
+            event!(
+                "pane.attached",
+                session = self.session.clone(),
+                reconnect = self.attaches > 0,
+                attempts = self.failures + 1,
+                connect_ms = connect,
+                since_mount_ms = self.mounted_at.elapsed()
+            );
+        }
         self.attaches += 1;
         self.failures = 0;
         self.live_at = Some(Instant::now());
@@ -934,6 +1246,7 @@ impl TransportTrace {
             return;
         };
         self.grids += 1;
+        self.empty = 0;
         if update.is_full_snapshot {
             self.snapshots += 1;
             if self.snapshots > 1 {
@@ -966,16 +1279,50 @@ impl TransportTrace {
     }
 
     pub(crate) fn drain_interrupted(&self) {
-        diri_telemetry::warn_event!("pane.drain_interrupted", session = self.session.clone());
+        if !self.flapping() {
+            diri_telemetry::warn_event!("pane.drain_interrupted", session = self.session.clone());
+        }
     }
 
-    pub(crate) fn detached(&mut self) {
+    /// `input_at_risk`: typed input may have been lost, so the pane says so;
+    /// otherwise the reconnect is silent and only counted.
+    pub(crate) fn detached(&mut self, input_at_risk: bool) {
+        let live_ms = self.live_at.take().map(|at| at.elapsed());
+        if !input_at_risk {
+            diri_telemetry::count("pane.reconnect_silent", 1);
+        }
+        if !self.flapping() {
+            diri_telemetry::warn_event!(
+                "pane.detached",
+                session = self.session.clone(),
+                live_ms = live_ms,
+                grids = self.grids,
+                reseeds = self.snapshots.saturating_sub(1),
+                input_at_risk = input_at_risk
+            );
+        }
+        if self.grids == 0 {
+            self.empty += 1;
+            if self.empty == ATTACH_FLAPPING_AFTER {
+                diri_telemetry::warn_event!(
+                    "pane.attach_flapping",
+                    session = self.session.clone(),
+                    attaches = self.empty,
+                    since_mount_ms = self.mounted_at.elapsed()
+                );
+            }
+        }
+    }
+
+    /// The Engine refused the attach; the pane waits for the session to
+    /// change, so this is recorded once per refusal, not per retry.
+    pub(crate) fn rejected(&mut self, reason: diri_proto::frames::AttachRejection) {
+        self.live_at = None;
         diri_telemetry::warn_event!(
-            "pane.detached",
+            "pane.attach_rejected",
             session = self.session.clone(),
-            live_ms = self.live_at.take().map(|at| at.elapsed()),
-            grids = self.grids,
-            reseeds = self.snapshots.saturating_sub(1)
+            reason = reason.as_str(),
+            since_mount_ms = self.mounted_at.elapsed()
         );
     }
 }
@@ -1095,13 +1442,13 @@ pub(crate) fn upload_now_summary(
     result: &Result<diri_proto::TelemetryUploadNowResult, String>,
 ) -> &'static str {
     match result.as_ref().map(|result| result.status.as_str()) {
-        Ok("sent") => "Sent. Thanks, this helps.",
-        Ok("up_to_date") => "Already sent. Nothing new since the last upload.",
-        Ok("failed") => "Couldn't reach the server. diri will try again.",
-        Ok("timeout") => "Still sending in the background.",
-        Ok("unavailable") => "Uploading isn't set up in this build.",
-        Ok(_) => "Sent.",
-        Err(_) => "The diri engine isn't running. Try again in a moment.",
+        Ok("sent") => crate::i18n::t("settings.privacy.sent"),
+        Ok("up_to_date") => crate::i18n::t("settings.privacy.up_to_date"),
+        Ok("failed") => crate::i18n::t("settings.privacy.send_failed"),
+        Ok("timeout") => crate::i18n::t("settings.privacy.send_timeout"),
+        Ok("unavailable") => crate::i18n::t("settings.privacy.send_unavailable"),
+        Ok(_) => crate::i18n::t("settings.privacy.sent_short"),
+        Err(_) => crate::i18n::t("settings.privacy.engine_down"),
     }
 }
 
@@ -1175,6 +1522,53 @@ mod tests {
     use super::*;
 
     #[test]
+    fn linux_launch_facts_are_closed_classes() {
+        assert_eq!(display_class("Wayland"), Some("wayland"));
+        assert_eq!(display_class("X11"), Some("x11"));
+        assert_eq!(display_class(""), None);
+        assert_eq!(desktop_class("ubuntu:GNOME"), "gnome");
+        assert_eq!(desktop_class("KDE"), "kde");
+        assert_eq!(desktop_class("X-Cinnamon"), "cinnamon");
+        assert_eq!(desktop_class("Hyprland"), "hyprland");
+        assert_eq!(desktop_class("Budgie:GNOME"), "budgie");
+        assert_eq!(desktop_class("my-own-wm"), "other");
+        assert_eq!(desktop_class(""), "none");
+        assert_eq!(gpu_class("NVIDIA", "NVIDIA GeForce RTX 4070"), "nvidia");
+        assert_eq!(gpu_class("radv", "AMD Radeon 780M (RADV PHOENIX)"), "amd");
+        assert_eq!(
+            gpu_class("Intel open-source Mesa driver", "Intel(R) Graphics (RPL-P)"),
+            "intel"
+        );
+        assert_eq!(
+            gpu_class("llvmpipe", "llvmpipe (LLVM 19.1.7, 256 bits)"),
+            "software"
+        );
+        assert_eq!(gpu_class("NVK", "NVIDIA GeForce GTX 1060"), "nouveau");
+        assert_eq!(gpu_class("Honeykrisp", "Apple M2 Pro (G14S B1)"), "asahi");
+        assert_eq!(gpu_class("", ""), "other");
+    }
+
+    #[test]
+    fn linux_package_kind_follows_the_install_layout() {
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("usr/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let exe = bin.join("diri");
+        assert_eq!(package_class(true, Some(&exe)), "appimage");
+        assert_eq!(package_class(false, Some(&exe)), "source");
+        std::fs::create_dir_all(temp.path().join("usr/lib/diri")).unwrap();
+        assert_eq!(package_class(false, Some(&exe)), "system");
+        assert_eq!(package_class(false, None), "source");
+    }
+
+    #[test]
+    fn macos_launches_carry_no_linux_facts() {
+        if cfg!(target_os = "macos") {
+            assert_eq!(LaunchPlatform::current("", None), LaunchPlatform::default());
+        }
+    }
+
+    #[test]
     fn privacy_changes_are_committed_only_after_a_successful_save() {
         let dir = tempfile::tempdir().unwrap();
         let mut settings = PrivacySettings {
@@ -1242,6 +1636,21 @@ mod tests {
     }
 
     #[test]
+    fn a_stall_carries_only_the_stack_sampled_during_it() {
+        let frames = |value: Option<Value>| match value {
+            Some(Value::List(frames)) => frames.len(),
+            _ => 0,
+        };
+        *STALL_STACK.lock().unwrap() = Some((7, vec!["diri a".to_owned(), "diri b".to_owned()]));
+        // Another stall's record never borrows this one's sample.
+        assert_eq!(frames(stall_stack(6, false)), 0);
+        // The 5 s ongoing record shows it and leaves it for the final one.
+        assert_eq!(frames(stall_stack(7, true)), 2);
+        assert_eq!(frames(stall_stack(7, false)), 2);
+        assert_eq!(frames(stall_stack(7, false)), 0);
+    }
+
+    #[test]
     fn page_faults_only_grow() {
         let before = process_faults();
         let touched = vec![1u8; 8 << 20];
@@ -1282,6 +1691,35 @@ mod tests {
             upload_now_blocking().is_err(),
             "tests never reach the real Engine"
         );
+    }
+
+    #[test]
+    fn agent_ready_names_where_the_first_agent_came_from() {
+        use diri_proto::AgentKind;
+        let none = crate::agent_setup::bundled_catalog(&[]);
+        assert_eq!(agent_ready(None, &none, true), None);
+        assert_eq!(
+            agent_ready(Some(&AgentKind::CLAUDE_CODE), &none, false),
+            None
+        );
+
+        let claude = crate::agent_setup::bundled_catalog(&["claude-code"]);
+        let ready = |installing: Option<&AgentKind>, first| {
+            agent_ready(installing, &claude, first).unwrap()
+        };
+        let (claude_code, codex) = (AgentKind::CLAUDE_CODE, AgentKind::CODEX);
+        let installed = ready(Some(&claude_code), false);
+        assert_eq!(installed.source, "onboarding_install");
+        assert_eq!(installed.agent, AgentKind::CLAUDE_CODE);
+        assert_eq!(installed.agents, 1);
+        assert_eq!(ready(None, true).source, "preexisting");
+        assert_eq!(ready(None, false).source, "manual");
+        // Waiting for Codex while Claude Code turns up is not the install.
+        assert_eq!(ready(Some(&codex), false).source, "manual");
+
+        let two = crate::agent_setup::bundled_catalog(&["codex", "claude-code"]);
+        let both = agent_ready(Some(&AgentKind::CODEX), &two, false).unwrap();
+        assert_eq!((both.agent, both.agents), (AgentKind::CODEX, 2));
     }
 
     #[test]

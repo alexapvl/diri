@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use diri_proto::frames::{Frame, FrameCodec, FrameType};
+use diri_proto::frames::{AttachRejection, Frame, FrameCodec, FrameType};
 
 use crate::registry::Registry;
 use crate::session::{AttachmentSeed, GridSignature, GridWake};
@@ -73,6 +73,14 @@ const IDLE_PUMP_CEILING: Duration = Duration::from_secs(30);
 /// How often a pump looks for its Session while a restart has removed it.
 const ABSENT_SESSION_RETRY: Duration = Duration::from_secs(1);
 const STALLED_SINK_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long a reseedable sink may stay behind before it is dropped after all.
+/// A throttled client (App Nap, memory pressure) catches up well inside it;
+/// past it the peer is wedged and only holds a thread and a descriptor.
+const LAGGING_SINK_LIMIT: Duration = Duration::from_secs(30);
+/// How often a pump looks at a lagging sink's socket for room to reseed it.
+/// Bounds the pump's wakeups while a client is descheduled, and the delay
+/// between the client reading again and its fresh screen.
+const LAGGING_RECHECK: Duration = Duration::from_millis(100);
 
 struct SinkOutput {
     enhanced_keyboard: bool,
@@ -87,6 +95,12 @@ struct SinkOutput {
     closed: bool,
     /// Why this sink was closed from the publishing side, for telemetry.
     close_reason: Option<&'static str>,
+    /// A pump-registered sink that falls behind discards its stale diffs and
+    /// is reseeded with a Full Snapshot instead of being closed. Off for
+    /// connections no pump serves (a completed session's read-only seed).
+    reseedable: bool,
+    /// Since when, and why, this sink has been behind; cleared by the reseed.
+    lagging: Option<(Instant, &'static str)>,
 }
 
 impl SinkOutput {
@@ -102,6 +116,8 @@ impl SinkOutput {
             last_progress: Instant::now(),
             closed: false,
             close_reason: None,
+            reseedable: false,
+            lagging: None,
         })
     }
 
@@ -114,10 +130,18 @@ impl SinkOutput {
             .map_or(SINK_BACKLOG_BYTES.max(bytes.len() + 64), |front| {
                 SINK_BACKLOG_BYTES.max(front.len() + 64)
             });
+        if self.lagging.is_some() {
+            // Stale: the reseed will carry this frame's effect.
+            return !self.closed;
+        }
         if self.closed
             || self.frames.len() >= SINK_BACKLOG_FRAMES
             || self.queued_bytes.saturating_add(bytes.len()) > limit
         {
+            if !self.closed && self.reseedable {
+                self.fall_behind("backlog");
+                return true;
+            }
             if !self.closed {
                 self.close_reason = Some("backlog");
             }
@@ -164,10 +188,59 @@ impl SinkOutput {
             }
         }
         if !self.frames.is_empty() && self.last_progress.elapsed() >= STALLED_SINK_TIMEOUT {
-            self.close_reason.get_or_insert("stalled");
+            if self.reseedable {
+                self.fall_behind("stalled");
+            } else {
+                self.close_reason.get_or_insert("stalled");
+                self.close();
+            }
+        }
+        if let Some((since, reason)) = self.lagging
+            && since.elapsed() >= LAGGING_SINK_LIMIT
+        {
+            self.close_reason.get_or_insert(reason);
             self.close();
         }
         !self.closed
+    }
+
+    /// The client stopped keeping up (it is descheduled or throttled, not
+    /// gone): drop every queued diff and wait for room to send one Full
+    /// Snapshot. A partially written frame stays, because the peer's codec is
+    /// mid-frame and anything spliced in would corrupt the stream.
+    fn fall_behind(&mut self, reason: &'static str) {
+        let partial = (self.offset > 0).then(|| self.frames.pop_front()).flatten();
+        self.frames.clear();
+        self.queued_bytes = partial.as_ref().map_or(0, |frame| frame.len());
+        self.frames.extend(partial);
+        self.lagging.get_or_insert((Instant::now(), reason));
+    }
+
+    /// Whether this sink is behind with nothing left to finish and its socket
+    /// has room again, so a reseed would be read rather than stall in turn.
+    fn ready_for_reseed(&self) -> bool {
+        if self.closed || self.lagging.is_none() || !self.frames.is_empty() {
+            return false;
+        }
+        use diri_platform::poll::{POLLOUT, PollFd};
+        let mut descriptor = PollFd {
+            fd: self.stream.as_raw_io(),
+            events: POLLOUT,
+            revents: 0,
+        };
+        // SAFETY: one valid entry for a live socket; a zero timeout never blocks.
+        unsafe {
+            diri_platform::poll::poll(&mut descriptor, 1, 0) > 0
+                && descriptor.revents & POLLOUT != 0
+        }
+    }
+
+    /// Replaces the dropped diffs with the current screen. Returns since
+    /// when, and why, the sink had been behind.
+    fn reseed(&mut self, grid: Arc<[u8]>, modes: Arc<[u8]>) -> Option<(Instant, &'static str)> {
+        let lagging = self.lagging.take()?;
+        let _ = self.enqueue(grid) && self.enqueue(modes);
+        Some(lagging)
     }
 
     fn close(&mut self) {
@@ -200,6 +273,7 @@ struct SessionSinks {
 pub struct AttachHub {
     sessions: Arc<Mutex<HashMap<String, SessionSinks>>>,
     next_sink: Arc<AtomicU64>,
+    rejections: Arc<Mutex<RejectionLog>>,
     #[cfg(test)]
     registration_hook: Arc<Mutex<Option<RegistrationHook>>>,
 }
@@ -207,9 +281,72 @@ pub struct AttachHub {
 #[cfg(test)]
 type RegistrationHook = Arc<dyn Fn() + Send + Sync>;
 
+/// One `attach.rejected` per session per window: a client that keeps
+/// retrying a refused attach must not turn into tens of thousands of events.
+const REJECTION_EVENT_EVERY: Duration = Duration::from_secs(60);
+/// Sessions remembered by [`RejectionLog`] before stale ones are forgotten.
+const REJECTION_LOG_CAP: usize = 256;
+
+#[derive(Default)]
+struct RejectionLog(HashMap<String, (Instant, u64)>);
+
+impl RejectionLog {
+    /// `Some(suppressed since the last event)` when an event is due now.
+    fn due(&mut self, session_id: &str, now: Instant) -> Option<u64> {
+        if let Some((last, suppressed)) = self.0.get_mut(session_id) {
+            if now.duration_since(*last) < REJECTION_EVENT_EVERY {
+                *suppressed += 1;
+                return None;
+            }
+            let count = std::mem::take(suppressed);
+            *last = now;
+            return Some(count);
+        }
+        if self.0.len() >= REJECTION_LOG_CAP {
+            self.0
+                .retain(|_, (last, _)| now.duration_since(*last) < REJECTION_EVENT_EVERY);
+        }
+        self.0.insert(session_id.to_owned(), (now, 0));
+        Some(0)
+    }
+}
+
 impl AttachHub {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Refuses an attach for good: one [`FrameType::AttachRejected`] frame,
+    /// then the caller closes. A client that knows the frame stops retrying;
+    /// an older one fails to decode it and sees the same close as before.
+    pub(crate) fn reject(
+        &self,
+        writer: &Arc<Mutex<UnixStream>>,
+        session_id: &str,
+        reason: AttachRejection,
+    ) {
+        if let Some(suppressed) = self
+            .rejections
+            .lock()
+            .ok()
+            .and_then(|mut log| log.due(session_id, Instant::now()))
+        {
+            diri_telemetry::event!(
+                "attach.rejected",
+                session = diri_telemetry::id(session_id),
+                reason = reason.as_str(),
+                suppressed = suppressed,
+            );
+        }
+        let Ok(encoded) = FrameCodec::encode(&Frame::attach_rejected(reason)) else {
+            return;
+        };
+        if let Ok(mut stream) = writer.lock() {
+            // A fresh socket's buffer takes five bytes; the timeout only
+            // guards a peer that is somehow not reading at all.
+            let _ = stream.set_write_timeout(Some(Duration::from_millis(250)));
+            let _ = stream.write_all(&encoded);
+        }
     }
 
     pub fn serve_preview_set(
@@ -360,6 +497,8 @@ impl AttachHub {
                 .get(session_id)
                 .is_some_and(|session| !session.allows_keyboard_controller(enhanced_keyboard))
             {
+                drop(guard);
+                self.reject(&writer, session_id, AttachRejection::KeyboardUnsupported);
                 return;
             }
             let _ = guard.wake_session(session_id);
@@ -382,19 +521,40 @@ impl AttachHub {
         // no live Session to attach to, but its final terminal may have been
         // retained. Serve that as a read-only seed on this connection.
         let completed = {
-            let Ok(guard) = registry.lock() else {
+            let Ok(mut guard) = registry.lock() else {
                 return;
             };
             if guard.get(session_id).is_some() {
                 None
             } else {
-                guard.completed_run(session_id)
+                guard.completed_run(session_id).and_then(|handle| {
+                    // Watched from the same lock as the lookup: a resume can
+                    // only install its Session after this, and closes it.
+                    let view = self.next_sink.fetch_add(1, Ordering::SeqCst);
+                    let stream = reader.try_clone().ok()?;
+                    guard.watch_completed_view(session_id, view, stream);
+                    Some((handle, view))
+                })
             }
         };
-        if let Some(handle) = completed {
-            self.serve_completed(handle, output, reader, buffered, session_id, preview);
+        if let Some((handle, view)) = completed {
+            // A retained run whose terminal never made it to disk (the Mac
+            // restarted before the checkpoint, or it no longer loads) has
+            // nothing to show. Refuse it like a missing session: a bare close
+            // reads as a dropped connection, and the pane would retry it every
+            // 30 s for as long as it stays open.
+            let served =
+                self.serve_completed(handle, output, reader, buffered, session_id, preview);
+            if let Ok(mut guard) = registry.lock() {
+                guard.forget_completed_view(session_id, view);
+            }
+            if !served && !preview {
+                self.reject(&writer, session_id, AttachRejection::SessionNotFound);
+            }
             return;
         }
+        // The pump serving this sink can reseed it when it falls behind.
+        output.reseedable = true;
         let attach_started = Instant::now();
         let seed_bytes;
         // Snapshot, seed queueing and registration share the publisher's
@@ -405,6 +565,10 @@ impl AttachHub {
                 return;
             };
             let Some(session) = guard.get(session_id) else {
+                drop(guard);
+                if !preview {
+                    self.reject(&writer, session_id, AttachRejection::SessionNotFound);
+                }
                 return;
             };
             if preview
@@ -421,6 +585,8 @@ impl AttachHub {
                 return;
             }
             if !preview && !session.allows_keyboard_controller(enhanced_keyboard) {
+                drop(guard);
+                self.reject(&writer, session_id, AttachRejection::KeyboardUnsupported);
                 return;
             }
             let seed = if preview {
@@ -559,6 +725,9 @@ impl AttachHub {
     /// pings are answered, every other frame is swallowed because there is no
     /// child to receive it, and nothing is ever published again. The pane
     /// sees the same thing a live exited session shows, its last screen.
+    /// A Session installed under the id (a resume) shuts the connection
+    /// down so the client reattaches to it.
+    /// False when there was no screen to seed, before anything was written.
     fn serve_completed(
         &self,
         handle: crate::registry::CompletedRunHandle,
@@ -567,19 +736,19 @@ impl AttachHub {
         buffered: Vec<u8>,
         session_id: &str,
         preview: bool,
-    ) {
+    ) -> bool {
         let Ok(Some(terminal)) = handle.load() else {
-            return;
+            return false;
         };
         let Some(mut screen) = terminal.screen() else {
-            return;
+            return false;
         };
         let Ok(grid) = Frame::grid(&screen.grid_update(true))
             .ok()
             .and_then(|frame| FrameCodec::encode(&frame).ok())
             .ok_or(())
         else {
-            return;
+            return false;
         };
         let grid = if preview {
             let ready = diri_proto::preview::PreviewReady {
@@ -587,7 +756,7 @@ impl AttachHub {
                 version: diri_proto::preview::PREVIEW_VERSION,
             };
             let Ok(mut bytes) = serde_json::to_vec(&ready) else {
-                return;
+                return false;
             };
             bytes.push(b'\n');
             bytes.extend_from_slice(&grid);
@@ -596,7 +765,7 @@ impl AttachHub {
             grid
         };
         if !output.enqueue(Arc::from(grid)) {
-            return;
+            return false;
         }
         let Ok(modes) = encoded(&Frame::modes_with_keyboard_capability(
             screen.is_alt_screen(),
@@ -605,10 +774,14 @@ impl AttachHub {
             terminal.checkpoint.keyboard,
             output.enhanced_keyboard,
         )) else {
-            return;
+            return false;
         };
-        if !output.enqueue(modes) || !drain_output(&mut output) {
-            return;
+        if !output.enqueue(modes) {
+            return false;
+        }
+        // Part of the seed may be on the wire: never splice a rejection after it.
+        if !drain_output(&mut output) {
+            return true;
         }
         let mut codec = FrameCodec::new();
         let mut chunk = [0u8; 4096];
@@ -643,6 +816,7 @@ impl AttachHub {
             }
         }
         output.close();
+        true
     }
 
     fn handle_frame(
@@ -862,22 +1036,96 @@ impl AttachHub {
         }
     }
 
-    fn flush_sinks(&self, session_id: &str) -> bool {
+    /// Writes what each sink can take. Returns whether frames remain queued,
+    /// whether any sink is behind, and the sinks that are ready for a reseed.
+    fn flush_sinks(&self, session_id: &str) -> (bool, bool, Vec<Arc<Mutex<SinkOutput>>>) {
         let mut pending = false;
+        let mut lagging = false;
+        let mut reseeds = Vec::new();
         for (id, output) in self.sink_outputs(session_id) {
             let keep = match output {
-                PublicationOutput::Socket(output) => output.lock().is_ok_and(|mut output| {
-                    let keep = output.flush();
-                    pending |= !output.frames.is_empty();
-                    keep
-                }),
+                PublicationOutput::Socket(output) => {
+                    let ready = output
+                        .lock()
+                        .map(|mut guard| {
+                            let keep = guard.flush();
+                            // A lagging sink's unfinished frame is retried on the
+                            // slower lagging cadence, not the write-retry spin.
+                            let behind = keep && guard.lagging.is_some();
+                            pending |= !guard.frames.is_empty() && !behind;
+                            lagging |= behind;
+                            (keep, keep && guard.ready_for_reseed())
+                        })
+                        .ok();
+                    match ready {
+                        Some((keep, ready)) => {
+                            if ready {
+                                reseeds.push(output);
+                            }
+                            keep
+                        }
+                        None => false,
+                    }
+                }
                 PublicationOutput::Mux(output) => !output.is_closed(),
             };
             if !keep {
                 self.deregister(session_id, id);
             }
         }
-        pending
+        (pending, lagging, reseeds)
+    }
+
+    /// Sends each ready lagging sink the current screen and modes. The
+    /// snapshot is taken under the Registry, the publication sequencing
+    /// boundary, by the pump that publishes every later diff — the same
+    /// ordering a fresh attach's seed gets.
+    fn reseed_sinks(
+        &self,
+        registry: &Arc<Mutex<Registry>>,
+        session_id: &str,
+        sinks: Vec<Arc<Mutex<SinkOutput>>>,
+    ) {
+        let Ok(guard) = registry.lock() else { return };
+        // Mid-restart the Session is briefly absent; the sinks stay behind
+        // and the next pass reseeds them from its replacement.
+        let Some(session) = guard.get(session_id) else {
+            return;
+        };
+        let seed = session.preview_seed();
+        let Ok(grid) = Frame::grid(&seed.grid)
+            .map_err(std::io::Error::other)
+            .and_then(|frame| encoded(&frame))
+        else {
+            return;
+        };
+        for output in sinks {
+            let Ok(mut output) = output.lock() else {
+                continue;
+            };
+            let Ok(modes) = encoded(
+                &Frame::modes_with_keyboard_capability(
+                    seed.modes.0,
+                    seed.modes.1,
+                    seed.modes.2,
+                    seed.signature.keyboard,
+                    output.enhanced_keyboard,
+                )
+                .with_secret_input(seed.secret_input),
+            ) else {
+                continue;
+            };
+            if let Some((since, reason)) = output.reseed(Arc::clone(&grid), modes) {
+                diri_telemetry::count("attach.lag_reseeds", 1);
+                diri_telemetry::debug_event!(
+                    "attach.sink_reseeded",
+                    session = diri_telemetry::id(session_id),
+                    reason = reason,
+                    preview = output.preview,
+                    lagged_ms = since.elapsed(),
+                );
+            }
+        }
     }
 
     /// Wait only on queued output, so a reader freeing socket capacity wakes
@@ -938,7 +1186,11 @@ impl AttachHub {
         let mut publication_pending = false;
         let mut session_present = true;
         loop {
-            let pending = self.flush_sinks(session_id);
+            let (mut pending, lagging, reseeds) = self.flush_sinks(session_id);
+            if !reseeds.is_empty() {
+                self.reseed_sinks(registry, session_id, reseeds);
+                pending = self.flush_sinks(session_id).0;
+            }
             // A publication deadline must not suspend partially sent frames.
             // Remember dirty state while the loop services bounded write retries.
             // Idle, the pump sleeps on the grid: output, a departing sink and
@@ -952,6 +1204,9 @@ impl AttachHub {
             } else {
                 ABSENT_SESSION_RETRY
             };
+            if lagging {
+                timeout = timeout.min(LAGGING_RECHECK);
+            }
             if pending {
                 self.wait_for_writable(session_id, timeout.min(WRITE_RETRY));
                 timeout = Duration::ZERO;
@@ -1234,6 +1489,8 @@ mod tests {
             reason: diri_proto::ExitReason::Exited,
             code: Some(0),
             signal: None,
+            system_restart: false,
+            interrupted: false,
         };
         let record = diri_proto::SessionRecord {
             attention_state: None,
@@ -1271,9 +1528,11 @@ mod tests {
             listening_ports: None,
             foreground_agent: None,
             terminal_cwd: None,
+            agent_workspace: None,
             note_id: None,
             foreground_ports: None,
             terminal_progress: None,
+            scheduled_run: None,
         };
         let child = ProcessIdentity::new(
             4321,
@@ -1394,6 +1653,122 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn resuming_a_completed_run_closes_its_read_only_attach() {
+        // Selecting an ended tab after an Engine restart attaches to its
+        // retained terminal; the auto-resume lands right after. That
+        // connection must end, or the pane keeps it and every keystroke
+        // is swallowed while the resumed Agent waits at its prompt.
+        let temp = tempfile::tempdir().unwrap();
+        let registry = retained_registry(temp.path());
+        let hub = AttachHub::new();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let writer = Arc::new(Mutex::new(server.try_clone().unwrap()));
+        let serve = {
+            let registry = Arc::clone(&registry);
+            let hub = hub.clone();
+            std::thread::spawn(move || hub.serve(&registry, "finished", server, Vec::new(), writer))
+        };
+        client
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let mut codec = FrameCodec::new();
+        read_frames(&mut codec, &mut client, 2);
+
+        let engine = Arc::new(crate::ManifestEngine::new(Vec::new()));
+        registry
+            .lock()
+            .unwrap()
+            .respawn(crate::session::SessionSpec {
+                id: "finished".into(),
+                pty: crate::pty::PtySpec::new(
+                    vec!["/bin/sh".into(), "-c".into(), "read line".into()],
+                    temp.path(),
+                )
+                .size(40, 4),
+                manifest_id: "shell".into(),
+                authority: crate::session::authority_for("shell", &engine),
+                logs_dir: temp.path().join("logs"),
+                holder: None,
+                remote: None,
+                defer_launch: false,
+            })
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut chunk = [0u8; 4096];
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "the read-only attach stayed open"
+            );
+            match client.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(_) => break,
+            }
+        }
+        serve.join().unwrap();
+
+        // A fresh attach now reaches the live run.
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let writer = Arc::new(Mutex::new(server.try_clone().unwrap()));
+        let serve = {
+            let registry = Arc::clone(&registry);
+            let hub = hub.clone();
+            std::thread::spawn(move || hub.serve(&registry, "finished", server, Vec::new(), writer))
+        };
+        client
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        read_frames(&mut FrameCodec::new(), &mut client, 2);
+        assert!(hub.has_sinks("finished"), "attached to the live Session");
+        drop(client);
+        serve.join().unwrap();
+        let _ = registry
+            .lock()
+            .unwrap()
+            .terminate("finished", Duration::from_millis(500));
+    }
+
+    #[test]
+    fn a_completed_run_whose_terminal_was_never_retained_is_refused() {
+        // A reboot ends the Holder before the final checkpoint is published:
+        // the run is still recorded, but there is no screen to seed. A bare
+        // close read as a dropped connection and the pane retried it forever.
+        let temp = tempfile::tempdir().unwrap();
+        let registry = retained_registry(temp.path());
+        let dir = temp
+            .path()
+            .join(crate::registry::COMPLETED_TERMINALS_DIR_NAME);
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            std::fs::remove_file(entry.unwrap().path()).unwrap();
+        }
+        let hub = AttachHub::new();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let writer = Arc::new(Mutex::new(server.try_clone().unwrap()));
+        let serve = {
+            let registry = Arc::clone(&registry);
+            let hub = hub.clone();
+            std::thread::spawn(move || hub.serve(&registry, "finished", server, Vec::new(), writer))
+        };
+        client
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let mut codec = FrameCodec::new();
+        let frames = read_frames(&mut codec, &mut client, 1);
+        assert_eq!(
+            frames[0].attach_rejected_payload(),
+            Some(AttachRejection::SessionNotFound)
+        );
+        serve.join().unwrap();
+    }
+
     #[test]
     fn keyboard_publication_preserves_legacy_bytes_and_shares_grid() {
         let hub = AttachHub::new();
@@ -1804,6 +2179,218 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn a_stalled_reseedable_sink_drops_stale_diffs_and_waits_for_room() {
+        let (mut output, mut reader) = constrained_output();
+        output.reseedable = true;
+        let diff = encoded(&Frame::input(vec![1; 65536])).unwrap();
+        assert!(output.enqueue(Arc::clone(&diff)));
+        assert!(output.flush());
+        let written = output.offset;
+        assert!(written > 0, "the socket takes a prefix of the first frame");
+        assert!(output.enqueue(encoded(&Frame::pong()).unwrap()));
+        output.last_progress = Instant::now() - STALLED_SINK_TIMEOUT;
+        assert!(output.flush(), "a slow client is not dropped");
+        assert_eq!(output.lagging.map(|(_, reason)| reason), Some("stalled"));
+        assert_eq!(output.frames.len(), 1, "only the unfinished frame stays");
+        assert_eq!(output.queued_bytes, diff.len());
+        assert!(output.enqueue(encoded(&Frame::pong()).unwrap()));
+        assert_eq!(output.frames.len(), 1, "diffs while behind are stale");
+        assert!(
+            !output.ready_for_reseed(),
+            "the unfinished frame comes first"
+        );
+
+        // The client reads again: the unfinished frame completes intact.
+        let mut received = Vec::new();
+        let mut bytes = [0; 4096];
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !output.frames.is_empty() {
+            assert!(Instant::now() < deadline);
+            assert!(output.flush());
+            while let Ok(count) = reader.read(&mut bytes) {
+                received.extend_from_slice(&bytes[..count]);
+            }
+        }
+        while let Ok(count) = reader.read(&mut bytes) {
+            received.extend_from_slice(&bytes[..count]);
+        }
+        assert!(output.ready_for_reseed());
+        let grid = encoded(&Frame::pong()).unwrap();
+        let modes = encoded(&Frame::ping()).unwrap();
+        assert_eq!(
+            output.reseed(grid, modes).map(|(_, reason)| reason),
+            Some("stalled")
+        );
+        assert!(output.lagging.is_none());
+        assert!(output.flush());
+        assert!(output.frames.is_empty());
+        while let Ok(count) = reader.read(&mut bytes) {
+            received.extend_from_slice(&bytes[..count]);
+        }
+        let frames = FrameCodec::new().feed(&received).unwrap();
+        let kinds: Vec<_> = frames.iter().map(|frame| frame.frame_type).collect();
+        assert_eq!(kinds, [FrameType::Input, FrameType::Pong, FrameType::Ping]);
+    }
+
+    #[test]
+    fn a_reseedable_sink_survives_backlog_and_is_dropped_only_when_wedged() {
+        let (mut output, _reader) = constrained_output();
+        output.reseedable = true;
+        let pong = encoded(&Frame::pong()).unwrap();
+        for _ in 0..=SINK_BACKLOG_FRAMES {
+            assert!(output.enqueue(Arc::clone(&pong)));
+        }
+        assert!(!output.closed);
+        assert_eq!(output.lagging.map(|(_, reason)| reason), Some("backlog"));
+        assert!(output.frames.is_empty() && output.queued_bytes == 0);
+        assert!(output.flush());
+        output.lagging = Some((Instant::now() - LAGGING_SINK_LIMIT, "backlog"));
+        assert!(!output.flush(), "a peer behind for too long is wedged");
+        assert_eq!(output.close_reason, Some("backlog"));
+    }
+
+    /// A client whose process is descheduled for longer than the stall
+    /// timeout (App Nap, memory pressure) keeps its connection: the Engine
+    /// discards what it missed and reseeds it with the current screen.
+    #[cfg(unix)]
+    #[test]
+    fn a_consumer_paused_past_the_stall_timeout_is_reseeded_not_dropped() {
+        use std::os::fd::AsRawFd;
+        let temp = tempfile::tempdir().unwrap();
+        let (engine, _) =
+            crate::detect::ManifestEngine::load_dir(&crate::detect::bundled_manifest_dir())
+                .unwrap();
+        let engine = Arc::new(engine);
+        let record: diri_proto::SessionRecord = serde_json::from_value(serde_json::json!({
+            "id":"s", "kind":diri_proto::AgentKind::new("generic"), "cwd":temp.path(),
+            "projectID":"p", "title":"fixture", "titleSource":diri_proto::TitleSource::Placeholder,
+            "status":diri_proto::SessionStatus::Idle, "resumability":diri_proto::Resumability::Live,
+            "createdAt":0.0,"updatedAt":0.0,"pinned":false
+        }))
+        .unwrap();
+        let mut registry = Registry::new(Arc::clone(&engine), temp.path().join("state.json"));
+        registry
+            .spawn(
+                crate::session::SessionSpec {
+                    id: "s".into(),
+                    pty: crate::pty::PtySpec::new(
+                        vec![
+                            "/bin/sh".into(),
+                            "-c".into(),
+                            "i=0; while :; do i=$((i+1)); printf 'output line %d %0200d\\n' $i 0; sleep 0.002; done".into(),
+                        ],
+                        temp.path(),
+                    )
+                    .size(80, 24),
+                    manifest_id: "generic".into(),
+                    authority: crate::session::authority_for("generic", &engine),
+                    logs_dir: temp.path().join("logs"),
+                    holder: None,
+                    remote: None,
+                    defer_launch: false,
+                },
+                record,
+            )
+            .unwrap();
+        let registry = Arc::new(Mutex::new(registry));
+        let hub = AttachHub::new();
+        let (writer, mut reader) = UnixStream::pair().unwrap();
+        let size: libc::c_int = 4096;
+        // SAFETY: live socket and correctly sized socket option value.
+        unsafe {
+            libc::setsockopt(
+                writer.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                (&size as *const libc::c_int).cast(),
+                std::mem::size_of_val(&size) as libc::socklen_t,
+            );
+        }
+        reader
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let worker = {
+            let hub = hub.clone();
+            let registry = Arc::clone(&registry);
+            std::thread::spawn(move || {
+                hub.serve(
+                    &registry,
+                    "s",
+                    writer.try_clone().unwrap(),
+                    Vec::new(),
+                    Arc::new(Mutex::new(writer)),
+                );
+            })
+        };
+        let mut codec = FrameCodec::new();
+        let mut bytes = [0; 65536];
+        let mut next_grids = |reader: &mut UnixStream, want: usize| {
+            let mut grids = Vec::new();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while grids.len() < want {
+                assert!(Instant::now() < deadline, "no output after {grids:?}");
+                let count = match reader.read(&mut bytes) {
+                    Ok(count) => count,
+                    // Signals from sibling tests' children, or a loaded runner.
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::Interrupted
+                                | std::io::ErrorKind::WouldBlock
+                                | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        continue;
+                    }
+                    Err(error) => panic!("the connection stays open: {error}"),
+                };
+                assert!(count > 0, "the Engine dropped a merely slow client");
+                for frame in codec.feed(&bytes[..count]).expect("intact frames") {
+                    if let Some(grid) = frame.grid_payload().unwrap() {
+                        grids.push(grid.is_full_snapshot);
+                    }
+                }
+            }
+            grids
+        };
+        // One read can carry more than one frame on a loaded machine (CI has
+        // delivered the seed and a second snapshot together), so only the
+        // first frame is the seed's to answer for.
+        assert_eq!(
+            next_grids(&mut reader, 1).first(),
+            Some(&true),
+            "the attach seed"
+        );
+        next_grids(&mut reader, 3);
+        // The consumer is descheduled while the session keeps printing.
+        std::thread::sleep(STALLED_SINK_TIMEOUT + Duration::from_millis(500));
+        let resumed = Instant::now();
+        let mut reseeded = false;
+        while !reseeded {
+            reseeded = next_grids(&mut reader, 1)[0];
+        }
+        let caught_up = resumed.elapsed();
+        assert!(
+            caught_up < Duration::from_secs(1),
+            "reseed took {caught_up:?} after the consumer resumed"
+        );
+        // Live diffs follow the reseed (a loaded runner may reseed again first).
+        let mut live = Vec::new();
+        while !live.iter().any(|full| !full) {
+            live.extend(next_grids(&mut reader, 1));
+            assert!(live.len() < 64, "no live diff after the reseed: {live:?}");
+        }
+        assert!(hub.has_sinks("s"), "the sink was never dropped");
+        let _ = reader.shutdown(std::net::Shutdown::Both);
+        worker.join().unwrap();
+        registry
+            .lock()
+            .unwrap()
+            .remove("s", &temp.path().join("logs"))
+            .unwrap();
+    }
+
     #[test]
     fn small_frames_are_count_bounded_and_stalled_sinks_close() {
         let (mut output, _) = constrained_output();

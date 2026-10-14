@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 
 use super::bootstrap::{PackagedArtifact, PlatformProbe, RemoteInstallLayout, RemoteTarget};
 use super::executor::{CommandOutput, ProcessExecutor, SshChannel};
-use super::ssh::{HelperCommand, SshTransport};
+use super::ssh::{CommandSpec, HelperCommand, SshTransport};
 
 // These wall-clock bounds include time spent in Diri's native OpenSSH
 // authentication UI. Network establishment is independently bounded by
@@ -193,12 +193,7 @@ impl RemoteManager {
         control_dir: PathBuf,
     ) -> io::Result<Self> {
         let control_dir = normalized_control_dir(&control_dir);
-        validate_control_dir_if_present(&control_dir)?;
-        diri_platform::security::private_dir_all(&control_dir)?;
-        // Recheck after creation to close the `/tmp` create race before chmod
-        // or any OpenSSH socket creation follows an attacker-placed symlink.
-        validate_control_dir_if_present(&control_dir)?;
-        diri_platform::security::owner_only(&control_dir, true)?;
+        prepare_control_dir(&control_dir)?;
         Ok(Self {
             executor,
             artifacts,
@@ -274,7 +269,7 @@ impl RemoteManager {
         if !transport.uses_control_master() {
             return Ok(());
         }
-        let output = self.executor.run(
+        let output = self.run_ssh(
             transport.control_exit(),
             Vec::new(),
             Duration::from_secs(2),
@@ -318,7 +313,7 @@ impl RemoteManager {
             self.forget_current_helper(host);
             return Ok(None);
         }
-        let output = self.executor.run(
+        let output = self.run_ssh(
             cached
                 .helper
                 .transport
@@ -379,7 +374,7 @@ impl RemoteManager {
         artifact.verify().map_err(io::Error::other)?;
 
         if !force_upload {
-            let final_probe = self.executor.run(
+            let final_probe = self.run_ssh(
                 transport
                     .helper_probe(&artifact.build_id)
                     .map_err(io::Error::other)?,
@@ -480,7 +475,7 @@ impl RemoteManager {
             ms = upload_started.elapsed(),
         );
         if install.is_err() {
-            let _ = self.executor.run(
+            let _ = self.run_ssh(
                 transport.cleanup_upload(&layout),
                 Vec::new(),
                 PROBE_TIMEOUT,
@@ -595,7 +590,7 @@ impl RemoteManager {
             return Ok(None);
         }
         let transport = self.transport(host);
-        let output = self.executor.run(
+        let output = self.run_ssh(
             transport
                 .helper_probe_then(&artifact.build_id, command)
                 .map_err(io::Error::other)?,
@@ -655,7 +650,7 @@ impl RemoteManager {
         // they are still remote actions. Gate them on the exact packaged
         // Helper so an app update synchronizes the host before doing work.
         self.ensure_helper(host)?;
-        self.executor.run(
+        self.run_ssh(
             self.transport(host).channel(script),
             input,
             timeout,
@@ -986,7 +981,7 @@ impl RemoteManager {
     }
 
     pub fn attach(&self, helper: &InstalledHelper) -> io::Result<SshChannel> {
-        self.executor.open(
+        self.open_ssh(
             helper
                 .transport
                 .helper_command(&helper.build_id, HelperCommand::Attach)
@@ -1022,7 +1017,7 @@ impl RemoteManager {
         input: Vec<u8>,
         timeout: Duration,
     ) -> io::Result<R> {
-        let output = self.executor.run(
+        let output = self.run_ssh(
             helper
                 .transport
                 .helper_command(&helper.build_id, command)
@@ -1039,6 +1034,26 @@ impl RemoteManager {
             ));
         }
         parse_json_line(&output.stdout)
+    }
+
+    /// Every OpenSSH invocation goes through here or `open_ssh`. The control
+    /// directory lives in `/tmp`, which macOS's periodic cleanup prunes after
+    /// three days without access, so a long-lived Engine re-establishes it
+    /// before each launch instead of trusting the check made at startup.
+    fn run_ssh(
+        &self,
+        spec: CommandSpec,
+        input: Vec<u8>,
+        timeout: Duration,
+        stdout_limit: usize,
+    ) -> io::Result<CommandOutput> {
+        prepare_control_dir(&self.control_dir)?;
+        self.executor.run(spec, input, timeout, stdout_limit)
+    }
+
+    fn open_ssh(&self, spec: CommandSpec) -> io::Result<SshChannel> {
+        prepare_control_dir(&self.control_dir)?;
+        self.executor.open(spec)
     }
 
     fn transport(&self, host: &HostEntry) -> SshTransport {
@@ -1070,13 +1085,26 @@ fn record_helper_outcome(
             protocol = helper.protocol.major,
             ms = elapsed,
         ),
-        Err(error) => diri_telemetry::incident!(
-            "remote.helper_failed",
-            host = diri_telemetry::id(&host.id),
-            forced = forced,
-            io = diri_telemetry::io_error(error),
-            ms = elapsed,
-        ),
+        // SSH itself failing (host asleep, offline, a mistyped destination)
+        // is the user's network, already explained to them by its class; an
+        // incident is for a Helper that SSH reached and still failed.
+        Err(error) => match super::ssh_error::SshFailure::from_io(error) {
+            Some(failure) => diri_telemetry::warn_event!(
+                "remote.helper_failed",
+                host = diri_telemetry::id(&host.id),
+                forced = forced,
+                io = diri_telemetry::io_error(error),
+                ssh = failure.class.code(),
+                ms = elapsed,
+            ),
+            None => diri_telemetry::incident!(
+                "remote.helper_failed",
+                host = diri_telemetry::id(&host.id),
+                forced = forced,
+                io = diri_telemetry::io_error(error),
+                ms = elapsed,
+            ),
+        },
     }
 }
 
@@ -1162,6 +1190,15 @@ fn require_rpc_success(output: CommandOutput) -> io::Result<CommandOutput> {
         return Err(failure.into_io_error());
     }
     output.require_success("remote Helper RPC")
+}
+
+fn prepare_control_dir(path: &Path) -> io::Result<()> {
+    validate_control_dir_if_present(path)?;
+    diri_platform::security::private_dir_all(path)?;
+    // Recheck after creation to close the `/tmp` create race before chmod
+    // or any OpenSSH socket creation follows an attacker-placed symlink.
+    validate_control_dir_if_present(path)?;
+    diri_platform::security::owner_only(path, true)
 }
 
 fn validate_control_dir_if_present(path: &Path) -> io::Result<()> {
@@ -1385,6 +1422,47 @@ mod tests {
         assert!(first.starts_with("/tmp"));
         assert!(first.as_os_str().as_bytes().len() < MAX_CONTROL_DIRECTORY_BYTES);
         assert_ne!(first, normalized_control_dir(&requested.join("different")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ssh_launch_recreates_a_pruned_control_directory() {
+        let temporary = tempfile::tempdir_in("/tmp").expect("temp");
+        let fake_ssh = temporary.path().join("ssh");
+        fs::write(&fake_ssh, "#!/bin/sh\nexec cat\n").expect("fake ssh");
+        fs::set_permissions(&fake_ssh, fs::Permissions::from_mode(0o700)).expect("mode");
+        let control = temporary.path().join("control");
+        let manager = RemoteManager::new(
+            ProcessExecutor::new(&fake_ssh),
+            ArtifactCatalog {
+                artifacts: HashMap::new(),
+            },
+            control.clone(),
+        )
+        .expect("manager");
+        let host = HostEntry {
+            id: "fixture".into(),
+            transport: Default::default(),
+            name: None,
+            ssh: "fake-host".into(),
+            default_cwd: None,
+            node: None,
+        };
+        let helper = InstalledHelper {
+            target: RemoteTarget::LinuxX86_64,
+            build_id: "test-build".into(),
+            protocol: ProtocolVersion { major: 1, minor: 3 },
+            transport: manager.transport(&host),
+        };
+        // macOS's periodic `/tmp` cleanup removes the directory under a
+        // long-lived Engine; OpenSSH then cannot bind its ControlPath socket.
+        fs::remove_dir(&control).expect("prune control directory");
+
+        drop(manager.attach(&helper).expect("attach"));
+
+        let metadata = fs::symlink_metadata(&control).expect("control directory");
+        assert!(metadata.is_dir());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
     }
 
     #[cfg(unix)]
@@ -1896,5 +1974,173 @@ mod tests {
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect()
+    }
+
+    fn failing_ssh_manager(script: &str, askpass: bool) -> (tempfile::TempDir, RemoteManager) {
+        let temporary = tempfile::tempdir().expect("temp");
+        let fake_ssh = temporary.path().join("ssh");
+        let script = script.replace("$TMP", &temporary.path().display().to_string());
+        let (shebang, body) = script.split_once('\n').expect("shebang");
+        fs::write(
+            &fake_ssh,
+            format!("{shebang}\n[ \"$1\" = --exec-probe ] && exit 0\n{body}"),
+        )
+        .expect("fake ssh");
+        fs::set_permissions(&fake_ssh, fs::Permissions::from_mode(0o700)).expect("mode");
+        // Linux refuses to exec a file while any process holds it open for
+        // writing; a sibling test's fork can inherit our write descriptor
+        // until its own exec (ETXTBSY). Once one exec succeeds, no copy of
+        // that descriptor is left, so the fixture's real calls cannot fail.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match std::process::Command::new(&fake_ssh)
+                .arg("--exec-probe")
+                .status()
+            {
+                Ok(status) => {
+                    assert!(status.success(), "fake ssh probe: {status}");
+                    break;
+                }
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("fake ssh probe: {error}"),
+            }
+        }
+        let mut executor = ProcessExecutor::new(&fake_ssh);
+        if askpass {
+            executor = executor.with_askpass("/fixture/diri-ssh-askpass");
+        }
+        let manager = RemoteManager::new(
+            executor,
+            ArtifactCatalog {
+                artifacts: HashMap::new(),
+            },
+            temporary.path().join("control"),
+        )
+        .expect("manager");
+        (temporary, manager)
+    }
+
+    fn fixture_host() -> HostEntry {
+        HostEntry {
+            id: "hogwarts".into(),
+            transport: Default::default(),
+            name: None,
+            ssh: "hogwarts".into(),
+            default_cwd: None,
+            node: None,
+        }
+    }
+
+    #[test]
+    fn openssh_setup_failures_surface_as_classified_errors() {
+        use super::super::ssh_error::{SshFailure, SshFailureClass};
+        let cases = [
+            (
+                "ssh: Could not resolve hostname hogwarts: nodename nor servname provided, or not known",
+                SshFailureClass::UnresolvedHost,
+            ),
+            (
+                "ssh: connect to host 192.0.2.7 port 22: Connection refused",
+                SshFailureClass::Refused,
+            ),
+            (
+                "ssh: connect to host 192.0.2.7 port 22: Operation timed out",
+                SshFailureClass::Timeout,
+            ),
+            (
+                "u@hogwarts: Permission denied (publickey).",
+                SshFailureClass::AuthFailed,
+            ),
+            ("Host key verification failed.", SshFailureClass::HostKey),
+        ];
+        for (stderr, class) in cases {
+            let (_temporary, manager) = failing_ssh_manager(
+                &format!("#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{stderr}' >&2\nexit 255\n"),
+                false,
+            );
+            let error = manager
+                .ensure_helper(&fixture_host())
+                .expect_err("ssh fails before the platform probe runs");
+            let failure = SshFailure::from_io(&error).expect("classified OpenSSH failure");
+            assert_eq!(failure.class, class, "{stderr}");
+            assert!(error.to_string().contains("remote platform probe"));
+            assert!(failure.user_message().starts_with(class.advice()));
+        }
+    }
+
+    #[test]
+    fn interactive_probe_uses_ssh_config_and_the_askpass_broker() {
+        use super::super::ssh_error::{SshFailure, SshFailureClass};
+        let (temporary, manager) = failing_ssh_manager(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '$TMP/args'\nprintf '%s|%s' \"$SSH_ASKPASS\" \"$SSH_ASKPASS_REQUIRE\" > '$TMP/env'\nprintf 'Host key verification failed.\\n' >&2\nexit 255\n",
+            true,
+        );
+        let error = manager
+            .ensure_helper(&fixture_host())
+            .expect_err("host key refused");
+        assert_eq!(
+            SshFailure::from_io(&error).map(|failure| failure.class),
+            Some(SshFailureClass::HostKey)
+        );
+        let args = fs::read_to_string(temporary.path().join("args")).expect("args");
+        let args = args.lines().collect::<Vec<_>>();
+        // The destination is the user's alias, resolved by their own
+        // ~/.ssh/config; nothing overrides that config or forbids prompts.
+        assert!(args.windows(2).any(|pair| pair == ["--", "hogwarts"]));
+        assert!(!args.contains(&"-F"));
+        assert!(!args.iter().any(|arg| arg.starts_with("BatchMode")));
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg.starts_with("StrictHostKeyChecking"))
+        );
+        assert_eq!(
+            fs::read_to_string(temporary.path().join("env")).expect("env"),
+            "/fixture/diri-ssh-askpass|force"
+        );
+    }
+
+    #[test]
+    fn an_exiting_control_master_is_retried_once_on_a_fresh_connection() {
+        use super::super::ssh_error::{SshFailure, SshFailureClass};
+        // First attempt: the shared master refuses. Second attempt reaches
+        // OpenSSH's own resolution, proving the retry ran exactly once.
+        let (temporary, manager) = failing_ssh_manager(
+            "#!/bin/sh\ncat >/dev/null\nprintf x >> '$TMP/calls'\nif [ \"$(cat '$TMP/calls')\" = x ]; then\n  printf 'mux_client_request_session: session request failed: Session open refused by peer\\n' >&2\nelse\n  printf 'ssh: Could not resolve hostname hogwarts: nodename nor servname provided, or not known\\n' >&2\nfi\nexit 255\n",
+            false,
+        );
+        let error = manager
+            .ensure_helper(&fixture_host())
+            .expect_err("unresolved");
+        assert_eq!(
+            SshFailure::from_io(&error).map(|failure| failure.class),
+            Some(SshFailureClass::UnresolvedHost)
+        );
+        assert_eq!(
+            fs::read_to_string(temporary.path().join("calls")).expect("calls"),
+            "xx"
+        );
+
+        let (temporary, manager) = failing_ssh_manager(
+            "#!/bin/sh\ncat >/dev/null\nprintf x >> '$TMP/calls'\nprintf 'mux_client_request_session: read from master failed: Broken pipe\\n' >&2\nexit 255\n",
+            false,
+        );
+        let error = manager
+            .ensure_helper(&fixture_host())
+            .expect_err("master keeps failing");
+        assert_eq!(
+            SshFailure::from_io(&error).map(|failure| failure.class),
+            Some(SshFailureClass::ControlMaster)
+        );
+        assert_eq!(
+            fs::read_to_string(temporary.path().join("calls")).expect("calls"),
+            "xx",
+            "never more than one retry"
+        );
     }
 }

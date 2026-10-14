@@ -12,15 +12,17 @@ impl UtilitySurfaces {
             (herdr.plan.clone(), herdr.scanning, herdr.importing)
         };
         let detail = match &plan {
-            _ if importing => "Opening sessions…".to_owned(),
-            None => "Looking for herdr sessions…".to_owned(),
-            Some(plan) if !plan.found => format!("No herdr sessions on {}.", crate::platform::local_machine_label_lowercase()),
-            Some(plan) if plan.is_empty() => "Everything from herdr is already here.".to_owned(),
+            _ if importing => t("settings.import.opening").to_owned(),
+            None => t("settings.import.looking").to_owned(),
+            Some(plan) if !plan.found => {
+                tf("settings.import.none_found", &[("machine", &crate::platform::local_machine_label_lowercase())])
+            }
+            Some(plan) if plan.is_empty() => t("settings.import.all_imported").to_owned(),
             Some(plan) => plan.summary(),
         };
         let control = match plan.filter(|plan| !plan.is_empty()) {
             Some(plan) if !importing => surface_button_with_window(
-                "Import…",
+                t("settings.import.import"),
                 "import-herdr",
                 colors,
                 cx,
@@ -38,7 +40,7 @@ impl UtilitySurfaces {
             .into_any_element(),
             _ if importing || scanning => div().into_any_element(),
             _ => surface_button(
-                "Check Again",
+                t("settings.import.check_again"),
                 "import-herdr-rescan",
                 colors,
                 cx,
@@ -53,7 +55,7 @@ impl UtilitySurfaces {
             .into_any_element(),
         };
         setting_section(
-            "Import",
+            t("settings.import.title"),
             setting_row("herdr", detail, control, colors),
             colors,
         )

@@ -37,6 +37,9 @@ use crate::floating;
 #[path = "table_view.rs"]
 mod table_view;
 use table_view::{TABLE_MENU, TableMenu};
+#[path = "block_handle.rs"]
+mod block_handle;
+use block_handle::{BLOCK_MENU, BlockDrag, BlockMenu};
 
 pub(crate) const EDITOR_CONTEXT: &str = "DiriNoteEditor";
 /// The editor's context while the ⌘K link panel owns the keyboard: none of
@@ -290,9 +293,17 @@ enum ChipHit {
 
 struct MentionMenu {
     block_id: u64,
-    /// Byte offset of the `@`.
+    /// Byte offset of the `@` (or of the `[[`).
     at: usize,
     selected: usize,
+    /// Opened by `[[`: links to notes only.
+    notes_only: bool,
+}
+
+impl MentionMenu {
+    fn trigger(&self) -> &'static str {
+        if self.notes_only { "[[" } else { "@" }
+    }
 }
 
 const CARET_BLINK: Duration = Duration::from_millis(530);
@@ -300,6 +311,9 @@ pub(super) const MARKER_WIDTH: f32 = 26.0;
 const INDENT_STEP: f32 = 24.0;
 /// Space above the title inside the scroll area.
 const PAGE_TOP: f32 = 56.0;
+/// Space either side of the text column: room for the block handle, and a
+/// list item's fold chevron beside it.
+const PAGE_SIDE: f32 = 56.0;
 /// Gutter width left of a list item that holds its fold chevron.
 const DISCLOSURE_WIDTH: f32 = 20.0;
 pub(crate) const MEASURE: f32 = 700.0;
@@ -321,6 +335,10 @@ enum SlashAction {
     Image,
     /// A 3 × 3 table.
     Table,
+    /// `[[`: pick a note to link.
+    LinkNote,
+    /// `@`: pick a session or a note to mention.
+    Mention,
 }
 
 #[derive(Clone, Copy)]
@@ -440,7 +458,68 @@ const SLASH_ITEMS: &[SlashItem] = &[
         group: 3,
         keywords: "image picture photo screenshot upload",
     },
+    SlashItem {
+        label: "Link to note",
+        icon: "link",
+        keys: None,
+        action: SlashAction::LinkNote,
+        group: 4,
+        keywords: "link note page wiki backlink reference [[",
+    },
+    SlashItem {
+        label: "Mention",
+        icon: "doc.text",
+        keys: None,
+        action: SlashAction::Mention,
+        group: 4,
+        keywords: "mention session agent note person at @",
+    },
 ];
+
+/// The `/` menu's rows for `query` (what follows the `/`), in menu order:
+/// a label containing the query, or a keyword starting with it.
+/// The shown name of a block kind or block action, from the English label
+/// the menus keep for filtering and tests.
+pub(super) fn block_label(label: &'static str) -> &'static str {
+    let id = match label {
+        "Text" => "notes.block.text",
+        "Heading 1" => "notes.block.heading_1",
+        "Heading 2" => "notes.block.heading_2",
+        "Heading 3" => "notes.block.heading_3",
+        "To-do" => "notes.block.todo",
+        "Bulleted list" => "notes.block.bulleted_list",
+        "Numbered list" => "notes.block.numbered_list",
+        "Quote" => "notes.block.quote",
+        "Code" => "notes.block.code",
+        "Callout" => "notes.block.callout",
+        "Divider" => "notes.block.divider",
+        "Table" => "notes.block.table",
+        "Image" => "notes.block.image",
+        "Link to note" => "notes.block.link_to_note",
+        "Mention" => "notes.block.mention",
+        "Add block below" => "notes.block.add_below",
+        "Duplicate" => "notes.block.duplicate",
+        "Move up" => "notes.block.move_up",
+        "Move down" => "notes.block.move_down",
+        "Delete" => "notes.block.delete",
+        _ => return label,
+    };
+    crate::i18n::t(id)
+}
+
+fn slash_filter(query: &str) -> Vec<SlashItem> {
+    let query = query.trim().to_lowercase();
+    SLASH_ITEMS
+        .iter()
+        .filter(|item| {
+            query.is_empty()
+                || item.label.to_lowercase().contains(&query)
+                || block_label(item.label).to_lowercase().contains(&query)
+                || item.keywords.split(' ').any(|k| k.starts_with(&query))
+        })
+        .copied()
+        .collect()
+}
 
 struct SlashMenu {
     block_id: u64,
@@ -476,6 +555,12 @@ pub(crate) struct NoteEditorView {
     mention: Option<MentionMenu>,
     link_editor: Option<LinkEditor>,
     table_menu: Option<TableMenu>,
+    /// The menu opened from a block's grip.
+    block_menu: Option<BlockMenu>,
+    /// The block whose grip is being dragged.
+    dragging: Option<u64>,
+    /// Shown under the note's last block: its backlinks.
+    footer: Option<gpui::AnyView>,
     /// Each table's sideways scroll, by its first cell's id.
     table_scrolls: std::cell::RefCell<std::collections::HashMap<u64, ScrollHandle>>,
     mentions: Rc<MentionDirectory>,
@@ -534,6 +619,9 @@ impl NoteEditorView {
             mention: None,
             link_editor: None,
             table_menu: None,
+            block_menu: None,
+            dragging: None,
+            footer: None,
             table_scrolls: Default::default(),
             mentions: Rc::default(),
             assets: None,
@@ -556,6 +644,9 @@ impl NoteEditorView {
     /// hop right by the `/`'s width) and move as the query is typed. The
     /// trigger's start is the same in last frame's layout and this one.
     fn trigger_anchor(&self) -> Option<Bounds<Pixels>> {
+        if self.block_menu.is_some() {
+            return self.block_menu_anchor();
+        }
         let (block_id, offset) = if let Some(menu) = &self.slash {
             (menu.block_id, menu.slash)
         } else if let Some(menu) = &self.mention {
@@ -579,12 +670,22 @@ impl NoteEditorView {
         self.colors = colors;
     }
 
+    /// A view shown under the note's last block (the backlinks).
+    pub(crate) fn set_footer(&mut self, footer: Option<gpui::AnyView>) {
+        self.footer = footer;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_footer_for_test(&self) -> bool {
+        self.footer.is_some()
+    }
+
     #[cfg(test)]
     pub(crate) fn is_blinking(&self) -> bool {
         self.blinking
     }
 
-    #[cfg(all(test, target_os = "macos"))]
+    #[cfg(test)]
     pub(crate) fn scroll_by_for_test(&mut self, dy: Pixels, cx: &mut Context<Self>) {
         let offset = self.scroll.offset();
         let max = self.scroll.max_offset().y;
@@ -739,6 +840,16 @@ impl NoteEditorView {
             && self.layout_count == self.editor.blocks().len())
         .then(|| self.layouts.get(index).and_then(Option::as_ref))
         .flatten()
+    }
+
+    /// Where block `index`'s reserved tail room starts, relative to its text.
+    /// Reads the last frame's layout and text, which agree with each other
+    /// even while typing changes this one: the room trails the words by a
+    /// frame instead of vanishing on every keystroke.
+    pub(super) fn tail_point(&self, index: usize) -> Option<Point<Pixels>> {
+        let tail = self.shown.get(index)?.tail?;
+        let layout = self.layouts.get(index)?.as_ref()?;
+        Some(layout.position_for_index(tail)? - layout.bounds().origin)
     }
 
     fn text_len(&self, index: usize) -> usize {
@@ -929,16 +1040,7 @@ impl NoteEditorView {
     }
 
     fn slash_matches(&self) -> Vec<SlashItem> {
-        let query = self.slash_query();
-        SLASH_ITEMS
-            .iter()
-            .filter(|item| {
-                query.is_empty()
-                    || item.label.to_lowercase().contains(&query)
-                    || item.keywords.split(' ').any(|k| k.starts_with(&query))
-            })
-            .copied()
-            .collect()
+        slash_filter(&self.slash_query())
     }
 
     fn maybe_open_slash(&mut self) {
@@ -993,6 +1095,14 @@ impl NoteEditorView {
                 self.editor.insert_empty_table(3, 3, now);
                 crate::telemetry::notes_event("notes.table.inserted", "slash");
             }
+            SlashAction::LinkNote => {
+                self.editor.insert_text("[[", now);
+                self.open_mention_menu(true);
+            }
+            SlashAction::Mention => {
+                self.editor.insert_text("@", now);
+                self.open_mention_menu(false);
+            }
         }
         self.edited(cx);
     }
@@ -1003,7 +1113,7 @@ impl NoteEditorView {
             files: true,
             directories: false,
             multiple: true,
-            prompt: Some("Insert".into()),
+            prompt: Some(crate::i18n::t("notes.image.insert").into()),
         });
         cx.spawn(async move |this, cx| {
             let Ok(Ok(Some(paths))) = paths.await else {
@@ -1081,10 +1191,11 @@ impl NoteEditorView {
         let Some(menu) = &self.mention else { return };
         let head = self.editor.selection.head;
         let block = self.editor.block(head.block);
+        let trigger = menu.trigger();
         let valid = self.editor.selection.is_collapsed()
             && block.id == menu.block_id
-            && head.offset > menu.at
-            && block.text.get(menu.at..menu.at + 1) == Some("@")
+            && head.offset >= menu.at + trigger.len()
+            && block.text.get(menu.at..menu.at + trigger.len()) == Some(trigger)
             // Typing into an existing chip is editing, not mentioning.
             && mention::at(block, menu.at + 1, false).is_none();
         if !valid {
@@ -1111,12 +1222,18 @@ impl NoteEditorView {
             return String::new();
         };
         let head = self.editor.selection.head;
-        self.editor
+        let query = self
+            .editor
             .block(head.block)
             .text
-            .get(menu.at + 1..head.offset)
-            .unwrap_or_default()
-            .to_owned()
+            .get(menu.at + menu.trigger().len()..head.offset)
+            .unwrap_or_default();
+        // `[[Title]]` typed out whole still matches its note.
+        if menu.notes_only {
+            query.trim_end_matches(']').to_owned()
+        } else {
+            query.to_owned()
+        }
     }
 
     #[cfg(test)]
@@ -1125,7 +1242,13 @@ impl NoteEditorView {
     }
 
     pub(super) fn mention_matches(&self) -> Vec<MentionEntry> {
-        let candidates = self.mentions.candidates();
+        let notes_only = self.mention.as_ref().is_some_and(|m| m.notes_only);
+        let candidates: Vec<Candidate> = self
+            .mentions
+            .candidates()
+            .into_iter()
+            .filter(|c| !notes_only || matches!(c.target, MentionTarget::Note(_)))
+            .collect();
         mention::rank(&self.mention_query(), &candidates, MENTION_LIMIT)
             .into_iter()
             .filter_map(|c| self.mentions.find(&c.target).cloned())
@@ -1151,6 +1274,41 @@ impl NoteEditorView {
             block_id: block.id,
             at,
             selected: 0,
+            notes_only: false,
+        });
+    }
+
+    /// `[[` typed: the same menu, offering notes to link.
+    fn maybe_open_note_link(&mut self) {
+        let head = self.editor.selection.head;
+        let block = self.editor.block(head.block);
+        if matches!(block.kind, BlockKind::Title | BlockKind::Code) || head.offset < 2 {
+            return;
+        }
+        let at = head.offset - 2;
+        if block.text.get(at..head.offset) != Some("[[") {
+            return;
+        }
+        let before = block.text[..at].chars().next_back();
+        if before.is_some_and(|c| !c.is_whitespace() && !"([{\"'".contains(c)) {
+            return;
+        }
+        self.open_mention_menu(true);
+    }
+
+    /// Opens the mention menu on the trigger just before the caret.
+    fn open_mention_menu(&mut self, notes_only: bool) {
+        let head = self.editor.selection.head;
+        let trigger = if notes_only { 2 } else { 1 };
+        if head.offset < trigger {
+            return;
+        }
+        self.slash = None;
+        self.mention = Some(MentionMenu {
+            block_id: self.editor.block(head.block).id,
+            at: head.offset - trigger,
+            selected: 0,
+            notes_only,
         });
     }
 
@@ -1172,9 +1330,10 @@ impl NoteEditorView {
         );
         crate::telemetry::notes_event(
             "notes.mention.inserted",
-            match entry.candidate.target {
-                MentionTarget::Session(_) => "session",
-                MentionTarget::Note(_) => "note",
+            match (&entry.candidate.target, menu.notes_only) {
+                (MentionTarget::Session(_), _) => "session",
+                (MentionTarget::Note(_), false) => "note",
+                (MentionTarget::Note(_), true) => "note_link",
             },
         );
         self.edited(cx);
@@ -1773,6 +1932,7 @@ impl NoteEditorView {
     /// state only: nothing is saved and undo is untouched. Other note
     /// features (a to-do's work context) build on this.
     /// Starts this editor is waiting on, for fixtures that answer them.
+    // Only the macOS What's New clip fixture uses this.
     #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn work_tickets_for_test(&self) -> Vec<(diri_notes::doc::BlockId, u64)> {
         self.work.pending_tickets()
@@ -1844,6 +2004,7 @@ impl NoteEditorView {
             || self.mention.take().is_some()
             || self.link_editor.take().is_some()
             || self.table_menu.take().is_some()
+            || self.block_menu.take().is_some()
         {
             cx.notify();
             return;
@@ -1969,8 +2130,12 @@ impl NoteEditorView {
         }
     }
 
-    fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
+    fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.selecting = false;
+        // A grip let go anywhere but on a block moves nothing.
+        if self.dragging.take().is_some() {
+            cx.notify();
+        }
     }
 
     fn link_at(&self, pos: Pos) -> Option<String> {
@@ -2098,6 +2263,9 @@ impl EntityInputHandler for NoteEditorView {
         }
         if text == "@" && !was_mention_open && !was_slash_open {
             self.maybe_open_mention();
+        }
+        if text == "[" && !was_mention_open && !was_slash_open {
+            self.maybe_open_note_link();
         }
         self.edited(cx);
     }
@@ -2302,17 +2470,17 @@ fn callout_look(tone: Tone, colors: SemanticColors) -> (&'static str, gpui::Rgba
 
 fn placeholder(kind: BlockKind, only_block: bool) -> &'static str {
     match kind {
-        BlockKind::Title => "Untitled",
-        BlockKind::Heading(1) => "Heading 1",
-        BlockKind::Heading(2) => "Heading 2",
-        BlockKind::Heading(_) => "Heading 3",
-        BlockKind::Todo { .. } => "To-do",
-        BlockKind::Bullet | BlockKind::Numbered => "List",
-        BlockKind::Quote => "Quote",
-        BlockKind::Code => "Code",
+        BlockKind::Title => crate::i18n::t("notes.untitled"),
+        BlockKind::Heading(1) => crate::i18n::t("notes.block.heading_1"),
+        BlockKind::Heading(2) => crate::i18n::t("notes.block.heading_2"),
+        BlockKind::Heading(_) => crate::i18n::t("notes.block.heading_3"),
+        BlockKind::Todo { .. } => crate::i18n::t("notes.block.todo"),
+        BlockKind::Bullet | BlockKind::Numbered => crate::i18n::t("notes.placeholder.list"),
+        BlockKind::Quote => crate::i18n::t("notes.block.quote"),
+        BlockKind::Code => crate::i18n::t("notes.block.code"),
         BlockKind::Callout(tone) => tone.label(),
-        BlockKind::Paragraph if only_block => "Start writing. Type / for blocks, @ to mention",
-        _ => "Type / for blocks, @ to mention",
+        BlockKind::Paragraph if only_block => crate::i18n::t("notes.placeholder.first"),
+        _ => crate::i18n::t("notes.placeholder.paragraph"),
     }
 }
 
@@ -2325,7 +2493,8 @@ fn highlights(
     colors: SemanticColors,
     faded: bool,
 ) -> Vec<(Range<usize>, HighlightStyle)> {
-    if block.marks.is_empty() && !faded {
+    // Inserts without marks are still drawn faded: a to-do's Start room.
+    if block.marks.is_empty() && !faded && shown.inserts.is_empty() {
         return Vec::new();
     }
     let text = &shown.text;
@@ -2445,6 +2614,7 @@ struct PaintState {
 
 impl Render for NoteEditorView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::perf_overlay::rendered("note editor");
         let colors = self.colors;
         let focused = self.focus.is_focused(window);
         self.focused_last_frame = focused;
@@ -2459,6 +2629,7 @@ impl Render for NoteEditorView {
             .retain(|(_, at)| at.elapsed() < Duration::from_millis(600));
 
         self.anchor_work_menu();
+        self.place_block_menu();
         self.image_rects.borrow_mut().clear();
         let mut layouts = Vec::with_capacity(self.editor.blocks().len());
         let mut shown_all = Vec::with_capacity(self.editor.blocks().len());
@@ -2513,7 +2684,7 @@ impl Render for NoteEditorView {
             let shown = if block.kind.is_atomic() {
                 Shown::default()
             } else {
-                Shown::of(block)
+                Shown::with_tail(block, self.wants_start(block).then_some(START_ROOM))
             };
             let text: SharedString = if block.text.is_empty() || block.kind.is_atomic() {
                 "\u{200B}".into()
@@ -2565,6 +2736,17 @@ impl Render for NoteEditorView {
                     ui
                 })
                 .child(styled);
+            // Start follows the to-do's last word, placed from the last
+            // frame's layout of the room reserved for it.
+            content = content.children(self.work_accessory(
+                index,
+                block,
+                focused && head.block == index,
+                format!("note-row-{}", block.id).into(),
+                look.line,
+                colors,
+                cx,
+            ));
             if show_placeholder {
                 content = content.child(
                     div()
@@ -2698,14 +2880,22 @@ impl Render for NoteEditorView {
                 }
                 _ => row.child(content),
             };
-            let row = row.children(self.work_accessory(
-                block,
-                focused && head.block == index,
-                group.clone(),
-                look.line,
-                colors,
-                cx,
-            ));
+            // The handle in the gutter, and where a dragged block would land.
+            let row = if !folded_away && index > 0 {
+                let gutter = if self.editor.has_children(index) {
+                    indent - DISCLOSURE_WIDTH
+                } else {
+                    indent
+                };
+                let target = block.id;
+                row.child(self.block_handle(index, gutter, look.top, look.line, group.clone(), cx))
+                    .children(self.drop_line(index, group.clone()))
+                    .on_drop(cx.listener(move |this, drag: &BlockDrag, _, cx| {
+                        this.drop_block(drag.block_id, target, cx);
+                    }))
+            } else {
+                row
+            };
             let id = block.id;
             let heights = Rc::clone(&heights);
             let row = row.child(
@@ -2720,7 +2910,7 @@ impl Render for NoteEditorView {
                 .absolute()
                 .inset_0(),
             );
-            column = column.child(row);
+            column = column.child(row.debug_selector(move || format!("note-row-{id}")));
             if !folded_away && let Some(status) = self.work_status_line(block, indent, colors, cx) {
                 column = column.child(status);
             }
@@ -2974,7 +3164,30 @@ impl Render for NoteEditorView {
         } else {
             None
         };
+        let block_menu = if self.block_menu.is_some() {
+            let height = self.block_menu_height();
+            self.host_menu(
+                BLOCK_MENU,
+                Self::block_menu_rows,
+                Self::block_menu_width(),
+                height,
+                window,
+                cx,
+            )
+        } else {
+            None
+        };
         let work_menu = self.work_menu(window, cx);
+        let footer = self.footer.clone().map(|footer| {
+            div()
+                .w_full()
+                .max_w(px(MEASURE))
+                .mx_auto()
+                .mt(px(56.0))
+                .cursor_default()
+                .debug_selector(|| "note-footer".into())
+                .child(footer)
+        });
 
         div()
             .id("note-editor")
@@ -3067,11 +3280,14 @@ impl Render for NoteEditorView {
                         }),
                     )
                     .child(
+                        // Block layout, centred by auto margins: as a flex
+                        // column's item the page took its height from wrapped
+                        // text measured wider than it is drawn, ending short
+                        // of its last rows, so the backlinks painted over them
+                        // and the note would not scroll to its end.
                         div()
                             .w_full()
-                            .flex()
-                            .justify_center()
-                            .px(px(48.0))
+                            .px(px(PAGE_SIDE))
                             .pt(px(PAGE_TOP))
                             .pb(px(240.0))
                             .child(
@@ -3079,10 +3295,12 @@ impl Render for NoteEditorView {
                                     .relative()
                                     .w_full()
                                     .max_w(px(MEASURE))
+                                    .mx_auto()
                                     .child(chip_backdrop)
                                     .child(column)
                                     .child(overlay),
-                            ),
+                            )
+                            .children(footer),
                     ),
             )
             .children(slash_menu)
@@ -3090,6 +3308,7 @@ impl Render for NoteEditorView {
             .children(work_menu)
             .children(link_menu)
             .children(table_menu)
+            .children(block_menu)
     }
 }
 
@@ -3131,7 +3350,7 @@ impl NoteEditorView {
         };
         let picture = match path {
             Some(path) => {
-                let missing = placeholder("This picture's file is missing".into());
+                let missing = placeholder(crate::i18n::t("notes.image.missing").into());
                 let missing = std::cell::RefCell::new(Some(missing));
                 let pixels = *self
                     .image_sizes
@@ -3154,9 +3373,9 @@ impl NoteEditorView {
             }
             None => {
                 let label = if block.src.contains("://") {
-                    format!("Picture on the web · {}", short_url(&block.src))
+                    crate::i18n::tf("notes.image.web", &[("url", &short_url(&block.src))])
                 } else {
-                    "This picture's file is missing".to_owned()
+                    crate::i18n::t("notes.image.missing").to_owned()
                 };
                 placeholder(label)
             }
@@ -3558,7 +3777,7 @@ impl NoteEditorView {
         let matches = self.slash_matches();
         let mut list = div().flex().flex_col().py(px(floating::MENU_PADDING_Y));
         if matches.is_empty() {
-            list = list.child(menu_empty("No matching blocks", colors));
+            list = list.child(menu_empty(crate::i18n::t("notes.menu.no_blocks"), colors));
         }
         let mut group = None;
         for (i, item) in matches.iter().enumerate() {
@@ -3584,7 +3803,7 @@ impl NoteEditorView {
                     this.apply_slash(i, cx);
                 }),
             )
-            .child(menu_label(item.label, colors))
+            .child(menu_label(block_label(item.label), colors))
             .when_some(item.keys, |row, keys| {
                 row.child(floating::menu_shortcut(
                     crate::commands::keystroke_label(keys),
@@ -3645,11 +3864,12 @@ impl NoteEditorView {
         let matches = self.mention_matches();
         let mut list = div().flex().flex_col().py(px(floating::MENU_PADDING_Y));
         if matches.is_empty() {
+            let notes_only = self.mention.as_ref().is_some_and(|m| m.notes_only);
             list = list.child(menu_empty(
-                if self.mentions.entries.is_empty() {
-                    "No sessions or notes to mention"
-                } else {
-                    "No matching sessions or notes"
+                match (notes_only, self.mentions.entries.is_empty()) {
+                    (true, _) => crate::i18n::t("notes.menu.no_notes"),
+                    (false, true) => crate::i18n::t("notes.menu.nothing_to_mention"),
+                    (false, false) => crate::i18n::t("notes.menu.no_mentions"),
                 },
                 colors,
             ));
@@ -3668,6 +3888,8 @@ impl NoteEditorView {
                 }
                 (Some(agent), _) => AgentLogo::new(agent, MENU_LOGO, colors)
                     .badged(false)
+                    .inset(MENU_LOGO_INSET)
+                    .monochrome(true)
                     .into_any_element(),
                 (None, _) => crate::icons::sf_symbol("doc.text", MENU_ICON, colors.secondary),
             };
@@ -3744,7 +3966,11 @@ impl NoteEditorView {
                     .child(if editor.query.is_empty() {
                         div()
                             .text_color(colors.tertiary)
-                            .child(format!("{}Paste or type a link", crate::navigation::CARET))
+                            .child(format!(
+                                "{}{}",
+                                crate::navigation::CARET,
+                                crate::i18n::t("notes.link.placeholder")
+                            ))
                             .into_any_element()
                     } else {
                         crate::navigation::query_label(&field_view(&editor.query))
@@ -3775,20 +4001,26 @@ impl NoteEditorView {
                         },
                     );
                     let label = match (&found, self.editor.selection.is_collapsed()) {
-                        (Some(found), true) => format!("Insert {}", found.title),
-                        (Some(found), false) => format!("Link to {}", found.name),
-                        (None, _) => format!("Link to {}", short_url(url)),
+                        (Some(found), true) => {
+                            crate::i18n::tf("notes.link.insert", &[("target", &found.title)])
+                        }
+                        (Some(found), false) => {
+                            crate::i18n::tf("notes.link.link_to", &[("target", &found.name)])
+                        }
+                        (None, _) => {
+                            crate::i18n::tf("notes.link.link_to", &[("target", &short_url(url))])
+                        }
                     };
                     (icon, label.into(), "↩")
                 }
                 LinkRow::Open { url } => (
                     crate::icons::sf_symbol("square.and.arrow.up", MENU_ICON, colors.secondary),
-                    format!("Open {}", short_url(url)).into(),
+                    crate::i18n::tf("notes.link.open", &[("target", &short_url(url))]).into(),
                     "⌘↩",
                 ),
                 LinkRow::Remove => (
                     crate::icons::sf_symbol("xmark", MENU_ICON, colors.secondary),
-                    "Remove link".into(),
+                    crate::i18n::t("notes.link.remove").into(),
                     "",
                 ),
             };
@@ -3923,10 +4155,11 @@ const SLASH_MENU_WIDTH: f32 = 240.0;
 const MENTION_MENU_WIDTH: f32 = 340.0;
 /// Glyphs and agent marks at the New Agent menu's sizes.
 pub(super) const MENU_ICON: f32 = 13.0;
-pub(super) const MENU_LOGO: f32 = 20.0;
-/// A status mark is inset 0.08 where a bare logo is inset 0.28; this size
-/// draws the mark exactly as large as the New Agent menu's 20 pt logos.
-const MENU_STATUS_MARK: f32 = MENU_LOGO * (1.0 - 2.0 * 0.28) / (1.0 - 2.0 * 0.08);
+pub(super) const MENU_LOGO: f32 = crate::floating::MENU_AGENT_LOGO;
+use crate::floating::MENU_AGENT_LOGO_INSET as MENU_LOGO_INSET;
+/// A status mark is inset 0.08; this size draws the mark exactly as large
+/// as the New Agent menu's logos.
+const MENU_STATUS_MARK: f32 = MENU_LOGO * (1.0 - 2.0 * MENU_LOGO_INSET) / (1.0 - 2.0 * 0.08);
 const MENU_GAP: f32 = 6.0;
 const MENU_MARGIN: f32 = 8.0;
 /// A separator's hairline plus its padding.
@@ -3996,6 +4229,9 @@ struct Shown {
     text: String,
     /// Ascending by model offset, a trailing insert before a leading one.
     inserts: Vec<Insert>,
+    /// Where the room reserved for an inline accessory starts in the layout,
+    /// past its breakable space: the to-do's Start sits there.
+    tail: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4016,9 +4252,19 @@ const CHIP_EDGE: &str = ".";
 const CHIP_ICON_ROOM: &str = "00";
 /// What leads a tool chip: its edge, then its glyph room.
 const CHIP_LEAD: &str = ".00";
+/// Room after a to-do's last word for its Start button, so the button
+/// follows the words and wraps with them instead of hanging off the column.
+/// The space lets the wrapper move the room to its own line; the digits keep
+/// it whole.
+const START_ROOM: &str = " 000000000000";
 
 impl Shown {
     fn of(block: &Block) -> Self {
+        Self::with_tail(block, None)
+    }
+
+    /// The block's layout text, with `room` reserved after its last word.
+    fn with_tail(block: &Block, room: Option<&'static str>) -> Self {
         let mut inserts = Vec::new();
         for chip in mention::in_block(block) {
             inserts.push(Insert {
@@ -4044,14 +4290,23 @@ impl Shown {
                 trailing: true,
             });
         }
-        if inserts.is_empty() {
+        if inserts.is_empty() && room.is_none() {
             return Self {
                 text: block.text.clone(),
                 inserts,
+                tail: None,
             };
         }
         inserts.sort_by_key(|i| (i.at, !i.trailing));
         inserts.dedup();
+        // Leading, so a caret at the end of the words stays before it.
+        if let Some(room) = room {
+            inserts.push(Insert {
+                at: block.text.len(),
+                text: room,
+                trailing: false,
+            });
+        }
         let extra: usize = inserts.iter().map(|i| i.text.len()).sum();
         let mut text = String::with_capacity(block.text.len() + extra);
         let mut last = 0;
@@ -4061,7 +4316,12 @@ impl Shown {
             last = insert.at;
         }
         text.push_str(&block.text[last..]);
-        Self { text, inserts }
+        let tail = room.map(|room| text.len() - room.len() + 1);
+        Self {
+            text,
+            inserts,
+            tail,
+        }
     }
 
     fn to_display(&self, model: usize) -> usize {

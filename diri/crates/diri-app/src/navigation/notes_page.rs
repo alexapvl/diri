@@ -76,6 +76,15 @@ impl NavigationOverlay {
         model
     }
 
+    /// Opening search re-reads the notes folder: a note written since the
+    /// last read must be findable even if the directory watcher missed it.
+    /// Unchanged files are reused, so this costs one directory listing.
+    pub(super) fn reread_notes(&mut self, cx: &mut Context<Self>) {
+        let model = self.notes_model(cx);
+        model.update(cx, |model, _| model.invalidate());
+        self.refresh_notes(cx);
+    }
+
     /// Re-reads the index and the store's note Sessions, keeping the
     /// highlight on the note it was on.
     pub(super) fn refresh_notes(&mut self, cx: &mut Context<Self>) {
@@ -143,11 +152,11 @@ impl NavigationOverlay {
 
     pub(super) fn notes_empty_label(&self, cx: &App) -> &'static str {
         if !self.notes_ready(cx) {
-            "Finding notes…"
+            crate::i18n::t("nav.notes.finding")
         } else if self.notes.entries.is_empty() {
-            "No notes yet"
+            crate::i18n::t("nav.notes.empty")
         } else {
-            "No matches"
+            crate::i18n::t("nav.no_matches")
         }
     }
 
@@ -238,7 +247,14 @@ impl NavigationOverlay {
                         title: entry.title.clone(),
                         system_image: "doc.text",
                         shortcut: None,
-                        detail: Some(if archived { "Archived note" } else { "Note" }.into()),
+                        detail: Some(
+                            if archived {
+                                crate::i18n::t("nav.notes.archived_note")
+                            } else {
+                                crate::i18n::t("nav.notes.note")
+                            }
+                            .into(),
+                        ),
                         enabled: true,
                         is_default: false,
                         command: PaletteCommand::OpenNote {
@@ -267,16 +283,19 @@ impl NavigationOverlay {
             .map(|name| name.to_string_lossy().into_owned());
         let mut meta: Vec<String> = Vec::new();
         if archived {
-            meta.push("Archived".to_owned());
+            meta.push(crate::i18n::t("nav.notes.archived").to_owned());
         }
         if let Some(project) = &project {
             meta.push(project.clone());
         }
         if entry.open_todos > 0 {
-            meta.push(format!(
-                "{} to-do{}",
-                entry.open_todos,
-                if entry.open_todos == 1 { "" } else { "s" }
+            meta.push(crate::i18n::tf(
+                if entry.open_todos == 1 {
+                    "nav.notes.todos_one"
+                } else {
+                    "nav.notes.todos_other"
+                },
+                &[("count", &entry.open_todos)],
             ));
         }
         let detail = {
@@ -285,7 +304,7 @@ impl NavigationOverlay {
                 lines.push(meta.join(" · "));
             }
             if archived {
-                lines.push("Opening restores it from the archive".to_owned());
+                lines.push(crate::i18n::t("nav.notes.restores_from_archive").to_owned());
             }
             lines.join("\n")
         };
@@ -307,7 +326,7 @@ impl NavigationOverlay {
                     .lines
                     .first()
                     .map(|line| line.text.clone())
-                    .unwrap_or_else(|| "Empty note".to_owned()),
+                    .unwrap_or_else(|| crate::i18n::t("nav.notes.empty_note").to_owned()),
                 Vec::new(),
             ),
         };

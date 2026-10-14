@@ -1,7 +1,21 @@
 #!/bin/bash
 # Build, sign, notarize, and publish a diri release.
 #
-# Usage: diri/scripts/release.sh <version>        e.g. diri/scripts/release.sh 0.2.0
+# Usage: diri/scripts/release.sh <version> [--wait-for-merge]
+#
+# The fast path (about five minutes, see diri/UPDATING.md): check out the
+# version-bump PR's branch and run with --wait-for-merge. The macOS app is
+# built, signed and notarized while the PR's CI runs; merge the PR meanwhile.
+# The script then finds the merge on main by its tree (a squash merge of an
+# up-to-date PR has the branch's exact tree), passes the gate on the PR's own
+# CI run, and publishes. Without the flag the checkout's tree must already be
+# on main.
+#
+# A release promoted from a macOS nightly (scripts/promote-nightly.sh) is cut
+# from origin/stable/<version> instead of main: when that branch exists, it is
+# the source branch for everything below (provenance, CI gate, Linux packages
+# and their signing identity), so commits that landed on main after the
+# nightly do not ride along.
 #
 # Env overrides:
 #   DIRI_SIGN_IDENTITY  "Developer ID Application: ..." (default: auto-detected)
@@ -12,28 +26,41 @@
 #   SKIP_GATES=1        skip the CI gate (for re-running a failed publish)
 #   DIRI_LOCAL_GATES=1  run cargo clippy/test here instead of trusting CI's run
 #   SKIP_PERF_GATE=1   skip packaged app memory/idle-CPU probe
+#   SKIP_PRICE_CHECK=1  release even if diri-usage/prices.json is behind LiteLLM
 #   DIRI_LINUX_DIST     use this Linux CI artifact directory instead of fetching
+#                       (it must carry CI's .sigstore.json signature bundles)
+#   DIRI_MERGE_TIMEOUT_SECONDS  how long --wait-for-merge waits (default 3600)
 #   DIRI_RELEASE_TARGET_DIR  build cache (default: diri/target/release-pipeline)
+#   NEW_FEED=1          start a brand-new update feed; only for a repo with no
+#                       published appcast.json (otherwise a failed fetch aborts)
+#   UPDATE_MIRROR       update mirror host checked after publishing
+#                       (default: updates.diri.sh; "off" skips the check)
 #
-# Speed: the macOS build runs locally while two things wait on GitHub Actions in
-# the background — CI's clippy/test run on the source commit (the gate), and a
-# Nightly run's Linux packages (dispatched if none exists; ~40 minutes). Both
-# are joined before anything is published. See scripts/await-ci.sh.
+# Speed: the macOS build runs locally while GitHub Actions work is awaited in
+# the background: the gate (a passing CI run on the release's exact tree) and
+# the signed Linux packages, which the Nightly workflow starts building when
+# the version bump merges. The macOS release, feed and cask go out as soon as
+# the gate passes; the Linux files are attached to the same release when they
+# arrive, verified the same way. See scripts/await-ci.sh.
 #
 # This publishes two notarized macOS artifacts plus the CI-built Linux
-# AppImage and Debian package:
+# AppImage and Debian package for each of x86_64 and aarch64:
 #   diri-<version>-universal.dmg  what people download by hand
 #   diri-<version>-universal.zip  what the in-app updater fetches
 # plus appcast.json, SHA256SUMS, and the reviewed dependency-license inventory.
+# The Linux files carry the Sigstore bundles CI signed them with
+# (<file>.sigstore.json); they are verified here before anything is published.
 # All are attached to a GitHub Release, so the updater feed has a stable URL.
 # See diri/UPDATING.md for the trust model and one-time setup.
 set -euo pipefail
 
-if [ $# -lt 1 ]; then
-    echo "usage: diri/scripts/release.sh <version>   (e.g. 0.2.0)" >&2
+if [ $# -lt 1 ] || [ $# -gt 2 ] || { [ $# -eq 2 ] && [ "$2" != "--wait-for-merge" ]; }; then
+    echo "usage: diri/scripts/release.sh <version> [--wait-for-merge]   (e.g. 0.2.0)" >&2
     exit 2
 fi
 VERSION="$1"
+WAIT_FOR_MERGE=0
+[ "${2:-}" = "--wait-for-merge" ] && WAIT_FOR_MERGE=1
 if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     echo "error: version '$VERSION' is not X.Y.Z" >&2
     exit 2
@@ -60,6 +87,8 @@ INVENTORY="$DIST/THIRD-PARTY-LICENSES.json"
 MINIMUM_SYSTEM="15.0"
 # Old builds stay downloadable but the repo should not grow without bound.
 KEEP_RELEASES=5
+# Fallback route the app uses when GitHub is unreachable (updates-mirror/).
+UPDATE_MIRROR="${UPDATE_MIRROR:-updates.diri.sh}"
 
 # See package.sh: prefer the persistent home toolchain over the /tmp one, which
 # macOS sweeps out from under us.
@@ -108,6 +137,12 @@ if ! command -v gh >/dev/null 2>&1; then
     echo "error: the GitHub CLI (gh) is required to publish" >&2
     exit 1
 fi
+# Checked now rather than after a 40-minute build: the Linux signatures are
+# verified before publishing, and an unverifiable release must not ship.
+if ! command -v cosign >/dev/null 2>&1; then
+    echo "error: cosign is required to verify the Linux signatures (brew install cosign)" >&2
+    exit 1
+fi
 if [ "${SKIP_CASK:-0}" != "1" ] && [ ! -f "$TAP_DIR/Casks/diri.rb" ]; then
     cat >&2 <<EOF
 error: Homebrew tap checkout is missing Casks/diri.rb: $TAP_DIR
@@ -119,9 +154,36 @@ EOF
     exit 1
 fi
 
+# Usage cost estimates ship the price table compiled into this tree, and a
+# release builds the tree exactly as reviewed, so stale prices are synced in
+# the bump PR (promote-nightly.sh does it in its bump commit), not here.
+if [ "${SKIP_PRICE_CHECK:-0}" != "1" ]; then
+    PRICE_STATUS=0
+    python3 "$WORKSPACE/scripts/sync-model-prices.py" --check || PRICE_STATUS=$?
+    if [ "$PRICE_STATUS" = 3 ]; then
+        cat >&2 <<EOF
+error: diri-usage/prices.json is behind LiteLLM's published prices.
+
+  Run diri/scripts/sync-model-prices.py, commit the result in the version-bump
+  PR, and re-run. SKIP_PRICE_CHECK=1 releases with the bundled prices.
+EOF
+        exit 1
+    elif [ "$PRICE_STATUS" != 0 ]; then
+        echo "warning: could not check model prices against LiteLLM; releasing with the bundled table" >&2
+    fi
+fi
+
 # ----------------------------------------------------------------------------
 # 1. Source provenance
 # ----------------------------------------------------------------------------
+# main, or stable/<version> when a promoted nightly created that branch.
+SOURCE_BRANCH=main
+if git -C "$ROOT" ls-remote --exit-code --heads origin "stable/$VERSION" >/dev/null 2>&1; then
+    SOURCE_BRANCH="stable/$VERSION"
+fi
+echo "    Source branch : $SOURCE_BRANCH"
+# The Linux packages must be signed by the Nightly workflow on that exact branch.
+LINUX_SIGNING_IDENTITY="https://github.com/$GH_REPO/.github/workflows/nightly.yml@refs/heads/$SOURCE_BRANCH"
 # The updater compares against CARGO_PKG_VERSION, so the manifest is the single
 # source of truth for what version this build claims to be. Version bumps go
 # through a normal pull request; a release must build the exact remote main
@@ -137,30 +199,51 @@ EOF
     exit 1
 fi
 if [ -n "$(git -C "$ROOT" status --porcelain --untracked-files=no)" ]; then
-    echo "error: tracked files are dirty; release from a clean main checkout" >&2
+    echo "error: tracked files are dirty; release from a clean checkout" >&2
     exit 1
 fi
-git -C "$ROOT" fetch --quiet origin main --tags
-SOURCE_COMMIT="$(git -C "$ROOT" rev-parse HEAD)"
-REMOTE_MAIN="$(git -C "$ROOT" rev-parse origin/main)"
-if [ "$SOURCE_COMMIT" != "$REMOTE_MAIN" ]; then
+# A release ships a reviewed commit on main. It is identified by its source
+# tree, so the bump PR's branch (whose squash merge has the same tree) can be
+# built and notarized before the merge, and a merge landing after it does not
+# force a rebuild. SOURCE_COMMIT is the newest main commit with this tree.
+SOURCE_TREE="$(git -C "$ROOT" rev-parse 'HEAD^{tree}')"
+# The remote Helper's Build ID is the tree too, so a bundle built from the
+# branch is byte-for-byte the bundle the merge commit would produce.
+export DIRI_REMOTE_BUILD_ID="$SOURCE_TREE"
+find_source_commit() {
+    git -C "$ROOT" fetch --quiet origin "$SOURCE_BRANCH" --tags
+    # awk reads to the end rather than exiting at the match: an early exit
+    # sends git log SIGPIPE, which pipefail turns into a failed lookup, so a
+    # found merge looked missing and --wait-for-merge polled forever.
+    git -C "$ROOT" log --first-parent -50 --format='%H %T' "origin/$SOURCE_BRANCH" \
+        | awk -v tree="$SOURCE_TREE" '$2 == tree && !found { print $1; found = 1 }'
+}
+SOURCE_COMMIT="$(find_source_commit)"
+if [ -z "$SOURCE_COMMIT" ] && [ "$WAIT_FOR_MERGE" != 1 ]; then
     cat >&2 <<EOF
-error: release source is not the current origin/main
-  local:  $SOURCE_COMMIT
-  remote: $REMOTE_MAIN
+error: this checkout's tree ($SOURCE_TREE) is not on origin/$SOURCE_BRANCH
 
-Merge the source and version bump first, then check out and pull main.
+Merge the version bump first, or run from the bump PR's branch with
+--wait-for-merge to build while it merges.
 EOF
     exit 1
 fi
-if git -C "$ROOT" rev-parse --verify --quiet "refs/tags/$TAG" >/dev/null; then
-    TAG_COMMIT="$(git -C "$ROOT" rev-list -n 1 "$TAG")"
-    if [ "$TAG_COMMIT" != "$SOURCE_COMMIT" ]; then
-        echo "error: $TAG points to $TAG_COMMIT, not release source $SOURCE_COMMIT" >&2
-        exit 1
+check_tag() {
+    if git -C "$ROOT" rev-parse --verify --quiet "refs/tags/$TAG" >/dev/null; then
+        local tag_commit
+        tag_commit="$(git -C "$ROOT" rev-list -n 1 "$TAG")"
+        if [ "$tag_commit" != "$SOURCE_COMMIT" ]; then
+            echo "error: $TAG points to $tag_commit, not release source $SOURCE_COMMIT" >&2
+            exit 1
+        fi
     fi
+}
+if [ -n "$SOURCE_COMMIT" ]; then
+    check_tag
+    echo "    source commit : $SOURCE_COMMIT"
+else
+    echo "    source tree   : $SOURCE_TREE (waiting for it to merge to $SOURCE_BRANCH)"
 fi
-echo "    source commit : $SOURCE_COMMIT"
 
 # ----------------------------------------------------------------------------
 # Background CI work, joined before publishing
@@ -194,35 +277,44 @@ check_background() {
 
 GATES_PID=""
 GATES_LOG="$CI_LOG_DIR/gates.log"
-if [ "${SKIP_GATES:-0}" = "1" ]; then
-    echo "==> Skipping the CI gate (SKIP_GATES=1)"
-elif [ "${DIRI_LOCAL_GATES:-0}" = "1" ]; then
-    echo "==> Running release gates locally (DIRI_LOCAL_GATES=1)"
-    cargo clippy --workspace --all-targets -- -D warnings
-    cargo test --workspace
-else
-    echo "==> Waiting on CI's clippy/test run for $SOURCE_COMMIT (background, log: $GATES_LOG)"
-    GH_REPO="$GH_REPO" "$WORKSPACE/scripts/await-ci.sh" gates "$SOURCE_COMMIT" \
-        > "$GATES_LOG" 2>&1 &
-    GATES_PID=$!
-    BACKGROUND_PIDS+=("$GATES_PID")
-fi
-
 LINUX_PID=""
 LINUX_LOG="$CI_LOG_DIR/linux.log"
+LINUX_FROM_ENV=0
 if [ -n "${DIRI_LINUX_DIST:-}" ]; then
     if [ ! -d "$DIRI_LINUX_DIST" ]; then
         echo "error: DIRI_LINUX_DIST is not a directory: $DIRI_LINUX_DIST" >&2
         exit 1
     fi
-    echo "==> Using Linux packages from $DIRI_LINUX_DIST"
-else
-    DIRI_LINUX_DIST="$CARGO_TARGET_DIR/linux-packages-$SOURCE_COMMIT"
-    echo "==> Fetching Linux packages for $SOURCE_COMMIT (background, log: $LINUX_LOG)"
-    GH_REPO="$GH_REPO" "$WORKSPACE/scripts/await-ci.sh" linux "$SOURCE_COMMIT" \
-        "$DIRI_LINUX_DIST" > "$LINUX_LOG" 2>&1 &
-    LINUX_PID=$!
-    BACKGROUND_PIDS+=("$LINUX_PID")
+    LINUX_FROM_ENV=1
+fi
+start_ci_work() {
+    if [ "${SKIP_GATES:-0}" = "1" ]; then
+        echo "==> Skipping the CI gate (SKIP_GATES=1)"
+    elif [ "${DIRI_LOCAL_GATES:-0}" = "1" ]; then
+        echo "==> Running release gates locally (DIRI_LOCAL_GATES=1)"
+        cargo clippy --workspace --all-targets -- -D warnings
+        cargo test --workspace
+    else
+        echo "==> Waiting on a passing CI run for $SOURCE_COMMIT's tree (background, log: $GATES_LOG)"
+        GH_REPO="$GH_REPO" "$WORKSPACE/scripts/await-ci.sh" gates "$SOURCE_COMMIT" \
+            > "$GATES_LOG" 2>&1 &
+        GATES_PID=$!
+        BACKGROUND_PIDS+=("$GATES_PID")
+    fi
+    if [ "$LINUX_FROM_ENV" = 1 ]; then
+        echo "==> Using Linux packages from $DIRI_LINUX_DIST"
+    else
+        DIRI_LINUX_DIST="$CARGO_TARGET_DIR/linux-packages-$SOURCE_COMMIT"
+        echo "==> Fetching Linux packages for $SOURCE_COMMIT (background, log: $LINUX_LOG)"
+        GH_REPO="$GH_REPO" DIRI_CI_REF="$SOURCE_BRANCH" \
+            "$WORKSPACE/scripts/await-ci.sh" linux "$SOURCE_COMMIT" \
+            "$DIRI_LINUX_DIST" > "$LINUX_LOG" 2>&1 &
+        LINUX_PID=$!
+        BACKGROUND_PIDS+=("$LINUX_PID")
+    fi
+}
+if [ -n "$SOURCE_COMMIT" ]; then
+    start_ci_work
 fi
 
 # ----------------------------------------------------------------------------
@@ -260,60 +352,142 @@ if [ "${SKIP_PERF_GATE:-0}" != "1" ]; then
 fi
 
 # ----------------------------------------------------------------------------
-# 3. Join CI: the gate must have passed and the Linux packages must be here
+# 3. Wait for the merge (--wait-for-merge), then the gate
 # ----------------------------------------------------------------------------
+if [ -z "$SOURCE_COMMIT" ]; then
+    echo "==> Built and notarized. Waiting for tree $SOURCE_TREE to merge to $SOURCE_BRANCH"
+    merge_deadline=$((SECONDS + ${DIRI_MERGE_TIMEOUT_SECONDS:-3600}))
+    until SOURCE_COMMIT="$(find_source_commit)" && [ -n "$SOURCE_COMMIT" ]; do
+        if [ "$SECONDS" -ge "$merge_deadline" ]; then
+            echo "error: the bump never reached $SOURCE_BRANCH with this tree; nothing was published" >&2
+            echo "  (a squash merge of a PR that is behind main has a different tree)" >&2
+            exit 1
+        fi
+        sleep 10
+    done
+    check_tag
+    echo "    source commit : $SOURCE_COMMIT"
+    start_ci_work
+fi
 if [ -n "$GATES_PID" ]; then
     echo "==> Waiting for the CI gate"
     join_background "$GATES_PID" "CI gate" "$GATES_LOG"
 fi
-if [ -n "$LINUX_PID" ]; then
-    echo "==> Waiting for the Linux packages (Nightly run)"
-    join_background "$LINUX_PID" "Linux packages" "$LINUX_LOG"
-fi
-LINUX_APPIMAGE_SOURCE="$(find "$DIRI_LINUX_DIST" -maxdepth 1 -type f -name '*.AppImage' -print -quit)"
-LINUX_DEB_SOURCE="$(find "$DIRI_LINUX_DIST" -maxdepth 1 -type f -name '*.deb' -print -quit)"
-LINUX_MANIFEST_SOURCE="$DIRI_LINUX_DIST/linux-release.json"
-if [ -z "$LINUX_APPIMAGE_SOURCE" ] || [ -z "$LINUX_DEB_SOURCE" ] || [ ! -f "$LINUX_MANIFEST_SOURCE" ]; then
-    echo "error: Linux CI artifact must contain one AppImage, one DEB, and linux-release.json" >&2
-    exit 1
-fi
 
-python3 - "$LINUX_MANIFEST_SOURCE" "$VERSION" "$SOURCE_COMMIT" \
-    "$LINUX_APPIMAGE_SOURCE" "$LINUX_DEB_SOURCE" <<'PYLINUX'
+# Validates the Linux CI artifact, verifies its Sigstore signatures against
+# the source branch's Nightly identity, and stages it in $DIST. Fills LINUX_PACKAGES and
+# LINUX_ASSETS.
+#
+# The artifact is Nightly's merged release set: an AppImage and a Debian
+# package for every architecture in LINUX_ARCHITECTURES, one SHA256SUMS over
+# all of them, and one linux-release.json. Its top-level "architecture" and
+# "artifacts" stay the x86_64 build's, as every release before aarch64 had
+# them; "builds" lists each architecture (see write-linux-release-manifest.py).
+LINUX_ARCHITECTURES="x86_64 aarch64"
+LINUX_PACKAGES=()
+LINUX_ASSETS=()
+stage_linux() {
+    LINUX_MANIFEST_SOURCE="$DIRI_LINUX_DIST/linux-release.json"
+    if [ ! -f "$LINUX_MANIFEST_SOURCE" ]; then
+        echo "error: Linux CI artifact must contain linux-release.json" >&2
+        exit 1
+    fi
+
+    local listing="$CI_LOG_DIR/linux-packages.txt"
+    python3 - "$LINUX_MANIFEST_SOURCE" "$VERSION" "$SOURCE_COMMIT" \
+        "$LINUX_ARCHITECTURES" > "$listing" <<'PYLINUX'
 import hashlib
 import json
 import pathlib
 import sys
 
-manifest_path, version, commit, *artifact_names = sys.argv[1:]
-manifest = json.loads(pathlib.Path(manifest_path).read_text())
+manifest_path, version, commit, architectures = sys.argv[1:]
+manifest_path = pathlib.Path(manifest_path)
+manifest = json.loads(manifest_path.read_text())
 if manifest.get("version") != version or manifest.get("commit") != commit:
     raise SystemExit("Linux artifact version/source commit does not match this release")
+# Readers that predate "builds" take the top-level fields as the x86_64 build.
 if manifest.get("platform") != "linux" or manifest.get("architecture") != "x86_64":
     raise SystemExit("Linux artifact has the wrong platform or architecture")
-records = {record["file"]: record for record in manifest.get("artifacts", [])}
-for name in artifact_names:
-    path = pathlib.Path(name)
-    record = records.get(path.name)
-    if record is None:
-        raise SystemExit(f"Linux manifest does not declare {path.name}")
-    digest = hashlib.sha256(path.read_bytes()).hexdigest()
-    if digest != record.get("sha256"):
-        raise SystemExit(f"Linux artifact digest mismatch: {path.name}")
+builds = {build.get("architecture"): build for build in manifest.get("builds", [])}
+if sorted(builds) != sorted(architectures.split()) or len(builds) != len(manifest["builds"]):
+    raise SystemExit(f"Linux artifact builds {sorted(builds)}, expected {architectures.split()}")
+if manifest.get("artifacts") != builds["x86_64"].get("artifacts"):
+    raise SystemExit("Linux manifest's top-level artifacts are not the x86_64 build")
+for architecture, build in builds.items():
+    formats = sorted(record.get("format") for record in build.get("artifacts", []))
+    if formats != ["appimage", "deb"]:
+        raise SystemExit(f"Linux {architecture} build must have one AppImage and one DEB")
+    for record in build["artifacts"]:
+        name = record["file"]
+        if "/" in name or name.startswith("."):
+            raise SystemExit(f"unsafe Linux artifact name {name!r}")
+        path = manifest_path.parent / name
+        if not path.is_file():
+            raise SystemExit(f"Linux CI artifact is missing {name}")
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        if digest != record.get("sha256"):
+            raise SystemExit(f"Linux artifact digest mismatch: {name}")
+        print(name)
 PYLINUX
 
-LINUX_APPIMAGE="$DIST/$(basename "$LINUX_APPIMAGE_SOURCE")"
-LINUX_DEB="$DIST/$(basename "$LINUX_DEB_SOURCE")"
-LINUX_MANIFEST="$DIST/linux-release.json"
-mkdir -p "$DIST"
-if [ "$LINUX_APPIMAGE_SOURCE" != "$LINUX_APPIMAGE" ]; then
-    cp "$LINUX_APPIMAGE_SOURCE" "$LINUX_APPIMAGE"
-fi
-if [ "$LINUX_DEB_SOURCE" != "$LINUX_DEB" ]; then
-    cp "$LINUX_DEB_SOURCE" "$LINUX_DEB"
-fi
-if [ "$LINUX_MANIFEST_SOURCE" != "$LINUX_MANIFEST" ]; then
-    cp "$LINUX_MANIFEST_SOURCE" "$LINUX_MANIFEST"
+    # The packages must carry signatures from the source branch's Nightly
+    # workflow. Overrides a maintainer may have exported for a rehearsal are
+    # dropped so the identity pinned above, not the environment, decides what is
+    # accepted. This also refuses any package in the directory that the manifest
+    # does not declare.
+    echo "==> Verifying Linux Sigstore signatures ($LINUX_SIGNING_IDENTITY)"
+    env -u DIRI_COSIGN_PUBLIC_KEY -u DIRI_SIGNING_OIDC_ISSUER \
+        DIRI_SIGNING_IDENTITY="$LINUX_SIGNING_IDENTITY" \
+        GH_REPO="$GH_REPO" "$WORKSPACE/scripts/linux-signatures.sh" verify "$DIRI_LINUX_DIST"
+
+    LINUX_MANIFEST="$DIST/linux-release.json"
+    # The release-wide SHA256SUMS below covers every platform and is written here,
+    # so it cannot carry CI's signature. CI's signed Linux-only list ships beside it
+    # under its own name; the bundle signs bytes, not a filename.
+    LINUX_CHECKSUMS="$DIST/SHA256SUMS-linux"
+    mkdir -p "$DIST"
+    copy_linux_asset() {
+        if [ "$1" != "$2" ]; then
+            cp "$1" "$2"
+        fi
+    }
+    LINUX_PACKAGES=()
+    local package_signatures=() name
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        copy_linux_asset "$DIRI_LINUX_DIST/$name" "$DIST/$name"
+        copy_linux_asset "$DIRI_LINUX_DIST/$name.sigstore.json" "$DIST/$name.sigstore.json"
+        LINUX_PACKAGES+=("$DIST/$name")
+        package_signatures+=("$DIST/$name.sigstore.json")
+    done < "$listing"
+    copy_linux_asset "$LINUX_MANIFEST_SOURCE" "$LINUX_MANIFEST"
+    copy_linux_asset "$DIRI_LINUX_DIST/SHA256SUMS" "$LINUX_CHECKSUMS"
+    copy_linux_asset "$LINUX_MANIFEST_SOURCE.sigstore.json" "$LINUX_MANIFEST.sigstore.json"
+    copy_linux_asset "$DIRI_LINUX_DIST/SHA256SUMS.sigstore.json" "$LINUX_CHECKSUMS.sigstore.json"
+    LINUX_SIGNATURES=(
+        "$LINUX_CHECKSUMS"
+        "${package_signatures[@]}"
+        "$LINUX_MANIFEST.sigstore.json"
+        "$LINUX_CHECKSUMS.sigstore.json"
+    )
+    LINUX_ASSETS=(
+        "${LINUX_PACKAGES[@]}" "$LINUX_MANIFEST" "${LINUX_SIGNATURES[@]}"
+    )
+}
+
+# Linux packages that are already here ship with the release; otherwise the
+# macOS release goes out now and they are attached when the Nightly run that
+# the bump's merge started has built and signed them (~15 minutes).
+LINUX_DEFERRED=0
+if [ "$LINUX_FROM_ENV" = 1 ]; then
+    stage_linux
+elif [ -n "$LINUX_PID" ] && ! kill -0 "$LINUX_PID" 2>/dev/null; then
+    join_background "$LINUX_PID" "Linux packages" "$LINUX_LOG"
+    stage_linux
+else
+    LINUX_DEFERRED=1
+    echo "==> Linux packages are still building; publishing macOS first"
 fi
 
 # ----------------------------------------------------------------------------
@@ -329,11 +503,43 @@ DMG_SHA256="$(shasum -a 256 "$DMG" | awk '{print $1}')"
 PUBLISHED="$(date -u +%Y-%m-%d)"
 
 # Start from the published feed so releases people skipped stay offerable.
+# A fetch that fails must stop the release: starting a fresh feed here would
+# publish one that lists only this version and silently drop every older one
+# (and with them the version picker's downgrade targets). Only an explicit
+# NEW_FEED=1 starts over, and only when GitHub says there is no feed (404).
 echo "==> Fetching the current feed"
-if ! curl -fsSL "https://github.com/$GH_REPO/releases/latest/download/appcast.json" -o "$FEED" 2>/dev/null; then
-    echo "    (no published feed yet — starting a new one)"
+FEED_SOURCE="https://github.com/$GH_REPO/releases/latest/download/appcast.json"
+FEED_STATUS=""
+for attempt in 1 2 3 4; do
     rm -f "$FEED"
-fi
+    FEED_STATUS="$(curl -sSL --connect-timeout 15 --max-time 60 -o "$FEED" \
+        -w '%{http_code}' "$FEED_SOURCE" || true)"
+    case "$FEED_STATUS" in
+        200|404) break ;;
+    esac
+    echo "    feed fetch failed (HTTP ${FEED_STATUS:-none}), attempt $attempt of 4" >&2
+    if [ "$attempt" -lt 4 ]; then sleep $((attempt * 5)); fi
+done
+case "$FEED_STATUS" in
+    200) ;;
+    404)
+        rm -f "$FEED"
+        if [ "${NEW_FEED:-0}" = 1 ]; then
+            echo "    (NEW_FEED=1 and no published feed — starting a new one)"
+        else
+            echo "error: $FEED_SOURCE is 404. If this repo has never published a feed," >&2
+            echo "       re-run with NEW_FEED=1; otherwise the latest release lost its" >&2
+            echo "       appcast.json and must be fixed before publishing." >&2
+            exit 1
+        fi
+        ;;
+    *)
+        rm -f "$FEED"
+        echo "error: could not fetch the published feed (HTTP ${FEED_STATUS:-none})." >&2
+        echo "       Refusing to start a new one, which would drop every older release." >&2
+        exit 1
+        ;;
+esac
 
 echo "==> Writing $FEED"
 VERSION="$VERSION" \
@@ -347,13 +553,15 @@ import json, os, pathlib
 feed_path = pathlib.Path(os.environ["FEED"])
 feed = {"feed_version": 1, "releases": []}
 if feed_path.exists():
+    # The same rule as the fetch: an unreadable published feed is a stop, not
+    # a reason to publish one with the older releases missing.
     try:
         feed = json.loads(feed_path.read_text())
-    except json.JSONDecodeError:
-        print("    (published feed did not parse — starting a new one)")
-        feed = {"feed_version": 1, "releases": []}
+    except json.JSONDecodeError as error:
+        raise SystemExit(f"error: the published feed did not parse ({error}); refusing to replace it")
+    if not isinstance(feed, dict) or not isinstance(feed.get("releases"), list) or not feed["releases"]:
+        raise SystemExit("error: the published feed lists no releases; refusing to replace it")
     feed.setdefault("feed_version", 1)
-    feed.setdefault("releases", [])
 
 version = os.environ["VERSION"]
 entry = {
@@ -387,17 +595,21 @@ if [ ! -f "$INVENTORY" ]; then
     exit 1
 fi
 
+# Covers the macOS files, the feed and the inventory, plus the Linux packages
+# when they ship together. Linux files attached later are covered by their own
+# signed SHA256SUMS-linux.
 echo "==> Writing $CHECKSUMS"
+CHECKSUMMED=("$(basename "$DMG")" "$(basename "$ZIP")")
+if [ "$LINUX_DEFERRED" = 0 ]; then
+    for package in "${LINUX_PACKAGES[@]}"; do
+        CHECKSUMMED+=("$(basename "$package")")
+    done
+    CHECKSUMMED+=("$(basename "$LINUX_MANIFEST")")
+fi
+CHECKSUMMED+=("$(basename "$FEED")" "$(basename "$INVENTORY")")
 (
     cd "$DIST"
-    shasum -a 256 \
-        "$(basename "$DMG")" \
-        "$(basename "$ZIP")" \
-        "$(basename "$LINUX_APPIMAGE")" \
-        "$(basename "$LINUX_DEB")" \
-        "$(basename "$LINUX_MANIFEST")" \
-        "$(basename "$FEED")" \
-        "$(basename "$INVENTORY")" > "$(basename "$CHECKSUMS")"
+    shasum -a 256 "${CHECKSUMMED[@]}" > "$(basename "$CHECKSUMS")"
     shasum -a 256 -c "$(basename "$CHECKSUMS")"
 )
 
@@ -416,11 +628,14 @@ worktrees, review tools, and direct SSH hosts.
 Universal (Apple silicon and Intel), signed and notarized, so it opens without
 a Gatekeeper prompt.
 
-**Linux beta:** download the x86_64 Debian package or AppImage. Ubuntu 22.04
-and 24.04 are supported under X11 and Wayland. Linux updates use a newer
-package/download rather than the in-app macOS updater.
+**Linux beta:** download the Debian package or AppImage for your machine:
+\`amd64\`/\`x86_64\` for Intel and AMD, \`arm64\`/\`aarch64\` for 64-bit ARM.
+Ubuntu 22.04 and 24.04 are supported under X11 and Wayland. Linux updates use
+a newer package/download rather than the in-app macOS updater.
 
-See \`SHA256SUMS\` and \`linux-release.json\` for artifact metadata. The macOS
+See \`SHA256SUMS\` and \`linux-release.json\` for artifact metadata. Each Linux
+file has a Sigstore \`.sigstore.json\` signature from this repository's CI;
+\`diri/LINUX.md\` shows how to verify it. The macOS
 app updates itself from the \`appcast.json\` feed attached here.
 NOTES
     echo "==> Wrote default notes to $NOTES_FILE (edit and re-run to customize)"
@@ -430,7 +645,7 @@ echo "==> Publishing $TAG to $GH_REPO"
 GH_REPO="$GH_REPO" SOURCE_COMMIT="$SOURCE_COMMIT" \
     "$WORKSPACE/scripts/publish-github-release.sh" \
     "$VERSION" "$NOTES_FILE" "$DMG" "$ZIP" \
-    "$LINUX_APPIMAGE" "$LINUX_DEB" "$LINUX_MANIFEST" \
+    ${LINUX_ASSETS[@]+"${LINUX_ASSETS[@]}"} \
     "$FEED" "$CHECKSUMS" "$INVENTORY"
 
 # ----------------------------------------------------------------------------
@@ -449,6 +664,47 @@ else
         "$VERSION" "$DMG" "$TAP_DIR"
 fi
 
+echo "==> macOS release, feed and cask are live: https://github.com/$GH_REPO/releases/tag/$TAG"
+
+# ----------------------------------------------------------------------------
+# 6b. Check the update mirror
+# ----------------------------------------------------------------------------
+# The mirror (updates-mirror/) proxies GitHub, so there is nothing to upload.
+# Fetching the new archive through it warms its edge cache and proves it
+# serves the exact bytes GitHub has. GitHub stays the source of truth: a
+# mirror problem is a warning to fix, not a failed release.
+if [ "$UPDATE_MIRROR" = off ]; then
+    echo "==> Skipping the update mirror check (UPDATE_MIRROR=off)"
+else
+    MIRROR_ZIP="https://$UPDATE_MIRROR/releases/download/$TAG/$(basename "$ZIP")"
+    echo "==> Checking the update mirror: $MIRROR_ZIP"
+    MIRROR_SHA="$(curl -fsSL --connect-timeout 15 --max-time 600 "$MIRROR_ZIP" \
+        | shasum -a 256 | awk '{print $1}' || true)"
+    if [ "$MIRROR_SHA" = "$SHA256" ] \
+        && curl -fsS --connect-timeout 15 --max-time 60 "https://$UPDATE_MIRROR/appcast.json" \
+            | python3 -c 'import json, sys; json.load(sys.stdin)["releases"][0]' 2>/dev/null; then
+        echo "    mirror serves the release archive byte for byte"
+    else
+        echo "warning: the update mirror at $UPDATE_MIRROR does not serve $TAG correctly" >&2
+        echo "         (archive sha256 ${MIRROR_SHA:-none}, expected $SHA256)." >&2
+        echo "         Users who cannot reach GitHub will not get this update until it does;" >&2
+        echo "         see updates-mirror/README.md." >&2
+    fi
+fi
+
+# ----------------------------------------------------------------------------
+# 7. Attach the Linux packages if they were still building
+# ----------------------------------------------------------------------------
+if [ "$LINUX_DEFERRED" = 1 ]; then
+    echo "==> Waiting for the Linux packages (Nightly run)"
+    join_background "$LINUX_PID" "Linux packages" "$LINUX_LOG"
+    stage_linux
+    echo "==> Attaching the Linux packages to $TAG"
+    PUBLISH_ATTACH=1 GH_REPO="$GH_REPO" \
+        "$WORKSPACE/scripts/publish-github-release.sh" \
+        "$VERSION" "$NOTES_FILE" "${LINUX_ASSETS[@]}"
+fi
+
 cat <<EOF
 
 ============================================================
@@ -456,8 +712,7 @@ cat <<EOF
 ============================================================
   DMG        : $DMG
   Update zip : $ZIP
-  AppImage   : $LINUX_APPIMAGE
-  Debian     : $LINUX_DEB
+  Linux      : $(for package in "${LINUX_PACKAGES[@]}"; do printf '%s ' "$(basename "$package")"; done)
   Linux meta : $LINUX_MANIFEST
   DMG sha256 : $DMG_SHA256
   ZIP sha256 : $SHA256

@@ -18,6 +18,9 @@ diri-notes.workspace = true
 diri-pty.workspace = true
 diri-telemetry.workspace = true
 diri-terminal-state.workspace = true
+# The Engine serves the `dirijor` MCP tools over loopback HTTP with the same
+# message handling as the stdio frontend (see src/mcp_http.rs).
+dirijor-mcp = { path = "../dirijor-mcp" }
 getrandom.workspace = true
 plist.workspace = true
 regex.workspace = true
@@ -25,10 +28,11 @@ rusqlite.workspace = true
 serde.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
 sha2.workspace = true
-toml_edit = { version = "0.22.27", features = ["serde"] }
+toml_edit = { version = "0.25.13", features = ["serde"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+socket2 = "0.6"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "=0.6.4"

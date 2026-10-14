@@ -20,6 +20,11 @@ use crate::agent::InjectionSpec;
 pub const SESSION_ID_ENV: &str = "DIRIJOR_SESSION_ID";
 pub const SOCKET_ENV: &str = "DIRIJOR_SOCKET";
 pub const CLI_ENV: &str = "DIRIJOR_CLI";
+/// The session's bearer token for the Engine-served MCP endpoint. Set only
+/// in that session's PTY environment; config files name it, never hold it.
+pub const MCP_TOKEN_ENV: &str = "DIRIJOR_MCP_TOKEN";
+/// The Claude `--mcp-config` that points at the Engine-served endpoint.
+pub const CLAUDE_MCP_HTTP_FILE: &str = "claude-mcp-http.json";
 
 /// A random v4 UUID in the lowercase-hex form Claude accepts as
 /// `--session-id`. Minting it ourselves is what makes resume possible later
@@ -95,6 +100,24 @@ pub fn write_claude_mcp_file(inject_dir: &Path, cli_path: &Path) -> io::Result<(
     )
 }
 
+/// The Claude `--mcp-config` for the Engine-served Streamable HTTP endpoint.
+/// Claude Code expands `${DIRIJOR_MCP_TOKEN}` from its own environment, so
+/// this one file serves every session and holds no secret.
+pub fn write_claude_mcp_http_file(inject_dir: &Path, url: &str) -> io::Result<()> {
+    write_atomic(
+        &inject_dir.join(CLAUDE_MCP_HTTP_FILE),
+        &serde_json::to_vec_pretty(&json!({
+            "mcpServers": {
+                "dirijor": {
+                    "type": "http",
+                    "url": url,
+                    "headers": { "Authorization": format!("Bearer ${{{MCP_TOKEN_ENV}}}") },
+                }
+            }
+        }))?,
+    )
+}
+
 fn mcp_launch(cli_path: &Path) -> (String, Vec<String>) {
     let proxy = cli_path
         .parent()
@@ -107,6 +130,59 @@ fn mcp_launch(cli_path: &Path) -> (String, Vec<String>) {
             cli_path.to_string_lossy().into_owned(),
             vec!["mcp-stdio".into()],
         )
+    }
+}
+
+/// Folder of the Claude Code plugin that carries Diri's skills.
+pub const CLAUDE_SKILLS_PLUGIN_DIR: &str = "claude-skills-plugin";
+
+/// Writes `<inject>/claude-skills-plugin/`: a Claude Code plugin named `diri`
+/// whose `skills/<name>/SKILL.md` load as native skills (`diri:scheduling`,
+/// …). Static like the hooks and MCP files, so one copy serves every session.
+/// Staged and swapped whole, so an Engine upgrade never leaves a skill from an
+/// older build behind.
+pub fn write_claude_skills_plugin(inject_dir: &Path) -> io::Result<PathBuf> {
+    let plugin_dir = inject_dir.join(CLAUDE_SKILLS_PLUGIN_DIR);
+    let staging = inject_dir.join(format!(
+        ".{CLAUDE_SKILLS_PLUGIN_DIR}.{}.tmp",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::create_dir_all(staging.join(".claude-plugin"))?;
+    write_atomic(
+        &staging.join(".claude-plugin/plugin.json"),
+        &serde_json::to_vec_pretty(&json!({
+            "name": "diri",
+            "version": "0.1.0",
+            "description": "How to use Diri from inside a Diri session: scheduling, notes, and coordinating other agents.",
+            "author": { "name": "Diri" },
+        }))?,
+    )?;
+    for skill in diri_proto::skills::ALL {
+        let folder = staging.join("skills").join(skill.name);
+        std::fs::create_dir_all(&folder)?;
+        write_atomic(&folder.join("SKILL.md"), skill.skill_md().as_bytes())?;
+    }
+    let backup = inject_dir.join(format!(
+        ".{CLAUDE_SKILLS_PLUGIN_DIR}.{}.old",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&backup);
+    if plugin_dir.exists() {
+        std::fs::rename(&plugin_dir, &backup)?;
+    }
+    match std::fs::rename(&staging, &plugin_dir) {
+        Ok(()) => {
+            let _ = std::fs::remove_dir_all(&backup);
+            Ok(plugin_dir)
+        }
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            if backup.exists() {
+                let _ = std::fs::rename(&backup, &plugin_dir);
+            }
+            Err(error)
+        }
     }
 }
 
@@ -133,7 +209,30 @@ pub fn injection_args_with_cursor(
     cli_path: &Path,
     cursor: Option<CursorInject<'_>>,
 ) -> Vec<String> {
+    injection_args_full(injection, inject_dir, cli_path, cursor, None).argv
+}
+
+/// Per-launch injection plus whether the Agent was pointed at the
+/// Engine-served MCP endpoint, in which case the caller must put the
+/// session's token in [`MCP_TOKEN_ENV`].
+pub struct Injected {
+    pub argv: Vec<String>,
+    pub mcp_http: bool,
+}
+
+/// Like [`injection_args_with_cursor`]; with `mcp_http_url`, Agents whose
+/// CLI speaks MCP over HTTP (Claude Code, Codex) reach the Engine directly
+/// instead of starting a `dirijor-mcp` process. Without it, or when the
+/// HTTP config is missing, they keep the stdio server.
+pub fn injection_args_full(
+    injection: &InjectionSpec,
+    inject_dir: &Path,
+    cli_path: &Path,
+    cursor: Option<CursorInject<'_>>,
+    mcp_http_url: Option<&str>,
+) -> Injected {
     let mut argv = Vec::new();
+    let mut mcp_http = false;
     if injection.claude_hooks {
         let hooks = inject_dir.join("claude-hooks.json");
         if hooks.exists() {
@@ -142,10 +241,23 @@ pub fn injection_args_with_cursor(
         }
     }
     if injection.claude_mcp {
-        let mcp = inject_dir.join("claude-mcp.json");
-        if mcp.exists() {
+        let http = inject_dir.join(CLAUDE_MCP_HTTP_FILE);
+        let stdio = inject_dir.join("claude-mcp.json");
+        let config = if mcp_http_url.is_some() && http.exists() {
+            mcp_http = true;
+            Some(http)
+        } else {
+            stdio.exists().then_some(stdio)
+        };
+        if let Some(config) = config {
             argv.push("--mcp-config".into());
-            argv.push(mcp.to_string_lossy().into_owned());
+            argv.push(config.to_string_lossy().into_owned());
+            // The skills explain those tools, so they travel together.
+            let skills = inject_dir.join(CLAUDE_SKILLS_PLUGIN_DIR);
+            if skills.join(".claude-plugin/plugin.json").exists() {
+                argv.push("--plugin-dir".into());
+                argv.push(skills.to_string_lossy().into_owned());
+            }
         }
     }
     if injection.codex_notify {
@@ -156,20 +268,34 @@ pub fn injection_args_with_cursor(
         ));
     }
     if injection.codex_mcp {
-        let (command, args) = mcp_launch(cli_path);
-        let encoded_args = args
-            .iter()
-            .map(|arg| toml_string(arg))
-            .collect::<Vec<_>>()
-            .join(",");
-        argv.push("-c".into());
-        argv.push(format!(
-            "mcp_servers.dirijor.command={}",
-            toml_string(&command)
-        ));
-        argv.push("-c".into());
-        argv.push(format!("mcp_servers.dirijor.args=[{encoded_args}]"));
+        if let Some(url) = mcp_http_url {
+            // Codex reads the bearer token from the named variable itself.
+            mcp_http = true;
+            argv.push("-c".into());
+            argv.push(format!("mcp_servers.dirijor.url={}", toml_string(url)));
+            argv.push("-c".into());
+            argv.push(format!(
+                "mcp_servers.dirijor.bearer_token_env_var={}",
+                toml_string(MCP_TOKEN_ENV)
+            ));
+        } else {
+            let (command, args) = mcp_launch(cli_path);
+            let encoded_args = args
+                .iter()
+                .map(|arg| toml_string(arg))
+                .collect::<Vec<_>>()
+                .join(",");
+            argv.push("-c".into());
+            argv.push(format!(
+                "mcp_servers.dirijor.command={}",
+                toml_string(&command)
+            ));
+            argv.push("-c".into());
+            argv.push(format!("mcp_servers.dirijor.args=[{encoded_args}]"));
+        }
     }
+    // Cursor stays on stdio: cursor-agent 2025.09.12 sends no configured
+    // headers to HTTP MCP servers (it falls into OAuth discovery instead).
     if (injection.cursor_mcp || injection.cursor_hooks)
         && let Some(cursor) = cursor
         && let Ok(plugin_dir) = write_cursor_plugin(
@@ -184,7 +310,7 @@ pub fn injection_args_with_cursor(
         argv.push("--plugin-dir".into());
         argv.push(plugin_dir.to_string_lossy().into_owned());
     }
-    argv
+    Injected { argv, mcp_http }
 }
 
 /// Writes `<inject>/cursor-plugin/<session>/` with plugin manifest, optional
@@ -436,6 +562,43 @@ mod tests {
         );
     }
 
+    /// Writes the real plugin to `DIRI_SKILLS_OUT` so it can be checked with
+    /// `claude plugin validate` and loaded with `claude --plugin-dir`.
+    #[test]
+    #[ignore = "writes the Claude skills plugin to DIRI_SKILLS_OUT"]
+    fn write_skills_plugin_for_inspection() {
+        let out = std::env::var_os("DIRI_SKILLS_OUT").expect("set DIRI_SKILLS_OUT");
+        let dir = write_claude_skills_plugin(Path::new(&out)).expect("write");
+        eprintln!("{}", dir.display());
+    }
+
+    #[test]
+    fn the_skills_plugin_holds_every_diri_skill_and_replaces_stale_ones() {
+        let temp = tempfile::tempdir().expect("temp");
+        let dir = write_claude_skills_plugin(temp.path()).expect("write");
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dir.join(".claude-plugin/plugin.json")).expect("manifest"),
+        )
+        .expect("json");
+        assert_eq!(manifest["name"], "diri", "skills load as diri:<name>");
+        for skill in diri_proto::skills::ALL {
+            let md = std::fs::read_to_string(dir.join("skills").join(skill.name).join("SKILL.md"))
+                .expect("skill file");
+            assert!(md.starts_with(&format!("---\nname: {}\n", skill.name)));
+            assert!(md.contains(skill.markdown));
+        }
+        // A skill an older build wrote must not survive an upgrade.
+        std::fs::create_dir_all(dir.join("skills/retired")).expect("stale");
+        write_claude_skills_plugin(temp.path()).expect("rewrite");
+        assert!(!dir.join("skills/retired").exists());
+        let leftovers: Vec<_> = std::fs::read_dir(temp.path())
+            .expect("list")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with('.'))
+            .collect();
+        assert!(leftovers.is_empty(), "staging left behind: {leftovers:?}");
+    }
+
     #[test]
     fn injection_args_cover_all_four_mechanisms() {
         let temp = tempfile::tempdir().expect("temp");
@@ -453,6 +616,12 @@ mod tests {
         assert!(args[1].ends_with("claude-hooks.json"));
         assert_eq!(args[2], "--mcp-config");
         assert!(args[3].ends_with("claude-mcp.json"));
+        // Without the skills plugin on disk, no dangling --plugin-dir.
+        assert_eq!(args.len(), 4, "{args:?}");
+        write_claude_skills_plugin(temp.path()).expect("skills");
+        let args = injection_args(&claude, temp.path(), &cli);
+        assert_eq!(args[4], "--plugin-dir");
+        assert!(args[5].ends_with(CLAUDE_SKILLS_PLUGIN_DIR));
 
         let codex = InjectionSpec {
             codex_notify: true,
@@ -467,6 +636,163 @@ mod tests {
                 .any(|arg| arg.starts_with("mcp_servers.dirijor.command=")),
             "{args:?}"
         );
+    }
+
+    #[test]
+    fn http_capable_agents_reach_the_engine_and_others_keep_stdio() {
+        let temp = tempfile::tempdir().expect("temp");
+        let cli = temp.path().join("dirijor");
+        let url = "http://127.0.0.1:4545/mcp";
+        write_claude_mcp_file(temp.path(), &cli).expect("stdio mcp");
+        let claude = InjectionSpec {
+            claude_mcp: true,
+            ..Default::default()
+        };
+        let codex = InjectionSpec {
+            codex_mcp: true,
+            ..Default::default()
+        };
+
+        // Endpoint up but the Claude HTTP config never written: stdio.
+        let injected = injection_args_full(&claude, temp.path(), &cli, None, Some(url));
+        assert!(!injected.mcp_http);
+        assert!(injected.argv[1].ends_with("claude-mcp.json"));
+
+        write_claude_mcp_http_file(temp.path(), url).expect("http mcp");
+        let config: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(temp.path().join(CLAUDE_MCP_HTTP_FILE)).expect("read"),
+        )
+        .expect("json");
+        assert_eq!(
+            config["mcpServers"]["dirijor"],
+            json!({
+                "type": "http",
+                "url": url,
+                "headers": {"Authorization": "Bearer ${DIRIJOR_MCP_TOKEN}"},
+            })
+        );
+        let injected = injection_args_full(&claude, temp.path(), &cli, None, Some(url));
+        assert!(injected.mcp_http);
+        assert_eq!(injected.argv[0], "--mcp-config");
+        assert!(injected.argv[1].ends_with(CLAUDE_MCP_HTTP_FILE));
+        // No endpoint: the stdio config, even with the HTTP file on disk.
+        let injected = injection_args_full(&claude, temp.path(), &cli, None, None);
+        assert!(!injected.mcp_http);
+        assert!(injected.argv[1].ends_with("claude-mcp.json"));
+
+        let injected = injection_args_full(&codex, temp.path(), &cli, None, Some(url));
+        assert!(injected.mcp_http);
+        assert_eq!(
+            injected.argv,
+            [
+                "-c",
+                "mcp_servers.dirijor.url=\"http://127.0.0.1:4545/mcp\"",
+                "-c",
+                "mcp_servers.dirijor.bearer_token_env_var=\"DIRIJOR_MCP_TOKEN\"",
+            ]
+        );
+        let injected = injection_args_full(&codex, temp.path(), &cli, None, None);
+        assert!(!injected.mcp_http);
+        assert!(
+            injected
+                .argv
+                .iter()
+                .any(|arg| arg.starts_with("mcp_servers.dirijor.command=")),
+            "{:?}",
+            injected.argv
+        );
+
+        // Cursor cannot send our header over HTTP: it stays on stdio.
+        let cursor = InjectionSpec {
+            cursor_mcp: true,
+            ..Default::default()
+        };
+        let socket = temp.path().join("d.sock");
+        let injected = injection_args_full(
+            &cursor,
+            temp.path(),
+            &cli,
+            Some(CursorInject {
+                session_id: "s_c",
+                socket_path: &socket,
+            }),
+            Some(url),
+        );
+        assert!(!injected.mcp_http);
+        let mcp: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(Path::new(&injected.argv[1]).join("mcp.json")).expect("mcp.json"),
+        )
+        .expect("json");
+        assert_eq!(mcp["mcpServers"]["dirijor"]["type"], "stdio");
+    }
+
+    /// A launch kept on stdio (endpoint down, or a CLI below the verified
+    /// HTTP minimum) must get exactly what it got before the HTTP endpoint
+    /// existed. The expected values are spelled out as main produced them.
+    #[test]
+    fn gated_out_launches_get_main_s_stdio_injection_byte_for_byte() {
+        let temp = tempfile::tempdir().expect("temp");
+        let dir = temp.path();
+        let cli = dir.join("bin/dirijor");
+        write_claude_hooks_file(dir).expect("hooks");
+        write_claude_mcp_file(dir, &cli).expect("mcp");
+        write_claude_skills_plugin(dir).expect("skills");
+        // The HTTP config sitting beside it must not change anything.
+        write_claude_mcp_http_file(dir, "http://127.0.0.1:1/mcp").expect("http");
+        let path = |name: &str| dir.join(name).to_string_lossy().into_owned();
+        let cli_text = cli.to_string_lossy().into_owned();
+
+        // main's exact expression for the stdio config (no sibling
+        // dirijor-mcp, so the CLI's `mcp-stdio` subcommand).
+        assert_eq!(
+            std::fs::read(dir.join("claude-mcp.json")).unwrap(),
+            serde_json::to_vec_pretty(&json!({
+                "mcpServers": {
+                    "dirijor": { "type": "stdio", "command": cli_text, "args": ["mcp-stdio"] }
+                }
+            }))
+            .unwrap()
+        );
+
+        let claude = InjectionSpec {
+            claude_hooks: true,
+            claude_mcp: true,
+            ..Default::default()
+        };
+        let injected = injection_args_full(&claude, dir, &cli, None, None);
+        assert!(!injected.mcp_http);
+        assert_eq!(
+            injected.argv,
+            [
+                "--settings".to_owned(),
+                path("claude-hooks.json"),
+                "--mcp-config".to_owned(),
+                path("claude-mcp.json"),
+                "--plugin-dir".to_owned(),
+                path(CLAUDE_SKILLS_PLUGIN_DIR),
+            ]
+        );
+        assert_eq!(injected.argv, injection_args(&claude, dir, &cli));
+
+        let codex = InjectionSpec {
+            codex_notify: true,
+            codex_mcp: true,
+            ..Default::default()
+        };
+        let injected = injection_args_full(&codex, dir, &cli, None, None);
+        assert!(!injected.mcp_http);
+        assert_eq!(
+            injected.argv,
+            [
+                "-c".to_owned(),
+                format!("notify=[\"{cli_text}\", \"notify\"]"),
+                "-c".to_owned(),
+                format!("mcp_servers.dirijor.command=\"{cli_text}\""),
+                "-c".to_owned(),
+                "mcp_servers.dirijor.args=[\"mcp-stdio\"]".to_owned(),
+            ]
+        );
+        assert_eq!(injected.argv, injection_args(&codex, dir, &cli));
     }
 
     #[test]

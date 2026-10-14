@@ -25,14 +25,17 @@ use sha2::{Digest, Sha256};
 
 use crate::registry::Registry;
 mod account_handoff;
+mod account_overview;
 mod account_switch;
 mod agent_relaunch;
+mod agent_sign_in;
 mod claude_accounts;
 mod codex_accounts;
 mod hook_queue;
 mod message_delivery;
 mod operations;
 mod orchestration;
+mod schedules;
 mod tasks;
 mod workspaces;
 
@@ -111,6 +114,20 @@ const TERMINAL_ONLY_METHODS: &[&str] = &[
     Method::SESSION_MIGRATE,
     Method::SESSION_CONTINUE_ACCOUNT,
 ];
+/// The last `terminal.configure`, in the config directory, so terminals the
+/// Engine starts before the app connects follow it too.
+const TERMINAL_SETTINGS_FILE: &str = "terminal.json";
+
+/// Missing or unreadable settings are the defaults: integration on.
+fn terminal_settings(config_dir: &Path) -> diri_proto::TerminalConfigureParams {
+    std::fs::read(config_dir.join(TERMINAL_SETTINGS_FILE))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or(diri_proto::TerminalConfigureParams {
+            shell_integration: true,
+        })
+}
+
 /// A terminal's shell: the user's own, as a login shell.
 fn login_shell_argv() -> Vec<String> {
     local_shell_argv(None)
@@ -135,6 +152,9 @@ pub struct ControlServer {
     engine_instance_id: String,
     registry: Arc<Mutex<Registry>>,
     socket_path: PathBuf,
+    /// The app's host catalog. Beside the socket by default (one root on
+    /// macOS); on Linux the socket is in the runtime dir and the app saves
+    /// hosts in the config dir, so the daemon is told where.
     logs_dir: PathBuf,
     holder: Option<crate::session::HolderConfig>,
     remote: Option<Arc<crate::remote::manager::RemoteManager>>,
@@ -143,6 +163,15 @@ pub struct ControlServer {
     attach: crate::attach::AttachHub,
     pr_monitor_wake: crate::pr_monitor::PrMonitorWake,
     injection: Option<InjectionConfig>,
+    /// The zsh/bash OSC 133 scripts, installed beside the injection files.
+    /// `terminal.configure` can switch them off (see [`TERMINAL_SETTINGS_FILE`]).
+    shell_integration: Option<crate::shell_integration::ShellIntegration>,
+    /// The Engine-served MCP endpoint, once [`ControlServer::start_mcp_http`]
+    /// bound it. Unset means every Agent keeps the stdio `dirijor-mcp`.
+    mcp_http: std::sync::OnceLock<crate::mcp_http::McpHttpEndpoint>,
+    /// Agent CLI versions, so only releases verified to speak HTTP MCP are
+    /// pointed at the endpoint.
+    cli_versions: crate::cli_version::CliVersions,
     governor: std::sync::Arc<Mutex<crate::governor::GovernorConfig>>,
     browser: std::sync::OnceLock<crate::browser::BrowserPool>,
     active_connections: Arc<AtomicUsize>,
@@ -151,6 +180,8 @@ pub struct ControlServer {
     workspaces: crate::workspace::WorkspaceStore,
     agent_catalog: Arc<Mutex<crate::agent_catalog::AgentCatalogStore>>,
     accounts: Mutex<crate::accounts::AccountStore>,
+    /// `hosts.json`, `agents.json` and `accounts.json` live here.
+    config_dir: PathBuf,
     account_operations: std::sync::RwLock<()>,
     session_operations: Mutex<std::collections::HashSet<String>>,
     agent_scans: Arc<Mutex<std::collections::HashMap<String, Arc<Mutex<()>>>>>,
@@ -158,6 +189,7 @@ pub struct ControlServer {
     /// Where note Sessions keep their files; `None` resolves the standard
     /// notes directory (tests pin a temporary one).
     notes_dir: Option<PathBuf>,
+    scheduler: Arc<schedules::Scheduler>,
 }
 
 /// Where injection files live and which CLI they point at. Present, spawns
@@ -204,6 +236,22 @@ fn local_session_uses_worktree(record: &diri_proto::SessionRecord, target: &Path
 }
 
 impl ControlServer {
+    /// One-time, at Engine start: pre-split `⌘J` terminals become panes of
+    /// their parent's tab. Later starts only read the marker.
+    pub fn adopt_pane_shells(&self) {
+        let records = self.registry.lock().expect("registry").records();
+        self.workspaces
+            .adopt_pane_shells(&live_pane_shells(&records));
+    }
+
+    /// Configure private power endpoints before starting the scheduler.
+    pub fn with_schedule_power(mut self, config: crate::wake::PowerConfig) -> Self {
+        Arc::get_mut(&mut self.scheduler)
+            .expect("scheduler not started")
+            .power = config;
+        self
+    }
+
     pub fn new(registry: Arc<Mutex<Registry>>, socket_path: impl Into<PathBuf>) -> Self {
         // Capture the bytes this process actually started from before an app
         // updater can replace the bundle path underneath the live daemon.
@@ -216,21 +264,13 @@ impl ControlServer {
             .parent()
             .map(|parent| parent.join("logs"))
             .unwrap_or_else(|| PathBuf::from("logs"));
-        let remote_bindings = socket_path.parent().and_then(|parent| {
-            crate::remote::binding::RemoteBindingStore::new(parent.join("remote-bindings")).ok()
-        });
-        let agent_config_path = socket_path
+        // Beside the socket unless the daemon names its config and state
+        // directories, which differ from the socket's on Linux.
+        let config_dir = socket_path
             .parent()
-            .map(|parent| parent.join("agents.json"))
-            .unwrap_or_else(|| PathBuf::from("agents.json"));
-        let agent_catalog = crate::agent_catalog::AgentCatalogStore::new(&agent_config_path)
-            .unwrap_or_else(|error| {
-                eprintln!("diri-engine: Agent configuration unavailable: {error}");
-                crate::agent_catalog::AgentCatalogStore::empty(&agent_config_path)
-            });
-        let accounts = Mutex::new(crate::accounts::AccountStore::new(
-            agent_config_path.with_file_name("accounts.json"),
-        ));
+            .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+        let remote_bindings = remote_binding_store(&config_dir);
+        let (agent_catalog, accounts) = agent_config_stores(&config_dir);
         let events = crate::events::EventBus::new();
         let activity_path = logs_dir
             .parent()
@@ -255,6 +295,9 @@ impl ControlServer {
             attach: crate::attach::AttachHub::new(),
             pr_monitor_wake: crate::pr_monitor::PrMonitorWake::default(),
             injection: None,
+            shell_integration: None,
+            mcp_http: std::sync::OnceLock::new(),
+            cli_versions: Default::default(),
             governor: std::sync::Arc::new(Mutex::new(crate::governor::GovernorConfig::default())),
             browser: std::sync::OnceLock::new(),
             active_connections: Arc::new(AtomicUsize::new(0)),
@@ -262,12 +305,14 @@ impl ControlServer {
             worktree_scan: Default::default(),
             workspaces,
             agent_catalog: Arc::new(Mutex::new(agent_catalog)),
-            accounts,
+            accounts: Mutex::new(accounts),
+            config_dir,
             account_operations: std::sync::RwLock::new(()),
             session_operations: Mutex::new(std::collections::HashSet::new()),
             agent_scans: Arc::new(Mutex::new(std::collections::HashMap::new())),
             hook_reports: hook_queue::HookQueue::new(),
             notes_dir: None,
+            scheduler: Arc::new(schedules::Scheduler::default()),
         }
     }
 
@@ -277,8 +322,89 @@ impl ControlServer {
     pub fn with_injection(mut self, config: InjectionConfig) -> Self {
         let _ = crate::inject::write_claude_hooks_file(&config.inject_dir);
         let _ = crate::inject::write_claude_mcp_file(&config.inject_dir, &config.cli_path);
+        let _ = crate::inject::write_claude_skills_plugin(&config.inject_dir);
+        match crate::shell_integration::ShellIntegration::install(&config.inject_dir) {
+            Ok(integration) => self.shell_integration = Some(integration),
+            Err(error) => eprintln!("diri-engine: shell integration unavailable: {error}"),
+        }
         self.injection = Some(config);
         self
+    }
+
+    /// The shell integration a new local terminal gets: `None` when it is
+    /// not installed or the user switched it off.
+    fn terminal_shell_integration(&self) -> Option<&crate::shell_integration::ShellIntegration> {
+        let integration = self.shell_integration.as_ref()?;
+        terminal_settings(&self.config_dir)
+            .shell_integration
+            .then_some(integration)
+    }
+
+    fn terminal_configure(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        let p: diri_proto::TerminalConfigureParams = decode(params)?;
+        if terminal_settings(&self.config_dir) != p {
+            let bytes = serde_json::to_vec_pretty(&p)
+                .map_err(|error| ControlError::internal(error.to_string()))?;
+            crate::shell_integration::write_private(
+                &self.config_dir.join(TERMINAL_SETTINGS_FILE),
+                &bytes,
+            )
+            .map_err(io_control_error)?;
+        }
+        Ok(json!({}))
+    }
+
+    /// Serves the `dirijor` MCP tools over loopback Streamable HTTP so Agents
+    /// whose CLI supports it need no `dirijor-mcp` process. Call once, after
+    /// the control socket is bound (the endpoint bridges to it). On failure
+    /// nothing changes: sessions keep the stdio server.
+    pub fn start_mcp_http(&self) -> std::io::Result<String> {
+        let Some(injection) = &self.injection else {
+            return Err(std::io::Error::other("MCP injection is not configured"));
+        };
+        if let Some(endpoint) = self.mcp_http.get() {
+            return Ok(endpoint.url().to_owned());
+        }
+        let (listener, endpoint) = crate::mcp_http::bind(&self.config_dir)?;
+        crate::inject::write_claude_mcp_http_file(&injection.inject_dir, endpoint.url())?;
+        crate::mcp_http::spawn(
+            listener,
+            endpoint.clone(),
+            Arc::clone(&self.registry),
+            self.socket_path.clone(),
+            self.resolved_notes_dir(),
+        )?;
+        let url = endpoint.url().to_owned();
+        let _ = self.mcp_http.set(endpoint);
+        let descriptors = self
+            .registry
+            .lock()
+            .map(|registry| {
+                let engine = registry.engine();
+                engine
+                    .ids()
+                    .into_iter()
+                    .filter_map(|id| engine.manifest(id)?.agent.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        crate::mcp_http::warm_versions(descriptors, self.cli_versions.clone());
+        Ok(url)
+    }
+
+    /// The endpoint URL a launch of `descriptor` may use: set only when the
+    /// endpoint runs and the Agent's CLI is a release verified to speak it.
+    fn mcp_http_url_for(&self, descriptor: &crate::agent::AgentDescriptor) -> Option<&str> {
+        let endpoint = self.mcp_http.get()?;
+        crate::mcp_http::http_allowed(descriptor, &self.cli_versions).then(|| endpoint.url())
+    }
+
+    /// The bearer token a local session uses for the Engine-served MCP
+    /// endpoint, or `None` while the endpoint is not running.
+    pub fn mcp_http_token(&self, session_id: &str) -> Option<String> {
+        self.mcp_http
+            .get()
+            .map(|endpoint| endpoint.token(session_id))
     }
 
     /// The bus this server publishes to — the daemon shares it with the
@@ -320,6 +446,25 @@ impl ControlServer {
         if let Err(error) = self.events.enable_activity_log(activity_path) {
             eprintln!("diri-engine: activity history unavailable: {error}");
         }
+        self
+    }
+
+    /// Where the user's host, Agent and account configuration lives. Defaults
+    /// to the socket's directory, which is right on macOS (one App Support
+    /// root) and wrong on Linux, where the socket sits in the runtime tmpfs
+    /// and the app writes `hosts.json` to the XDG config directory.
+    pub fn with_config_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.config_dir = dir.into();
+        let (agent_catalog, accounts) = agent_config_stores(&self.config_dir);
+        self.agent_catalog = Arc::new(Mutex::new(agent_catalog));
+        self.accounts = Mutex::new(accounts);
+        self
+    }
+
+    /// Where remote session bindings are kept. They must outlive a reboot of
+    /// this machine, since the remote Holders do.
+    pub fn with_remote_bindings_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.remote_bindings = remote_binding_store(&dir.into());
         self
     }
 
@@ -624,18 +769,20 @@ impl ControlServer {
                     // its immediate pass seeing a foreground/recent session
                     // even if registration has not completed yet.
                     if let Ok(mut registry) = self.registry.lock() {
-                        // The attach stream has no error frame: closing at once
-                        // is how it fails, as for any id without a terminal.
-                        if registry.is_note(&attach.attach.0) {
-                            diri_telemetry::event!(
-                                "attach.note_rejected",
-                                session = diri_telemetry::id(&attach.attach.0),
-                            );
-                            return Ok(());
-                        }
-                        if registry.get(&attach.attach.0).is_some_and(|session| {
+                        // A refusal is definitive: say why, then close, so the
+                        // client stops retrying instead of reconnecting forever.
+                        let rejection = if registry.is_note(&attach.attach.0) {
+                            Some(diri_proto::frames::AttachRejection::NotTerminal)
+                        } else if registry.get(&attach.attach.0).is_some_and(|session| {
                             !session.allows_keyboard_controller(attach.enhanced_keyboard)
                         }) {
+                            Some(diri_proto::frames::AttachRejection::KeyboardUnsupported)
+                        } else {
+                            None
+                        };
+                        if let Some(rejection) = rejection {
+                            drop(registry);
+                            self.attach.reject(&writer, &attach.attach.0, rejection);
                             return Ok(());
                         }
                         let _ = registry.ensure_session_awake(&attach.attach.0);
@@ -703,12 +850,16 @@ impl ControlServer {
                         | Method::SESSION_SPAWN_TRACKED
                         | Method::SESSION_CONTINUE_ACCOUNT
                         | Method::ACCOUNT_SWITCH_ALL
+                        | Method::ACCOUNT_OVERVIEW
+                        | Method::ACCOUNT_ADOPT
+                        | Method::ACCOUNT_ADD
                         | Method::ACCOUNT_CODEX_LOGIN
                         | Method::ACCOUNT_CLAUDE_LOGIN
                         | Method::HOST_INITIALIZE
                         | Method::HOST_USAGE
                         | Method::HOST_LIST_DIRECTORIES
                         | Method::SESSION_READ_DIFF
+                        | Method::SESSION_READ_IMAGE
                         | Method::WORKTREE_INTEGRATE
                         | Method::TASK_ANSWER
                         | Method::TASK_CANCEL
@@ -919,6 +1070,8 @@ impl ControlServer {
                 | Method::ACCOUNT_CODEX_CAPTURE
                 | Method::ACCOUNT_CLAUDE_LOGIN
                 | Method::ACCOUNT_CLAUDE_CAPTURE
+                | Method::ACCOUNT_ADOPT
+                | Method::ACCOUNT_ADD
         ) {
             Some(self.account_operations.try_write().map_err(|_| ControlError::bad_request("An account or session operation is already in progress. Retry when it finishes."))?)
         } else {
@@ -952,6 +1105,9 @@ impl ControlServer {
             Method::ACCOUNT_CODEX_CAPTURE => self.codex_account_capture(params),
             Method::ACCOUNT_CLAUDE_LOGIN => self.claude_account_login(params),
             Method::ACCOUNT_CLAUDE_CAPTURE => self.claude_account_capture(params),
+            Method::ACCOUNT_OVERVIEW => self.account_overview(params),
+            Method::ACCOUNT_ADOPT => self.account_adopt(params),
+            Method::ACCOUNT_ADD => self.account_add(params),
             Method::SESSION_CONTINUE_ACCOUNT => self.session_continue_account(params),
             Method::ACCOUNT_PROFILES_LIST => {
                 encode(&self.accounts.lock().map_err(poisoned)?.catalog()?)
@@ -961,7 +1117,20 @@ impl ControlServer {
                 if let Some(host) = &profile.host {
                     self.resolve_host(host)?;
                 }
-                encode(&self.accounts.lock().map_err(poisoned)?.upsert(profile)?)
+                let accounts = self.accounts.lock().map_err(poisoned)?;
+                let renamed = accounts
+                    .catalog()?
+                    .profiles
+                    .iter()
+                    .any(|p| p.id == profile.id && p.label != profile.label);
+                // Under the catalog lock, so naming a new profile after its
+                // email never lands after this rename.
+                if renamed {
+                    self.keep_chosen_name(&profile);
+                }
+                let catalog = accounts.upsert(profile)?;
+                drop(accounts);
+                encode(&catalog)
             }
             Method::ACCOUNT_PROFILES_REMOVE => {
                 let params: diri_proto::AgentAccountId = decode(params)?;
@@ -978,6 +1147,11 @@ impl ControlServer {
             Method::TASK_ANSWER => self.task_answer(params),
             Method::TASK_CANCEL => self.task_cancel(params),
             Method::TASK_LIST => self.task_list(params),
+            Method::SCHEDULE_CREATE => self.schedule_create(params),
+            Method::SCHEDULE_UPDATE => self.schedule_update(params),
+            Method::SCHEDULE_DELETE => self.schedule_delete(params),
+            Method::SCHEDULE_LIST => self.schedule_list(),
+            Method::SCHEDULE_RUN_NOW => self.schedule_run_now(params),
             Method::SESSION_LIST | Method::STATE_SNAPSHOT => self.session_list(),
             Method::SESSION_DELIVER_MESSAGE => self.session_deliver_message(params),
             Method::SESSION_SEND_KEY => self.session_send_key(params),
@@ -1023,10 +1197,12 @@ impl ControlServer {
             Method::SESSION_RESUME_FROM_HISTORY => self.session_resume_from_history(params),
             Method::SESSION_REOPEN_LAST => self.session_reopen_last(),
             Method::SESSION_REVEAL => self.session_reveal(params),
+            Method::SESSION_OPEN_API_REQUEST => self.session_open_api_request(params),
             Method::AGENT_READINESS => self.agent_readiness(params),
             Method::AGENT_CONFIGURE => self.agent_configure(params),
             Method::PROJECT_ADD => self.project_add(params),
             Method::SESSION_READ_DIFF => self.session_read_diff(params),
+            Method::SESSION_READ_IMAGE => self.session_read_image(params),
             Method::SESSION_READ_TRANSCRIPT => self.session_read_transcript(params),
             Method::WORKTREE_INTEGRATE => self.worktree_integrate(params),
             Method::SESSION_HIBERNATE => self.session_hibernate(params),
@@ -1036,6 +1212,7 @@ impl ControlServer {
             Method::DAEMON_SHUTDOWN => self.daemon_shutdown(),
             Method::TELEMETRY_UPLOAD_NOW => telemetry_upload_now(),
             Method::GOVERNOR_CONFIGURE => self.governor_configure(params),
+            Method::TERMINAL_CONFIGURE => self.terminal_configure(params),
             Method::CLIENT_SET_ACTIVE => self.client_set_active(params),
             other => Err(ControlError::not_found(format!(
                 "method {other:?} is not implemented by this engine yet"
@@ -1083,13 +1260,45 @@ impl ControlServer {
     /// `generic` need an explicit `argv`, since their manifests declare no
     /// binary.
     fn session_spawn(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
-        self.session_spawn_identified(params, None)
+        self.session_spawn_identified(params, None, None)
     }
 
     fn session_spawn_identified(
         &self,
         params: Option<JsonValue>,
         reserved_id: Option<String>,
+        scheduled: Option<diri_proto::schedules::ScheduledRunInfo>,
+    ) -> Result<JsonValue, ControlError> {
+        let raw = params.ok_or_else(|| ControlError::bad_request("params are required"))?;
+        // Decoded before the spawn so a malformed hint never starts a process.
+        let placement = spawn_pane_placement(&raw)?;
+        let parent = raw
+            .get("parent")
+            .and_then(JsonValue::as_str)
+            .map(diri_proto::SessionId::new);
+        let result = self.session_spawn_unplaced(Some(raw), reserved_id, scheduled)?;
+        if let Some(placement) = placement
+            && let Some(id) = result.get("id").and_then(JsonValue::as_str)
+            && let Some(snapshot) = self.workspaces.place_spawned(
+                &diri_proto::SessionId::new(id),
+                parent.as_ref(),
+                &placement,
+            )
+        {
+            self.events.publish(
+                diri_proto::EventName::WORKSPACE_UPDATED,
+                json!({"revision": snapshot.revision}),
+                None,
+            );
+        }
+        Ok(result)
+    }
+
+    fn session_spawn_unplaced(
+        &self,
+        params: Option<JsonValue>,
+        reserved_id: Option<String>,
+        scheduled: Option<diri_proto::schedules::ScheduledRunInfo>,
     ) -> Result<JsonValue, ControlError> {
         let raw = params.ok_or_else(|| ControlError::bad_request("params are required"))?;
         // Validate before any account, worktree, or remote side effect. Missing
@@ -1119,7 +1328,7 @@ impl ControlServer {
             p.host.as_deref(),
         )?;
         if p.host.is_some() {
-            return self.session_spawn_remote(p, argv, account_profile, reserved_id);
+            return self.session_spawn_remote(p, argv, account_profile, reserved_id, scheduled);
         }
         if let Some(profile) = &account_profile
             && profile.agent == "codex"
@@ -1138,6 +1347,11 @@ impl ControlServer {
         }
 
         let kind = p.kind.id().to_string();
+        // A plain terminal: the user's login shell, which may get Diri's
+        // shell integration below.
+        let login_terminal = argv.is_empty()
+            && kind == diri_proto::AgentKind::SHELL_ID
+            && p.kind.command().is_none_or(str::is_empty);
         // A generic kind carries the user's command line inside itself.
         let argv = if argv.is_empty() {
             match p.kind.command() {
@@ -1166,7 +1380,7 @@ impl ControlServer {
         }
         let cwd_path = PathBuf::from(&cwd);
         if !cwd_path.is_dir() {
-            return Err(ControlError::bad_request(format!(
+            return Err(ControlError::cwd_missing(format!(
                 "cwd {cwd:?} is not a directory"
             )));
         }
@@ -1189,10 +1403,12 @@ impl ControlServer {
         // quoted inside the shell's `-c` command.
         let mut launch_args = argv.clone();
         let mut agent_session_id = None;
+        let mut mcp_http_token = None;
         if descriptor.binary.is_some() {
             launch_args.extend(descriptor.spawn_args.iter().cloned());
+            launch_args.extend(self.configured_launch_args(None, &kind)?);
             if let Some(injection) = &self.injection {
-                launch_args.extend(crate::inject::injection_args_with_cursor(
+                let injected = crate::inject::injection_args_full(
                     &descriptor.injection,
                     &injection.inject_dir,
                     &injection.cli_path,
@@ -1200,7 +1416,13 @@ impl ControlServer {
                         session_id: &id,
                         socket_path: &self.socket_path,
                     }),
-                ));
+                    self.mcp_http_url_for(&descriptor),
+                );
+                launch_args.extend(injected.argv);
+                mcp_http_token = injected
+                    .mcp_http
+                    .then(|| self.mcp_http.get().map(|endpoint| endpoint.token(&id)))
+                    .flatten();
             }
             let minted = descriptor
                 .mints_conversation_id()
@@ -1238,13 +1460,43 @@ impl ControlServer {
             // No binary in the manifest: the caller has to say what to run.
             None if !argv.is_empty() => {
                 let mut spec = crate::pty::PtySpec::new(argv.clone(), launch_path);
-                spec.env = inherited;
+                // A terminal is scrubbed by its manifest too: an Engine
+                // started from inside a Claude session must not hand its
+                // child-session marker to a `claude` typed in this shell,
+                // which would then save no transcript.
+                spec.env = inherited
+                    .into_iter()
+                    .filter(|(key, _)| !descriptor.should_scrub(key))
+                    .collect();
                 // GUI apps launched by launchd commonly inherit no terminal
                 // environment. A binary-free descriptor is still attached to
                 // Diri's colour-capable PTY, so assert the same capabilities
                 // as manifest-backed Agents instead of leaving tools such as
                 // `clear` unable to operate.
                 crate::agent::assert_color_environment(&mut spec.env);
+                // Every pane can name itself to `dirijor`, as manifest-backed
+                // ones do below; no hooks or MCP config apply to a bare argv.
+                if let Some(injection) = &self.injection {
+                    spec.env.retain(|(key, _)| {
+                        !matches!(
+                            key.as_str(),
+                            crate::inject::SESSION_ID_ENV
+                                | crate::inject::SOCKET_ENV
+                                | crate::inject::CLI_ENV
+                        )
+                    });
+                    spec.env.extend([
+                        (crate::inject::SESSION_ID_ENV.into(), id.clone()),
+                        (
+                            crate::inject::SOCKET_ENV.into(),
+                            self.socket_path.to_string_lossy().into_owned(),
+                        ),
+                        (
+                            crate::inject::CLI_ENV.into(),
+                            injection.cli_path.to_string_lossy().into_owned(),
+                        ),
+                    ]);
+                }
                 spec
             }
             None => {
@@ -1253,11 +1505,15 @@ impl ControlServer {
                 )));
             }
         };
+        if login_terminal && let Some(integration) = self.terminal_shell_integration() {
+            integration.apply(&mut pty);
+        }
 
         if let Some(profile) = &mut account_profile {
             crate::accounts::bind_pty(profile, &mut pty)?;
         }
         let mut record = new_record(&id, &kind, &cwd);
+        record.scheduled_run = scheduled;
         record.terminal_cwd = start_directory.map(|path| path.to_string_lossy().into_owned());
         record.account_profile = account_profile;
         record.kind = p.kind.clone();
@@ -1293,6 +1549,13 @@ impl ControlServer {
                     crate::inject::CLI_ENV.into(),
                     injection.cli_path.to_string_lossy().into_owned(),
                 ));
+                // Never pass on a token the Engine itself inherited (an Engine
+                // started from inside a Diri session): it names that session.
+                pty.env
+                    .retain(|(key, _)| key != crate::inject::MCP_TOKEN_ENV);
+                if let Some(token) = mcp_http_token.take() {
+                    pty.env.push((crate::inject::MCP_TOKEN_ENV.into(), token));
+                }
                 pty.env.push((
                     diri_proto::paths::ENV_SESSION_RECOVERY_DIR.into(),
                     registry
@@ -1360,7 +1623,12 @@ impl ControlServer {
             .spawn(spec, record)
             .map_err(|error| ControlError::internal(error.to_string()))?;
         if let Some(record) = registry.record(&id) {
-            crate::telemetry::record_session_spawn(&record, "fresh", spawn_started.elapsed());
+            crate::telemetry::record_session_spawn(
+                &record,
+                "fresh",
+                spawn_started.elapsed(),
+                registry.other_live_agent(&id),
+            );
         }
         if tracked {
             registry.persist_for_shutdown().map_err(io_control_error)?;
@@ -1375,6 +1643,7 @@ impl ControlServer {
         // raced Claude Code's boot and lost keystrokes into a composer that
         // did not exist yet.
         let prompt = p.initial_prompt.clone().filter(|prompt| !prompt.is_empty());
+        let appearance = p.appearance;
         let accept_claude_workspace = kind == diri_proto::AgentKind::CLAUDE_CODE_ID;
         let record = registry
             .record(&id)
@@ -1386,13 +1655,19 @@ impl ControlServer {
         // workspace-trust convenience remains background work so an ordinary
         // launch still returns as soon as its session exists.
         if let Some(prompt) = prompt {
-            prepare_agent_input(&self.registry, &id, accept_claude_workspace, Some(&prompt))
-                .map_err(|error| initial_prompt_control_error(&id, error))?;
+            prepare_agent_input(
+                &self.registry,
+                &id,
+                accept_claude_workspace,
+                appearance,
+                Some(&prompt),
+            )
+            .map_err(|error| initial_prompt_control_error(&id, error))?;
         } else if accept_claude_workspace {
             let registry = Arc::clone(&self.registry);
             let session_id = id.clone();
             std::thread::spawn(move || {
-                let _ = prepare_agent_input(&registry, &session_id, true, None);
+                let _ = prepare_agent_input(&registry, &session_id, true, appearance, None);
             });
         }
 
@@ -1451,7 +1726,7 @@ impl ControlServer {
         }
         let cwd = p.cwd.trim().to_owned();
         if cwd.is_empty() || !Path::new(&cwd).is_dir() {
-            return Err(ControlError::bad_request(format!(
+            return Err(ControlError::cwd_missing(format!(
                 "cwd {cwd:?} is not a directory"
             )));
         }
@@ -1540,6 +1815,7 @@ impl ControlServer {
     /// and stays removed. Runs once per Engine start, oldest note first.
     pub fn adopt_orphan_notes(&self) -> Result<usize, ControlError> {
         let store = self.note_store()?;
+        self.relink_notes(&store)?;
         let mut notes = store.list().map_err(io_control_error)?;
         notes.sort_by(|a, b| a.created.cmp(&b.created).then(a.id.cmp(&b.id)));
         let known: std::collections::HashSet<String> = self
@@ -1569,6 +1845,41 @@ impl ControlServer {
             }
         }
         Ok(adopted)
+    }
+
+    /// Gives back a note Session's file link when its record lost it. An
+    /// Engine that predates notes rewrites state.json without `noteId` (it
+    /// does not know the field) and reaps the record as exited; the note then
+    /// opens as "file is gone" although its file is intact. The file names
+    /// its Session in front matter, so the link is recovered from there.
+    /// Returns how many records were repaired.
+    fn relink_notes(&self, store: &diri_notes::store::NoteStore) -> Result<usize, ControlError> {
+        let notes = store.list().map_err(io_control_error)?;
+        let mut repaired = 0;
+        let mut registry = self.registry.lock().map_err(poisoned)?;
+        for note in notes {
+            let Some(session) = note.session.as_deref() else {
+                continue;
+            };
+            let Some(mut record) = registry.record(session) else {
+                continue;
+            };
+            if !record.is_note() || record.note_id.is_some() {
+                continue;
+            }
+            record.note_id = Some(note.id.clone());
+            if matches!(record.status, diri_proto::SessionStatus::Exited(_)) {
+                record.status = diri_proto::SessionStatus::Idle;
+            }
+            registry.insert_record(record);
+            self.publish_updated(&registry, session);
+            repaired += 1;
+        }
+        if repaired > 0 {
+            registry.persist_for_shutdown().map_err(io_control_error)?;
+            diri_telemetry::event!("notes.relinked", count = repaired);
+        }
+        Ok(repaired)
     }
 
     /// Adopts orphan notes on a one-shot thread, off the accept path.
@@ -1608,6 +1919,7 @@ impl ControlServer {
         caller_argv: Vec<String>,
         mut account_profile: Option<diri_proto::AgentAccountProfile>,
         reserved_id: Option<String>,
+        scheduled: Option<diri_proto::schedules::ScheduledRunInfo>,
     ) -> Result<JsonValue, ControlError> {
         let manager = self
             .remote
@@ -1646,7 +1958,7 @@ impl ControlServer {
                 p.worktree_base.as_deref(),
             )
             .map_err(io_control_error)?;
-            requested_cwd.clone_from(&info.path);
+            requested_cwd.clone_from(&info.info.path);
             Some(info)
         } else {
             None
@@ -1701,6 +2013,7 @@ impl ControlServer {
         let mut launch_args = caller_argv.clone();
         if descriptor.binary.is_some() {
             launch_args.extend(descriptor.spawn_args.iter().cloned());
+            launch_args.extend(self.configured_launch_args(Some(&host.id), &kind)?);
             let minted = descriptor
                 .mints_conversation_id()
                 .then(crate::inject::uuid_v4);
@@ -1790,15 +2103,21 @@ impl ControlServer {
         };
 
         let mut record = new_record(&id, &kind, &captured.cwd);
+        record.scheduled_run = scheduled;
         record.account_profile = account_profile;
         record.kind = p.kind.clone();
         record.originating_prompt = p.initial_prompt.clone();
         record.host = Some(host.id.clone());
-        record.project_id = crate::registry::session_project_id(&captured.cwd, Some(&host.id));
+        // As on the local spawn path, a linked worktree is an execution cwd
+        // inside the checkout it came from, not a first-level project.
+        let project_root = worktree
+            .as_ref()
+            .map_or_else(|| captured.cwd.clone(), |created| created.repo_root.clone());
+        record.project_id = crate::registry::session_project_id(&project_root, Some(&host.id));
         record.remote_persistence = Some(persistence);
-        if let Some(info) = worktree {
-            record.worktree_path = Some(info.path);
-            record.git_branch = info.branch;
+        if let Some(created) = worktree {
+            record.worktree_path = Some(created.info.path);
+            record.git_branch = created.info.branch;
         }
         record.parent = p.parent.clone();
         record.agent_session_id = agent_session_id;
@@ -1826,9 +2145,14 @@ impl ControlServer {
         self.spawn_session_with_intent(spec, Some(record), tracked)?;
         let mut registry = self.registry.lock().map_err(poisoned)?;
         if let Some(record) = registry.record(&id) {
-            crate::telemetry::record_session_spawn(&record, "fresh", spawn_started.elapsed());
+            crate::telemetry::record_session_spawn(
+                &record,
+                "fresh",
+                spawn_started.elapsed(),
+                registry.other_live_agent(&id),
+            );
         }
-        self.ensure_published_project(&mut registry, &captured.cwd, Some(&host.id));
+        self.ensure_published_project(&mut registry, &project_root, Some(&host.id));
         if tracked {
             registry.persist_for_shutdown().map_err(io_control_error)?;
         } else {
@@ -1837,6 +2161,7 @@ impl ControlServer {
         self.publish_updated(&registry, &id);
 
         let prompt = p.initial_prompt.filter(|prompt| !prompt.is_empty());
+        let appearance = p.appearance;
         let accept_claude_workspace = kind == diri_proto::AgentKind::CLAUDE_CODE_ID;
         let record = registry
             .record(&id)
@@ -1844,13 +2169,19 @@ impl ControlServer {
         drop(registry);
 
         if let Some(prompt) = prompt {
-            prepare_agent_input(&self.registry, &id, accept_claude_workspace, Some(&prompt))
-                .map_err(|error| initial_prompt_control_error(&id, error))?;
+            prepare_agent_input(
+                &self.registry,
+                &id,
+                accept_claude_workspace,
+                appearance,
+                Some(&prompt),
+            )
+            .map_err(|error| initial_prompt_control_error(&id, error))?;
         } else if accept_claude_workspace {
             let registry = Arc::clone(&self.registry);
             let session_id = id.clone();
             std::thread::spawn(move || {
-                let _ = prepare_agent_input(&registry, &session_id, true, None);
+                let _ = prepare_agent_input(&registry, &session_id, true, appearance, None);
             });
         }
         serde_json::to_value(&record).map_err(|error| ControlError::internal(error.to_string()))
@@ -1863,6 +2194,14 @@ impl ControlServer {
         params: Option<JsonValue>,
     ) -> Result<JsonValue, ControlError> {
         let params = params.ok_or_else(|| ControlError::bad_request("params are required"))?;
+        // Missing pieces are a fact about this install, not a pool fault:
+        // say so in a code the Agent can stop on.
+        if let Some(reason) = crate::browser::BrowserPool::unavailable_reason() {
+            return Err(ControlError::new(
+                diri_proto::control::BROWSER_UNAVAILABLE,
+                reason,
+            ));
+        }
         let pool = self
             .browser
             .get_or_init(|| crate::browser::BrowserPool::new(&self.logs_dir));
@@ -2108,6 +2447,8 @@ impl ControlServer {
                     reason: diri_proto::ExitReason::Exited,
                     code: Some(0),
                     signal: None,
+                    system_restart: false,
+                    interrupted: false,
                 });
                 record.needs_input = None;
                 record.hibernation = None;
@@ -2407,10 +2748,8 @@ impl ControlServer {
     /// a stateless SSH action. Live Holder operations deliberately use their
     /// session binding's creation-time Helper instead.
     fn hosts_file(&self) -> PathBuf {
-        self.socket_path
-            .parent()
-            .map(|parent| parent.join("hosts.json"))
-            .unwrap_or_else(|| PathBuf::from("hosts.json"))
+        self.config_dir
+            .join(diri_proto::paths::HOSTS_CONFIG_FILE_NAME)
     }
 
     /// `session.list` and `state.snapshot` are the same view: every record
@@ -2560,7 +2899,7 @@ impl ControlServer {
         }
         let screen = self
             .completed_terminal_screen(&p.session_id.0)?
-            .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?;
+            .ok_or_else(|| self.no_retained_terminal(&p.session_id.0))?;
         let (cols, rows) = screen.size();
         encode(&diri_proto::ReadScreenResult {
             text: screen.lines().join("\n"),
@@ -2582,6 +2921,33 @@ impl ControlServer {
             .map(|(screen, _)| screen))
     }
 
+    /// Why a terminal read found nothing: an ended session whose final
+    /// screen was never kept says so, so callers stop asking; an unknown id
+    /// is simply not found.
+    fn no_retained_terminal(&self, session_id: &str) -> ControlError {
+        let ended = self.registry.lock().ok().and_then(|registry| {
+            registry
+                .record(session_id)
+                .filter(|record| matches!(record.status, diri_proto::SessionStatus::Exited(_)))
+                .map(|record| record.host.is_some())
+        });
+        match ended {
+            Some(false) => ControlError::new(
+                diri_proto::control::TERMINAL_NOT_RETAINED,
+                format!(
+                    "{session_id} has ended and Diri did not keep its final screen (its process was lost or ended while Diri was not running). Read its conversation with read_output mode \"transcript\" instead; reading the screen again will not change this."
+                ),
+            ),
+            Some(true) => ControlError::new(
+                diri_proto::control::TERMINAL_NOT_RETAINED,
+                format!(
+                    "{session_id} is a remote session that has ended; Diri keeps no final screen for remote sessions."
+                ),
+            ),
+            None => ControlError::not_found(session_id.to_owned()),
+        }
+    }
+
     /// The retained screen and the stable owner identity of its exact run.
     fn completed_terminal(
         &self,
@@ -2594,9 +2960,18 @@ impl ControlServer {
         let Some(handle) = handle else {
             return Ok(None);
         };
-        let terminal = handle.load().map_err(|error| {
-            ControlError::new("completed_terminal_unavailable", error.to_string())
-        })?;
+        let terminal = match handle.load() {
+            Ok(terminal) => terminal,
+            // A lost process or an Engine-restart exit has no exit facts, so
+            // its terminal was never retained: nothing to read, not a fault.
+            Err(crate::completed_terminal::StorageError::UnsupportedRecord) => None,
+            Err(error) => {
+                return Err(ControlError::new(
+                    "completed_terminal_unavailable",
+                    error.to_string(),
+                ));
+            }
+        };
         let Some(terminal) = terminal else {
             return Ok(None);
         };
@@ -2650,6 +3025,60 @@ impl ControlServer {
         })
     }
 
+    /// One chunk of an inline image. The bytes are shared with the store,
+    /// so the Registry is held only long enough to find them. A remote
+    /// session's chunk is read from its Holder after the Registry is
+    /// released.
+    fn session_read_image(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        let p: diri_proto::SessionReadImageParams = decode(params)?;
+        let not_found = || ControlError::new("image_not_found", "No such image");
+        let source = {
+            let registry = self.registry.lock().map_err(poisoned)?;
+            let session = registry
+                .get(&p.session_id.0)
+                .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?;
+            match session.remote_inline_images() {
+                Some(client) => Err(client),
+                None => Ok(session.inline_image(&p.key)),
+            }
+        };
+        let image = match source {
+            Ok(image) => image.ok_or_else(not_found)?,
+            Err(client) => {
+                if !diri_proto::inline_image::valid_key(&p.key) {
+                    return Err(not_found());
+                }
+                let chunk = client
+                    .read_image(&p.key, p.offset)
+                    .map_err(|error| {
+                        ControlError::new("remote_image_unavailable", error.to_string())
+                    })?
+                    .ok_or_else(not_found)?;
+                return encode(&diri_proto::SessionReadImageResult {
+                    format: chunk.format,
+                    compressed: chunk.compressed,
+                    width: chunk.width,
+                    height: chunk.height,
+                    total: chunk.total,
+                    offset: chunk.offset,
+                    data: chunk.data,
+                });
+            }
+        };
+        let total = image.data.len() as u64;
+        let start = p.offset.min(total) as usize;
+        let end = (start + diri_proto::inline_image::READ_IMAGE_CHUNK_BYTES).min(image.data.len());
+        encode(&diri_proto::SessionReadImageResult {
+            format: image.format,
+            compressed: image.compressed,
+            width: image.width,
+            height: image.height,
+            total,
+            offset: start as u64,
+            data: image.data[start..end].to_vec(),
+        })
+    }
+
     fn session_reset_terminal(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
         let p: diri_proto::SessionIdParams = decode(params)?;
         let registry = self.registry.lock().map_err(poisoned)?;
@@ -2690,7 +3119,7 @@ impl ControlServer {
         }
         let (screen, owner) = self
             .completed_terminal(&p.session_id.0)?
-            .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?;
+            .ok_or_else(|| self.no_retained_terminal(&p.session_id.0))?;
         let (cols, visible_rows) = screen.size();
         if cols.saturating_mul(visible_rows) > diri_proto::FIND_CAPTURE_MAX_CELLS {
             return Err(ControlError::new(
@@ -2726,7 +3155,7 @@ impl ControlServer {
         }
         let mut screen = self
             .completed_terminal_screen(&p.session_id.0)?
-            .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?;
+            .ok_or_else(|| self.no_retained_terminal(&p.session_id.0))?;
         encode(&screen.scrollback())
     }
 
@@ -2749,7 +3178,7 @@ impl ControlServer {
         }
         let (mut screen, _) = self
             .completed_terminal(&p.session_id.0)?
-            .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?;
+            .ok_or_else(|| self.no_retained_terminal(&p.session_id.0))?;
         encode(&screen.scrollback_cells(p.first_row, p.max_rows))
     }
 
@@ -2869,20 +3298,24 @@ impl ControlServer {
         if let Some(store) = &self.remote_bindings {
             let _ = store.remove(&p.session_id.0);
         }
-        // Closing a note's tab puts its file in the notes trash, from which
-        // "reopen closed" brings it back; its history stays either way.
-        if removed.is_note()
-            && let Some(note_id) = &removed.note_id
-            && let Ok(store) = self.note_store()
-        {
-            let _ = store.trash(note_id);
-        }
+        // Closing a note's tab never touches its file: the note stays in
+        // Search notes (as a closed note) and opening it there brings its tab
+        // back, the way closed chats stay in conversation search.
+        drop(registry);
         self.events.record_removed(&removed);
         self.events.publish(
             diri_proto::EventName::SESSION_REMOVED,
             json!({ "id": p.session_id.0, "reason": "released" }),
             Some(&p.session_id.0),
         );
+        // Closing a pane collapses its split; the tab stays one sidebar row.
+        if let Some(snapshot) = self.workspaces.prune_session(&p.session_id) {
+            self.events.publish(
+                diri_proto::EventName::WORKSPACE_UPDATED,
+                json!({"revision": snapshot.revision}),
+                None,
+            );
+        }
         Ok(json!({}))
     }
 
@@ -3158,6 +3591,17 @@ impl ControlServer {
         // A local terminal has no conversation to re-enter: it restarts as a
         // fresh login shell, back in the directory it had `cd`'d to.
         let restored_directory = restored_terminal_directory(&record);
+        // A deleted project or worktree: the Holder's spawn could only fail
+        // with ENOENT, after the dead run had been evicted and the launch
+        // wait had run out. Refuse now and leave the record as it is.
+        if record.host.is_none() && restored_directory.is_none() && !Path::new(&record.cwd).is_dir()
+        {
+            crate::telemetry::record_resume(&record, "cwd_missing", None);
+            return Err(ControlError::cwd_missing(format!(
+                "the session's folder {:?} no longer exists",
+                record.cwd
+            )));
+        }
         let mut spec = if record.host.is_some() {
             crate::telemetry::record_resume(&record, "remote", record.agent_session_id.as_deref());
             self.remote_resume_spec(&record)?
@@ -3233,6 +3677,21 @@ impl ControlServer {
             .record(&p.session_id.0)
             .ok_or_else(|| ControlError::not_found(p.session_id.0.clone()))?;
         let exited = matches!(record.status, diri_proto::SessionStatus::Exited(_));
+        // The previous run's size is the pane's size: the App kept sizing that
+        // PTY. Waiting for the App to propose it again cost the whole launch
+        // fallback (an unchanged pane sends no resize) and started the agent
+        // at the 80x24 default, to be reflowed once the App caught up.
+        if let Some((cols, rows)) = registry
+            .get(&p.session_id.0)
+            .map(crate::session::Session::screen_size)
+            .or_else(|| previous_screen_size(&spec))
+            .and_then(|(cols, rows)| Some((u16::try_from(cols).ok()?, u16::try_from(rows).ok()?)))
+            .filter(|&(cols, rows)| cols >= 2 && rows >= 2)
+        {
+            spec.pty.cols = cols;
+            spec.pty.rows = rows;
+            spec.defer_launch = false;
+        }
         if registry.get(&p.session_id.0).is_some() {
             if !exited {
                 // Already live: resuming is a no-op, not an error.
@@ -3431,6 +3890,7 @@ impl ControlServer {
             ));
         }
         let mut launch_args = descriptor.spawn_args.clone();
+        launch_args.extend(self.configured_launch_args(Some(&host.id), kind.id())?);
         let provider_dir = captured
             .environment
             .iter()
@@ -3539,6 +3999,9 @@ impl ControlServer {
         let mut pty = crate::pty::PtySpec::new(login_shell_argv(), launch_path);
         pty.env = std::env::vars().collect();
         crate::agent::assert_color_environment(&mut pty.env);
+        if let Some(integration) = self.terminal_shell_integration() {
+            integration.apply(&mut pty);
+        }
         Ok(crate::session::SessionSpec {
             id: record.id.0.clone(),
             pty,
@@ -3549,6 +4012,78 @@ impl ControlServer {
             remote: None,
             defer_launch: true,
         })
+    }
+
+    /// Hands a scheduled run's prompt to the session an earlier run of the
+    /// same schedule opened, so a repeating schedule keeps one conversation
+    /// instead of opening a tab per run. An exited agent is resumed first; a
+    /// working one is given time to finish its turn. `Ok(false)` means the
+    /// session is gone or could not be revived and nothing was typed, so the
+    /// caller may start a fresh one. Once typing begins, a failure is final:
+    /// a prompt of unknown fate is never sent twice.
+    fn continue_scheduled_session(
+        &self,
+        session_id: &str,
+        prompt: &str,
+        info: diri_proto::schedules::ScheduledRunInfo,
+    ) -> Result<bool, ControlError> {
+        // Queueing a prompt behind a running turn would race its repaints,
+        // so wait the turn out before reserving the session.
+        let deadline = Instant::now() + SCHEDULED_TURN_WAIT;
+        loop {
+            let registry = self.registry.lock().map_err(poisoned)?;
+            let Some(record) = registry.record(session_id) else {
+                return Ok(false);
+            };
+            if record.status != diri_proto::SessionStatus::Working || Instant::now() >= deadline {
+                break;
+            }
+            drop(registry);
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        let _account = self.account_operations.try_read().map_err(|_| {
+            ControlError::new(
+                "busy",
+                "An account switch is in progress. Retry when it finishes.",
+            )
+        })?;
+        let _operation = account_handoff::SessionOperation::for_session(self, session_id)?;
+        let (kind, needs_resume) = {
+            let registry = self.registry.lock().map_err(poisoned)?;
+            let Some(record) = registry.record(session_id) else {
+                return Ok(false);
+            };
+            let exited = matches!(record.status, diri_proto::SessionStatus::Exited(_));
+            (record.kind, exited || registry.get(session_id).is_none())
+        };
+        if needs_resume
+            && let Err(error) = self.session_resume(Some(json!({ "sessionID": session_id })))
+        {
+            eprintln!(
+                "diri-scheduler: could not resume {session_id}, starting a new session: {}",
+                error.message
+            );
+            return Ok(false);
+        }
+        {
+            let mut registry = self.registry.lock().map_err(poisoned)?;
+            registry
+                .wake_session(session_id)
+                .map_err(io_control_error)?;
+            registry.update_record(session_id, |record| record.scheduled_run = Some(info));
+            let _ = registry.persist();
+            self.publish_updated(&registry, session_id);
+        }
+        // A freshly resumed Claude may ask about workspace trust again.
+        prepare_agent_input(
+            &self.registry,
+            session_id,
+            needs_resume && kind == diri_proto::AgentKind::CLAUDE_CODE,
+            None,
+            Some(prompt),
+        )
+        .map_err(|error| initial_prompt_control_error(session_id, error))?;
+        Ok(true)
     }
 
     /// Revives a conversation found in an agent's own history: a NEW record
@@ -3576,7 +4111,12 @@ impl ControlServer {
             .spawn(spec, record)
             .map_err(|error| ControlError::internal(error.to_string()))?;
         if let Some(record) = registry.record(&id) {
-            crate::telemetry::record_session_spawn(&record, "history", spawn_started.elapsed());
+            crate::telemetry::record_session_spawn(
+                &record,
+                "history",
+                spawn_started.elapsed(),
+                registry.other_live_agent(&id),
+            );
         }
         let _ = registry.persist();
         self.publish_updated(&registry, &id);
@@ -3584,15 +4124,23 @@ impl ControlServer {
             .record(&id)
             .ok_or_else(|| ControlError::internal("the resumed session vanished"))?;
         drop(registry);
+        // A resumed conversation is past Claude's first run.
+        let appearance = None;
         let accept_claude_workspace = kind == diri_proto::AgentKind::CLAUDE_CODE_ID;
         if let Some(prompt) = prompt {
-            prepare_agent_input(&self.registry, &id, accept_claude_workspace, Some(&prompt))
-                .map_err(|error| initial_prompt_control_error(&id, error))?;
+            prepare_agent_input(
+                &self.registry,
+                &id,
+                accept_claude_workspace,
+                appearance,
+                Some(&prompt),
+            )
+            .map_err(|error| initial_prompt_control_error(&id, error))?;
         } else if accept_claude_workspace {
             let registry = Arc::clone(&self.registry);
             let session_id = id.clone();
             std::thread::spawn(move || {
-                let _ = prepare_agent_input(&registry, &session_id, true, None);
+                let _ = prepare_agent_input(&registry, &session_id, true, appearance, None);
             });
         }
         serde_json::to_value(&record).map_err(|error| ControlError::internal(error.to_string()))
@@ -3659,8 +4207,10 @@ impl ControlServer {
         let binary = descriptor.binary.clone().expect("checked above");
         descriptor.binary = Some(self.resolve_local_agent_executable(kind, &binary)?);
         let mut launch_args = descriptor.spawn_args.clone();
+        launch_args.extend(self.configured_launch_args(None, kind)?);
+        let mut mcp_http_token = None;
         if let Some(injection) = &self.injection {
-            launch_args.extend(crate::inject::injection_args_with_cursor(
+            let injected = crate::inject::injection_args_full(
                 &descriptor.injection,
                 &injection.inject_dir,
                 &injection.cli_path,
@@ -3668,7 +4218,13 @@ impl ControlServer {
                     session_id: id,
                     socket_path: &self.socket_path,
                 }),
-            ));
+                self.mcp_http_url_for(&descriptor),
+            );
+            launch_args.extend(injected.argv);
+            mcp_http_token = injected
+                .mcp_http
+                .then(|| self.mcp_http.get().map(|endpoint| endpoint.token(id)))
+                .flatten();
         }
         let provider_dir = registry.recovery_directory(id).join("provider");
         let launch = match action {
@@ -3714,6 +4270,11 @@ impl ControlServer {
                 crate::inject::CLI_ENV.into(),
                 injection.cli_path.to_string_lossy().into_owned(),
             ));
+            pty.env
+                .retain(|(key, _)| key != crate::inject::MCP_TOKEN_ENV);
+            if let Some(token) = mcp_http_token.take() {
+                pty.env.push((crate::inject::MCP_TOKEN_ENV.into(), token));
+            }
             pty.env.push((
                 diri_proto::paths::ENV_SESSION_RECOVERY_DIR.into(),
                 registry
@@ -3783,6 +4344,21 @@ impl ControlServer {
     fn agent_readiness(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
         let p: diri_proto::AgentReadinessParams = decode(params).unwrap_or_default();
         encode(&self.agent_catalog(&p, false)?)
+    }
+
+    /// The user's extra arguments for `kind` on `host`, appended after the
+    /// manifest's own `spawnArgs` on every spawn and resume.
+    fn configured_launch_args(
+        &self,
+        host: Option<&str>,
+        kind: &str,
+    ) -> Result<Vec<String>, ControlError> {
+        Ok(self
+            .agent_catalog
+            .lock()
+            .map_err(poisoned)?
+            .preference(host, kind)
+            .launch_args)
     }
 
     fn resolve_local_agent_executable(
@@ -3878,15 +4454,21 @@ impl ControlServer {
         if let Some(host) = p.host.as_deref() {
             self.resolve_host(host)?;
         }
-        let preference = crate::agent_catalog::AgentPreference {
-            executable_path: p.executable_path,
-            show_in_quick_create: Some(p.show_in_quick_create),
-        };
-        self.agent_catalog
-            .lock()
-            .map_err(poisoned)?
-            .configure(p.host.as_deref(), &kind, preference)
-            .map_err(io_control_error)?;
+        {
+            let mut catalog = self.agent_catalog.lock().map_err(poisoned)?;
+            let launch_args = match p.launch_args {
+                Some(args) => args,
+                None => catalog.preference(p.host.as_deref(), &kind).launch_args,
+            };
+            let preference = crate::agent_catalog::AgentPreference {
+                executable_path: p.executable_path,
+                show_in_quick_create: Some(p.show_in_quick_create),
+                launch_args,
+            };
+            catalog
+                .configure(p.host.as_deref(), &kind, preference)
+                .map_err(io_control_error)?;
+        }
         let result = self.agent_catalog(
             &diri_proto::AgentReadinessParams {
                 host: p.host,
@@ -4080,7 +4662,13 @@ impl ControlServer {
                 }
                 descriptor
             });
+            let signed_in = if params.host.is_none() && path.is_some() {
+                self.agent_signed_in(&id)
+            } else {
+                None
+            };
             agents.push(diri_proto::AgentReadinessItem {
+                signed_in,
                 kind: diri_proto::AgentKind::new(id),
                 binary,
                 path,
@@ -4088,6 +4676,7 @@ impl ControlServer {
                 configured_path: preference.executable_path,
                 path_source,
                 show_in_quick_create: show,
+                launch_args: preference.launch_args,
                 error: resolution.configured_error,
                 descriptor,
             });
@@ -4236,7 +4825,14 @@ impl ControlServer {
     /// The test is the one the request applies, held continuously for `grace`:
     /// a live session or any connection resets it, so nothing that could be
     /// stranded or interrupted ever sees the exit.
-    pub fn spawn_orphan_watch(self: &Arc<Self>, grace: Duration, tick: Duration) {
+    /// `sessions_keep_alive`: whether live sessions and enabled schedules
+    /// count as being needed. A development build passes `false`.
+    pub fn spawn_orphan_watch(
+        self: &Arc<Self>,
+        grace: Duration,
+        tick: Duration,
+        sessions_keep_alive: bool,
+    ) {
         let server = Arc::clone(self);
         let _ = std::thread::Builder::new()
             .name("dirijord-orphan-watch".into())
@@ -4248,7 +4844,12 @@ impl ControlServer {
                     let Ok(mut registry) = server.registry.lock() else {
                         return;
                     };
-                    let live_sessions = registry.live_count();
+                    // An enabled schedule is work the Engine must stay up for.
+                    let live_sessions = if sessions_keep_alive {
+                        registry.live_count() + server.scheduler.enabled_count()
+                    } else {
+                        0
+                    };
                     if !watch.observe(live_sessions, connections, Instant::now(), grace) {
                         continue;
                     }
@@ -4329,6 +4930,30 @@ impl ControlServer {
             Some(&id),
         );
         Ok(json!({}))
+    }
+
+    /// Relays an HTTP request an agent wants opened in its Session's API tab.
+    /// The Engine only validates and forwards it; the app decides whether it
+    /// is ever sent, and never sends anything but a `GET` unasked.
+    fn session_open_api_request(
+        &self,
+        params: Option<JsonValue>,
+    ) -> Result<JsonValue, ControlError> {
+        let p: diri_proto::SessionOpenApiRequestParams = decode(params)?;
+        p.request.validate().map_err(ControlError::bad_request)?;
+        let id = p.session_id.0.clone();
+        let live = self
+            .registry
+            .lock()
+            .map_err(poisoned)?
+            .record(&id)
+            .is_some_and(|record| !record.is_archived());
+        if !live {
+            return Err(ControlError::not_found(format!("no session {id}")));
+        }
+        self.events
+            .publish_encoded(diri_proto::EventName::SESSION_API_REQUEST, &p, Some(&id));
+        Ok(json!({ "opened": true, "autoSend": p.request.may_auto_send() }))
     }
 
     fn publish_updated(&self, registry: &Registry, id: &str) {
@@ -4414,6 +5039,19 @@ impl Drop for ControlServer {
 /// `None` leaves the record's id untouched (not Claude, or nothing to check
 /// against), `Some(Some(id))` resumes a conversation whose transcript exists,
 /// and `Some(None)` means the tab's id was never written and must start fresh.
+/// The grid size of this session's last screen checkpoint: the size its
+/// previous run was using when the Engine last saved it.
+fn previous_screen_size(spec: &crate::session::SessionSpec) -> Option<(usize, usize)> {
+    let log = spec.logs_dir.join(format!("{}.bin", spec.id));
+    let checkpoint = crate::checkpoint::ScreenCheckpoint::load(
+        &crate::checkpoint::ScreenCheckpoint::path_for_log(&log),
+    )?;
+    Some((
+        usize::from(checkpoint.grid.cols),
+        usize::from(checkpoint.grid.rows),
+    ))
+}
+
 fn claude_resume_target(record: &diri_proto::SessionRecord) -> Option<Option<String>> {
     claude_resume_target_in(
         record,
@@ -4447,6 +5085,52 @@ fn claude_resume_target_in(
         Some(id) => Some(Some(id)),
         None => agent_session_id.map(|_| None),
     }
+}
+
+/// The optional placement hint of `session.spawn`. Absent, a pane shell (a
+/// shell with a parent) docks below its parent; anything else is not placed.
+fn spawn_pane_placement(
+    params: &JsonValue,
+) -> Result<Option<diri_proto::workspace::SpawnPane>, ControlError> {
+    use diri_proto::workspace::{SPAWN_PANE_FIELD, SpawnPane};
+    if let Some(value) = params.get(SPAWN_PANE_FIELD) {
+        return serde_json::from_value(value.clone())
+            .map(Some)
+            .map_err(|_| ControlError::bad_request("pane is not a valid placement"));
+    }
+    let shell = params
+        .get("kind")
+        .and_then(|kind| serde_json::from_value::<diri_proto::AgentKind>(kind.clone()).ok())
+        .is_some_and(|kind| kind == diri_proto::AgentKind::SHELL);
+    let parented = params.get("parent").is_some_and(JsonValue::is_string);
+    Ok((shell && parented).then_some(SpawnPane::BelowParent))
+}
+
+/// Running pane shells with their parents, newest first: what the one-time
+/// layout adoption moves into the parents' tabs.
+fn live_pane_shells(
+    records: &[diri_proto::SessionRecord],
+) -> Vec<(diri_proto::SessionId, diri_proto::SessionId)> {
+    let mut shells: Vec<_> = records
+        .iter()
+        .filter(|record| {
+            record.kind == diri_proto::AgentKind::SHELL
+                && !record.is_archived()
+                && !matches!(record.status, diri_proto::SessionStatus::Exited(_))
+        })
+        .filter_map(|record| {
+            Some((
+                record.created_at.0,
+                record.id.clone(),
+                record.parent.clone()?,
+            ))
+        })
+        .collect();
+    shells.sort_by(|left, right| right.0.total_cmp(&left.0));
+    shells
+        .into_iter()
+        .map(|(_, id, parent)| (id, parent))
+        .collect()
 }
 
 fn decode_launch_argv(params: &JsonValue) -> Result<Vec<String>, ControlError> {
@@ -4617,9 +5301,11 @@ pub(crate) fn new_record(id: &str, kind: &str, cwd: &str) -> diri_proto::Session
         listening_ports: None,
         foreground_agent: None,
         terminal_cwd: None,
+        agent_workspace: None,
         note_id: None,
         foreground_ports: None,
         terminal_progress: None,
+        scheduled_run: None,
     }
 }
 
@@ -4644,7 +5330,7 @@ struct BackgroundRequest(Arc<AtomicUsize>);
 impl BackgroundRequest {
     fn acquire(counter: &Arc<AtomicUsize>) -> Option<Self> {
         counter
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
                 (active < 32).then_some(active + 1)
             })
             .ok()?;
@@ -4854,6 +5540,30 @@ fn migrate_control_error(error: crate::migrate::MigrateError) -> ControlError {
     }
 }
 
+fn agent_config_stores(
+    config_dir: &Path,
+) -> (
+    crate::agent_catalog::AgentCatalogStore,
+    crate::accounts::AccountStore,
+) {
+    let agent_config_path = config_dir.join("agents.json");
+    let agent_catalog = crate::agent_catalog::AgentCatalogStore::new(&agent_config_path)
+        .unwrap_or_else(|error| {
+            eprintln!("diri-engine: Agent configuration unavailable: {error}");
+            crate::agent_catalog::AgentCatalogStore::empty(&agent_config_path)
+        });
+    let accounts = crate::accounts::AccountStore::new(config_dir.join("accounts.json"));
+    (agent_catalog, accounts)
+}
+
+/// `dir` is the parent of `remote-bindings/`.
+fn remote_binding_store(dir: &Path) -> Option<crate::remote::binding::RemoteBindingStore> {
+    crate::remote::binding::RemoteBindingStore::new(
+        dir.join(crate::layout_migration::REMOTE_BINDINGS_DIR_NAME),
+    )
+    .ok()
+}
+
 fn io_control_error(error: std::io::Error) -> ControlError {
     if error
         .get_ref()
@@ -4869,6 +5579,9 @@ fn io_control_error(error: std::io::Error) -> ControlError {
             "remote_transport_failed",
             "Remote transport failed; the Agent's last state is preserved.",
         );
+    }
+    if let Some(failure) = crate::remote::ssh_error::SshFailure::from_io(&error) {
+        return ControlError::new(failure.class.code(), failure.user_message());
     }
     match error.kind() {
         std::io::ErrorKind::NotFound => ControlError::not_found(error.to_string()),
@@ -4935,10 +5648,11 @@ fn prepare_agent_input(
     registry: &Arc<Mutex<Registry>>,
     session_id: &str,
     accept_claude_workspace: bool,
+    appearance: Option<diri_proto::TerminalAppearance>,
     prompt: Option<&str>,
 ) -> Result<(), InitialPromptFailure> {
     if accept_claude_workspace {
-        accept_claude_workspace_trust(registry, session_id);
+        accept_claude_workspace_trust(registry, session_id, appearance);
     }
     if let Some(prompt) = prompt {
         let gemini = with_session(registry, session_id, |session| {
@@ -4946,7 +5660,7 @@ fn prepare_agent_input(
         })
         .unwrap_or(false);
         if gemini {
-            accept_gemini_folder_trust(registry, session_id);
+            accept_gemini_folder_trust(registry, session_id)?;
         }
         let pi = with_session(registry, session_id, |session| {
             session.manifest_id() == "pi"
@@ -4968,6 +5682,20 @@ fn prepare_agent_input(
         .unwrap_or(false);
         if kimi {
             accept_kimi_workspace_trust(registry, session_id);
+        }
+        let droid = with_session(registry, session_id, |session| {
+            session.manifest_id() == "droid"
+        })
+        .unwrap_or(false);
+        if droid {
+            accept_droid_folder_trust(registry, session_id);
+        }
+        let antigravity = with_session(registry, session_id, |session| {
+            session.manifest_id() == "antigravity"
+        })
+        .unwrap_or(false);
+        if antigravity {
+            prepare_antigravity_input(registry, session_id)?;
         }
         let copilot = with_session(registry, session_id, |session| {
             session.manifest_id() == "copilot"
@@ -5067,21 +5795,47 @@ fn initial_prompt_control_error(session_id: &str, failure: InitialPromptFailure)
 /// directory the session was pointed at. That is defensible when the user
 /// picked the directory in the UI, and weaker when they did not — an
 /// orchestrator spawning into a freshly cloned repository gets trust without
-/// anyone affirming it. The window is bounded (20s), but a session whose own
-/// output contains the matched phrases inside that window would also receive
-/// the keystroke.
+/// anyone affirming it. The window is bounded (20s, stretched to at most 30
+/// minutes while Claude's own first-run screens are up), but a session whose
+/// own output contains the matched phrases inside that window would also
+/// receive the keystroke.
+///
+/// The same watch answers the first run's "Choose the text style" question
+/// when the client said whether its window is light or dark: Diri's terminal
+/// cannot answer Claude's background-color query, so "Auto" would guess, and
+/// a newcomer should not have to pick a palette before they have typed
+/// anything. Sign-in and the safety notes are always left to the user.
 ///
 /// The watch ends as soon as a Claude hook reports: Claude runs no hooks
 /// until the workspace is trusted, so a hook proves the picker is not coming.
 /// Without that exit an already-trusted folder — the common case — held a
 /// spawn's initial prompt, and the spawn RPC with it, for the full 20s.
-fn accept_claude_workspace_trust(registry: &Arc<Mutex<Registry>>, session_id: &str) {
-    for _ in 0..200 {
-        let Some((exited, screen, hooked)) = with_session(registry, session_id, |session| {
+///
+/// The answer is navigated, never typed blind. Claude 2.1 lists an
+/// unnumbered "No, exit" first and focused; the old answer, "1" and Enter,
+/// confirmed that and every first launch in a new folder exited with code 1.
+/// Enter is only ever pressed with the focus on "Yes, I trust this folder".
+///
+/// Claude drops keys that arrive just as the picker mounts, so each key is
+/// judged by the screen it leaves: an arrow that did not move the focus, or
+/// an Enter that did not close the picker, is pressed again, within a budget.
+fn accept_claude_workspace_trust(
+    registry: &Arc<Mutex<Registry>>,
+    session_id: &str,
+    appearance: Option<diri_proto::TerminalAppearance>,
+) {
+    let started = Instant::now();
+    let mut deadline = started + CLAUDE_TRUST_WATCH;
+    let mut keys = 0;
+    let mut seen = false;
+    let mut theme_keys = 0;
+    let mut theme_seen = false;
+    while Instant::now() < deadline {
+        let Some((exited, lines, hooked)) = with_session(registry, session_id, |session| {
             let view = session.view();
             (
                 view.exited,
-                session.screen_lines().join("\n"),
+                session.screen_lines(),
                 view.status_evidence.is_some_and(|evidence| {
                     evidence.source == diri_proto::StatusEvidenceSource::Hook
                 }),
@@ -5092,37 +5846,217 @@ fn accept_claude_workspace_trust(registry: &Arc<Mutex<Registry>>, session_id: &s
         if exited {
             return;
         }
-        if is_claude_workspace_trust_screen(&screen) {
+        // A first run puts its welcome, theme, sign-in and safety screens
+        // ahead of the picker, and signing in takes as long as the browser
+        // does. The watch outlasts them, or a newcomer meets the picker
+        // after it gave up, with "No, exit" focused.
+        if claude_first_run_screen(&lines) {
+            deadline = (Instant::now() + CLAUDE_TRUST_WATCH).min(started + CLAUDE_FIRST_RUN_LIMIT);
+        }
+        if let Some(appearance) = appearance
+            && theme_keys < CLAUDE_TRUST_MAX_KEYS
+            && let Some(key) = claude_theme_key(&lines, appearance)
+        {
+            if !theme_seen {
+                theme_seen = true;
+                std::thread::sleep(CLAUDE_TRUST_SETTLE);
+                continue;
+            }
+            press_claude_key(registry, session_id, key);
+            theme_keys += 1;
+            let answered = wait_for_claude_screen_change(registry, session_id, 20, |lines| {
+                claude_theme_key(lines, appearance) != Some(key)
+            });
+            if key == ClaudeTrustKey::Confirm && answered {
+                diri_telemetry::event!(
+                    "prompt.first_run_theme_answered",
+                    session = diri_telemetry::id(session_id),
+                    keys = theme_keys,
+                );
+            }
+            continue;
+        }
+        let Some(key) = claude_workspace_trust_key(&lines) else {
+            if hooked {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
+        };
+        if !seen {
+            seen = true;
+            std::thread::sleep(CLAUDE_TRUST_SETTLE);
+            continue;
+        }
+        if keys >= CLAUDE_TRUST_MAX_KEYS {
+            // The picker will not take the answer: leave it to the user.
+            diri_telemetry::warn_event!(
+                "prompt.workspace_trust_unanswered",
+                session = diri_telemetry::id(session_id),
+                keys = keys,
+            );
+            return;
+        }
+        press_claude_key(registry, session_id, key);
+        keys += 1;
+        // Decide again only once the screen has answered, so a slow repaint
+        // never earns a second arrow past "Yes". After Enter this also lets
+        // Claude persist trust and replace the picker before a caller's
+        // initial prompt starts its own readiness loop.
+        let answered = wait_for_claude_screen_change(registry, session_id, 20, |lines| {
+            claude_workspace_trust_key(lines) != Some(key)
+        });
+        if key == ClaudeTrustKey::Confirm && answered {
             diri_telemetry::event!(
                 "prompt.workspace_trust_accepted",
                 session = diri_telemetry::id(session_id),
+                keys = keys,
             );
-            let _ = with_session(registry, session_id, |session| session.send_text("1", true));
-            // Let Claude persist trust and replace the picker before a caller's
-            // initial prompt starts its own readiness/verification loop.
-            for _ in 0..20 {
-                std::thread::sleep(Duration::from_millis(100));
-                let changed = with_session(registry, session_id, |session| {
-                    !is_claude_workspace_trust_screen(&session.screen_lines().join("\n"))
-                })
-                .unwrap_or(true);
-                if changed {
-                    return;
-                }
-            }
             return;
         }
-        if hooked {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
-fn is_claude_workspace_trust_screen(screen: &str) -> bool {
-    let normalized = screen.to_ascii_lowercase();
-    normalized.contains("yes, i trust this folder")
-        && (normalized.contains("1.") || normalized.contains("1 "))
+fn press_claude_key(registry: &Arc<Mutex<Registry>>, session_id: &str, key: ClaudeTrustKey) {
+    let bytes: &[u8] = match key {
+        ClaudeTrustKey::Confirm => b"\r",
+        ClaudeTrustKey::Down => b"\x1b[B",
+        ClaudeTrustKey::Up => b"\x1b[A",
+    };
+    let _ = with_session(registry, session_id, |session| session.write_input(bytes));
+}
+
+/// How long the trust watch waits for the picker once nothing else is
+/// on screen.
+const CLAUDE_TRUST_WATCH: Duration = Duration::from_secs(20);
+
+/// The longest a first run (sign-in included) may hold the trust watch open.
+const CLAUDE_FIRST_RUN_LIMIT: Duration = Duration::from_secs(30 * 60);
+
+/// Whether Claude is showing one of the screens of its first run, which come
+/// before the workspace-trust picker.
+fn claude_first_run_screen(lines: &[String]) -> bool {
+    const MARKERS: &[&str] = &[
+        "choose the text style",
+        "select login method",
+        "paste code here",
+        "browser didn't open",
+        "login successful",
+        "security notes:",
+        "use claude code's terminal setup",
+        "detected a custom api key",
+    ];
+    crate::detect::bottom_non_empty(lines, 40)
+        .iter()
+        .any(|line| {
+            let line = line.to_ascii_lowercase();
+            MARKERS.iter().any(|marker| line.contains(marker))
+        })
+}
+
+/// The key that moves Claude's first-run text-style picker to the plain
+/// light or dark style, or `None` when that picker is not showing.
+fn claude_theme_key(
+    lines: &[String],
+    appearance: diri_proto::TerminalAppearance,
+) -> Option<ClaudeTrustKey> {
+    let bottom = crate::detect::bottom_non_empty(lines, 30);
+    if !bottom
+        .iter()
+        .any(|line| line.to_ascii_lowercase().contains("choose the text style"))
+    {
+        return None;
+    }
+    let wanted = match appearance {
+        diri_proto::TerminalAppearance::Light => "light mode",
+        diri_proto::TerminalAppearance::Dark => "dark mode",
+    };
+    // "❯ ✔ Dark mode", "  Light mode", or numbered "2. Light mode".
+    let option = |line: &str| {
+        let line = line.trim_start();
+        let focused = line.starts_with('❯');
+        let label = line
+            .trim_start_matches('❯')
+            .trim_start()
+            .trim_start_matches('✔')
+            .trim_start();
+        let label = label
+            .split_once(". ")
+            .filter(|(number, _)| number.chars().all(|c| c.is_ascii_digit()))
+            .map_or(label, |(_, rest)| rest);
+        (focused, label.trim_end().to_ascii_lowercase())
+    };
+    let target = bottom.iter().position(|line| option(line).1 == wanted)?;
+    let focus = bottom.iter().position(|line| option(line).0)?;
+    Some(match focus.cmp(&target) {
+        std::cmp::Ordering::Equal => ClaudeTrustKey::Confirm,
+        std::cmp::Ordering::Less => ClaudeTrustKey::Down,
+        std::cmp::Ordering::Greater => ClaudeTrustKey::Up,
+    })
+}
+
+/// How long the picker stands before the first key, which Claude would
+/// otherwise drop while it is still mounting.
+const CLAUDE_TRUST_SETTLE: Duration = Duration::from_millis(300);
+
+/// Keys, arrows and Enters together, the trust watch may press before it
+/// gives the picker to the user.
+const CLAUDE_TRUST_MAX_KEYS: usize = 6;
+
+/// What accepts Claude's workspace-trust picker from where its `❯` focus is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClaudeTrustKey {
+    /// The focus is on "Yes, I trust this folder".
+    Confirm,
+    Down,
+    Up,
+}
+
+/// The key that moves Claude's trust picker toward "Yes", or `None` when the
+/// picker — both of its options at the bottom of the screen, one focused —
+/// is not showing.
+fn claude_workspace_trust_key(lines: &[String]) -> Option<ClaudeTrustKey> {
+    let bottom = crate::detect::bottom_non_empty(lines, 12);
+    let find = |needle: &str| {
+        bottom
+            .iter()
+            .position(|line| line.to_ascii_lowercase().contains(needle))
+    };
+    let yes = find("yes, i trust this folder")?;
+    let no = find("no, exit")?;
+    let focused = |index: usize| bottom[index].trim_start().starts_with('❯');
+    if focused(yes) {
+        Some(ClaudeTrustKey::Confirm)
+    } else if focused(no) {
+        Some(if yes > no {
+            ClaudeTrustKey::Down
+        } else {
+            ClaudeTrustKey::Up
+        })
+    } else {
+        None
+    }
+}
+
+/// Whether the screen moved past what `unchanged` describes within
+/// `ticks` × 100 ms.
+fn wait_for_claude_screen_change(
+    registry: &Arc<Mutex<Registry>>,
+    session_id: &str,
+    ticks: usize,
+    changed: impl Fn(&[String]) -> bool,
+) -> bool {
+    for _ in 0..ticks {
+        std::thread::sleep(Duration::from_millis(100));
+        let moved = with_session(registry, session_id, |session| {
+            changed(&session.screen_lines())
+        })
+        .unwrap_or(true);
+        if moved {
+            return true;
+        }
+    }
+    false
 }
 
 /// Answers Gemini CLI's "Do you trust the files in this folder?" dialog when
@@ -5139,17 +6073,26 @@ fn is_claude_workspace_trust_screen(screen: &str) -> bool {
 /// A trusted folder costs about a second: the composer has to stand alone
 /// long enough to rule out the dialog Gemini opens just after it. Capped at
 /// 20s either way.
-fn accept_gemini_folder_trust(registry: &Arc<Mutex<Registry>>, session_id: &str) {
+fn accept_gemini_folder_trust(
+    registry: &Arc<Mutex<Registry>>,
+    session_id: &str,
+) -> Result<(), InitialPromptFailure> {
     let mut accepted_at: Option<Instant> = None;
     let mut composer_since: Option<Instant> = None;
     for _ in 0..200 {
         let Some((exited, screen)) = with_session(registry, session_id, |session| {
             (session.view().exited, session.screen_lines())
         }) else {
-            return;
+            return Err(InitialPromptFailure::SessionEnded);
         };
         if exited {
-            return;
+            return Err(InitialPromptFailure::SessionEnded);
+        }
+        if is_gemini_auth_screen(&screen) {
+            // Signed out: the paste is dropped and the injector's Enter picks
+            // "Sign in with Google", then confirms opening a browser. Sign-in
+            // is the user's to start.
+            return Err(InitialPromptFailure::SubmissionUnconfirmed);
         }
         if is_gemini_folder_trust_screen(&screen) {
             composer_since = None;
@@ -5182,13 +6125,14 @@ fn accept_gemini_folder_trust(registry: &Arc<Mutex<Registry>>, session_id: &str)
                 }
             };
             if ready {
-                return;
+                return Ok(());
             }
         } else {
             composer_since = None;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+    Ok(())
 }
 
 /// How long Gemini's composer must stand with no trust dialog before a
@@ -5215,6 +6159,17 @@ fn is_gemini_folder_trust_screen(lines: &[String]) -> bool {
         .join("\n")
         .to_lowercase();
     bottom.contains("1. trust folder") && bottom.contains("don't trust")
+}
+
+/// Gemini signed out: "How would you like to authenticate?" in place of the
+/// composer, or the browser sign-in it leads to.
+fn is_gemini_auth_screen(lines: &[String]) -> bool {
+    let bottom = crate::detect::bottom_non_empty(lines, 20)
+        .join("\n")
+        .to_lowercase();
+    bottom.contains("how would you like to authenticate")
+        || bottom.contains("opening authentication page in your browser")
+        || bottom.contains("waiting for authentication")
 }
 
 fn is_gemini_composer_screen(lines: &[String]) -> bool {
@@ -5337,6 +6292,142 @@ fn is_kimi_workspace_trust_screen(lines: &[String]) -> bool {
             .any(|line| line.trim_start().starts_with("│ >"))
 }
 
+/// Droid asks "Trust this folder?" before its composer exists, in every
+/// folder it has not seen. The injector's paste went into that selector and
+/// was dropped, and its Enter then trusted the folder anyway: the spawn
+/// reported an unconfirmed prompt and the turn never started. Answer it first,
+/// only when a prompt was requested, with the workspace-trust tradeoff
+/// [`accept_claude_workspace_trust`] documents. Without a prompt the dialog is
+/// left to the user, where the manifest reports it as a question.
+///
+/// The composer only ever follows the dialog, so it ends the wait as soon as
+/// it shows. Capped at 20s.
+fn accept_droid_folder_trust(registry: &Arc<Mutex<Registry>>, session_id: &str) {
+    let mut accepted = false;
+    for _ in 0..200 {
+        let Some((exited, screen)) = with_session(registry, session_id, |session| {
+            (session.view().exited, session.screen_lines())
+        }) else {
+            return;
+        };
+        if exited {
+            return;
+        }
+        if is_droid_folder_trust_screen(&screen) {
+            if !accepted {
+                diri_telemetry::event!(
+                    "prompt.workspace_trust_accepted",
+                    session = diri_telemetry::id(session_id),
+                );
+                // Enter on the preselected "1. Trust this folder".
+                let _ = with_session(registry, session_id, |session| session.submit_input());
+                accepted = true;
+            }
+        } else if is_droid_composer_screen(&screen) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn is_droid_folder_trust_screen(lines: &[String]) -> bool {
+    let bottom = crate::detect::bottom_non_empty(lines, 20);
+    bottom
+        .iter()
+        .any(|line| line.contains("Trust this folder?"))
+        && bottom
+            .iter()
+            .any(|line| line.trim_start().starts_with("> 1. Trust this folder"))
+        && bottom
+            .iter()
+            .rev()
+            .take(2)
+            .any(|line| line.contains("Enter to confirm · Esc to exit"))
+}
+
+/// Droid's composer box directly over its `? for help` footer.
+fn is_droid_composer_screen(lines: &[String]) -> bool {
+    let bottom = crate::detect::bottom_non_empty(lines, 4);
+    bottom
+        .iter()
+        .any(|line| line.trim_start().starts_with("│ >"))
+        && bottom.iter().any(|line| line.contains("? for help"))
+}
+
+/// agy asks "Do you trust the contents of this project?" in every folder it
+/// has not seen, and a signed-out agy stops at its login method picker. A
+/// paste into either is dropped; the injector's Enter then trusts the folder
+/// (prompt lost) or starts Google OAuth. Answer the trust dialog first, only
+/// when a prompt was requested, with the workspace-trust tradeoff
+/// [`accept_claude_workspace_trust`] documents. Never answer login or the
+/// first-run colour/terms pages for the user: report the prompt undelivered.
+///
+/// The composer only ever follows those screens, so it ends the wait as soon
+/// as it shows. Capped at 20s; past that the injector's own confirmation
+/// decides.
+fn prepare_antigravity_input(
+    registry: &Arc<Mutex<Registry>>,
+    session_id: &str,
+) -> Result<(), InitialPromptFailure> {
+    let mut accepted = false;
+    for _ in 0..200 {
+        let (exited, screen) = with_session(registry, session_id, |session| {
+            (session.view().exited, session.screen_lines())
+        })
+        .ok_or(InitialPromptFailure::SessionEnded)?;
+        if exited {
+            return Err(InitialPromptFailure::SessionEnded);
+        }
+        if is_antigravity_trust_screen(&screen) {
+            if !accepted {
+                diri_telemetry::event!(
+                    "prompt.workspace_trust_accepted",
+                    session = diri_telemetry::id(session_id),
+                );
+                // Enter on the preselected "> Yes, I trust this folder".
+                let _ = with_session(registry, session_id, |session| session.submit_input());
+                accepted = true;
+            }
+        } else if is_antigravity_setup_screen(&screen) {
+            return Err(InitialPromptFailure::SubmissionUnconfirmed);
+        } else if is_antigravity_composer_screen(&screen) {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Ok(())
+}
+
+fn is_antigravity_trust_screen(lines: &[String]) -> bool {
+    let bottom = crate::detect::bottom_non_empty(lines, 8);
+    bottom
+        .iter()
+        .any(|line| line.contains("Do you trust the contents of this project?"))
+        && bottom
+            .iter()
+            .any(|line| line.trim_start().starts_with("> Yes, I trust this folder"))
+}
+
+/// The signed-out login picker and the first run's colour-scheme and terms
+/// pages: questions only the user can answer.
+fn is_antigravity_setup_screen(lines: &[String]) -> bool {
+    lines.iter().any(|line| {
+        let line = line.trim();
+        line == "Select login method:"
+            || line.starts_with("Choose your color scheme:")
+            || line == "Terms of Service & Data Use"
+    })
+}
+
+/// The composer between two rules, over the idle `? for shortcuts` footer.
+fn is_antigravity_composer_screen(lines: &[String]) -> bool {
+    let bottom = crate::detect::bottom_non_empty(lines, 3);
+    bottom.iter().any(|line| line.trim_start().starts_with('>'))
+        && bottom
+            .last()
+            .is_some_and(|line| line.starts_with("? for shortcuts"))
+}
+
 /// Copilot's folder selector drops pasted text; a blind Enter then accepts
 /// trust with the initial prompt lost. As with Gemini/Pi, explicitly accept
 /// the one-session "Yes" before injecting, only when a prompt was requested.
@@ -5417,14 +6508,7 @@ fn prepare_cursor_input(
                 .map_err(|_| InitialPromptFailure::InputFailed)?;
                 accepted = true;
             }
-        } else if crate::detect::bottom_non_empty(&lines, 8)
-            .iter()
-            .any(|line| {
-                let line = line.trim();
-                line.starts_with("→ Plan, search, build anything")
-                    || line.starts_with("→ Add a follow-up")
-            })
-        {
+        } else if cursor_composer_ready(&lines) {
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -5432,11 +6516,28 @@ fn prepare_cursor_input(
     Err(InitialPromptFailure::SubmissionUnconfirmed)
 }
 
+fn cursor_composer_ready(lines: &[String]) -> bool {
+    !is_cursor_workspace_trust_screen(lines)
+        && crate::detect::bottom_non_empty(lines, 8)
+            .iter()
+            .any(|line| {
+                let line = line.trim();
+                line.starts_with("→ Plan, search, build anything")
+                    || line.starts_with("→ Add a follow-up")
+            })
+}
+
+/// The selector is live only while an option carries the `▶` marker. Once
+/// answered, cursor-agent 2026.10.01-14929f9 repaints the box without it and
+/// with `Trusting workspace...`, then leaves that box above the composer as
+/// stale paint. The footer is not required: a composer painted under the
+/// dialog can push it out of view.
 fn is_cursor_workspace_trust_screen(lines: &[String]) -> bool {
-    let bottom = crate::detect::bottom_non_empty(lines, 8).join("\n");
-    bottom.contains("[a] Trust this workspace")
-        && bottom.contains("[q] Quit")
-        && bottom.contains("Use arrow keys to navigate, Enter to select, or press the key shown")
+    let has = |needle: &str| lines.iter().any(|line| line.contains(needle));
+    has("[a] Trust this workspace")
+        && has("[q] Quit")
+        && (has("▶ [a] Trust this workspace") || has("▶ [q] Quit"))
+        && !has("Trusting workspace")
 }
 
 /// Types and submits an initial prompt at most once. Screen observations can
@@ -5542,6 +6643,9 @@ enum EchoOutcome {
 /// of its MCP servers have started. Both end early on confirmation, so the
 /// long window only delays reporting an outcome that stays unknown.
 const ECHO_WINDOW: Duration = Duration::from_millis(1500);
+/// Longest a scheduled run waits for the turn already running in its reused
+/// session to finish before typing its prompt anyway.
+const SCHEDULED_TURN_WAIT: Duration = Duration::from_secs(30 * 60);
 const LANDED_WINDOW: Duration = Duration::from_secs(10);
 
 /// Polls for the typed prompt to appear on screen. With no usable probe —
@@ -5822,6 +6926,65 @@ mod tests {
     mod send_key_tests;
 
     #[test]
+    fn antigravity_trust_setup_and_composer_screens_are_told_apart() {
+        let screen = |name: &str| {
+            std::fs::read_to_string(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/antigravity_screens")
+                    .join(format!("{name}.txt")),
+            )
+            .expect("fixture screen")
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+        };
+        let trust = screen("trust");
+        assert!(is_antigravity_trust_screen(&trust));
+        assert!(!is_antigravity_setup_screen(&trust));
+        assert!(!is_antigravity_composer_screen(&trust));
+        for setup in ["login", "onboarding_color", "onboarding_terms"] {
+            let setup = screen(setup);
+            assert!(is_antigravity_setup_screen(&setup));
+            assert!(!is_antigravity_trust_screen(&setup));
+            assert!(!is_antigravity_composer_screen(&setup));
+        }
+        for idle in ["fresh", "done"] {
+            let idle = screen(idle);
+            assert!(is_antigravity_composer_screen(&idle));
+            assert!(!is_antigravity_trust_screen(&idle));
+            assert!(!is_antigravity_setup_screen(&idle));
+        }
+        assert!(!is_antigravity_composer_screen(&screen("working")));
+    }
+
+    #[test]
+    fn gemini_sign_in_screens_stop_the_initial_prompt() {
+        let lines = |text: &str| text.lines().map(str::to_owned).collect::<Vec<_>>();
+        assert!(is_gemini_auth_screen(&lines(include_str!(
+            "../tests/fixtures/gemini_screens/auth.txt"
+        ))));
+        assert!(is_gemini_auth_screen(&lines(include_str!(
+            "../tests/fixtures/gemini_screens/auth_browser.txt"
+        ))));
+        assert!(!is_gemini_auth_screen(&lines(
+            "  >   Type your message or @path/to/file\n  ~/project   no sandbox   gemini-2.5-flash"
+        )));
+    }
+
+    #[test]
+    fn droid_trust_and_composer_screens_are_told_apart() {
+        let lines = |text: &str| text.lines().map(str::to_owned).collect::<Vec<_>>();
+        let trust = include_str!("../tests/fixtures/droid_screens/trust.txt");
+        let idle = include_str!("../tests/fixtures/droid_screens/idle.txt");
+        let working = include_str!("../tests/fixtures/droid_screens/working_stream.txt");
+        assert!(is_droid_folder_trust_screen(&lines(trust)));
+        assert!(!is_droid_composer_screen(&lines(trust)));
+        assert!(is_droid_composer_screen(&lines(idle)));
+        assert!(!is_droid_folder_trust_screen(&lines(idle)));
+        assert!(!is_droid_folder_trust_screen(&lines(working)));
+    }
+
+    #[test]
     fn kimi_trust_requires_the_active_selector() {
         let lines = |text: &str| text.lines().map(str::to_owned).collect::<Vec<_>>();
         let trust = include_str!("../tests/fixtures/kimi_screens/trust.txt");
@@ -5831,6 +6994,58 @@ mod tests {
         assert!(!is_kimi_workspace_trust_screen(&lines(&format!(
             "{trust}{idle}"
         ))));
+    }
+
+    #[test]
+    fn open_api_request_relays_a_valid_draft_for_a_live_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let server = server(temp.path());
+        server
+            .registry
+            .lock()
+            .unwrap()
+            .insert_record(test_record("agent"));
+        let stream = server.events.subscribe(
+            None,
+            crate::events::Filter::new(
+                None,
+                Some(vec![diri_proto::EventName::SESSION_API_REQUEST.to_owned()]),
+            ),
+        );
+        let params = |session: &str, method: &str| {
+            json!({
+                "sessionID": session,
+                "request": {"method": method, "url": "http://localhost:3000/items", "autoSend": true}
+            })
+        };
+        let result = server
+            .dispatch(
+                Method::SESSION_OPEN_API_REQUEST,
+                Some(params("agent", "POST")),
+            )
+            .unwrap();
+        assert_eq!(result["autoSend"], false, "only a GET may send itself");
+        let event = stream.try_recv().expect("relayed to the app");
+        assert_eq!(event.session_id.as_deref(), Some("agent"));
+        let relayed: diri_proto::SessionOpenApiRequestParams =
+            serde_json::from_slice(&event.encoded).unwrap();
+        assert_eq!(relayed.request.method, "POST");
+
+        let missing = server
+            .dispatch(
+                Method::SESSION_OPEN_API_REQUEST,
+                Some(params("gone", "GET")),
+            )
+            .unwrap_err();
+        assert_eq!(missing.code, "not_found");
+        let invalid = server
+            .dispatch(
+                Method::SESSION_OPEN_API_REQUEST,
+                Some(params("agent", "TRACE")),
+            )
+            .unwrap_err();
+        assert_eq!(invalid.code, "bad_request");
+        assert!(stream.try_recv().is_none(), "refusals publish nothing");
     }
 
     #[test]
@@ -5893,6 +7108,54 @@ mod tests {
                 "bad_request"
             );
         }
+    }
+
+    #[test]
+    fn terminal_configure_switches_shell_integration_and_survives_a_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let start = || {
+            let registry = Registry::new(engine(), temp.path().join("state.json"));
+            ControlServer::new(Arc::new(Mutex::new(registry)), temp.path().join("socket"))
+                .with_injection(InjectionConfig {
+                    inject_dir: temp.path().join("inject"),
+                    cli_path: temp.path().join("dirijor"),
+                })
+        };
+        let server = start();
+        let integration = server
+            .terminal_shell_integration()
+            .expect("on by default once installed");
+        let mut spec = crate::pty::PtySpec::new(vec!["/bin/zsh".into(), "-l".into()], "/tmp");
+        integration.apply(&mut spec);
+        assert!(spec.env.iter().any(|(key, _)| key == "ZDOTDIR"));
+
+        server
+            .dispatch(
+                Method::TERMINAL_CONFIGURE,
+                Some(json!({ "shellIntegration": false })),
+            )
+            .unwrap();
+        assert!(server.terminal_shell_integration().is_none());
+        let settings = temp.path().join(TERMINAL_SETTINGS_FILE);
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&settings).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        // Terminals the next Engine restarts before the app connects.
+        assert!(start().terminal_shell_integration().is_none());
+
+        server
+            .dispatch(
+                Method::TERMINAL_CONFIGURE,
+                Some(json!({ "shellIntegration": true })),
+            )
+            .unwrap();
+        assert!(start().terminal_shell_integration().is_some());
+        // Without injection (tests, a bare Engine) nothing is installed.
+        let registry = Registry::new(engine(), temp.path().join("state.json"));
+        let bare = ControlServer::new(Arc::new(Mutex::new(registry)), temp.path().join("socket"));
+        assert!(bare.terminal_shell_integration().is_none());
     }
 
     #[test]
@@ -6015,9 +7278,11 @@ mod tests {
             listening_ports: None,
             foreground_agent: None,
             terminal_cwd: None,
+            agent_workspace: None,
             note_id: None,
             foreground_ports: None,
             terminal_progress: None,
+            scheduled_run: None,
         }
     }
 
@@ -6063,6 +7328,8 @@ mod tests {
             reason: diri_proto::ExitReason::Exited,
             code: Some(0),
             signal: None,
+            system_restart: false,
+            interrupted: false,
         });
         record.resumability = diri_proto::Resumability::Resumable;
         record
@@ -6136,16 +7403,45 @@ mod tests {
         assert_eq!(note.doc.todo_progress(), (0, 1));
         assert_eq!(note.project(), Some(project.to_string_lossy().as_ref()));
 
-        // Closing the note's tab trashes its file; reopening brings it back.
+        // Closing the note's tab keeps its file, so search can still find it;
+        // reopening brings the tab back.
         ok_of(call(
             &server,
             "session.remove",
             Some(json!({ "sessionID": record.id.0 })),
         ));
-        assert!(store.load(&note_id).is_err(), "closed note is in the trash");
+        assert!(store.load(&note_id).is_ok(), "a closed note stays findable");
         let reopened = ok_of(call(&server, "session.reopen_last", None));
         assert_eq!(reopened["id"], record.id.0.as_str());
         assert_eq!(store.load(&note_id).unwrap().doc.title, "Launch plan");
+
+        // An Engine that predates notes drops `noteId` from the record and
+        // reaps it; the next notes-aware start links it back from the file.
+        {
+            let mut registry = registry.lock().expect("registry");
+            let mut broken = registry.record(&record.id.0).expect("listed");
+            broken.note_id = None;
+            broken.status = diri_proto::SessionStatus::Exited(diri_proto::ExitInfo {
+                reason: diri_proto::ExitReason::DaemonRestart,
+                code: None,
+                signal: None,
+                system_restart: false,
+                interrupted: false,
+            });
+            registry.insert_record(broken);
+        }
+        server.adopt_orphan_notes().expect("relink");
+        let healed = registry
+            .lock()
+            .expect("registry")
+            .record(&record.id.0)
+            .expect("listed");
+        assert_eq!(
+            healed.note_id.as_deref(),
+            Some(note_id.as_str()),
+            "link restored"
+        );
+        assert!(matches!(healed.status, diri_proto::SessionStatus::Idle));
 
         // A daemon restart finds no holder for the note and must not call it lost.
         registry.lock().expect("registry").reap_orphans_for_test();
@@ -6155,6 +7451,55 @@ mod tests {
             .record(&record.id.0)
             .expect("still listed");
         assert!(matches!(after.status, diri_proto::SessionStatus::Idle));
+    }
+
+    /// A note an agent wrote belongs to the user: the agent ending, being
+    /// closed, or vanishing in a restart leaves the note and its file alone.
+    #[test]
+    fn a_note_outlives_the_agent_that_wrote_it() {
+        let temp = tempfile::tempdir().expect("temp");
+        let (registry, server) = note_server(&temp);
+        let project = temp.path().join("proj");
+        std::fs::create_dir_all(&project).expect("project");
+        let mut agent = new_record("s_agent", "claude-code", &project.to_string_lossy());
+        agent.status = diri_proto::SessionStatus::Working;
+        registry.lock().expect("registry").insert_record(agent);
+        let note = ok_of(call(
+            &server,
+            "session.spawn",
+            Some(json!({
+                "kind": "note",
+                "cwd": project.to_string_lossy(),
+                "title": "Findings",
+                "parent": "s_agent",
+            })),
+        ));
+        let note: diri_proto::SessionRecord = serde_json::from_value(note).expect("record");
+        let note_id = note.note_id.clone().expect("note id");
+
+        let intact = || {
+            let record = registry
+                .lock()
+                .expect("registry")
+                .record(&note.id.0)
+                .expect("the note is still listed");
+            assert_eq!(record.note_id.as_deref(), Some(note_id.as_str()));
+            assert!(matches!(record.status, diri_proto::SessionStatus::Idle));
+            let store =
+                diri_notes::store::NoteStore::open(temp.path().join("notes")).expect("store");
+            assert_eq!(store.load(&note_id).expect("file").doc.title, "Findings");
+        };
+        // The agent's holder is gone after a restart.
+        registry.lock().expect("registry").reap_orphans_for_test();
+        intact();
+        ok_of(call(
+            &server,
+            "session.remove",
+            Some(json!({ "sessionID": "s_agent" })),
+        ));
+        intact();
+        server.adopt_orphan_notes().expect("adopt");
+        intact();
     }
 
     fn note_server(temp: &tempfile::TempDir) -> (Arc<Mutex<Registry>>, Arc<ControlServer>) {
@@ -6167,6 +7512,52 @@ mod tests {
                 .with_notes_dir(temp.path().join("notes")),
         );
         (registry, server)
+    }
+
+    /// Attaches over a socket pair and returns everything the Engine wrote
+    /// before it closed.
+    fn refused_attach(server: &Arc<ControlServer>, id: &str) -> Vec<diri_proto::frames::Frame> {
+        let (mut client, engine_end) = UnixStream::pair().expect("pair");
+        let serving = {
+            let server = Arc::clone(server);
+            std::thread::spawn(move || server.serve(engine_end))
+        };
+        // Before the request: macOS rejects SO_RCVTIMEO with EINVAL once the
+        // Engine has already refused and closed its end.
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .expect("timeout");
+        let mut line = serde_json::to_vec(&json!({ "attach": id })).expect("line");
+        line.push(b'\n');
+        client.write_all(&line).expect("attach line");
+        let mut bytes = Vec::new();
+        client.read_to_end(&mut bytes).expect("engine closes");
+        serving.join().expect("serve").expect("served");
+        diri_proto::frames::FrameCodec::new()
+            .feed(&bytes)
+            .expect("frames")
+    }
+
+    #[test]
+    fn a_refused_attach_says_why_before_closing() {
+        use diri_proto::frames::AttachRejection;
+        let temp = tempfile::tempdir().expect("temp");
+        let (_, server) = note_server(&temp);
+        let note = ok_of(call(
+            &server,
+            "session.spawn",
+            Some(json!({"kind": "note", "cwd": temp.path().to_string_lossy(), "title": "Plan"})),
+        ));
+        let note = note["id"].as_str().expect("id").to_owned();
+
+        for (id, reason) in [
+            (note.as_str(), AttachRejection::NotTerminal),
+            ("s_never_existed", AttachRejection::SessionNotFound),
+        ] {
+            let frames = refused_attach(&server, id);
+            assert_eq!(frames.len(), 1, "{id}: one frame, then EOF");
+            assert_eq!(frames[0].attach_rejected_payload(), Some(reason), "{id}");
+        }
     }
 
     #[test]
@@ -6407,6 +7798,71 @@ mod tests {
         assert_eq!(result["profiles"], json!([]));
     }
 
+    /// A session whose Holder was lost ends without exit facts, so its
+    /// terminal is never retained. Reading it says so in a code callers can
+    /// stop on, instead of `completed_terminal_unavailable` on every ask.
+    #[cfg(unix)]
+    #[test]
+    fn reading_a_lost_session_says_its_screen_was_not_kept() {
+        use diri_proto::process::{BootId, ProcessBirth, ProcessIdentity};
+        let temp = tempfile::tempdir().expect("temp");
+        let server = server(temp.path());
+        let mut record = test_record("lost");
+        // The run was bound while it lived; then a restart found it gone.
+        let child = ProcessIdentity::new(
+            4321,
+            ProcessBirth::Macos {
+                boot_session: BootId::parse("0f0e0d0c-0b0a-0908-0706-050403020100").unwrap(),
+                start_seconds: 1_700_000_000,
+                start_microseconds: 1,
+            },
+        )
+        .unwrap();
+        let key = crate::completed_terminal::CompletedRunKey::bind(&record, child, 10).unwrap();
+        record.status = diri_proto::SessionStatus::Exited(diri_proto::ExitInfo::restart(false));
+        let completed_dir = temp
+            .path()
+            .join(crate::registry::COMPLETED_TERMINALS_DIR_NAME);
+        std::fs::create_dir(&completed_dir).unwrap();
+        std::fs::set_permissions(
+            &completed_dir,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        {
+            let mut registry = server.registry.lock().expect("registry");
+            registry.insert_record(record);
+            let recovery = registry.recovery_directory("lost");
+            std::fs::create_dir_all(&recovery).unwrap();
+            diri_proto::recovery::SessionRecoveryStore::new(recovery)
+                .write_completed_run(&key)
+                .unwrap();
+        }
+
+        for (method, params) in [
+            ("session.read_screen", json!({ "sessionID": "lost" })),
+            ("session.read_scrollback", json!({ "sessionID": "lost" })),
+            (
+                "session.read_scrollback_cells",
+                json!({ "sessionID": "lost", "firstRow": 0, "maxRows": 1 }),
+            ),
+        ] {
+            let error = err_of(call(&server, method, Some(params)));
+            assert_eq!(
+                error.code,
+                diri_proto::control::TERMINAL_NOT_RETAINED,
+                "{method}: {error:?}"
+            );
+            assert!(error.message.contains("transcript"), "{error:?}");
+        }
+        let unknown = err_of(call(
+            &server,
+            "session.read_screen",
+            Some(json!({ "sessionID": "never" })),
+        ));
+        assert_eq!(unknown.code, "not_found");
+    }
+
     #[cfg(unix)]
     #[test]
     fn read_screen_serves_a_retained_terminal_for_a_completed_session() {
@@ -6418,6 +7874,8 @@ mod tests {
             reason: diri_proto::ExitReason::Exited,
             code: Some(0),
             signal: None,
+            system_restart: false,
+            interrupted: false,
         };
         record.status = diri_proto::SessionStatus::Exited(exit.clone());
         let child = ProcessIdentity::new(
@@ -6540,6 +7998,8 @@ mod tests {
                 reason: diri_proto::ExitReason::DaemonRestart,
                 code: None,
                 signal: None,
+                system_restart: false,
+                interrupted: false,
             });
             registry.insert_record(other);
         }
@@ -6725,6 +8185,7 @@ mod tests {
                 crate::agent_catalog::AgentPreference {
                     executable_path: Some(executable.to_string_lossy().into_owned()),
                     show_in_quick_create: Some(true),
+                    launch_args: vec!["--dangerously-skip-permissions".into()],
                 },
             )
             .expect("bind fake claude executable");
@@ -6740,6 +8201,10 @@ mod tests {
             command.contains(&format!("{}'", executable.display()))
                 && command.contains("'--resume' 'uuid-1'"),
             "resume flags must reach the agent: {command:?}"
+        );
+        assert!(
+            command.contains("'--dangerously-skip-permissions' '--resume' 'uuid-1'"),
+            "configured launch arguments precede the resume grammar: {command:?}"
         );
 
         let fork = server
@@ -6757,6 +8222,45 @@ mod tests {
             command.contains("'--resume' 'uuid-1' '--fork-session'"),
             "fork grammar must reach the agent: {command:?}"
         );
+        assert!(
+            command.contains("'--dangerously-skip-permissions'"),
+            "forks keep the configured launch arguments: {command:?}"
+        );
+    }
+
+    #[test]
+    fn configuring_an_agent_without_launch_args_keeps_them() {
+        let temp = tempfile::tempdir().expect("temp");
+        let server = server(temp.path());
+        let configure = |args: serde_json::Value| {
+            let mut params = json!({
+                "kind": "claude-code",
+                "executablePath": "/usr/bin/true",
+                "showInQuickCreate": true,
+            });
+            if !args.is_null() {
+                params["launchArgs"] = args;
+            }
+            let result: diri_proto::AgentConfigureResult =
+                serde_json::from_value(server.agent_configure(Some(params)).expect("configure"))
+                    .expect("result");
+            result
+                .agents
+                .into_iter()
+                .find(|item| item.kind.id() == "claude-code")
+                .expect("claude row")
+                .launch_args
+        };
+        assert_eq!(
+            configure(json!(["--dangerously-skip-permissions"])),
+            ["--dangerously-skip-permissions"]
+        );
+        assert_eq!(
+            configure(serde_json::Value::Null),
+            ["--dangerously-skip-permissions"],
+            "a client that only edits the path must not clear the arguments"
+        );
+        assert!(configure(json!([])).is_empty(), "an empty list clears them");
     }
 
     #[cfg(unix)]
@@ -6783,6 +8287,7 @@ mod tests {
                 crate::agent_catalog::AgentPreference {
                     executable_path: Some(executable.to_string_lossy().into_owned()),
                     show_in_quick_create: Some(true),
+                    launch_args: Vec::new(),
                 },
             )
             .unwrap();
@@ -6901,6 +8406,7 @@ mod tests {
                 crate::agent_catalog::AgentPreference {
                     executable_path: Some(configured.to_string_lossy().into_owned()),
                     show_in_quick_create: Some(true),
+                    launch_args: Vec::new(),
                 },
             )
             .expect("bind fake claude executable");
@@ -7025,6 +8531,57 @@ mod tests {
     #[test]
     fn revive_archived_session_clears_archive_durably() {
         check_resume_relaunches(true);
+    }
+
+    #[test]
+    fn resume_size_falls_back_to_the_last_screen_checkpoint() {
+        // After an Engine restart a dead session is no longer in the
+        // registry; its last checkpoint still records the size it ran at.
+        let temp = tempfile::tempdir().expect("temp");
+        let logs = temp.path().join("logs");
+        std::fs::create_dir_all(&logs).expect("logs");
+        let spec = crate::session::SessionSpec {
+            id: "s_gone".into(),
+            pty: crate::pty::PtySpec::new(vec!["/bin/sh".into()], "/tmp"),
+            manifest_id: "shell".into(),
+            authority: crate::Authority::ProcessOnly,
+            logs_dir: logs.clone(),
+            holder: None,
+            remote: None,
+            defer_launch: true,
+        };
+        assert_eq!(previous_screen_size(&spec), None, "no checkpoint, no size");
+
+        let row = vec![diri_proto::grid::GridCell::BLANK; 3];
+        let checkpoint = crate::checkpoint::ScreenCheckpoint {
+            keyboard_snapshot: None,
+            keyboard: None,
+            log_offset: 0,
+            history_metadata: Vec::new(),
+            history: Vec::new(),
+            grid: diri_proto::grid::GridUpdate {
+                cols: 3,
+                rows: 2,
+                cursor_col: 0,
+                cursor_row: 0,
+                cursor_visible: true,
+                is_full_snapshot: true,
+                changed_rows: vec![
+                    diri_proto::grid::ChangedRow::new(0, row.clone()),
+                    diri_proto::grid::ChangedRow::new(1, row),
+                ],
+            },
+            marker_buffer: Vec::new(),
+            alt_screen: false,
+            bracketed_paste: false,
+            mouse: diri_proto::terminal::MouseModes::default(),
+        };
+        checkpoint
+            .write_atomically(&crate::checkpoint::ScreenCheckpoint::path_for_log(
+                &logs.join("s_gone.bin"),
+            ))
+            .expect("write checkpoint");
+        assert_eq!(previous_screen_size(&spec), Some((3, 2)));
     }
 
     #[test]
@@ -7709,6 +9266,8 @@ mod tests {
                             content_seq: 1,
                             prompt_excerpt: None,
                             options: None,
+                            stale_after_submit: false,
+                            turn_started: false,
                         },
                     ));
             }
@@ -7783,10 +9342,18 @@ mod tests {
             Arc::clone(&registry),
             temp.path().join("daemon.sock"),
         ));
+        // Only SessionStart may move the tab to another conversation, so the
+        // later reports switch with it; applied out of order, the first
+        // prompt would arrive for a foreign conversation and lose its title.
         fn prompt(uuid: &str, prompt: &str) -> Option<JsonValue> {
+            let event = if uuid == "uuid-1" {
+                "UserPromptSubmit"
+            } else {
+                "SessionStart"
+            };
             Some(json!({
-                "kind": "claude-hook", "dirijorSessionID": "s_hook", "event": "UserPromptSubmit",
-                "payload": {"session_id": uuid, "hook_event_name": "UserPromptSubmit", "prompt": prompt},
+                "kind": "claude-hook", "dirijorSessionID": "s_hook", "event": event,
+                "payload": {"session_id": uuid, "hook_event_name": event, "prompt": prompt},
             }))
         }
         let busy = registry.lock().expect("registry");
@@ -8485,6 +10052,8 @@ mod tests {
         );
     }
 
+    /// Linux keeps the socket in the runtime dir and the app's hosts.json in
+    /// the config dir: every host the app added was "unknown" to the Engine.
     #[test]
     fn host_initialization_fails_closed_without_the_remote_transport() {
         let temp = tempfile::tempdir().expect("temp");
@@ -8510,6 +10079,44 @@ mod tests {
         ));
 
         assert_eq!(error.code, crate::remote::TRANSPORT_UNAVAILABLE_CODE);
+    }
+
+    /// Linux keeps the socket in `$XDG_RUNTIME_DIR/diri` and the app saves
+    /// hosts to `~/.config/diri/hosts.json`. Reading hosts beside the socket
+    /// answered every Settings "Connect" with `bad_request` (unknown host).
+    #[test]
+    fn hosts_come_from_the_config_dir_not_the_socket_dir() {
+        let temp = tempfile::tempdir().expect("temp");
+        let runtime = temp.path().join("run");
+        let config = temp.path().join("config");
+        std::fs::create_dir_all(&runtime).unwrap();
+        diri_proto::HostsConfig {
+            hosts: vec![diri_proto::HostEntry {
+                id: "forge".into(),
+                transport: Default::default(),
+                name: Some("Forge".into()),
+                ssh: "you@forge".into(),
+                default_cwd: None,
+                node: None,
+            }],
+        }
+        .save(config.join(diri_proto::paths::HOSTS_CONFIG_FILE_NAME))
+        .expect("host catalog");
+        let registry = Registry::new(engine(), temp.path().join("state.json"));
+        let server = Arc::new(
+            ControlServer::new(Arc::new(Mutex::new(registry)), runtime.join("daemon.sock"))
+                .with_config_dir(&config)
+                .with_remote_bindings_dir(temp.path().join("state")),
+        );
+
+        let listed = ok_of(call(&server, Method::HOST_LIST, None));
+
+        assert_eq!(listed["hosts"][0]["id"], "forge");
+        assert_eq!(
+            server.resolve_host("forge").map(|host| host.ssh).ok(),
+            Some("you@forge".to_owned())
+        );
+        assert!(temp.path().join("state/remote-bindings").is_dir());
     }
 
     #[test]
@@ -8653,14 +10260,35 @@ mod tests {
     #[test]
     fn cursor_trust_requires_the_live_selector() {
         let lines = |screen: &str| screen.lines().map(str::to_owned).collect::<Vec<_>>();
-        assert!(is_cursor_workspace_trust_screen(&lines(include_str!(
-            "../tests/fixtures/cursor_screens/trust.txt"
-        ))));
-        assert!(!is_cursor_workspace_trust_screen(&lines(include_str!(
+        let waiting = lines(include_str!("../tests/fixtures/cursor_screens/trust.txt"));
+        assert!(is_cursor_workspace_trust_screen(&waiting));
+        assert!(!cursor_composer_ready(&waiting));
+        // A build that paints the composer under the dialog and no footer.
+        let footerless = include_str!("../tests/fixtures/cursor_screens/trust.txt").replace(
+            "Use arrow keys to navigate, Enter to select, or press the key shown",
+            "",
+        ) + "  Cursor Agent\n  → Plan, search, build anything\n  Diri Fake\n";
+        let footerless = lines(&footerless);
+        assert!(is_cursor_workspace_trust_screen(&footerless));
+        assert!(
+            !cursor_composer_ready(&footerless),
+            "the composer under the dialog is not the input target"
+        );
+        // After `a` the box stays as stale paint above a composer that works.
+        let answered = lines(include_str!("../tests/fixtures/cursor_screens/trusted.txt"));
+        assert!(!is_cursor_workspace_trust_screen(&answered));
+        assert!(cursor_composer_ready(&answered));
+        for other in [
+            include_str!("../tests/fixtures/cursor_screens/idle.txt"),
+            include_str!("../tests/fixtures/cursor_screens/login.txt"),
+            include_str!("../tests/fixtures/cursor_screens/browser-login.txt"),
+            include_str!("../tests/fixtures/cursor_screens/working.txt"),
+        ] {
+            let screen = lines(other);
+            assert!(!is_cursor_workspace_trust_screen(&screen), "{other}");
+        }
+        assert!(cursor_composer_ready(&lines(include_str!(
             "../tests/fixtures/cursor_screens/idle.txt"
-        ))));
-        assert!(!is_cursor_workspace_trust_screen(&lines(include_str!(
-            "../tests/fixtures/cursor_screens/login.txt"
         ))));
     }
 
@@ -8693,15 +10321,98 @@ mod tests {
 
     #[test]
     fn workspace_trust_auto_accept_is_narrowly_scoped_to_claudes_exact_picker() {
-        assert!(is_claude_workspace_trust_screen(
-            "1. Yes, I trust this folder\n2. No, exit"
-        ));
-        assert!(!is_claude_workspace_trust_screen(
-            "1. Yes, allow this shell command\n2. No"
-        ));
-        assert!(!is_claude_workspace_trust_screen(
-            "Yes, I trust this folder"
-        ));
+        let lines = |text: &str| text.lines().map(str::to_owned).collect::<Vec<_>>();
+        let key = |screen: &str| claude_workspace_trust_key(&lines(screen));
+        // Claude Code 2.1.286, rendered: "No, exit" first, unnumbered, focused.
+        let current = " Claude Code'll be able to read, edit, and execute files here.\n\n \
+                       Security guide\n\n \
+                       ❯ No, exit\n   Yes, I trust this folder\n\n \
+                       Enter to confirm · Esc to cancel";
+        assert_eq!(key(current), Some(ClaudeTrustKey::Down));
+        let moved = current
+            .replace("❯ No, exit", "  No, exit")
+            .replace("  Yes, I trust", "❯ Yes, I trust");
+        assert_eq!(key(&moved), Some(ClaudeTrustKey::Confirm));
+        // The older numbered layout: "Yes" first and focused.
+        assert_eq!(
+            key("❯ 1. Yes, I trust this folder\n  2. No, exit\n\nEnter to confirm"),
+            Some(ClaudeTrustKey::Confirm)
+        );
+        assert_eq!(
+            key("  1. Yes, I trust this folder\n❯ 2. No, exit"),
+            Some(ClaudeTrustKey::Up)
+        );
+        // Not the picker: another dialog, the phrase alone, no focus.
+        assert_eq!(key("❯ 1. Yes, allow this shell command\n  2. No"), None);
+        assert_eq!(key("Yes, I trust this folder"), None);
+        assert_eq!(key("  Yes, I trust this folder\n  No, exit"), None);
+        // The phrases scrolled up out of the bottom of a busy screen.
+        let scrolled = format!("{current}{}", "\noutput".repeat(12));
+        assert_eq!(key(&scrolled), None);
+    }
+
+    /// Claude Code 2.1.287's first screen, as rendered in a fresh config.
+    const CLAUDE_THEME_PICKER: &str = " Let's get started.\n\n \
+        Choose the text style that looks best with your terminal\n \
+        To change this later, run /theme\n\n     \
+        Auto (match terminal)\n \
+        ❯ ✔ Dark mode\n     \
+        Light mode\n     \
+        Dark mode (colorblind-friendly)\n     \
+        Light mode (colorblind-friendly)\n     \
+        Dark mode (ANSI colors only)\n     \
+        Light mode (ANSI colors only)\n \
+        ╌╌╌╌╌╌╌╌\n  1  function greet() {\n \
+        ╌╌╌╌╌╌╌╌\n  Syntax theme: Monokai Extended (ctrl+t to disable)";
+
+    #[test]
+    fn the_first_run_text_style_follows_the_window_and_never_a_variant() {
+        use diri_proto::TerminalAppearance::{Dark, Light};
+        let lines = |text: &str| text.lines().map(str::to_owned).collect::<Vec<_>>();
+        let key = |screen: &str, appearance| claude_theme_key(&lines(screen), appearance);
+        assert_eq!(
+            key(CLAUDE_THEME_PICKER, Dark),
+            Some(ClaudeTrustKey::Confirm)
+        );
+        assert_eq!(key(CLAUDE_THEME_PICKER, Light), Some(ClaudeTrustKey::Down));
+        let on_light = CLAUDE_THEME_PICKER
+            .replace("❯ ✔ Dark mode", "  ✔ Dark mode")
+            .replace("     Light mode\n", " ❯   Light mode\n");
+        assert_eq!(key(&on_light, Light), Some(ClaudeTrustKey::Confirm));
+        assert_eq!(key(&on_light, Dark), Some(ClaudeTrustKey::Up));
+        // Past the colorblind variant: back up, never confirm it.
+        let past = CLAUDE_THEME_PICKER
+            .replace("❯ ✔ Dark mode", "  ✔ Dark mode")
+            .replace("     Light mode (colorblind", " ❯   Light mode (colorblind");
+        assert_eq!(key(&past, Light), Some(ClaudeTrustKey::Up));
+        // A numbered layout.
+        assert_eq!(
+            key(
+                "Choose the text style\n❯ 1. Dark mode\n  2. Light mode",
+                Light
+            ),
+            Some(ClaudeTrustKey::Down)
+        );
+        // Any other list that happens to say "Light mode" is not the picker.
+        assert_eq!(key("/theme\n❯ Dark mode\n  Light mode", Light), None);
+    }
+
+    #[test]
+    fn first_run_screens_hold_the_trust_watch_but_a_composer_does_not() {
+        let lines = |text: &str| text.lines().map(str::to_owned).collect::<Vec<_>>();
+        assert!(claude_first_run_screen(&lines(CLAUDE_THEME_PICKER)));
+        assert!(claude_first_run_screen(&lines(
+            " Select login method:\n ❯ 1. Claude account with subscription"
+        )));
+        assert!(claude_first_run_screen(&lines(
+            " Browser didn't open? Use the url below to sign in\n Paste code here if prompted >"
+        )));
+        assert!(claude_first_run_screen(&lines(
+            " Security notes:\n 1. Claude can make mistakes.\n Press Enter to continue…"
+        )));
+        assert!(!claude_first_run_screen(&lines(
+            "╭────╮\n│ > │\n╰────╯\n  ? for shortcuts"
+        )));
     }
 
     #[test]
@@ -8727,6 +10438,30 @@ mod tests {
         assert!(!watch.observe(0, 0, at(1000), grace));
         assert!(!watch.observe(0, 0, at(1599), grace));
         assert!(watch.observe(0, 0, at(1600), grace));
+    }
+
+    #[test]
+    fn openssh_failures_become_structured_codes_not_internal() {
+        use crate::remote::ssh_error::{SshFailure, SshFailureClass};
+        let error = io_control_error(
+            SshFailure::new(
+                SshFailureClass::UnresolvedHost,
+                "remote platform probe",
+                b"ssh: Could not resolve hostname hogwarts: nodename nor servname provided, or not known\n",
+            )
+            .into_io_error(),
+        );
+        assert_eq!(error.code, "ssh_unresolved_host");
+        assert!(
+            error
+                .message
+                .starts_with("SSH could not resolve the host name.")
+        );
+        assert!(
+            error
+                .message
+                .contains("Could not resolve hostname hogwarts")
+        );
     }
 
     #[test]
@@ -8805,5 +10540,50 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         panic!("subscription worker did not observe Drop cancellation");
+    }
+}
+
+#[cfg(test)]
+mod pane_placement_tests {
+    use super::*;
+    use diri_proto::workspace::{DockEdge, SpawnPane};
+
+    #[test]
+    fn a_parented_shell_docks_below_its_parent_unless_told_otherwise() {
+        let shell = serde_json::to_value(diri_proto::AgentKind::SHELL).unwrap();
+        let claude = serde_json::to_value(diri_proto::AgentKind::CLAUDE_CODE).unwrap();
+        let placement = |params: JsonValue| spawn_pane_placement(&params).unwrap();
+        // An Agent's MCP `shell` child, and a ⌘J from an older client.
+        assert_eq!(
+            placement(json!({"kind": shell, "cwd": "/w", "parent": "s_1"})),
+            Some(SpawnPane::BelowParent)
+        );
+        // A top-level shell, or a child Agent, is not a pane.
+        assert_eq!(placement(json!({"kind": shell, "cwd": "/w"})), None);
+        assert_eq!(
+            placement(json!({"kind": claude, "cwd": "/w", "parent": "s_1"})),
+            None
+        );
+        // Explicit placements win, including "not a pane".
+        assert_eq!(
+            placement(
+                json!({"kind": shell, "cwd": "/w", "parent": "s_1", "pane": {"type": "detached"}})
+            ),
+            Some(SpawnPane::Detached)
+        );
+        assert_eq!(
+            placement(json!({"kind": shell, "cwd": "/w", "pane": {
+                "type": "beside", "tabId": "t", "target": "p", "edge": "right"
+            }})),
+            Some(SpawnPane::Beside {
+                tab_id: diri_proto::workspace::TabId::new("t"),
+                target: diri_proto::workspace::PaneId::new("p"),
+                edge: DockEdge::Right,
+            })
+        );
+        // A malformed hint is refused before anything spawns.
+        assert!(
+            spawn_pane_placement(&json!({"kind": shell, "pane": {"type": "sideways"}})).is_err()
+        );
     }
 }

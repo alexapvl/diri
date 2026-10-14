@@ -92,8 +92,10 @@ fn parse_distributions(bytes: &[u8]) -> std::io::Result<Vec<String>> {
             return Err(invalid());
         }
         let units = bytes
-            .chunks_exact(2)
-            .map(|p| u16::from_le_bytes([p[0], p[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair))
             .collect::<Vec<_>>();
         String::from_utf16(&units).map_err(|_| invalid())?
     } else {

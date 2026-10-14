@@ -69,8 +69,8 @@ impl Sidebar {
             .rounded(px(SIDEBAR_ROW_RADIUS))
             .flex()
             .items_center()
-            .gap(px(7.0))
-            .px(px(9.0))
+            .gap(px(8.0))
+            .px(px(Space::ROW_H))
             .text_size(px(Typo::META.size))
             .text_color(colors.secondary)
             .cursor_text()
@@ -84,7 +84,16 @@ impl Sidebar {
                 this.filter_focus.focus(window, cx);
                 cx.notify();
             }))
-            .child(sf_symbol("magnifyingglass", 11.0, colors.secondary));
+            // Same leading and title columns as the rows above.
+            .child(
+                div()
+                    .size(px(LEADING_SLOT))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(sf_symbol("magnifyingglass", 11.0, colors.secondary)),
+            );
         if self.filter_open {
             control = control.child(
                 div()
@@ -94,9 +103,9 @@ impl Sidebar {
                     .overflow_hidden()
                     .role(Role::TextInput)
                     .aria_label(if self.workspace_nav.active.is_some() {
-                        "Filter tab labels"
+                        t("sidebar.filter.tabs")
                     } else {
-                        "Filter session labels"
+                        t("sidebar.filter.sessions")
                     })
                     .child(if self.filter_focus.is_focused(window) {
                         query_label(&self.filter_query)
@@ -111,16 +120,14 @@ impl Sidebar {
                     .id("clear-sidebar-filter")
                     .debug_selector(|| "clear-sidebar-filter".into())
                     .role(Role::Button)
-                    .aria_label("Clear filter")
-                    .size(px(20.0))
-                    .flex_none()
-                    .cursor_pointer()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(5.0))
-                    .hover(move |button| button.bg(colors.primary.alpha(0.08)))
-                    .child(sf_symbol("xmark", 9.0, colors.tertiary))
+                    .aria_label(t("sidebar.filter.clear"))
+                    .trailing_row_action(colors)
+                    .child(sf_symbol_weighted(
+                        "xmark",
+                        8.5,
+                        SymbolWeight::Bold,
+                        colors.secondary,
+                    ))
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.filter_query.clear();
                         this.filter_open = false;
@@ -132,8 +139,8 @@ impl Sidebar {
         } else {
             control = control
                 .role(Role::Button)
-                .aria_label("Filter agents")
-                .child("Filter agents");
+                .aria_label(t("sidebar.filter.agents"))
+                .child(t("sidebar.filter.agents"));
         }
         let expanded = (self.ui.width - Space::INSET * 2.0).max(0.0);
         if self.filter_open && !cx.reduce_motion() {

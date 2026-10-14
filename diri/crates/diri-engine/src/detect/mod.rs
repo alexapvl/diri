@@ -44,6 +44,11 @@ pub struct ScreenObservation {
     pub content_seq: u64,
     pub prompt_excerpt: Option<String>,
     pub options: Option<Vec<String>>,
+    /// The rule's `stale_after_submit` flag: right after a submit this screen
+    /// can still be the previous turn's composer, so it cannot end the new one.
+    pub stale_after_submit: bool,
+    /// The rule's `turn_started` flag: proof the submitted turn is running.
+    pub turn_started: bool,
 }
 
 /// Immutable manifest storage, built once and shared across sessions.
@@ -254,6 +259,8 @@ impl ManifestEngine {
             content_seq: snapshot.content_seq,
             prompt_excerpt: excerpt,
             options,
+            stale_after_submit: rule.has_flag("stale_after_submit"),
+            turn_started: rule.has_flag("turn_started"),
         })
     }
 }
@@ -363,7 +370,7 @@ mod tests {
 
         // The whole catalog, by name. A shrunken catalog does not error: a
         // missing agent just spawns as a bare login shell, which is how this
-        // shipped broken once already. Spelling out all twenty-two ids means a
+        // shipped broken once already. Spelling out all twenty-three ids means a
         // dropped manifest fails here instead of in someone's terminal.
         let mut ids = engine.ids();
         ids.sort_unstable();
@@ -392,6 +399,7 @@ mod tests {
                 "pi",
                 "qoder",
                 "shell",
+                "whipcode",
             ]
         );
 
@@ -403,7 +411,7 @@ mod tests {
             .into_iter()
             .map(|id| engine.manifest(id).expect("manifest").rules.len())
             .sum();
-        assert_eq!(rules, 119, "the shipped ruleset lost rules");
+        assert_eq!(rules, 135, "the shipped ruleset lost rules");
 
         for id in engine.ids() {
             let expected_empty = matches!(id, "shell" | "generic");
@@ -419,7 +427,7 @@ mod tests {
     /// decodes it as `diri_proto::AgentDescriptor`. That type needs `id` and
     /// `displayName`, and a single manifest missing either fails the *whole*
     /// response — leaving the client with no catalog and every agent spawning
-    /// as a bare shell. Decode all twenty-two the way the client will.
+    /// as a bare shell. Decode all twenty-three the way the client will.
     #[test]
     fn every_shipped_descriptor_decodes_the_way_the_client_decodes_it() {
         let engine = engine();
@@ -666,6 +674,109 @@ mod tests {
         }
     }
 
+    /// Gemini CLI 0.62 signed out, captured by `tests/gemini_real.rs`: the
+    /// auth picker replaces the composer, and the browser confirmation it
+    /// leads to carries "Esc to cancel", which the working rule read as a
+    /// turn in progress.
+    #[test]
+    fn gemini_sign_in_screens_need_input() {
+        let engine = engine();
+        for text in [
+            include_str!("../../tests/fixtures/gemini_screens/auth.txt"),
+            include_str!("../../tests/fixtures/gemini_screens/auth_browser.txt"),
+        ] {
+            let observation = engine
+                .evaluate(
+                    &ScreenSnapshot::from_lines(text.lines().map(str::to_owned)),
+                    "gemini",
+                )
+                .expect("Gemini sign-in screen should match");
+            assert_eq!(
+                (observation.state, observation.matched_rule_id.as_str()),
+                (ManifestState::BlockedQuestion, "auth-dialog"),
+                "{text}"
+            );
+        }
+    }
+
+    /// Visible grids captured from Antigravity CLI (agy) 1.2.17 via
+    /// `tests/antigravity_real.rs`; the onboarding pages from a PTY run of
+    /// the same build. Only the temporary project path is normalized. Before
+    /// these rules agy had no idle rule, so its "Signing in..." spinner left
+    /// every session working until it went stale; login, trust, onboarding
+    /// and `ask_question` matched nothing; and the permission rule wanted
+    /// "edit command" and "do you want to proceed?", which 1.2 no longer
+    /// draws, so no approval ever read as blocked.
+    #[test]
+    fn antigravity_rules_match_the_screens_agy_draws() {
+        let engine = engine();
+        let cases = [
+            (
+                "login",
+                Some((ManifestState::BlockedQuestion, "login-method-dialog")),
+            ),
+            (
+                "onboarding_color",
+                Some((ManifestState::BlockedQuestion, "onboarding-dialog")),
+            ),
+            (
+                "onboarding_terms",
+                Some((ManifestState::BlockedQuestion, "onboarding-dialog")),
+            ),
+            (
+                "trust",
+                Some((ManifestState::BlockedQuestion, "workspace-trust-dialog")),
+            ),
+            ("fresh", Some((ManifestState::Idle, "idle-composer"))),
+            ("done", Some((ManifestState::Idle, "idle-composer"))),
+            ("idle", Some((ManifestState::Idle, "idle-composer"))),
+            ("denied", Some((ManifestState::Idle, "idle-composer"))),
+            ("ctrl_c_once", Some((ManifestState::Idle, "idle-composer"))),
+            (
+                "working",
+                Some((ManifestState::Working, "working-spinner-verb")),
+            ),
+            (
+                "permission_command",
+                Some((
+                    ManifestState::BlockedPermission,
+                    "blocked-permission-request",
+                )),
+            ),
+            (
+                "permission_file",
+                Some((
+                    ManifestState::BlockedPermission,
+                    "blocked-permission-request",
+                )),
+            ),
+            (
+                "question",
+                Some((ManifestState::BlockedQuestion, "blocked-ask-question")),
+            ),
+            // Typing a slash command swaps the footer for "esc to cancel":
+            // neither work nor a finished turn, so the status stays put.
+            ("slash_menu", None),
+        ];
+        for (name, expected) in cases {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/antigravity_screens")
+                .join(format!("{name}.txt"));
+            let text = std::fs::read_to_string(&path).expect("fixture screen");
+            let actual = engine
+                .evaluate(
+                    &ScreenSnapshot::from_lines(text.lines().map(str::to_owned)),
+                    "antigravity",
+                )
+                .map(|observation| (observation.state, observation.matched_rule_id));
+            assert_eq!(
+                actual.as_ref().map(|(state, rule)| (*state, rule.as_str())),
+                expected,
+                "{name}:\n{text}"
+            );
+        }
+    }
+
     /// Screens captured from Pi 0.99.2 (and 0.73.1, whose loader sits above
     /// the composer instead of in its border) driven by tests/pi_real.rs.
     #[test]
@@ -782,6 +893,72 @@ mod tests {
                 (observation.state, observation.matched_rule_id.as_str()),
                 (state, rule_id),
                 "{lines:#?}"
+            );
+        }
+    }
+
+    /// Visible grids captured from Droid 0.233.0 via `tests/droid_real.rs`.
+    /// Only the temporary project path is normalized in the fixture screens.
+    /// Before these rules Droid had no idle rule, so every finished turn read
+    /// as unknown; its trust dialog matched nothing and stayed "starting";
+    /// and the approval options sit inside a box border the old line regex
+    /// could not get past, so a permission never read as blocked.
+    #[test]
+    fn droid_rules_match_the_screens_droid_draws() {
+        let engine = engine();
+        let cases = [
+            (
+                include_str!("../../tests/fixtures/droid_screens/trust.txt"),
+                ManifestState::BlockedQuestion,
+                "workspace-trust-dialog",
+            ),
+            (
+                include_str!("../../tests/fixtures/droid_screens/idle.txt"),
+                ManifestState::Idle,
+                "idle-composer",
+            ),
+            (
+                include_str!("../../tests/fixtures/droid_screens/idle_no_model.txt"),
+                ManifestState::Idle,
+                "idle-composer",
+            ),
+            (
+                include_str!("../../tests/fixtures/droid_screens/done.txt"),
+                ManifestState::Idle,
+                "idle-composer",
+            ),
+            (
+                include_str!("../../tests/fixtures/droid_screens/working_stream.txt"),
+                ManifestState::Working,
+                "working-spinner-stop",
+            ),
+            (
+                include_str!("../../tests/fixtures/droid_screens/working_execute.txt"),
+                ManifestState::Working,
+                "working-spinner-stop",
+            ),
+            (
+                include_str!("../../tests/fixtures/droid_screens/permission.txt"),
+                ManifestState::BlockedPermission,
+                "blocked-approval-panel",
+            ),
+            (
+                include_str!("../../tests/fixtures/droid_screens/ask_user.txt"),
+                ManifestState::BlockedQuestion,
+                "blocked-ask-user",
+            ),
+        ];
+        for (text, state, rule_id) in cases {
+            let actual = engine
+                .evaluate(
+                    &ScreenSnapshot::from_lines(text.lines().map(str::to_owned)),
+                    "droid",
+                )
+                .expect("captured Droid screen must match");
+            assert_eq!(
+                (actual.state, actual.matched_rule_id.as_str()),
+                (state, rule_id),
+                "{text}"
             );
         }
     }
@@ -930,6 +1107,188 @@ mod tests {
             assert_eq!(
                 (observation.state, observation.matched_rule_id.as_str()),
                 (state, rule)
+            );
+        }
+    }
+
+    /// Captured from whipcode v1.0.0 at 120x36 against
+    /// `tests/fixtures/fake_openai_api.py` (see tests/whipcode_real.rs); the
+    /// left column is whipcode's own sidebar, the cwd footer is shortened.
+    #[test]
+    fn whipcode_rules_match_the_screens_whipcode_draws() {
+        let composer = |placeholder: &'static str, footer: &'static str| {
+            vec![
+                "    [2] Context                        0%",
+                "                                            ┃",
+                placeholder,
+                "                                            ┃",
+                "    [3] LSP                             0   ┃  Off · fake-model  fake",
+                "                                            ┃",
+                footer,
+            ]
+        };
+        let idle_footer = " ~/project                                                    ctrl+r repl  ctrl+p commands";
+        let busy_footer = " ⬝⬝⬝■■■⬝⬝ esc interrupt                                        ctrl+r repl  ctrl+p commands";
+        let idle_input = "                                            ┃  Ask whipcode anything… (/ commands, tab completes)";
+        let busy_input =
+            "                                            ┃  busy — enter steers the running turn";
+        let with = |head: &[&'static str], tail: Vec<&'static str>| {
+            head.iter().copied().chain(tail).collect::<Vec<_>>()
+        };
+        let permission = [
+            "    blocked root       In[1] print(shell…",
+            "                                            ⚒ rlm_exec {\"code\": \"print(shell.run(command=\\\"touch diri-e2e-file\\\"))\"}",
+            "                                            ⚠ Allow bash?",
+            "                                              touch diri-e2e-file",
+            "                                              always: bash touch",
+            "                                              agent src5sni7oyp4ak4vn3qa · permission 09791b3401fcf6355f4da264ba5faa1a",
+        ];
+        let cases = [
+            (
+                with(&["    idle root"], composer(idle_input, idle_footer)),
+                ManifestState::Idle,
+                "idle-footer",
+            ),
+            (
+                // Typed-but-unsent text hides the placeholder; the footer still reads idle.
+                with(
+                    &["    idle root"],
+                    composer(
+                        "                                            ┃  fix the build",
+                        idle_footer,
+                    ),
+                ),
+                ManifestState::Idle,
+                "idle-footer",
+            ),
+            (
+                with(
+                    &[
+                        "    running root",
+                        "                                            ● slow part 0 slow part 1",
+                    ],
+                    composer(busy_input, busy_footer),
+                ),
+                ManifestState::Working,
+                "footer-interrupt",
+            ),
+            (
+                with(
+                    &["    running root"],
+                    composer(
+                        busy_input,
+                        " ■■■⬝⬝⬝⬝⬝ esc again to interrupt                               ctrl+r repl  ctrl+p commands",
+                    ),
+                ),
+                ManifestState::Working,
+                "footer-interrupt",
+            ),
+            (
+                // The leader chord replaces the footer for two seconds.
+                with(
+                    &["    running root"],
+                    composer(
+                        busy_input,
+                        " ctrl+x r repl b sidebar 1·2·3 panels s stop t themes m model",
+                    ),
+                ),
+                ManifestState::Working,
+                "busy-placeholder",
+            ),
+            (
+                with(
+                    &permission,
+                    with(
+                        &[
+                            "                                              ❯ allow once (a)    allow always for this tree (t)    reject (r)",
+                        ],
+                        composer(busy_input, busy_footer),
+                    ),
+                ),
+                ManifestState::BlockedPermission,
+                "permission-dialog",
+            ),
+            (
+                // After 'r' the options give way to the reason field.
+                with(
+                    &permission,
+                    with(
+                        &[
+                            "                                              reject with message: █",
+                            "                                              enter sends · esc back",
+                        ],
+                        composer(busy_input, busy_footer),
+                    ),
+                ),
+                ManifestState::BlockedPermission,
+                "permission-dialog",
+            ),
+            (
+                with(
+                    &[
+                        "    running root       In[1] print(user.…",
+                        "                                                Question                                                        esc",
+                        "                                                Which database should I use?",
+                        "                                                1 Postgres                                               relational",
+                        "                                                2 SQLite                                                   embedded",
+                        "                                                ↑↓ select  enter answer  esc dismiss  1-2 jump",
+                    ],
+                    composer(busy_input, busy_footer),
+                ),
+                ManifestState::BlockedQuestion,
+                "question-dialog",
+            ),
+            (
+                with(
+                    &[
+                        "                                                     Connect a provider                                     esc",
+                        "                                                     Search",
+                        "                                                     Popular",
+                        "                                                     OpenRouter",
+                        "                                                     Custom endpoint",
+                        "                                                     enter select  ctrl+e manage",
+                    ],
+                    composer(
+                        "                                            ┃  Connect a provider to get started · /connect",
+                        " ~/project                                                     /connect providers  ctrl+p commands",
+                    ),
+                ),
+                ManifestState::BlockedQuestion,
+                "provider-picker",
+            ),
+            (
+                // The picker dismissed: its hint remains in the composer, which is ready.
+                composer(
+                    "                                            ┃  Connect a provider to get started · /connect",
+                    " ~/project                                                     /connect providers  ctrl+p commands",
+                ),
+                ManifestState::Idle,
+                "idle-footer",
+            ),
+            (
+                // An answered permission leaves only the tool row and its result.
+                with(
+                    &[
+                        "                                               ⚙ rlm_exec {\"code\": \"print(shell.run(command=\\\"touch diri-e2e-file\\\"))…",
+                        "                                               ↳ Error: Permission denied: the user rejected this action",
+                        "                                               The command ran. DONECMD",
+                    ],
+                    composer(idle_input, idle_footer),
+                ),
+                ManifestState::Idle,
+                "idle-footer",
+            ),
+        ];
+
+        let engine = engine();
+        for (lines, state, rule) in cases {
+            let observation = engine
+                .evaluate(&ScreenSnapshot::from_lines(lines.clone()), "whipcode")
+                .unwrap_or_else(|| panic!("WhipCode screen should match: {lines:#?}"));
+            assert_eq!(
+                (observation.state, observation.matched_rule_id.as_str()),
+                (state, rule),
+                "{lines:#?}"
             );
         }
     }
@@ -1442,7 +1801,7 @@ mod tests {
         }
     }
 
-    /// Real 100x30 screens from cursor-agent 2026.09.28-64d2043 through
+    /// Real 100x30 screens from cursor-agent 2026.10.01-14929f9 through
     /// tests/cursor_real.rs, default zen UI (OSC status indicators off).
     #[test]
     fn cursor_rules_match_the_screens_cursor_cli_draws() {
@@ -1473,9 +1832,14 @@ mod tests {
                 ManifestState::BlockedPermission,
                 "confirm-dialog",
             ),
-            // The accepted trust dialog stays above this composer; it must not stick.
             (
                 include_str!("../../tests/fixtures/cursor_screens/idle.txt"),
+                ManifestState::Idle,
+                "idle-follow-up-placeholder",
+            ),
+            // The answered trust box stays above the composer; it must not stick.
+            (
+                include_str!("../../tests/fixtures/cursor_screens/trusted.txt"),
                 ManifestState::Idle,
                 "idle-follow-up-placeholder",
             ),
@@ -1543,6 +1907,72 @@ mod tests {
         let observation = engine.evaluate(&idle_prompt, "cursor").expect("match");
         assert_eq!(observation.state, ManifestState::Idle);
         assert_eq!(observation.matched_rule_id, "idle-prompt-arrow");
+    }
+
+    #[test]
+    fn cursor_permission_prompts_from_2026_10_01_still_block() {
+        let engine = engine();
+        for prompt in [
+            "Run this command?",
+            "Run this command outside the sandbox?",
+            "Read this file?",
+            "Allow this web search?",
+            "Allow this web fetch?",
+            "Proceed with this edit?",
+        ] {
+            let observation = engine
+                .evaluate(
+                    &cursor_snapshot(&[prompt, "→ Run (once) (y)"], None),
+                    "cursor",
+                )
+                .expect(prompt);
+            assert_eq!(
+                observation.state,
+                ManifestState::BlockedPermission,
+                "{prompt}"
+            );
+            assert_eq!(observation.matched_rule_id, "confirm-dialog", "{prompt}");
+        }
+        // The same words inside a prompt or reply are not a dialog.
+        let prose = engine
+            .evaluate(
+                &cursor_snapshot(
+                    &[
+                        "can you read this file? and allow this web fetch?",
+                        "⠠⠜ Generating",
+                    ],
+                    None,
+                ),
+                "cursor",
+            )
+            .expect("working");
+        assert_eq!(prose.state, ManifestState::Working);
+    }
+
+    /// Composer chrome may be the previous turn's right after Enter; the
+    /// status line proves the new one started. The reducer reads these flags.
+    #[test]
+    fn cursor_rules_flag_submit_chrome_and_turn_start() {
+        let engine = engine();
+        let evaluate = |lines: &[&str]| {
+            engine
+                .evaluate(&cursor_snapshot(lines, None), "cursor")
+                .expect("match")
+        };
+        let arrow = evaluate(&["→ Add a follow-up"]);
+        assert!(arrow.stale_after_submit && !arrow.turn_started);
+        let placeholder = evaluate(&["→ Plan, search, build anything"]);
+        assert!(placeholder.stale_after_submit);
+        let working = evaluate(&["⠠⠜ Generating", "→ Add a follow-up"]);
+        assert!(working.turn_started && !working.stale_after_submit);
+        let ready = engine
+            .evaluate(
+                &cursor_snapshot(&["→ Add a follow-up"], Some("Chat - Ready")),
+                "cursor",
+            )
+            .expect("ready");
+        assert_eq!(ready.matched_rule_id, "idle-osc-title");
+        assert!(!ready.stale_after_submit);
     }
 
     #[test]
@@ -1650,6 +2080,11 @@ mod tests {
                 "opencode",
                 "curl -fsSL https://opencode.ai/install | bash",
                 None,
+            ),
+            (
+                "whipcode",
+                "curl -fsSL https://raw.githubusercontent.com/context-labs/whip/main/install.sh | sh",
+                Some("Python 3"),
             ),
         ]
         .map(|(id, command, requirement)| {

@@ -2822,3 +2822,131 @@ cargo test -p diri-engine --features latency-trace --test keystroke_latency \
 `attach::a_held_session_publishes_an_echo_without_waiting_out_the_batch`
 guards the regression (median 9.3 ms before, sub-millisecond after, asserts
 ≤ 5 ms).
+
+## Working marks without rendering — 2026-10-02
+
+The installed 0.9.1 app sat at 15–23% CPU with two agents working and nothing
+else moving. An Instruments trace showed about 23 frames a second at about
+5 ms each, and the sidebar re-rendering in about 14 of them: every 125 ms
+working-mark step notified the working rows, a notify marks every ancestor
+dirty, and the sidebar re-ran taffy layout over its whole tree to swap one
+14px sprite.
+
+The eight working frames are now rasterized once and swapped inside the
+already-drawn scene (`Window::paint_animated_svg` in the vendored GPUI, see
+`vendor/gpui/DIRI_PATCHES.md`). On an idle display refresh the window only
+checks the clock; on a step boundary it rewrites the marks' tiles and
+presents the same scene again. Nothing renders, lays out or paints, and the
+sidebar's 8 Hz tick now runs only for indeterminate progress sweeps.
+
+| per working-mark step, 51 sessions / 4 working, release | main thread |
+| --- | ---: |
+| before: sidebar render (cached rows reused) | 1.10 ms |
+| after: tile swap in the drawn scene | 0.0001 ms |
+
+Presenting the frame (GPU encode) is the same in both. Reproduce from `diri/`:
+
+```sh
+cargo test --release -p diri-app --bin diri -- --ignored --nocapture \
+    --test-threads=1 working_mark_step_cost
+```
+
+`swapped_working_mark_frames_paint_like_a_full_render` checks the swapped
+frames pixel for pixel against full renders under headless Metal, and
+`working_marks_advance_without_rendering_anything` asserts that a step
+renders no view.
+
+## Sidebar rows outside the viewport are not built (2026-10-04)
+
+**Where the time went.** Session rows are cached views (#517), but the list
+still mounted every row each sidebar render: props computed and compared, a
+view and its wrapper laid out, prepainted, and its cached ranges replayed. A
+notify the props cannot account for (`rows_stale`) re-rendered every row, and
+GPUI notifies the sidebar on every scroll-wheel step, so scrolling a long
+list rebuilt all of it per frame. Even a root-only frame replayed every row.
+
+**What changed.** The list walks its rows top to bottom with a content-space
+cursor (`sidebar/row_window.rs`, the idea of Ely GPUI's `VirtualList`) and
+builds only the rows within the viewport plus overscan (half a viewport,
+at least 240 px, each side). Each skipped run becomes one spacer of the same
+height, so the column lays out exactly as before and the scroll container,
+section lifts and shifts, disclosures, drops and edge fades are unchanged.
+Held rows are always built: selection, keyboard cursor, hover and its card,
+rename, delegation mark, rows a drag carries, and settling titles. Motion
+that moves rows off their walked slot (a disclosure, a section shift, a
+lifted project, a row growing in) builds every row while it runs. The
+keyboard reveals unbuilt rows from their walked slots.
+
+**How it was measured.** `sidebar_fleet_render_cost` (root.rs, ignored,
+macOS, headless Metal) now takes `DIRI_BENCH_PROJECTS` and has three more
+cases: `sidebar-notify` (a notify that stales every row), `scroll-step` (one
+wheel step: offset moved and the sidebar notified) and `full-refresh`
+(`window.refresh()`). Release build, 150 steps, 4 working sessions, 20
+projects, step median (render + layout + prepaint + paint):
+
+| Case | 50 sessions | 200 sessions | 1,000 sessions |
+| --- | ---: | ---: | ---: |
+| Scroll step | 2.67 → 2.51 ms | 5.83 → 2.93 ms | 32.75 → 5.28 ms |
+| Sidebar notify (rows stale) | 2.61 → 2.21 ms | 5.84 → 2.54 ms | 33.10 → 4.87 ms |
+| Full refresh | 2.92 → 2.59 ms | 6.28 → 2.82 ms | 34.52 → 6.20 ms |
+| Activity tick | 1.98 → 1.84 ms | 2.90 → 2.10 ms | 9.26 → 4.13 ms |
+| Store publication (nothing changed) | 1.93 → 1.84 ms | 2.90 → 2.22 ms | 9.94 → 4.16 ms |
+| Root-only frame | 0.36 → 0.33 ms | 0.79 → 0.43 ms | 3.69 → 2.24 ms |
+
+Rows built per stale step fell from 50 / 200 / 1,000 to 28 / 36 / 39. At a
+realistic 50 sessions the win is small; it grows with the list, and at 1,000
+sessions a scroll step goes from below 30 fps to well inside one frame.
+What remains at 1,000 is O(sessions) work outside the rows (projection,
+focus rows, the walk itself).
+
+**Visual checks.** `windowed_sidebar_rows_paint_like_every_row_built`
+captures 1,000 sessions scrolled into the middle with windowing on and off
+and requires identical pixels. Unit and GPUI tests in `row_window.rs` and
+`sidebar/view/windowing.rs` check that walked slots match painted bounds in
+both groupings (archives, collapsed projects, the preview fleet), that every
+row in view is built after scrolling, keyboard reveal of a never-built row,
+shift-click ranges across unbuilt rows, and a drag whose source scrolls out
+of view.
+
+```sh
+DIRI_BENCH_SESSIONS=1000 DIRI_BENCH_PROJECTS=20 DIRI_BENCH_ITERATIONS=150 \
+  cargo test --release -p diri-app --bin diri sidebar_fleet_render_cost -- --ignored --nocapture
+cargo test --release -p diri-app --bin diri -- --ignored --exact \
+  root::tests::windowed_sidebar_rows_paint_like_every_row_built
+```
+
+## One process coalition per Agent, at no memory cost (2026-10-04)
+
+Force-quitting a Chrome that an Agent's browser MCP server had launched
+SIGTERMed 184 processes, every session included: LaunchServices force-quits
+an app's whole process coalition, and every Agent descended from the one
+Holder manager, so all of them, and that Chrome, shared one.
+
+On macOS a bundled Engine now has the manager start each Agent as a launchd
+job of its own (a fresh coalition) through diri.app's own executable, which
+forks, takes the PTY as its controlling terminal and execs the Agent. The
+job's process exits at once; TCC keeps crediting diri.app through the fork
+and the exec. The manager keeps the PTY and is itself a launchd job, outside
+any app launch's coalition.
+
+**Memory and idle cost: none.** The process tree per session is unchanged
+(the Agent and what it starts); no trampoline, Holder or guard is added. A
+per-session-process design measured 6.2 MB a session (trampoline 3.3, holder
+1.6, guard 1.3) against the shared manager's 4.2 MB for a whole fleet, and was
+dropped for this one.
+
+**Launch cost** (15 launches each, release, `/bin/sleep` Agent):
+
+| Spawn | p50 | p90 | first (cold) |
+| --- | ---: | ---: | ---: |
+| detached (launchd job) | 31.1 ms | 33.9 ms | 752 ms |
+| direct (Holder's child) | 1.0 ms | 1.3 ms | 1.6 ms |
+
+Paid once per Agent start, which itself takes seconds.
+
+```sh
+cargo build -p diri-app --bin diri
+DIRI_AGENT_LAUNCHER=$PWD/target/debug/diri \
+  cargo test -p diri-engine --test detached_agent -- --ignored
+```
+

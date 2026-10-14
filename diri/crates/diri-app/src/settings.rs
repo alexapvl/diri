@@ -17,11 +17,11 @@ pub enum SettingsSection {
 }
 
 impl SettingsSection {
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Personal => "Personal",
-            Self::System => "System",
-        }
+    pub fn label(self) -> &'static str {
+        crate::i18n::t(match self {
+            Self::Personal => "settings.section.personal",
+            Self::System => "settings.section.system",
+        })
     }
 }
 
@@ -46,6 +46,7 @@ pub enum SettingsTab {
     WhatsNew,
     Agents,
     Skills,
+    Schedules,
     Accounts,
     Shortcuts,
     Terminal,
@@ -57,11 +58,12 @@ pub enum SettingsTab {
 }
 
 impl SettingsTab {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::General,
         Self::WhatsNew,
         Self::Agents,
         Self::Skills,
+        Self::Schedules,
         Self::Accounts,
         Self::Shortcuts,
         Self::Terminal,
@@ -72,38 +74,40 @@ impl SettingsTab {
         Self::Phone,
     ];
 
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::General => "General",
-            Self::WhatsNew => "What's New",
-            Self::Agents => "Agents",
-            Self::Skills => "Skills",
-            Self::Accounts => "Accounts",
-            Self::Shortcuts => "Shortcuts",
-            Self::Terminal => "Appearance",
-            Self::Usage => "Usage",
-            Self::Worktrees => "Worktrees",
-            Self::Resources => "Resources",
-            Self::Remote => "Remote",
-            Self::Phone => "Phone access",
-        }
+    pub fn label(self) -> &'static str {
+        crate::i18n::t(match self {
+            Self::General => "settings.tab.general",
+            Self::WhatsNew => "settings.tab.whats_new",
+            Self::Agents => "settings.tab.agents",
+            Self::Skills => "settings.tab.skills",
+            Self::Schedules => "settings.tab.schedules",
+            Self::Accounts => "settings.tab.accounts",
+            Self::Shortcuts => "settings.tab.shortcuts",
+            Self::Terminal => "settings.tab.appearance",
+            Self::Usage => "settings.tab.usage",
+            Self::Worktrees => "settings.tab.worktrees",
+            Self::Resources => "settings.tab.resources",
+            Self::Remote => "settings.tab.remote",
+            Self::Phone => "settings.tab.phone",
+        })
     }
 
-    pub const fn subtitle(self) -> &'static str {
-        match self {
-            Self::General => "Startup, sessions, and updates",
-            Self::WhatsNew => "Latest release notes",
-            Self::Agents => "Installed CLIs and quick create",
-            Self::Skills => "Browse local and project skills",
-            Self::Accounts => "Profiles for work and personal accounts",
-            Self::Shortcuts => "Keyboard commands and bindings",
-            Self::Terminal => "Themes and terminal type",
-            Self::Usage => "Costs, tokens, and cache savings",
-            Self::Worktrees => "Pull requests and disk cleanup",
-            Self::Resources => "Idle sessions and memory",
-            Self::Remote => "SSH execution hosts",
-            Self::Phone => "Code from your iPhone",
-        }
+    pub fn subtitle(self) -> &'static str {
+        crate::i18n::t(match self {
+            Self::General => "settings.subtitle.general",
+            Self::WhatsNew => "settings.subtitle.whats_new",
+            Self::Agents => "settings.subtitle.agents",
+            Self::Skills => "settings.subtitle.skills",
+            Self::Schedules => "settings.subtitle.schedules",
+            Self::Accounts => "settings.subtitle.accounts",
+            Self::Shortcuts => "settings.subtitle.shortcuts",
+            Self::Terminal => "settings.subtitle.appearance",
+            Self::Usage => "settings.subtitle.usage",
+            Self::Worktrees => "settings.subtitle.worktrees",
+            Self::Resources => "settings.subtitle.resources",
+            Self::Remote => "settings.subtitle.remote",
+            Self::Phone => "settings.subtitle.phone",
+        })
     }
 
     /// Personal pages change how diri behaves for this user; System pages
@@ -114,6 +118,7 @@ impl SettingsTab {
             | Self::WhatsNew
             | Self::Agents
             | Self::Skills
+            | Self::Schedules
             | Self::Accounts
             | Self::Shortcuts
             | Self::Terminal
@@ -130,6 +135,7 @@ impl SettingsTab {
             Self::WhatsNew => "sparkles",
             Self::Agents => "sparkles",
             Self::Skills => "doc.text",
+            Self::Schedules => "clock.fill",
             Self::Accounts => "account.circle",
             Self::Shortcuts => "keyboard",
             Self::Terminal => "terminal",
@@ -189,14 +195,14 @@ impl HostDraft {
     pub fn entry(&self, existing: &[HostEntry]) -> Result<HostEntry, String> {
         let name = self.name.trim();
         if name.is_empty() {
-            return Err("Give this host a name.".to_owned());
+            return Err(crate::i18n::t("settings.remote.error_name").to_owned());
         }
         let ssh = self.ssh.trim();
         if ssh.is_empty() {
-            return Err("Enter an SSH destination, such as you@forge.".to_owned());
+            return Err(crate::i18n::t("settings.remote.error_ssh").to_owned());
         }
         if ssh.chars().any(char::is_whitespace) {
-            return Err("The SSH destination cannot contain spaces.".to_owned());
+            return Err(crate::i18n::t("settings.remote.error_ssh_spaces").to_owned());
         }
 
         let id = self
@@ -208,7 +214,7 @@ impl HostDraft {
         let node_token_file = self.node_token_file.trim();
         let node_id = self.node_id.trim();
         if node_endpoint.is_empty() != node_token_file.is_empty() {
-            return Err("Enter both the node endpoint and its local token file.".to_owned());
+            return Err(crate::i18n::t("settings.remote.error_node_pair").to_owned());
         }
         if !node_endpoint.is_empty()
             && (node_endpoint.chars().any(char::is_whitespace)
@@ -217,7 +223,7 @@ impl HostDraft {
                     .unwrap_or(node_endpoint)
                     .contains(':'))
         {
-            return Err("Use a node endpoint like tcp://100.64.0.2:7337.".to_owned());
+            return Err(crate::i18n::t("settings.remote.error_endpoint").to_owned());
         }
         Ok(HostEntry {
             transport: Default::default(),
@@ -269,11 +275,79 @@ pub fn theme(id: &str) -> TermTheme {
 }
 
 pub fn next_theme(id: &str) -> TermTheme {
-    let index = TermTheme::CATALOG
-        .iter()
-        .position(|theme| theme.id == id)
-        .unwrap_or(0);
-    TermTheme::CATALOG[(index + 1) % TermTheme::CATALOG.len()]
+    let all = diri_term::themes::all();
+    let index = all.iter().position(|theme| theme.id == id);
+    index.map_or(TermTheme::DIRIJOR_DARK, |index| {
+        all[(index + 1) % all.len()]
+    })
+}
+
+/// A group of the theme picker, in the order it lists them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThemeGroup {
+    Imported,
+    Dark,
+    Light,
+}
+
+/// One row of the theme picker: a group header or a theme.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ThemePickerRow {
+    Header(ThemeGroup),
+    Theme(&'static TermTheme),
+}
+
+/// The picker's rows for `query`: imported themes, then dark, then light,
+/// each in catalog order (curated first), empty groups left out. Every word
+/// of the query must appear in the theme's name or in "dark"/"light".
+pub fn theme_picker_rows(query: &str) -> Vec<ThemePickerRow> {
+    use diri_term::theme::ThemeAppearance;
+    let query = query.to_lowercase();
+    let words = query.split_whitespace().collect::<Vec<_>>();
+    let matches = |theme: &TermTheme| {
+        words.is_empty() || {
+            let haystack = format!(
+                "{} {}",
+                theme.name.to_lowercase(),
+                theme.appearance.label().to_lowercase()
+            );
+            words.iter().all(|word| haystack.contains(word))
+        }
+    };
+    let imported = diri_term::themes::imported();
+    let catalog = diri_term::themes::catalog();
+    let groups: [(ThemeGroup, Box<dyn Iterator<Item = &'static TermTheme>>); 3] = [
+        (ThemeGroup::Imported, Box::new(imported.iter().copied())),
+        (
+            ThemeGroup::Dark,
+            Box::new(
+                catalog
+                    .iter()
+                    .filter(|theme| theme.appearance == ThemeAppearance::Dark),
+            ),
+        ),
+        (
+            ThemeGroup::Light,
+            Box::new(
+                catalog
+                    .iter()
+                    .filter(|theme| theme.appearance == ThemeAppearance::Light),
+            ),
+        ),
+    ];
+    let mut rows = Vec::new();
+    for (group, themes) in groups {
+        let header = rows.len();
+        rows.extend(
+            themes
+                .filter(|theme| matches(theme))
+                .map(ThemePickerRow::Theme),
+        );
+        if rows.len() > header {
+            rows.insert(header, ThemePickerRow::Header(group));
+        }
+    }
+    rows
 }
 
 pub fn cycle_hibernate_minutes(value: u32) -> u32 {
@@ -320,8 +394,71 @@ mod tests {
     #[test]
     fn terminal_theme_falls_back_and_wraps() {
         assert_eq!(theme("missing").id, TermTheme::DIRIJOR_DARK.id);
-        let last = TermTheme::CATALOG.last().unwrap();
-        assert_eq!(next_theme(last.id).id, TermTheme::DIRIJOR_DARK.id);
+        let all = diri_term::themes::all();
+        let last = all.last().unwrap();
+        assert_eq!(next_theme(last.id).id, all[0].id);
+        assert_eq!(next_theme("missing").id, TermTheme::DIRIJOR_DARK.id);
+        // Vendored and curated ids both resolve.
+        assert_eq!(theme("3024-night").name, "3024 Night");
+        assert_eq!(theme("vesper"), TermTheme::VESPER);
+    }
+
+    #[test]
+    fn theme_picker_groups_and_filters_the_whole_catalog() {
+        let headers = |rows: &[ThemePickerRow]| {
+            rows.iter()
+                .filter_map(|row| match row {
+                    ThemePickerRow::Header(group) => Some(*group),
+                    ThemePickerRow::Theme(_) => None,
+                })
+                .filter(|group| *group != ThemeGroup::Imported)
+                .collect::<Vec<_>>()
+        };
+        let all = theme_picker_rows("");
+        assert_eq!(headers(&all), [ThemeGroup::Dark, ThemeGroup::Light]);
+        assert!(all.len() > 700, "{}", all.len());
+        let dark_first = all.iter().find_map(|row| match row {
+            // Other tests import themes into the shared registry.
+            ThemePickerRow::Theme(theme)
+                if theme.appearance == diri_term::theme::ThemeAppearance::Dark
+                    && !diri_term::themes::is_imported(theme.id) =>
+            {
+                Some(theme.id)
+            }
+            _ => None,
+        });
+        assert_eq!(
+            dark_first,
+            Some(TermTheme::DIRIJOR_DARK.id),
+            "curated themes lead"
+        );
+
+        let gruvbox = theme_picker_rows("GRUVBOX light");
+        assert_eq!(headers(&gruvbox), [ThemeGroup::Light]);
+        assert!(gruvbox.iter().all(|row| match row {
+            ThemePickerRow::Theme(theme) => theme.name.to_lowercase().contains("gruvbox"),
+            ThemePickerRow::Header(_) => true,
+        }));
+        assert!(gruvbox.iter().any(
+            |row| matches!(row, ThemePickerRow::Theme(theme) if theme.id == TermTheme::GRUVBOX_LIGHT.id)
+        ));
+        assert!(theme_picker_rows("no such theme anywhere").is_empty());
+    }
+
+    /// The picker rebuilds its rows on every keystroke and frame it is open.
+    #[test]
+    fn theme_picker_rows_are_cheap_to_rebuild() {
+        let _ = theme_picker_rows("");
+        let start = std::time::Instant::now();
+        for query in ["", "a", "night", "solarized dark"] {
+            let _ = theme_picker_rows(query);
+        }
+        // Generous for a debug build on a busy machine; release is ~50x faster.
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(250),
+            "{:?}",
+            start.elapsed()
+        );
     }
 
     #[test]

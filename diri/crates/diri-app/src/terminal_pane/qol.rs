@@ -2,6 +2,7 @@
 use super::autoscroll;
 use super::*;
 use diri_proto::grid::{GridCell, GridRowCodec, RowMetadata, TermStyle};
+use diri_term::command_marks::{CommandOutput, LastCommandOutput};
 use diri_term::element::ReferenceHit;
 use gpui::{Pixels, Point};
 use std::io::Write;
@@ -28,7 +29,13 @@ pub(super) struct QolState {
     pub autoscroll: Option<Autoscroll>,
     autoscroll_generation: u64,
     export_files: Vec<tempfile::NamedTempFile>,
-    busy: bool,
+    pub(super) busy: bool,
+    /// The history read whose result may still land; a newer read or a
+    /// session switch replaces it.
+    pub(super) read_owner: Option<Arc<()>>,
+    pub(super) message_jump: Option<super::messages::MessageJump>,
+    pub(super) message_mark: Option<super::messages::MessageMark>,
+    pub(super) message_tokens: u64,
     /// Which file references under the pointer name a real local file.
     files: crate::file_links::ExistenceCache,
 }
@@ -95,33 +102,53 @@ enum MenuAction {
     Export,
     PreviousPrompt,
     NextPrompt,
+    PreviousMessage,
+    NextMessage,
+    /// The output of the finished shell command under the pointer.
+    SelectCommandOutput(CommandOutput),
+    CopyCommandOutput(CommandOutput),
+}
+
+/// What a prompt jump that finds no prompt mark does.
+#[derive(Clone, Copy)]
+pub(super) enum PromptMiss {
+    /// Explains that prompt jumps need shell integration.
+    NeedsMarks,
+    /// Says this instead: a message jump found nothing either.
+    Say(&'static str),
+    /// Returns to the latest output, as Next past the last message does.
+    Live,
 }
 
 impl MenuAction {
     fn label(self, editor: Option<crate::file_links::Editor>) -> SharedString {
         match self {
             Self::OpenFile => match editor {
-                Some(editor) => format!("Open in {}", editor.name()).into(),
-                None => "Open file".into(),
+                Some(editor) => tf("terminal.menu.open_in", &[("editor", &editor.name())]).into(),
+                None => t("terminal.menu.open_file").into(),
             },
             other => other.static_label().into(),
         }
     }
 
     fn static_label(self) -> &'static str {
-        match self {
-            Self::Open => "Open link",
-            Self::CopyLink => "Copy link",
-            Self::OpenFile => "Open file",
-            Self::CopyPath => "Copy path",
-            Self::Copy => "Copy selection",
-            Self::Paste => "Paste",
-            Self::Find => "Find selection",
-            Self::CopyMode => "Keyboard copy mode",
-            Self::Export => "Open scrollback in editor",
-            Self::PreviousPrompt => "Previous shell prompt",
-            Self::NextPrompt => "Next shell prompt",
-        }
+        t(match self {
+            Self::Open => "terminal.menu.open_link",
+            Self::CopyLink => "terminal.menu.copy_link",
+            Self::OpenFile => "terminal.menu.open_file",
+            Self::CopyPath => "terminal.menu.copy_path",
+            Self::Copy => "terminal.menu.copy_selection",
+            Self::Paste => "terminal.menu.paste",
+            Self::Find => "terminal.menu.find_selection",
+            Self::CopyMode => "terminal.menu.copy_mode",
+            Self::Export => "terminal.menu.export",
+            Self::PreviousPrompt => "terminal.menu.previous_prompt",
+            Self::NextPrompt => "terminal.menu.next_prompt",
+            Self::PreviousMessage => "terminal.menu.previous_message",
+            Self::NextMessage => "terminal.menu.next_message",
+            Self::SelectCommandOutput(_) => "terminal.menu.select_command_output",
+            Self::CopyCommandOutput(_) => "terminal.menu.copy_command_output",
+        })
     }
 }
 
@@ -135,6 +162,7 @@ impl TerminalPane {
                 .and_then(|id| self.residents.get(id))
             {
                 previous.element.pin_keyboard_selection(false);
+                previous.element.hold_frame(false);
             }
             self.qol = QolState {
                 session: Some(id.clone()),
@@ -214,7 +242,7 @@ impl TerminalPane {
                     .and_then(|file| crate::file_links::open_url(&file, self.file_editor()));
                 match opened {
                     Some(url) => cx.open_url(&url),
-                    None => self.show_terminal_feedback("That file is not on this Mac", window, cx),
+                    None => self.show_terminal_feedback(t("terminal.file_not_local"), window, cx),
                 }
             }
         }
@@ -266,6 +294,7 @@ impl TerminalPane {
         };
         let target = resident.element.reference_hit_at(col, row);
         let has_selection = !resident.element.selected_text().is_empty();
+        let command_output = resident.element.command_output_at(col, row);
         let target = self.linkable(target);
         let mut actions = Vec::new();
         match target.as_ref().map(|hit| &hit.reference) {
@@ -280,13 +309,18 @@ impl TerminalPane {
         if has_selection {
             actions.extend([MenuAction::Copy, MenuAction::Find]);
         }
-        actions.extend([
-            MenuAction::Paste,
-            MenuAction::CopyMode,
-            MenuAction::Export,
-            MenuAction::PreviousPrompt,
-            MenuAction::NextPrompt,
-        ]);
+        if let Some(output) = command_output {
+            actions.extend([
+                MenuAction::CopyCommandOutput(output),
+                MenuAction::SelectCommandOutput(output),
+            ]);
+        }
+        actions.extend([MenuAction::Paste, MenuAction::CopyMode, MenuAction::Export]);
+        if self.message_gutter().is_some() {
+            actions.extend([MenuAction::PreviousMessage, MenuAction::NextMessage]);
+        } else {
+            actions.extend([MenuAction::PreviousPrompt, MenuAction::NextPrompt]);
+        }
         let editor = self.file_editor();
         self.qol.menu = Some(TerminalMenu {
             position,
@@ -324,7 +358,7 @@ impl TerminalPane {
                 });
                 if let Some(file) = file {
                     cx.write_to_clipboard(ClipboardItem::new_string(file.display()));
-                    self.show_terminal_feedback("Path copied", window, cx);
+                    self.show_terminal_feedback(t("terminal.path_copied"), window, cx);
                 }
             }
             MenuAction::CopyLink => {
@@ -332,7 +366,7 @@ impl TerminalPane {
                     cx.write_to_clipboard(ClipboardItem::new_string(
                         hit.reference.destination().to_owned(),
                     ));
-                    self.show_terminal_feedback("Link copied", window, cx);
+                    self.show_terminal_feedback(t("terminal.link_copied"), window, cx);
                 }
             }
             MenuAction::Copy => self.copy_selection(&CopySelection, window, cx),
@@ -340,8 +374,23 @@ impl TerminalPane {
             MenuAction::Find => self.find_selection(window, cx),
             MenuAction::CopyMode => self.enter_copy_mode(window, cx),
             MenuAction::Export => self.read_terminal_history(None, window, cx),
-            MenuAction::PreviousPrompt => self.read_terminal_history(Some(false), window, cx),
-            MenuAction::NextPrompt => self.read_terminal_history(Some(true), window, cx),
+            MenuAction::PreviousPrompt | MenuAction::PreviousMessage => {
+                self.read_terminal_history(Some(false), window, cx)
+            }
+            MenuAction::NextPrompt | MenuAction::NextMessage => {
+                self.read_terminal_history(Some(true), window, cx)
+            }
+            MenuAction::SelectCommandOutput(output) => {
+                if let Some(resident) = self.selected_id().and_then(|id| self.residents.get(&id)) {
+                    resident.element.select_range(output.start, output.end);
+                }
+            }
+            MenuAction::CopyCommandOutput(output) => {
+                if let Some(resident) = self.selected_id().and_then(|id| self.residents.get(&id)) {
+                    resident.element.select_range(output.start, output.end);
+                }
+                self.copy_selection(&CopySelection, window, cx);
+            }
         }
         cx.notify();
     }
@@ -421,11 +470,11 @@ impl TerminalPane {
         let message = native_paste_review_message(&paste.text, paste.secret);
         let answer = window.prompt(
             gpui::PromptLevel::Warning,
-            PASTE_REVIEW_TITLE,
+            paste_review_title(),
             Some(&message),
             &[
-                gpui::PromptButton::ok("Paste"),
-                gpui::PromptButton::cancel("Cancel"),
+                gpui::PromptButton::ok(t("terminal.menu.paste")),
+                gpui::PromptButton::cancel(t("terminal.paste.cancel")),
             ],
             cx,
         );
@@ -457,7 +506,7 @@ impl TerminalPane {
             || resident.bracketed_paste != pending.bracketed
             || resident.attachment_state != AttachmentState::Live
         {
-            self.show_terminal_feedback("Terminal changed. Paste again to review.", window, cx);
+            self.show_terminal_feedback(t("terminal.paste.changed"), window, cx);
         } else {
             resident.send_user_input(terminal_paste(&pending.text, resident.bracketed_paste));
         }
@@ -609,11 +658,7 @@ impl TerminalPane {
             selecting: false,
         });
         window.focus(&self.focus, cx);
-        self.show_terminal_feedback(
-            "Copy mode · arrows or h j k l · v select · y copy · Esc exit",
-            window,
-            cx,
-        );
+        self.show_terminal_feedback(t("terminal.copy_mode.on"), window, cx);
     }
 
     pub(super) fn handle_qol_key(
@@ -775,6 +820,65 @@ impl TerminalPane {
         true
     }
 
+    /// Copies the output of the newest finished shell command in retained
+    /// history, found from its OSC 133 output and end marks.
+    pub(super) fn copy_last_command_output(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.selected_id() else {
+            return;
+        };
+        self.reset_qol_session(&id);
+        if self.qol.busy || !self.residents.contains_key(&id) {
+            return;
+        }
+        let client = Arc::clone(self.runtime.client());
+        let request_id = id.clone();
+        let task = self.tokio.spawn(async move {
+            let mut last = LastCommandOutput::default();
+            read_retained_rows(&client, &request_id, |_, cells, metadata| {
+                last.push_row(cells, metadata);
+                if last.held_cells() > COMMAND_OUTPUT_MAX_CELLS {
+                    return Err(t("terminal.command_output.too_large"));
+                }
+                Ok(())
+            })
+            .await?;
+            Ok::<_, &'static str>(last.finish().map(|output| command_output_text(&output)))
+        });
+        self.qol.busy = true;
+        let read_owner = Arc::new(());
+        self.qol.read_owner = Some(Arc::clone(&read_owner));
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            let _ = crate::floating::update_in_owner(&this, cx, |this, window, cx| {
+                if this
+                    .qol
+                    .read_owner
+                    .as_ref()
+                    .is_none_or(|owner| !Arc::ptr_eq(owner, &read_owner))
+                {
+                    return;
+                }
+                this.qol.busy = false;
+                this.qol.read_owner = None;
+                if this.selected_id().as_ref() != Some(&id) {
+                    return;
+                }
+                let message = match result {
+                    Ok(Ok(Some(text))) if !text.is_empty() => {
+                        cx.write_to_clipboard(ClipboardItem::new_string(text));
+                        t("terminal.command_output.copied")
+                    }
+                    Ok(Ok(_)) => t("terminal.command_output.none"),
+                    Ok(Err(message)) => message,
+                    Err(_) => t("terminal.history.read_failed"),
+                };
+                this.show_terminal_feedback(message, window, cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// Uses the same Engine RPC for local and remote history. A changing
     /// sequence aborts instead of exporting mismatched pages or jumping wrong.
     pub(super) fn read_terminal_history(
@@ -783,12 +887,31 @@ impl TerminalPane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.qol.busy {
+        if let Some(next) = direction
+            && let Some(gutter) = self.message_gutter()
+        {
+            self.jump_to_message(next, gutter, window, cx);
             return;
         }
+        self.read_history(direction, PromptMiss::NeedsMarks, window, cx);
+    }
+
+    /// Exports the history, or with a `direction` jumps to the shell prompt
+    /// that way; `miss` says what happens when there is none.
+    pub(super) fn read_history(
+        &mut self,
+        direction: Option<bool>,
+        miss: PromptMiss,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(id) = self.selected_id() else {
             return;
         };
+        self.reset_qol_session(&id);
+        if self.qol.busy {
+            return;
+        }
         let Some(resident) = self.residents.get(&id) else {
             return;
         };
@@ -797,103 +920,133 @@ impl TerminalPane {
         let client = Arc::clone(self.runtime.client());
         let request_id = id.clone();
         let task = self.tokio.spawn(async move {
-            let mut first = 0_i64;
-            let mut sequence = None;
             let mut text = String::new();
             let mut prompts = Vec::new();
-            let mut live_start = 0;
-            loop {
-                let response = client
-                    .read_scrollback_cells(&request_id, first, 128)
-                    .await
-                    .map_err(|_| "Could not read terminal history")?;
-                if sequence.is_some_and(|seq| seq != response.content_seq) {
-                    return Err("Output changed during the read. Try again when it settles.");
-                }
-                sequence = Some(response.content_seq);
-                if first == 0 {
-                    live_start = response.live_start_row;
-                }
-                let count =
-                    usize::try_from(response.row_count).map_err(|_| "Invalid history response")?;
-                if count > 128 || response.first_row != first || response.total_rows > 1_000_000 {
-                    return Err("Invalid history response");
-                }
-                let rows = GridRowCodec::decode_rows(&response.payload, count)
-                    .map_err(|_| "Invalid history response")?;
-                for (index, row) in rows.iter().enumerate() {
-                    if row
+            let (live_start, total, sequence) =
+                read_retained_rows(&client, &request_id, |row, cells, metadata| {
+                    if cells
                         .iter()
                         .any(|cell| cell.style.contains(TermStyle::PROMPT_START))
                     {
-                        prompts.push(first + index as i64);
+                        prompts.push(row);
                     }
                     if direction.is_none() {
-                        append_export_row(&mut text, row, response.metadata.get(index));
+                        append_export_row(&mut text, cells, metadata);
+                        if text.len() > 16 * 1024 * 1024 {
+                            return Err(t("terminal.history.too_large"));
+                        }
                     }
-                }
-                if text.len() > 16 * 1024 * 1024 {
-                    return Err("Retained output is too large to export");
-                }
-                first += count as i64;
-                if count == 0 || first >= response.total_rows {
-                    break;
-                }
-            }
-            Ok((
-                text,
-                prompts,
-                live_start,
-                first,
-                sequence.unwrap_or_default(),
-            ))
+                    Ok(())
+                })
+                .await?;
+            Ok::<_, &'static str>((text, prompts, live_start, total, sequence))
         });
         self.qol.busy = true;
-        self.show_terminal_feedback("Reading retained terminal output…", window, cx);
+        self.show_terminal_feedback(t("terminal.history.reading"), window, cx);
+        let read_owner = Arc::new(());
+        self.qol.read_owner = Some(Arc::clone(&read_owner));
         cx.spawn_in(window, async move |this, cx| {
             let result = task.await;
             let _ = crate::floating::update_in_owner(&this, cx, |this, window, cx| {
-                if this.selected_id().as_ref() != Some(&id) { return; }
+                if this.selected_id().as_ref() != Some(&id)
+                    || this
+                        .qol
+                        .read_owner
+                        .as_ref()
+                        .is_none_or(|owner| !Arc::ptr_eq(owner, &read_owner))
+                {
+                    return;
+                }
                 this.qol.busy = false;
-                if this.residents.get(&id).is_none_or(|resident| resident.attachment_generation != generation) {
-                    this.show_terminal_feedback("Terminal changed. Try again.", window, cx);
+                this.qol.read_owner = None;
+                if this.residents.get(&id).is_none_or(|resident| {
+                    resident.attachment_generation != generation
+                        || resident.element.view_offset() != top_offset
+                }) {
+                    this.show_terminal_feedback(t("terminal.history.terminal_changed"), window, cx);
                     return;
                 }
                 match result {
                     Ok(Ok((text, prompts, live_start, total, sequence))) => {
                         if let Some(next) = direction {
                             let top = live_start - top_offset;
-                            let target = if next { prompts.into_iter().find(|row| *row > top) } else { prompts.into_iter().rev().find(|row| *row < top) };
+                            let target = if next {
+                                prompts.into_iter().find(|row| *row > top)
+                            } else {
+                                prompts.into_iter().rev().find(|row| *row < top)
+                            };
                             if let Some(target) = target {
                                 if let Some(resident) = this.residents.get(&id) {
                                     let rows = usize::from(resident.element.grid_rows());
-                                    resident.element.adopt_history_geometry(live_start, total, sequence, rows);
+                                    resident
+                                        .element
+                                        .adopt_history_geometry(live_start, total, sequence, rows);
                                     resident.element.scroll_to_absolute(target, 0.0, rows);
                                     this.pump_scrollback_fetch(&id, rows);
                                 }
                                 this.qol.feedback = None;
-                            } else { this.show_terminal_feedback("No shell prompt in that direction · requires OSC 133 prompt marks", window, cx); }
+                            } else {
+                                match miss {
+                                    PromptMiss::NeedsMarks => this.show_terminal_feedback(
+                                        t("terminal.prompt.none"),
+                                        window,
+                                        cx,
+                                    ),
+                                    PromptMiss::Say(message) => {
+                                        this.show_terminal_feedback(message, window, cx);
+                                    }
+                                    PromptMiss::Live => {
+                                        if let Some(resident) = this.residents.get(&id) {
+                                            let rows = usize::from(resident.element.grid_rows());
+                                            resident.element.scroll_to_live(rows);
+                                        }
+                                        this.show_terminal_feedback(
+                                            t("terminal.back_to_latest"),
+                                            window,
+                                            cx,
+                                        );
+                                    }
+                                }
+                            }
                         } else {
                             let saved = (|| -> std::io::Result<tempfile::NamedTempFile> {
-                                let mut file = tempfile::Builder::new().prefix("diri-scrollback-").suffix(".txt").tempfile()?;
-                                file.write_all(text.as_bytes())?; file.flush()?; Ok(file)
+                                let mut file = tempfile::Builder::new()
+                                    .prefix("diri-scrollback-")
+                                    .suffix(".txt")
+                                    .tempfile()?;
+                                file.write_all(text.as_bytes())?;
+                                file.flush()?;
+                                Ok(file)
                             })();
                             match saved {
                                 Ok(file) => {
-                                    if let Ok(url) = url::Url::from_file_path(file.path()) { cx.open_url(url.as_str()); }
+                                    if let Ok(url) = url::Url::from_file_path(file.path()) {
+                                        cx.open_url(url.as_str());
+                                    }
                                     this.qol.export_files.push(file);
-                                    this.show_terminal_feedback("Opened retained output in your editor", window, cx);
+                                    this.show_terminal_feedback(
+                                        t("terminal.history.opened"),
+                                        window,
+                                        cx,
+                                    );
                                 }
-                                Err(_) => this.show_terminal_feedback("Could not save terminal output", window, cx),
+                                Err(_) => this.show_terminal_feedback(
+                                    t("terminal.history.save_failed"),
+                                    window,
+                                    cx,
+                                ),
                             }
                         }
                     }
                     Ok(Err(message)) => this.show_terminal_feedback(message, window, cx),
-                    Err(_) => this.show_terminal_feedback("Could not read terminal history", window, cx),
+                    Err(_) => {
+                        this.show_terminal_feedback(t("terminal.history.read_failed"), window, cx)
+                    }
                 }
                 cx.notify();
             });
-        }).detach();
+        })
+        .detach();
     }
 
     pub(super) fn render_qol(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
@@ -948,7 +1101,7 @@ impl TerminalPane {
                     .bg(colors.floating_surface())
                     .text_size(px(11.0))
                     .text_color(colors.primary)
-                    .child("Copy mode · v select · y copy · Esc exit"),
+                    .child(t("terminal.copy_mode.hint")),
             );
         }
         if let Some(menu) = &self.qol.menu {
@@ -1046,7 +1199,7 @@ impl TerminalPane {
                                     div()
                                         .text_size(px(Typo::DISPLAY_TITLE.size))
                                         .font_weight(Typo::DISPLAY_TITLE.weight)
-                                        .child(PASTE_REVIEW_TITLE),
+                                        .child(paste_review_title()),
                                 )
                                 .child(
                                     div()
@@ -1066,9 +1219,9 @@ impl TerminalPane {
                                         .text_size(px(Typo::META.size))
                                         .text_color(colors.secondary)
                                         .child(if truncated {
-                                            "Clipboard preview · first 4,000 characters"
+                                            t("terminal.paste.preview_truncated")
                                         } else {
-                                            "Clipboard preview"
+                                            t("terminal.paste.preview")
                                         }),
                                 )
                                 .child(
@@ -1118,7 +1271,7 @@ impl TerminalPane {
                                 .text_color(colors.primary)
                                 .hover(move |style| style.bg(colors.primary.alpha(0.06)))
                                 .active(move |style| style.bg(colors.primary.alpha(0.1)))
-                                .child("Cancel")
+                                .child(t("terminal.paste.cancel"))
                                 .child(
                                     div()
                                         .text_size(px(Typo::META.size))
@@ -1147,7 +1300,7 @@ impl TerminalPane {
                                 .text_color(colors.background)
                                 .hover(move |style| style.bg(colors.primary.alpha(0.88)))
                                 .active(move |style| style.bg(colors.primary.alpha(0.75)))
-                                .child("Paste")
+                                .child(t("terminal.menu.paste"))
                                 .child(
                                     div()
                                         .when(paste.cancel_selected, |hint| hint.invisible())
@@ -1178,16 +1331,18 @@ impl TerminalPane {
     }
 }
 
-const PASTE_REVIEW_TITLE: &str = "Paste into terminal?";
+fn paste_review_title() -> &'static str {
+    t("terminal.paste.title")
+}
 
 fn paste_review_message(text: &str) -> &'static str {
     let has_controls = text
         .chars()
         .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\r' | '\t'));
     if has_controls {
-        "This text contains control characters. They’ll be replaced with spaces before pasting."
+        t("terminal.paste.controls")
     } else {
-        "This terminal may run each line as a command when you paste."
+        t("terminal.paste.multiline")
     }
 }
 
@@ -1217,9 +1372,13 @@ pub(super) fn native_paste_review_message(text: &str, secret: bool) -> String {
     }
     let hidden = total.saturating_sub(LINES);
     if hidden > 0 {
-        shown.push_str(&format!(
-            "… and {hidden} more line{}",
-            if hidden == 1 { "" } else { "s" }
+        shown.push_str(&tf(
+            if hidden == 1 {
+                "terminal.paste.more_lines_one"
+            } else {
+                "terminal.paste.more_lines_other"
+            },
+            &[("count", &hidden)],
         ));
     }
     format!("{warning}\n\n{}", shown.trim_end())
@@ -1229,9 +1388,9 @@ pub(super) fn native_paste_review_message(text: &str, secret: bool) -> String {
 /// is only its size: the text is most likely the password itself.
 pub(super) fn paste_review_preview(chars: &mut std::str::Chars<'_>, secret: bool) -> String {
     if secret {
-        return format!(
-            "{} characters, hidden while the terminal reads a password.",
-            chars.by_ref().count()
+        return tf(
+            "terminal.paste.secret",
+            &[("count", &chars.by_ref().count())],
         );
     }
     chars
@@ -1245,6 +1404,76 @@ pub(super) fn paste_review_preview(chars: &mut std::str::Chars<'_>, secret: bool
             }
         })
         .collect()
+}
+
+/// Cells a copied command output may hold: the Engine retains 4 MiB of
+/// history, so this is never the limit for a single command in practice.
+const COMMAND_OUTPUT_MAX_CELLS: usize = 4 * 1024 * 1024;
+
+/// Reads all retained rows through the Engine RPC used for local and remote
+/// history alike, in order. A changing sequence aborts instead of mixing
+/// revisions. Returns the live start row, the rows read and the sequence.
+async fn read_retained_rows(
+    client: &diri_client::DaemonClient,
+    id: &SessionId,
+    mut visit: impl FnMut(i64, &[GridCell], Option<&RowMetadata>) -> Result<(), &'static str>,
+) -> Result<(i64, i64, u64), &'static str> {
+    let mut first = 0_i64;
+    let mut sequence = None;
+    let mut live_start = 0;
+    let mut page_rows = 1_i64;
+    let mut width = None;
+    loop {
+        let response = client
+            .read_scrollback_cells(id, first, page_rows)
+            .await
+            .map_err(|_| t("terminal.history.read_failed"))?;
+        if sequence.is_some_and(|seq| seq != response.content_seq) {
+            return Err(t("terminal.history.changed"));
+        }
+        sequence = Some(response.content_seq);
+        if first == 0 {
+            live_start = response.live_start_row;
+        }
+        let count =
+            usize::try_from(response.row_count).map_err(|_| t("terminal.history.invalid"))?;
+        if count as i64 > page_rows
+            || response.first_row != first
+            || response.total_rows > 1_000_000
+            || !(1..=4096).contains(&response.cols)
+            || width.is_some_and(|cols| cols != response.cols)
+            || (!response.metadata.is_empty() && response.metadata.len() != count)
+        {
+            return Err(t("terminal.history.invalid"));
+        }
+        width = Some(response.cols);
+        // Worst-case RLE plus base64 must fit one control response,
+        // even for wide, densely styled terminal rows.
+        page_rows = (diri_proto::FIND_CAPTURE_MAX_CELLS as i64 / response.cols).clamp(1, 1024);
+        let rows = GridRowCodec::decode_rows(&response.payload, count)
+            .map_err(|_| t("terminal.history.invalid"))?;
+        if rows.iter().any(|row| row.len() as i64 != response.cols) {
+            return Err(t("terminal.history.invalid"));
+        }
+        for (index, row) in rows.iter().enumerate() {
+            visit(first + index as i64, row, response.metadata.get(index))?;
+        }
+        first += count as i64;
+        if count == 0 || first >= response.total_rows {
+            break;
+        }
+    }
+    Ok((live_start, first, sequence.unwrap_or_default()))
+}
+
+/// The text of a command's output rows, without the blank lines a shell
+/// leaves before its next prompt.
+fn command_output_text(output: &diri_term::command_marks::OutputRows) -> String {
+    let mut text = String::new();
+    for (cells, metadata) in &output.rows {
+        append_export_row(&mut text, cells, metadata.as_ref());
+    }
+    text.trim_end_matches('\n').to_owned()
 }
 
 fn append_export_row(text: &mut String, row: &[GridCell], metadata: Option<&RowMetadata>) {
@@ -1331,5 +1560,49 @@ mod native_paste_review_tests {
         let message = native_paste_review_message("hunter2\nhunter2", true);
         assert!(!message.contains("hunter2"));
         assert!(message.ends_with("15 characters, hidden while the terminal reads a password."));
+    }
+}
+
+#[cfg(test)]
+mod command_output_tests {
+    use super::command_output_text;
+    use diri_proto::grid::{GridCell, TermStyle};
+    use diri_term::command_marks::LastCommandOutput;
+
+    fn row(text: &str, marks: &[(usize, TermStyle)], width: usize) -> Vec<GridCell> {
+        let mut cells = vec![GridCell::BLANK; width];
+        for (cell, ch) in cells.iter_mut().zip(text.chars()) {
+            cell.scalar = u32::from(ch);
+        }
+        for &(col, mark) in marks {
+            cells[col].style |= mark;
+        }
+        cells
+    }
+
+    #[test]
+    fn copied_output_is_the_text_between_the_output_mark_and_the_end() {
+        let width = 8;
+        let mut wrapped = row("abcdefgh", &[], width);
+        wrapped[width - 1].style |= TermStyle::SOFT_WRAP;
+        let rows = [
+            row("$ ls", &[(0, TermStyle::PROMPT_START)], width),
+            // Output starting mid-row, as after `echo -n` or a same-line C.
+            row("$ x  out", &[(5, TermStyle::OUTPUT_START)], width),
+            wrapped,
+            row("ij", &[], width),
+            row("", &[], width),
+            row(
+                "$",
+                &[(0, TermStyle::COMMAND_FAILED | TermStyle::PROMPT_START)],
+                width,
+            ),
+        ];
+        let mut last = LastCommandOutput::default();
+        for cells in &rows {
+            last.push_row(cells, None);
+        }
+        let output = last.finish().expect("a finished output");
+        assert_eq!(command_output_text(&output), "out\nabcdefghij");
     }
 }

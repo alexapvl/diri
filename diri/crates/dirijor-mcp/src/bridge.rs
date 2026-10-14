@@ -13,12 +13,15 @@ use sha2::{Digest, Sha256};
 use crate::control::{ControlClient, ControlFailure, default_socket_path};
 use crate::tools::{ToolDefinition, tool_definitions_for};
 
+mod api;
 #[cfg(test)]
 mod audit_tests;
+mod layout;
 mod notes;
 pub use notes::NoteSpawn;
 mod orchestration;
 mod policy;
+mod schedules;
 mod tasks;
 
 use policy::{McpPolicy, WRITE_POLICY, WriteAction};
@@ -120,6 +123,10 @@ impl Bridge {
             "answer_task" => self.answer_task(arguments),
             "cancel_task" => self.cancel_task(arguments),
             "list_tasks" => self.list_tasks(arguments),
+            "get_skill" => get_skill(arguments),
+            "schedule_agent" => self.schedule_agent(arguments),
+            "list_schedules" => self.list_schedules(),
+            "delete_schedule" => self.delete_schedule(arguments),
             "wait_any" => self.wait_any(arguments),
             "get_diff" => self.get_diff(arguments),
             "integrate" => self.integrate(arguments),
@@ -135,14 +142,18 @@ impl Bridge {
             "release_agent" => self.release_agent(arguments),
             "test_run" => self.test_run(arguments),
             "browser" => self.browser(arguments),
+            "open_api_request" => self.open_api_request(arguments),
             "quick_open_include" => self.quick_open_include(arguments),
             "whoami" => self.whoami(),
+            "get_layout" => self.get_layout(arguments),
+            "manage_layout" => self.manage_layout(arguments),
             "list_children" => self.list_children(arguments),
             "wait_for_children" => self.wait_for_children(arguments),
             "summarize_children" => self.summarize_children(arguments),
             "report_to_parent" => self.report_to_parent(arguments),
             "list_notes" => self.list_notes(arguments),
             "read_note" => self.read_note(arguments),
+            "note_links" => self.note_links(arguments),
             "write_note" => self.write_note(arguments),
             "edit_note" => self.edit_note(arguments),
             "replace_section" => self.replace_section(arguments),
@@ -154,13 +165,23 @@ impl Bridge {
     }
 
     pub fn request(&self, method: &str, params: Value, timeout: Duration) -> Result<Value, String> {
+        self.request_failure(method, params, timeout)
+            .map_err(render_failure)
+    }
+
+    /// [`Self::request`] keeping the Engine's error code for callers that
+    /// answer some refusals themselves.
+    fn request_failure(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, ControlFailure> {
         let deadline = Instant::now()
             .checked_add(timeout)
-            .ok_or_else(|| "invalid request timeout".to_owned())?;
-        let mut client = self.connect(timeout).map_err(render_failure)?;
-        client
-            .request_until(method.into(), params, deadline)
-            .map_err(render_failure)
+            .ok_or_else(|| ControlFailure::Protocol("invalid request timeout".into()))?;
+        let mut client = self.connect(timeout)?;
+        client.request_until(method.into(), params, deadline)
     }
 
     fn request_typed<T: DeserializeOwned>(
@@ -232,7 +253,10 @@ impl Bridge {
         let kind = resolve_agent_kind(&readiness, &requested);
 
         let tracked = parent.is_some();
+        // Resolved before launching, so a bad split request starts nothing.
+        let placement = self.spawn_placement(arguments, tracked)?;
         let params = SessionSpawnParams {
+            appearance: None,
             kind,
             cwd: required_string(arguments, "cwd")?,
             new_worktree: optional_bool(arguments, "worktree"),
@@ -249,10 +273,19 @@ impl Bridge {
             same_repo_as: None,
             start_directory: None,
             note_id: None,
+            argv: None,
         };
-        let params = serde_json::to_value(params).map_err(|error| error.to_string())?;
+        let mut params = serde_json::to_value(params).map_err(|error| error.to_string())?;
+        if let Some((pane, _)) = &placement {
+            params[diri_proto::workspace::SPAWN_PANE_FIELD] =
+                serde_json::to_value(pane).map_err(|error| error.to_string())?;
+        }
         if !tracked {
-            return self.request(Method::SESSION_SPAWN, params, SPAWN_TIMEOUT);
+            let mut spawned = self.request(Method::SESSION_SPAWN, params, SPAWN_TIMEOUT)?;
+            if let Some((_, anchor)) = &placement {
+                spawned["layout"] = self.spawned_layout(spawned["id"].as_str(), anchor);
+            }
+            return Ok(spawned);
         }
         let mut identity = arguments.clone();
         identity.as_object_mut().unwrap().remove("operation_id");
@@ -270,6 +303,12 @@ impl Bridge {
             "senderID":self.require_caller()?, "operationID":operation_id, "spawn":params,
         }), SPAWN_TIMEOUT).map_err(|error| format!("{error}. Spawn identity: {operation_id}. Retry only the same arguments and operation_id; never launch a fresh copy after a lost response."))?;
         spawned["since_ms"] = json!(since_ms);
+        if let Some((_, anchor)) = &placement {
+            let session = spawned["spawn_receipt"]["session_id"]
+                .as_str()
+                .filter(|_| spawned["ok"] == true);
+            spawned["layout"] = self.spawned_layout(session, anchor);
+        }
         if as_task {
             let session_id = spawned["spawn_receipt"]["session_id"]
                 .as_str()
@@ -986,6 +1025,19 @@ fn render_failure(error: ControlFailure) -> String {
     }
 }
 
+/// Skills are compiled in, so this needs neither the Engine nor a session.
+fn get_skill(arguments: &Value) -> Result<Value, String> {
+    let name = required_string(arguments, "name")?;
+    let skill = diri_proto::skills::find(&name).ok_or_else(|| {
+        format!("unknown skill {name:?}; use scheduling, notes, or orchestration")
+    })?;
+    Ok(json!({
+        "name": skill.name,
+        "description": skill.description,
+        "markdown": skill.markdown,
+    }))
+}
+
 fn required_string(arguments: &Value, key: &str) -> Result<String, String> {
     arguments
         .get(key)
@@ -1385,9 +1437,11 @@ mod tests {
             listening_ports: None,
             foreground_agent: None,
             terminal_cwd: None,
+            agent_workspace: None,
             note_id: None,
             foreground_ports: None,
             terminal_progress: None,
+            scheduled_run: None,
         }
     }
 

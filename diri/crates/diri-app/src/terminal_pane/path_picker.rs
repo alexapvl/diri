@@ -43,7 +43,7 @@ impl TerminalPane {
             return;
         };
         if self.qol.copy_mode.is_some() {
-            self.show_terminal_feedback("Exit copy mode before inserting a path", window, cx);
+            self.show_terminal_feedback(t("terminal.path.exit_copy_mode"), window, cx);
             cx.stop_propagation();
             return;
         }
@@ -51,14 +51,7 @@ impl TerminalPane {
             return;
         };
         if session.host.is_some() {
-            self.show_terminal_feedback(
-                format!(
-                    "Insert Path browses {}, so it's unavailable in remote sessions",
-                    crate::platform::local_machine_label_lowercase()
-                ),
-                window,
-                cx,
-            );
+            self.show_terminal_feedback(t("terminal.path.local_only"), window, cx);
             cx.stop_propagation();
             return;
         }
@@ -108,20 +101,19 @@ impl TerminalPane {
                 if root.is_dir() {
                     Ok(path_picker::scan(&root))
                 } else {
-                    Err(format!(
-                        "{} is not a folder on {}",
-                        root.display(),
-                        crate::platform::local_machine_label_lowercase()
+                    Err(tf(
+                        "terminal.path.not_folder",
+                        &[("path", &root.display()), ("machine", &crate::platform::local_machine_label_lowercase())],
                     ))
                 }
             })
             .await
-            .unwrap_or_else(|error| Err(format!("scan failed: {error}")))
+            .unwrap_or_else(|error| Err(tf("terminal.path.scan_failed", &[("error", &error)])))
         });
         cx.spawn(async move |this, cx| {
             let result = job
                 .await
-                .unwrap_or_else(|error| Err(format!("scan failed: {error}")));
+                .unwrap_or_else(|error| Err(tf("terminal.path.scan_failed", &[("error", &error)])));
             let _ = this.update(cx, |this, cx| {
                 let Some(state) = this.path_picker.as_mut() else {
                     return;
@@ -279,7 +271,7 @@ impl TerminalPane {
         let picker = &state.picker;
 
         let placeholder = picker.root().map_or_else(
-            || "Finding files…".to_owned(),
+            || t("terminal.path.finding").to_owned(),
             |root| {
                 let home = diri_platform::home_dir()
                     .map(|p| p.into_os_string())
@@ -319,10 +311,10 @@ impl TerminalPane {
                     },
                 ));
             let body: AnyElement = match &picker.index {
-                PickerIndex::Loading => status_line("Finding files…", colors),
+                PickerIndex::Loading => status_line(t("terminal.path.finding"), colors),
                 PickerIndex::Failed(message) => status_line(message, colors),
                 PickerIndex::Ready(_) if picker.rows.is_empty() => {
-                    status_line("No matching files", colors)
+                    status_line(t("terminal.path.no_matches"), colors)
                 }
                 PickerIndex::Ready(_) => {
                     let mut rows: Vec<AnyElement> = picker

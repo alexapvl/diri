@@ -222,9 +222,10 @@ fn show_system_menu(_: &Window, _: gpui::Point<gpui::Pixels>) {}
 /// How much of the caption lane a toolbar must leave free at its trailing
 /// edge, given where it starts and how far its right edge stops short of the
 /// window's. It grows continuously as a neighbour such as the inspector slides
-/// away, so trailing actions never jump.
+/// away, so trailing actions never jump. A toolbar inset by the island gap
+/// still shares the caption's row.
 pub(crate) fn caption_inset(top: f32, right_gap: f32) -> f32 {
-    if top > 0.5 {
+    if top >= Metrics::TITLE_BAR / 2.0 {
         0.0
     } else {
         (caption_lane() - right_gap.max(0.0)).max(0.0)

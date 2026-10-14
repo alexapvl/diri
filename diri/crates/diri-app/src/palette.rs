@@ -15,11 +15,14 @@ use crate::agent_catalog::{
 };
 use crate::commands::{self, CommandId};
 use crate::fuzzy::{FuzzyMatcher, FuzzyQuery, PreparedText, Score};
+use crate::i18n::{t, tf};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PaletteCommand {
     Workspace(crate::palette_workspace::WorkspaceCommand),
     Themes,
+    /// The interface style page: Modern, System, Themed, Blended.
+    InterfaceStyles,
     /// A static application command. The palette dispatches the same typed
     /// action used by key bindings, menus, and toolbar controls.
     Action(CommandId),
@@ -37,6 +40,12 @@ pub enum PaletteCommand {
     /// `host.sync_prefs` to one configured host.
     SyncPrefs {
         host: String,
+    },
+    /// Resume every session a restart ended (see `store::resume_all`).
+    ResumeAll,
+    /// Switch every open tab of the account's Agent to this saved account.
+    SwitchAccount {
+        profile_id: String,
     },
     /// Show a note (from the notes ⌘K finds while typing), with the caret
     /// on the block that matched.
@@ -110,8 +119,8 @@ pub fn actions_for_catalogs(
         ));
     }
     let terminal_title = default_host.map_or_else(
-        || "New Terminal".to_owned(),
-        |host| format!("New Terminal on {}", host.display_name()),
+        || t("palette.new_terminal").to_owned(),
+        |host| tf("palette.new_terminal_on", &[("host", &host.display_name())]),
     );
     // ⌘T needs exactly one row, and it must describe what ⌘T will actually do.
     // The quick-create loop above carries the badge whenever it lists the
@@ -142,8 +151,13 @@ pub fn actions_for_catalogs(
             );
             result.push(default_action(
                 default_host.map_or_else(
-                    || format!("New {name} Session"),
-                    |host| format!("New {name} on {}", host.display_name()),
+                    || tf("palette.new_agent_session", &[("agent", &name)]),
+                    |host| {
+                        tf(
+                            "palette.new_agent_on",
+                            &[("agent", &name), ("host", &host.display_name())],
+                        )
+                    },
                 ),
                 system_image(&kind),
                 &format!("{} agent spawn start create default", kind.id()),
@@ -207,13 +221,23 @@ pub fn actions_for_catalogs(
                 Some(PathBuf::from(&target.project.root)),
             );
             action.title = target_host.map_or_else(
-                || format!("New {} in {}", agent.display_name, target.project.name),
+                || {
+                    tf(
+                        "palette.new_agent_in",
+                        &[
+                            ("agent", &agent.display_name),
+                            ("project", &target.project.name),
+                        ],
+                    )
+                },
                 |host| {
-                    format!(
-                        "New {} in {} on {}",
-                        agent.display_name,
-                        target.project.name,
-                        host.display_name()
+                    tf(
+                        "palette.new_agent_in_on",
+                        &[
+                            ("agent", &agent.display_name),
+                            ("project", &target.project.name),
+                            ("host", &host.display_name()),
+                        ],
                     )
                 },
             );
@@ -261,8 +285,13 @@ fn new_dynamic_agent_action(
     PaletteAction {
         id,
         title: host.map_or_else(
-            || format!("New {label} Session"),
-            |host| format!("New {label} on {}", host.display_name()),
+            || tf("palette.new_agent_session", &[("agent", &label)]),
+            |host| {
+                tf(
+                    "palette.new_agent_on",
+                    &[("agent", &label), ("host", &host.display_name())],
+                )
+            },
         ),
         system_image: system_image_for_kind(&kind),
         shortcut: shortcut
@@ -315,6 +344,7 @@ fn append_management_actions(
                 action.command,
                 PaletteCommand::MigrateSelected { .. }
                     | PaletteCommand::Themes
+                    | PaletteCommand::InterfaceStyles
                     | PaletteCommand::SyncPrefs { .. }
                     | PaletteCommand::Action(
                         CommandId::OpenWorktrees
@@ -324,10 +354,15 @@ fn append_management_actions(
                             | CommandId::ToggleSidebar
                             | CommandId::HorizontalTabs
                             | CommandId::VerticalTabs
+                            | CommandId::ComfortableDensity
+                            | CommandId::CompactDensity
                             | CommandId::OpenSettings
                             | CommandId::ToggleHistory
                             | CommandId::ToggleNotifications
                             | CommandId::CheckForUpdates
+                            | CommandId::ShowWhatsNew
+                            | CommandId::TogglePerfOverlay
+                            | CommandId::ToggleRenderCounters
                     )
             )
         }),
@@ -344,6 +379,73 @@ pub fn actions(
     actions_for_default_host(default_agent, catalog, projects, hosts, selected, None)
 }
 
+/// "Switch Claude Code to Personal" for every saved account not in use, as
+/// last reported with its limits. The one with the most room is marked.
+pub fn account_actions(
+    limits: &[crate::usage::limits::AccountLimits],
+    now: i64,
+) -> Vec<PaletteAction> {
+    use crate::usage::limits::{ROOM_MARGIN, roomiest};
+    // The same rule Settings › Accounts marks "Most room" by.
+    let suggested = [AgentKind::CLAUDE_CODE_ID, AgentKind::CODEX_ID]
+        .map(|agent| roomiest(limits, agent, ROOM_MARGIN, now, |_| true));
+    let candidates: Vec<_> = limits
+        .iter()
+        .filter(|account| account.profile_id.is_some() && !account.live)
+        .filter(|account| !account.needs_sign_in())
+        .collect();
+    candidates
+        .iter()
+        .map(|account| {
+            let agent = if account.provider == "Codex" {
+                "Codex"
+            } else {
+                "Claude Code"
+            };
+            let roomiest = account.profile_id.is_some() && suggested.contains(&account.profile_id);
+            PaletteAction {
+                id: format!(
+                    "switch-account-{}",
+                    account.profile_id.as_deref().unwrap_or_default()
+                ),
+                title: tf(
+                    "palette.switch_account",
+                    &[("agent", &agent), ("account", &account.account)],
+                ),
+                system_image: "account.circle",
+                shortcut: None,
+                detail: roomiest.then(|| t("palette.most_room").into()),
+                enabled: true,
+                is_default: false,
+                command: PaletteCommand::SwitchAccount {
+                    profile_id: account.profile_id.clone().unwrap_or_default(),
+                },
+                keywords: format!(
+                    "account switch login limit usage {} {}",
+                    account.plan.as_deref().unwrap_or_default(),
+                    account.provider
+                ),
+            }
+        })
+        .collect()
+}
+
+/// "Resume All (N)", offered while more than one session a restart ended
+/// can be brought back.
+pub fn resume_all_action(count: usize) -> PaletteAction {
+    PaletteAction {
+        id: "resume-all".into(),
+        title: crate::terminal_pane::resume_all_label(count),
+        system_image: "arrow.clockwise",
+        shortcut: None,
+        detail: None,
+        enabled: true,
+        is_default: false,
+        command: PaletteCommand::ResumeAll,
+        keywords: "resume restart restore reboot sessions all agents".into(),
+    }
+}
+
 pub fn actions_for_default_host(
     default_agent: AgentKind,
     catalog: &AgentReadinessResult,
@@ -358,7 +460,7 @@ pub fn actions_for_default_host(
     let mut result = Vec::new();
     if default_agent == AgentKind::SHELL {
         result.push(default_action(
-            "New Terminal".into(),
+            t("palette.new_terminal").into(),
             "terminal",
             "shell console zsh bash tty default",
         ));
@@ -370,8 +472,13 @@ pub fn actions_for_default_host(
         let name = display_name(&default_agent, catalog);
         result.push(default_action(
             default_host.map_or_else(
-                || format!("New {name} Session"),
-                |host| format!("New {name} on {}", host.display_name()),
+                || tf("palette.new_agent_session", &[("agent", &name)]),
+                |host| {
+                    tf(
+                        "palette.new_agent_on",
+                        &[("agent", &name), ("host", &host.display_name())],
+                    )
+                },
             ),
             system_image(&default_agent),
             &format!("{} agent spawn start create default", default_agent.id()),
@@ -384,8 +491,8 @@ pub fn actions_for_default_host(
             .map(|option| new_agent_action(option, false, default_host)),
     );
     let terminal_title = default_host.map_or_else(
-        || "New Terminal".to_owned(),
-        |host| format!("New Terminal on {}", host.display_name()),
+        || t("palette.new_terminal").to_owned(),
+        |host| tf("palette.new_terminal_on", &[("host", &host.display_name())]),
     );
     // A Terminal default already heads the list as the ⌘T row; a second
     // ⌥⌘T "New Terminal" beside it would read as a duplicate.
@@ -428,7 +535,10 @@ pub fn actions_for_default_host(
     for project in projects {
         result.push(PaletteAction {
             id: format!("new-default-in-{}", project.root),
-            title: format!("New {default_name} in {}", project.name),
+            title: tf(
+                "palette.new_agent_in",
+                &[("agent", &default_name), ("project", &project.name)],
+            ),
             system_image: "folder",
             shortcut: None,
             detail: None,
@@ -449,7 +559,13 @@ pub fn actions_for_default_host(
         for option in &options {
             result.push(PaletteAction {
                 id: format!("new-{}-on-{}", option.kind.id(), host.id),
-                title: format!("New {} on {}", option.display_name, host.display_name()),
+                title: tf(
+                    "palette.new_agent_on",
+                    &[
+                        ("agent", &option.display_name),
+                        ("host", &host.display_name()),
+                    ],
+                ),
                 system_image: "network",
                 shortcut: None,
                 detail: None,
@@ -470,6 +586,7 @@ pub fn actions_for_default_host(
         && session.is_note()
     {
         result.push(registered_action(CommandId::NoteVersionHistory));
+        result.push(registered_action(CommandId::NoteGraph));
     }
 
     // Session handoff: move the SELECTED Claude session across hosts (v1 is
@@ -483,7 +600,7 @@ pub fn actions_for_default_host(
             if hosts.iter().any(|host| &host.id == current) {
                 result.push(PaletteAction {
                     id: "migrate-to-local".into(),
-                    title: "Move Session to Local".into(),
+                    title: t("palette.move_session_local").into(),
                     system_image: "arrow.left.arrow.right",
                     shortcut: None,
                     detail: None,
@@ -497,7 +614,7 @@ pub fn actions_for_default_host(
             for host in hosts {
                 result.push(PaletteAction {
                     id: format!("migrate-to-{}", host.id),
-                    title: format!("Move Session to {}", host.display_name()),
+                    title: tf("palette.move_session_to", &[("host", &host.display_name())]),
                     system_image: "arrow.left.arrow.right",
                     shortcut: None,
                     detail: None,
@@ -516,7 +633,7 @@ pub fn actions_for_default_host(
     for host in hosts {
         result.push(PaletteAction {
             id: format!("sync-prefs-{}", host.id),
-            title: format!("Sync Prefs to {}", host.display_name()),
+            title: tf("palette.sync_prefs_to", &[("host", &host.display_name())]),
             system_image: "arrow.triangle.2.circlepath",
             shortcut: None,
             detail: None,
@@ -542,7 +659,7 @@ pub fn actions_for_default_host(
         registered_action(CommandId::ToggleNotifications),
         PaletteAction {
             id: "color-theme".into(),
-            title: "Color theme".into(),
+            title: t("palette.color_theme").into(),
             system_image: "moon.fill",
             shortcut: None,
             detail: None,
@@ -551,7 +668,25 @@ pub fn actions_for_default_host(
             command: PaletteCommand::Themes,
             keywords: "settings appearance dark light preferences".into(),
         },
+        PaletteAction {
+            id: "interface-style".into(),
+            title: t("palette.interface_style").into(),
+            system_image: "desktopcomputer",
+            shortcut: None,
+            detail: None,
+            enabled: true,
+            is_default: false,
+            command: PaletteCommand::InterfaceStyles,
+            keywords:
+                "appearance glass transparent solid system modern themed blended blur material"
+                    .into(),
+        },
+        registered_action(CommandId::ComfortableDensity),
+        registered_action(CommandId::CompactDensity),
         registered_action(CommandId::CheckForUpdates),
+        registered_action(CommandId::ShowWhatsNew),
+        registered_action(CommandId::TogglePerfOverlay),
+        registered_action(CommandId::ToggleRenderCounters),
     ]);
     result
 }
@@ -561,7 +696,7 @@ fn registered_action(id: CommandId) -> PaletteAction {
     let title = command
         .palette
         .expect("palette commands must carry palette metadata")
-        .title
+        .title()
         .to_owned();
     registered_action_with_title(id, title)
 }
@@ -615,8 +750,21 @@ fn new_agent_action(
             format!("new-{}", option.kind.id())
         },
         title: host.map_or_else(
-            || format!("New {} Session", option.display_name),
-            |host| format!("New {} on {}", option.display_name, host.display_name()),
+            || {
+                tf(
+                    "palette.new_agent_session",
+                    &[("agent", &option.display_name)],
+                )
+            },
+            |host| {
+                tf(
+                    "palette.new_agent_on",
+                    &[
+                        ("agent", &option.display_name),
+                        ("host", &host.display_name()),
+                    ],
+                )
+            },
         ),
         system_image: system_image(&option.kind),
         shortcut: registered
@@ -769,6 +917,49 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn every_saved_account_not_in_use_can_be_switched_to() {
+        let now = 1_000;
+        let mut limits = crate::usage::limits::preview();
+        let switch_targets = |limits: &[crate::usage::limits::AccountLimits]| {
+            account_actions(limits, now)
+                .into_iter()
+                .map(|a| (a.command, a.detail))
+                .collect::<Vec<_>>()
+        };
+        for account in &mut limits {
+            for window in &mut account.windows {
+                window.resets_at = Some(now + 600);
+            }
+        }
+        assert_eq!(
+            switch_targets(&limits),
+            vec![
+                (
+                    PaletteCommand::SwitchAccount {
+                        profile_id: "preview-1".into()
+                    },
+                    Some(t("palette.most_room").to_owned())
+                ),
+                (
+                    PaletteCommand::SwitchAccount {
+                        profile_id: "preview-3".into()
+                    },
+                    None
+                ),
+            ],
+            "Personal and the idle Side project: Work and Main are in use"
+        );
+        let title = &account_actions(&limits, now)[0].title;
+        assert!(
+            title.contains("Claude Code") && title.contains("Personal"),
+            "{title}"
+        );
+        // A login that needs signing in again is not offered.
+        limits[1].error = Some(crate::usage::limits::SIGN_IN_AGAIN);
+        assert_eq!(switch_targets(&limits).len(), 1);
+    }
+
     fn catalog() -> AgentReadinessResult {
         AgentReadinessResult {
             agents: vec![
@@ -797,7 +988,9 @@ mod tests {
             configured_path: None,
             path_source: available.then_some(AgentPathSource::SystemPath),
             show_in_quick_create: available,
+            launch_args: Vec::new(),
             error: None,
+            signed_in: None,
             descriptor: Some(AgentDescriptor {
                 id: id.into(),
                 display_name: display_name.into(),
@@ -1134,7 +1327,13 @@ mod tests {
                 "history",
                 "toggle-notifications",
                 "color-theme",
+                "interface-style",
+                "comfortable-density",
+                "compact-density",
                 "check-for-updates",
+                "whats-new",
+                "toggle-perf-overlay",
+                "toggle-render-counters",
             ]
         );
         assert_eq!(result[0].title, "New Codex Session");
@@ -1289,9 +1488,11 @@ mod tests {
             listening_ports: None,
             foreground_agent: None,
             terminal_cwd: None,
+            agent_workspace: None,
             note_id: None,
             foreground_ports: None,
             terminal_progress: None,
+            scheduled_run: None,
         }
     }
 

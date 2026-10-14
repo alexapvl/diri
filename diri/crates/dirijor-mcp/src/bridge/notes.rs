@@ -10,6 +10,7 @@
 //! `session.list`.
 
 use super::*;
+use diri_notes::backlinks::{self, LinkIndex, Reference, WikiRewrite};
 use diri_notes::handoff::{self, TodoSelector};
 use diri_notes::history::Author;
 use diri_notes::mention::{self, MentionTarget};
@@ -23,6 +24,11 @@ const ORIGIN: &str = "origin";
 const MAX_ENTRY_CHARS: usize = 500;
 const MAX_HISTORY_ROWS: usize = 50;
 const NOTE_SPAWN_TIMEOUT: Duration = Duration::from_secs(10);
+/// Backlinks read_note lists before it says how many more there are.
+const READ_BACKLINKS: usize = 20;
+/// Links and mentions note_links lists of each kind.
+const MAX_LINK_ROWS: usize = 100;
+const DEFAULT_UNLINKED: usize = 20;
 
 /// What happened when the CLI asked the Engine to create a note Session.
 #[derive(Debug)]
@@ -46,6 +52,7 @@ impl Bridge {
         parent: Option<&str>,
     ) -> Result<NoteSpawn, String> {
         let params = SessionSpawnParams {
+            appearance: None,
             account_profile_id: None,
             kind: AgentKind::NOTE,
             cwd: cwd.to_owned(),
@@ -61,6 +68,7 @@ impl Bridge {
             same_repo_as: None,
             start_directory: None,
             note_id: None,
+            argv: None,
         };
         let params = serde_json::to_value(params).map_err(|e| e.to_string())?;
         let mut client = match self.connect(NOTE_SPAWN_TIMEOUT) {
@@ -106,6 +114,21 @@ impl Bridge {
         let project = optional_string(args, "project")
             .unwrap_or_else(|| if self.caller.is_some() { "mine" } else { "all" }.to_owned());
         let mentions = optional_string(args, "mentions");
+        // Notes linking to one note: "search by link".
+        let linking: Option<(String, Vec<String>)> = match optional_string(args, "links_to") {
+            None => None,
+            Some(query) => {
+                let target = self.resolve_note(&store, &query, self.sessions().as_deref().ok())?;
+                let index =
+                    LinkIndex::read(&store).map_err(|e| format!("cannot read notes: {e}"))?;
+                let sources = index
+                    .linking_notes(&target.id)
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect();
+                Some((target.id, sources))
+            }
+        };
 
         // Session facts are optional unless the filter itself needs them.
         let snapshot = self.snapshot();
@@ -169,6 +192,11 @@ impl Bridge {
             {
                 continue;
             }
+            if let Some((_, sources)) = &linking
+                && !sources.contains(&note.id)
+            {
+                continue;
+            }
             let via = match &mentioned {
                 None => None,
                 Some(ids) => {
@@ -194,13 +222,17 @@ impl Bridge {
                 rows.push(row);
             }
         }
-        Ok(json!({
+        let mut result = json!({
             "notes": rows,
             "total": total,
             "truncated": total > rows.len(),
             "project": project_root,
             "notes_dir": store.dir(),
-        }))
+        });
+        if let Some((target, _)) = linking {
+            result["links_to"] = json!(target);
+        }
+        Ok(result)
     }
 
     pub(super) fn read_note(&self, args: &Value) -> Result<Value, String> {
@@ -282,10 +314,96 @@ impl Bridge {
         object.insert("path".into(), json!(meta.path));
         object.insert("todos".into(), Value::Array(todos));
         object.insert("mentions".into(), Value::Array(mentions));
+        // Notes that link here: often the context this note was written in.
+        let mut index = LinkIndex::default();
+        for other in &notes {
+            if other.id == meta.id {
+                index.upsert_doc(&meta.id, &note.doc);
+            } else if let Ok(loaded) = store.load(&other.id) {
+                index.upsert_doc(&other.id, &loaded.doc);
+            }
+        }
+        let backlinks = index.backlinks(&meta.id);
+        object.insert("backlinks_total".into(), json!(backlinks.len()));
+        object.insert(
+            "backlinks".into(),
+            Value::Array(
+                backlinks
+                    .iter()
+                    .take(READ_BACKLINKS)
+                    .map(reference_row)
+                    .collect(),
+            ),
+        );
         if let Err(error) = sessions {
             object.insert("sessions_unavailable".into(), json!(error));
         }
         Ok(result)
+    }
+
+    /// A note's place among the others: the notes it links to, the notes
+    /// linking to it (with the words around each link), places that write
+    /// its title without linking, and optionally its neighbourhood graph.
+    pub(super) fn note_links(&self, args: &Value) -> Result<Value, String> {
+        let store = self.note_store()?;
+        let sessions = self.sessions();
+        let meta = self.resolve_note(
+            &store,
+            &required_string(args, "note")?,
+            sessions.as_deref().ok(),
+        )?;
+        let index = LinkIndex::read(&store).map_err(|e| format!("cannot read notes: {e}"))?;
+        let outgoing: Vec<Value> = index
+            .outgoing(&meta.id)
+            .iter()
+            .take(MAX_LINK_ROWS)
+            .map(|link| {
+                let mut row = json!({
+                    "note": link.target,
+                    "label": link.label,
+                    "block": link.block,
+                    "context": link.context,
+                });
+                match index.title(&link.target) {
+                    Some(title) => row["title"] = json!(title),
+                    None => row["missing"] = json!(true),
+                }
+                row
+            })
+            .collect();
+        let backlinks = index.backlinks(&meta.id);
+        let mut result = json!({
+            "note": meta.id,
+            "title": meta.display_title(),
+            "links": outgoing,
+            "backlinks": backlinks.iter().take(MAX_LINK_ROWS).map(reference_row).collect::<Vec<_>>(),
+            "backlinks_total": backlinks.len(),
+        });
+        if optional_bool(args, "unlinked").unwrap_or(true) {
+            let unlinked = index.unlinked_mentions(&meta.id, DEFAULT_UNLINKED);
+            result["unlinked_mentions"] =
+                Value::Array(unlinked.iter().map(reference_row).collect());
+        }
+        if let Some(depth) = args["depth"].as_u64() {
+            let graph = index.neighborhood(&meta.id, depth.clamp(1, 3) as usize);
+            result["graph"] = json!({
+                "nodes": graph.nodes.iter().map(|n| json!({"note": n.id, "title": n.title, "links": n.degree})).collect::<Vec<_>>(),
+                "edges": graph.edges.iter().map(|(a, b)| json!([graph.nodes[*a].id, graph.nodes[*b].id])).collect::<Vec<_>>(),
+            });
+        }
+        Ok(result)
+    }
+
+    /// `[[Title]]` in Markdown an agent is about to store, as note links.
+    fn link_wiki_markdown(&self, store: &NoteStore, markdown: &str) -> WikiRewrite {
+        if !markdown.contains("[[") {
+            return WikiRewrite {
+                text: markdown.to_owned(),
+                ..WikiRewrite::default()
+            };
+        }
+        let notes = store.list().unwrap_or_default();
+        backlinks::rewrite_wiki_links(markdown, |name| backlinks::wiki_target(&notes, name))
     }
 
     pub(super) fn write_note(&self, args: &Value) -> Result<Value, String> {
@@ -369,11 +487,14 @@ impl Bridge {
             .as_deref()
             .and_then(|id| snapshot.sessions.iter().find(|r| r.id.0 == id))
             .cloned();
+        let catalog = store.list().unwrap_or_default();
+        let mut wiki = WikiRewrite::default();
         let (note, (index, changes)) = store
             .update(
                 &meta.id,
                 &Author::Session(self.require_caller()?.to_owned()),
                 |note: &mut Note| {
+                    let before = block_texts(note);
                     let index = match &todo {
                         Some(selector) => {
                             Some(handoff::find_todo(note, selector).map_err(|e| {
@@ -425,11 +546,13 @@ impl Bridge {
                         note_store::append_markdown(note, text);
                         changes.push("appended");
                     }
+                    wiki = link_new_blocks(note, &before, &catalog);
                     Ok((index, changes))
                 },
             )
             .map_err(|e| format!("cannot write note {}: {e}", meta.id))?;
         let mut result = json!({"note": meta.id, "changes": changes});
+        add_wiki_report(&mut result, &wiki);
         if let Some(index) = index
             && let Some(todo) = handoff::todos(&note).into_iter().find(|t| t.index == index)
         {
@@ -465,7 +588,14 @@ impl Bridge {
             }
             None => self.caller_project(&snapshot)?.0,
         };
-        let record = match self.spawn_note(&folder, &title, &markdown, Some(&caller))? {
+        let wiki = match self.note_store() {
+            Ok(store) => self.link_wiki_markdown(&store, &markdown),
+            Err(_) => WikiRewrite {
+                text: markdown.clone(),
+                ..WikiRewrite::default()
+            },
+        };
+        let record = match self.spawn_note(&folder, &title, &wiki.text, Some(&caller))? {
             NoteSpawn::Created(record) => record,
             NoteSpawn::Unavailable(reason) => {
                 return Err(format!("cannot create the note: {reason}"));
@@ -479,12 +609,14 @@ impl Bridge {
                 DEFAULT_TIMEOUT,
             )?;
         }
-        Ok(json!({
+        let mut result = json!({
             "note": record.note_id,
             "session_id": record.id.0,
             "title": record.title,
             "opened": opened,
-        }))
+        });
+        add_wiki_report(&mut result, &wiki);
+        Ok(result)
     }
 
     /// Starts an agent on a note (or one of its to-dos) with the note as its
@@ -734,9 +866,15 @@ impl Bridge {
         )?;
         self.authorize_note_write(&snapshot, &meta)?;
         let caller = self.require_caller()?.to_owned();
+        let catalog = store.list().unwrap_or_default();
+        let mut wiki = WikiRewrite::default();
         let (_, edited) = store
             .update(&meta.id, &Author::Session(caller), |note| {
-                change(note).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+                let before = block_texts(note);
+                let edited = change(note)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+                wiki = link_new_blocks(note, &before, &catalog);
+                Ok(edited)
             })
             .map_err(|e| match e.kind() {
                 std::io::ErrorKind::InvalidInput => e.to_string(),
@@ -754,6 +892,7 @@ impl Bridge {
             "version": version,
             "undo": "Every earlier version is kept: note_history lists them, and the person can restore one.",
         });
+        add_wiki_report(&mut result, &wiki);
         if edited.tolerant {
             result["matched"] = json!(
                 "ignoring table spacing: Diri re-aligns tables after each change, so your text matched one row once spaces around | were ignored"
@@ -954,6 +1093,48 @@ fn note_row(note: &NoteMeta) -> Value {
     })
 }
 
+/// A backlink or an unlinked mention, as the tools return it.
+fn reference_row(reference: &Reference) -> Value {
+    json!({
+        "note": reference.source,
+        "title": reference.source_title,
+        "block": reference.block,
+        "context": reference.context,
+    })
+}
+
+/// Every block's text, to tell the blocks a write added or changed.
+fn block_texts(note: &Note) -> std::collections::HashSet<String> {
+    note.doc.blocks.iter().map(|b| b.text.clone()).collect()
+}
+
+/// Links `[[Title]]` in the blocks a write added or changed; the person's
+/// untouched text is left exactly as it was.
+fn link_new_blocks(
+    note: &mut Note,
+    before: &std::collections::HashSet<String>,
+    catalog: &[NoteMeta],
+) -> WikiRewrite {
+    backlinks::link_wiki_blocks(
+        &mut note.doc,
+        |block| block.text.contains("[[") && !before.contains(&block.text),
+        |name| backlinks::wiki_target(catalog, name),
+    )
+}
+
+/// Tells the agent which `[[…]]` became links and which matched no note.
+fn add_wiki_report(result: &mut Value, wiki: &WikiRewrite) {
+    if !wiki.linked.is_empty() {
+        result["linked_notes"] = json!(wiki.linked);
+    }
+    if !wiki.unresolved.is_empty() {
+        result["unlinked_titles"] = json!(wiki.unresolved);
+        result["unlinked_hint"] = json!(
+            "No single note has these titles, so they stay as text. Check the title with list_notes, or pass the note's id: [[<id>]]."
+        );
+    }
+}
+
 fn session_fact(record: &SessionRecord) -> Value {
     let mut value = compact(record);
     let live = !record.is_archived() && !matches!(record.status, SessionStatus::Exited(_));
@@ -1084,6 +1265,93 @@ mod tests {
         }
     }
 
+    /// An Agent reading a note session's "screen" gets the note itself; the
+    /// Engine's `session_has_no_terminal` would only be retried.
+    #[test]
+    fn read_output_of_a_note_session_returns_the_note() {
+        let notes = tempfile::tempdir().unwrap();
+        let store = NoteStore::open(notes.path()).unwrap();
+        let (note_id, _) = store
+            .create(Document::new("Plan", Vec::new()), None)
+            .unwrap();
+        store
+            .append(&note_id, "ship the fix", &diri_notes::history::Author::Cli)
+            .unwrap();
+        let mut note = super::super::tests::record("s_note", None);
+        note.kind = AgentKind::NOTE;
+        note.note_id = Some(note_id);
+        let mut sessions = sessions();
+        sessions.push(note);
+        let (fixture, _) = Fixture::scripted(sessions, |method| {
+            (method == Method::SESSION_READ_SCREEN).then(|| {
+                json!({"__error": {
+                    "code": diri_proto::control::SESSION_HAS_NO_TERMINAL,
+                    "message": "s_note is a note, which has no terminal",
+                }})
+            })
+        });
+        let fixture = Fixture { notes, ..fixture };
+
+        let output = fixture
+            .bridge("root")
+            .call("read_output", &json!({"session_id": "s_note"}))
+            .unwrap();
+
+        assert_eq!(output["mode"], "note");
+        assert_eq!(output["title"], "Plan");
+        assert!(
+            output["markdown"]
+                .as_str()
+                .unwrap()
+                .contains("ship the fix"),
+            "{output}"
+        );
+    }
+
+    /// An ended session whose screen was never kept answers once, with its
+    /// conversation, instead of `terminal_not_retained` on every call.
+    #[test]
+    fn read_output_of_an_ended_session_without_a_screen_says_so() {
+        let (fixture, calls) = Fixture::scripted(sessions(), |method| match method {
+            Method::SESSION_READ_SCREEN => Some(json!({"__error": {
+                "code": diri_proto::control::TERMINAL_NOT_RETAINED,
+                "message": "other has ended and Diri did not keep its final screen",
+            }})),
+            Method::SESSION_READ_TRANSCRIPT => Some(json!({
+                "available": true,
+                "turns": [{"role": "agent", "text": "all done"}],
+            })),
+            _ => None,
+        });
+
+        for mode in ["screen", "tail", "last_message"] {
+            let output = fixture
+                .bridge("root")
+                .call("read_output", &json!({"session_id": "other", "mode": mode}))
+                .unwrap();
+            if mode == "last_message" {
+                assert_eq!(output["message"], "all done", "{output}");
+                continue;
+            }
+            assert_eq!(output["mode"], "ended", "{mode}: {output}");
+            assert!(
+                output["screen_unavailable"]
+                    .as_str()
+                    .unwrap()
+                    .contains("did not keep"),
+                "{output}"
+            );
+            assert_eq!(output["turns"][0]["text"], "all done", "{output}");
+        }
+        assert!(
+            calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|method| method == Method::SESSION_READ_TRANSCRIPT)
+        );
+    }
+
     #[test]
     fn read_note_resolves_mentions_and_todo_sessions() {
         let fixture = Fixture::new(sessions());
@@ -1175,6 +1443,96 @@ mod tests {
             "{source}"
         );
         assert!(source.trim_end().ends_with("Done in PR #600."), "{source}");
+    }
+
+    #[test]
+    fn note_links_reports_links_backlinks_and_unlinked_mentions() {
+        let fixture = Fixture::new(sessions());
+        let plan = fixture.note("Release plan", None, "Ship on Friday.");
+        let brief = fixture.note(
+            "Launch brief",
+            None,
+            &format!("Builds on [@Release plan](diri://note/{plan}) and the pricing page."),
+        );
+        let retro = fixture.note("Retro", None, "The release plan slipped a day.");
+        let bridge = fixture.bridge("root");
+        let links = bridge
+            .call("note_links", &json!({"note": "Release plan", "depth": 1}))
+            .unwrap();
+        assert_eq!(links["note"], plan.as_str());
+        assert_eq!(links["backlinks_total"], 1);
+        assert_eq!(links["backlinks"][0]["note"], brief.as_str());
+        assert_eq!(links["backlinks"][0]["title"], "Launch brief");
+        assert!(
+            links["backlinks"][0]["context"]
+                .as_str()
+                .unwrap()
+                .contains("Builds on @Release plan"),
+            "{links}"
+        );
+        assert_eq!(links["unlinked_mentions"][0]["note"], retro.as_str());
+        assert_eq!(links["graph"]["nodes"].as_array().unwrap().len(), 2);
+        assert_eq!(links["graph"]["edges"][0], json!([plan, brief]));
+        let out = bridge
+            .call("note_links", &json!({"note": brief, "unlinked": false}))
+            .unwrap();
+        assert_eq!(out["links"][0]["note"], plan.as_str());
+        assert_eq!(out["links"][0]["title"], "Release plan");
+        assert!(out.get("unlinked_mentions").is_none());
+
+        // read_note carries the backlinks; list_notes searches by link.
+        let read = bridge.call("read_note", &json!({"note": plan})).unwrap();
+        assert_eq!(read["backlinks_total"], 1);
+        assert_eq!(read["backlinks"][0]["note"], brief.as_str());
+        let listed = bridge
+            .call(
+                "list_notes",
+                &json!({"project": "all", "links_to": "Release plan"}),
+            )
+            .unwrap();
+        assert_eq!(ids(&listed), ["Launch brief"]);
+        assert_eq!(listed["links_to"], plan.as_str());
+    }
+
+    #[test]
+    fn wiki_links_written_by_agents_become_note_links() {
+        let fixture = Fixture::new(sessions());
+        let plan = fixture.note("Release plan", None, "Ship on Friday.");
+        let id = fixture.note("Status", None, "Untouched [[Release plan]] stays as typed.");
+        let bridge = fixture.bridge("root");
+        let result = bridge
+            .call(
+                "write_note",
+                &json!({"note": id, "append": "Follows [[release plan]] and [[Nowhere]]."}),
+            )
+            .unwrap();
+        assert_eq!(result["linked_notes"], json!([plan]));
+        assert_eq!(result["unlinked_titles"], json!(["Nowhere"]));
+        let source = fixture.store().load(&id).unwrap().to_markdown();
+        assert!(
+            source.contains(&format!("Follows [@Release plan](diri://note/{plan}) and")),
+            "{source}"
+        );
+        assert!(
+            source.contains("Untouched \\[\\[Release plan\\]\\] stays"),
+            "the person's own text is not rewritten: {source}"
+        );
+        let edited = bridge
+            .call(
+                "edit_note",
+                &json!({"note": "Release plan", "old_string": "Ship on Friday.", "new_string": "Ship on Friday, see [[Status|status]]."}),
+            )
+            .unwrap();
+        assert_eq!(edited["linked_notes"], json!([id]));
+        let links = bridge.call("note_links", &json!({"note": id})).unwrap();
+        assert_eq!(links["backlinks"][0]["note"], plan.as_str());
+        assert!(
+            links["backlinks"][0]["context"]
+                .as_str()
+                .unwrap()
+                .contains("@status"),
+            "{links}"
+        );
     }
 
     #[test]

@@ -33,8 +33,8 @@ const PREVIEW_LINE: f32 = 16.0;
 /// panel reserves before it is measured.
 const PREVIEW_CHARS_PER_LINE: usize = 62;
 const LABEL_HEIGHT: f32 = 24.0;
-/// The Start affordance sits in the margin right of the text column.
-const ACCESSORY_GAP: f32 = 12.0;
+/// Start's height; it sits centred on the line holding the to-do's last word.
+const ACCESSORY_HEIGHT: f32 = 24.0;
 
 /// What the editor asks its host to do for a work item.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,6 +47,9 @@ pub(crate) enum WorkRequest {
         block: BlockId,
         kind: AgentKind,
         agent_name: String,
+        /// The existing session the to-do mentions, asked instead of a new
+        /// agent being spawned.
+        session: Option<String>,
     },
     /// Show this session (the sidebar selects it).
     Open { session: String },
@@ -60,6 +63,8 @@ pub(crate) struct AgentChoice {
     pub kind: AgentKind,
     pub name: String,
     pub is_default: bool,
+    /// Set for the session the to-do mentions: Start prompts it.
+    pub session: Option<String>,
 }
 
 pub(crate) struct StartPanel {
@@ -76,7 +81,11 @@ struct TickPanel {
     selected: usize,
 }
 
-const TICK_CHOICES: [&str; 3] = ["Tick and stop the agent", "Tick, keep it running", "Cancel"];
+const TICK_CHOICES: [&str; 3] = [
+    "notes.work.tick_stop",
+    "notes.work.tick_keep",
+    "notes.cancel",
+];
 
 enum Pending {
     Starting { ticket: u64, label: String },
@@ -88,6 +97,9 @@ enum Pending {
 #[derive(Default)]
 pub(crate) struct WorkView {
     facts: HashMap<String, SessionFacts>,
+    /// To-dos that mention a session nobody has asked to take them on yet:
+    /// Start prompts that session instead of spawning one.
+    handoff: HashMap<BlockId, String>,
     pending: HashMap<BlockId, Pending>,
     start: Option<StartPanel>,
     tick: Option<TickPanel>,
@@ -98,6 +110,17 @@ impl WorkView {
     /// linked session missing here is unknown to the Engine.
     pub(crate) fn set_facts(&mut self, facts: HashMap<String, SessionFacts>) {
         self.facts = facts;
+    }
+
+    /// The to-dos whose mentioned session Start would prompt.
+    pub(crate) fn set_handoff(&mut self, handoff: HashMap<BlockId, String>) -> bool {
+        let changed = self.handoff != handoff;
+        self.handoff = handoff;
+        changed
+    }
+
+    pub(crate) fn handoff(&self, block: BlockId) -> Option<&str> {
+        self.handoff.get(&block).map(String::as_str)
     }
 
     /// Tickets of starts still waiting on the Engine.
@@ -116,6 +139,10 @@ impl WorkView {
             return WorkState::Starting;
         }
         let checked = block.kind == BlockKind::Todo { checked: true };
+        // A mention is where the work should go, not work under way.
+        if !checked && self.handoff.contains_key(&block.id) {
+            return WorkState::Ready;
+        }
         let session = work::current_session(block);
         work::state(
             checked,
@@ -160,6 +187,14 @@ impl WorkView {
                 None => self.tick = None,
             }
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn start_panel_agents(&self) -> Vec<AgentChoice> {
+        self.start
+            .as_ref()
+            .map(|panel| panel.agents.clone())
+            .unwrap_or_default()
     }
 
     #[cfg(test)]
@@ -231,6 +266,7 @@ impl NoteEditorView {
             block: panel.block,
             kind: agent.kind.clone(),
             agent_name: agent.name.clone(),
+            session: agent.session.clone(),
         }));
         cx.notify();
     }
@@ -388,10 +424,21 @@ impl NoteEditorView {
     // -----------------------------------------------------------------------
     // Pixels
 
-    /// The quiet Start affordance in the margin right of an unstarted to-do.
+    /// Whether an unstarted to-do offers Start, so its text keeps room for it.
+    pub(super) fn wants_start(&self, block: &Block) -> bool {
+        block.kind == (BlockKind::Todo { checked: false })
+            && !block.text.trim().is_empty()
+            && self.work.state(block) == WorkState::Ready
+            && self.work.failure(block.id).is_none()
+    }
+
+    /// The quiet Start affordance right after an unstarted to-do's last word,
+    /// so a narrow window wraps it with the words instead of cutting it off.
     /// It shows while the row is hovered or holds the caret.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn work_accessory(
         &self,
+        index: usize,
         block: &Block,
         caret_here: bool,
         group: SharedString,
@@ -399,27 +446,20 @@ impl NoteEditorView {
         colors: SemanticColors,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        if block.kind != (BlockKind::Todo { checked: false })
-            || block.text.trim().is_empty()
-            || self.work.state(block) != WorkState::Ready
-            || self.work.failure(block.id).is_some()
-        {
+        if !self.wants_start(block) {
             return None;
         }
+        let at = self.tail_point(index)?;
         let id = block.id;
         Some(
             div()
                 .absolute()
-                .top_0()
-                .left_full()
-                .h(px(line))
-                .pl(px(ACCESSORY_GAP))
-                .flex()
-                .items_center()
+                .left(at.x)
+                .top(at.y + px((line - ACCESSORY_HEIGHT) / 2.0))
                 .child(
                     div()
                         .id(("todo-start", id))
-                        .h(px(24.0))
+                        .h(px(ACCESSORY_HEIGHT))
                         .px(px(8.0))
                         .flex()
                         .items_center()
@@ -432,7 +472,7 @@ impl NoteEditorView {
                             el.opacity(0.0).group_hover(group, |el| el.opacity(1.0))
                         })
                         .hover(|el| el.bg(colors.primary.alpha(0.06)).text_color(colors.primary))
-                        .child("Start")
+                        .child(crate::i18n::t("notes.work.start"))
                         .child(div().text_color(colors.tertiary).child(START_SHORTCUT))
                         .on_mouse_down(
                             MouseButton::Left,
@@ -464,7 +504,7 @@ impl NoteEditorView {
             if let Some(reason) = self.work.failure(id) {
                 (
                     Some(Ink::DANGER),
-                    "Couldn't start".to_owned(),
+                    crate::i18n::t("notes.work.failed").to_owned(),
                     Some(one_line(reason, 160)),
                 )
             } else {
@@ -472,17 +512,17 @@ impl NoteEditorView {
                     WorkState::Ready | WorkState::Done => return None,
                     WorkState::Starting => (
                         Some(colors.primary.alpha(0.3)),
-                        "Starting…".to_owned(),
+                        crate::i18n::t("notes.work.starting").to_owned(),
                         None,
                     ),
                     WorkState::Working => (
                         Some(colors.primary.alpha(0.54)),
-                        "Working on it".to_owned(),
+                        crate::i18n::t("notes.work.working").to_owned(),
                         None,
                     ),
                     WorkState::NeedsYou(question) => (
                         Some(Ink::ATTENTION),
-                        "Needs you".to_owned(),
+                        crate::i18n::t("notes.work.needs_you").to_owned(),
                         Some(one_line(
                             question.excerpt.as_deref().unwrap_or(&question.summary),
                             200,
@@ -491,8 +531,10 @@ impl NoteEditorView {
                     WorkState::Review(pr) => (
                         Some(Ink::FRESH),
                         match pr {
-                            Some(pr) => format!("Ready to review · PR #{} open", pr.number),
-                            None => "Ready to review".to_owned(),
+                            Some(pr) => {
+                                crate::i18n::tf("notes.work.review_pr", &[("number", &pr.number)])
+                            }
+                            None => crate::i18n::t("notes.work.review").to_owned(),
                         },
                         None,
                     ),
@@ -508,16 +550,22 @@ impl NoteEditorView {
             && self.work.failure(id).is_none()
         {
             let label = if matches!(state, WorkState::NeedsYou(_)) {
-                "Answer in session"
+                crate::i18n::t("notes.work.answer")
             } else {
-                "Open"
+                crate::i18n::t("notes.work.open")
             };
             actions.push((label, WorkRequest::Open { session }));
         }
         if self.work.failure(id).is_some() {
-            actions.push(("Try again", WorkRequest::Prepare { block: id }));
+            actions.push((
+                crate::i18n::t("notes.work.retry"),
+                WorkRequest::Prepare { block: id },
+            ));
         } else if block.kind == (BlockKind::Todo { checked: false }) && state.can_restart() {
-            actions.push(("Start again", WorkRequest::Prepare { block: id }));
+            actions.push((
+                crate::i18n::t("notes.work.restart"),
+                WorkRequest::Prepare { block: id },
+            ));
         }
 
         let mut line = div()
@@ -668,10 +716,14 @@ impl NoteEditorView {
             .flex()
             .flex_col()
             .py(px(floating::MENU_PADDING_Y))
-            .child(section_label("Start with".into(), None, colors));
+            .child(section_label(
+                crate::i18n::t("notes.work.start_with").into(),
+                None,
+                colors,
+            ));
         if panel.agents.is_empty() {
             list = list.child(super::editor_view::menu_empty(
-                "No agents installed. Add one in Settings.",
+                crate::i18n::t("notes.work.no_agents"),
                 colors,
             ));
         }
@@ -682,6 +734,8 @@ impl NoteEditorView {
                 colors,
             )
             .badged(false)
+            .inset(floating::MENU_AGENT_LOGO_INSET)
+            .monochrome(true)
             .into_any_element();
             let row = floating::menu_row(
                 ("note-work-agent", index),
@@ -709,32 +763,60 @@ impl NoteEditorView {
             .when(index == panel.selected, |row| {
                 row.child(floating::menu_shortcut("↩", colors))
             })
-            .when(agent.is_default && index != panel.selected, |row| {
-                row.child(floating::menu_shortcut("Default", colors))
-            });
+            .when(agent.session.is_some() && index != panel.selected, |row| {
+                row.child(floating::menu_shortcut(
+                    crate::i18n::t("notes.work.mentioned"),
+                    colors,
+                ))
+            })
+            .when(
+                agent.is_default && agent.session.is_none() && index != panel.selected,
+                |row| {
+                    row.child(floating::menu_shortcut(
+                        crate::i18n::t("notes.work.default"),
+                        colors,
+                    ))
+                },
+            );
             list = list.child(row);
         }
         let brief = &panel.brief;
         let mut summary = vec![format_bytes(brief.prompt.len())];
         if brief.context_lines > 0 {
-            summary.push(plural(brief.context_lines, "context line", "context lines"));
+            summary.push(plural(
+                brief.context_lines,
+                "notes.work.brief.context_lines_one",
+                "notes.work.brief.context_lines_other",
+            ));
         }
         if brief.links > 0 {
-            summary.push(plural(brief.links, "link", "links"));
+            summary.push(plural(
+                brief.links,
+                "notes.work.brief.links_one",
+                "notes.work.brief.links_other",
+            ));
         }
         if brief.notes > 0 {
-            summary.push(plural(brief.notes, "note", "notes"));
+            summary.push(plural(
+                brief.notes,
+                "notes.work.brief.notes_one",
+                "notes.work.brief.notes_other",
+            ));
         }
         if brief.sessions > 0 {
-            summary.push(plural(brief.sessions, "session", "sessions"));
+            summary.push(plural(
+                brief.sessions,
+                "notes.work.brief.sessions_one",
+                "notes.work.brief.sessions_other",
+            ));
         }
         if brief.truncated {
-            summary.push("shortened".to_owned());
+            summary.push(crate::i18n::t("notes.work.brief.shortened").to_owned());
         }
         list = list
             .child(floating::menu_separator(colors))
             .child(section_label(
-                "What the agent gets".into(),
+                crate::i18n::t("notes.work.brief.title").into(),
                 Some(summary.join(" · ").into()),
                 colors,
             ))
@@ -767,7 +849,7 @@ impl NoteEditorView {
             .flex_col()
             .py(px(floating::MENU_PADDING_Y))
             .child(section_label(
-                "The agent is still working".into(),
+                crate::i18n::t("notes.work.still_working").into(),
                 None,
                 colors,
             ));
@@ -802,7 +884,10 @@ impl NoteEditorView {
                     this.confirm_tick(index, cx);
                 }),
             )
-            .child(super::editor_view::menu_label(*label, colors))
+            .child(super::editor_view::menu_label(
+                crate::i18n::t(label),
+                colors,
+            ))
             .when(index == 2, |row| {
                 row.child(floating::menu_shortcut("esc", colors))
             });
@@ -874,13 +959,13 @@ fn one_line(text: &str, max_chars: usize) -> String {
     format!("{}…", cut.trim_end())
 }
 
-fn plural(count: usize, one: &str, many: &str) -> String {
-    format!("{count} {}", if count == 1 { one } else { many })
+fn plural(count: usize, one: &'static str, many: &'static str) -> String {
+    crate::i18n::tf(if count == 1 { one } else { many }, &[("count", &count)])
 }
 
 fn format_bytes(bytes: usize) -> String {
     if bytes < 1024 {
-        format!("{bytes} bytes")
+        crate::i18n::tf("notes.work.brief.bytes", &[("count", &bytes)])
     } else {
         format!("{:.1} KB", bytes as f64 / 1024.0)
     }
@@ -950,12 +1035,113 @@ impl super::NotePane {
                 })
                 .collect()
         };
+        let handoff = self.handoff_targets(&editor, cx);
         editor.update(cx, |view, cx| {
+            let handoff_changed = view.work.set_handoff(handoff);
             if view.work.facts != facts {
                 view.work.set_facts(facts);
                 cx.notify();
+            } else if handoff_changed {
+                cx.notify();
             }
         });
+    }
+
+    /// Unticked to-dos whose newest session chip names an agent the user
+    /// mentioned rather than one Start made: not this note's child, and not
+    /// yet reporting under the to-do. Start asks that session to take it on.
+    fn handoff_targets(
+        &self,
+        editor: &gpui::Entity<super::editor_view::NoteEditorView>,
+        cx: &Context<Self>,
+    ) -> HashMap<BlockId, String> {
+        let super::PaneState::Open(open) = &self.state else {
+            return HashMap::new();
+        };
+        let view = editor.read(cx);
+        let blocks = view.editor.blocks();
+        let store = self.runtime.store.read().expect("store");
+        let mut out = HashMap::new();
+        for (index, block) in blocks.iter().enumerate() {
+            if block.kind != (BlockKind::Todo { checked: false }) {
+                continue;
+            }
+            let Some(session) = work::current_session(block) else {
+                continue;
+            };
+            let Some(record) = store.sessions().get(&SessionId::new(session.clone())) else {
+                continue;
+            };
+            let askable = !record.is_note()
+                && !record.is_archived()
+                && !record.effective_kind().is_terminal()
+                && record.parent.as_ref() != Some(&open.session)
+                && !work::has_update_from(blocks, index, &session);
+            if askable {
+                out.insert(block.id, session);
+            }
+        }
+        out
+    }
+
+    /// The Start panel row for the session a to-do mentions.
+    fn mentioned_choice(&self, session: &str) -> Option<AgentChoice> {
+        let store = self.runtime.store.read().expect("store");
+        let record = store.sessions().get(&SessionId::new(session.to_owned()))?;
+        Some(AgentChoice {
+            kind: record.effective_kind().clone(),
+            name: crate::switcher::display_title_str(record).to_owned(),
+            is_default: true,
+            session: Some(session.to_owned()),
+        })
+    }
+
+    /// Start on a to-do that mentions a session: send that session the
+    /// brief, and note under the to-do that it was asked, which is also what
+    /// turns the to-do from "Start" into tracked work.
+    fn hand_off_work(&mut self, block: BlockId, session: &str, cx: &mut Context<Self>) {
+        let Some((note, todo)) = self.work_note(block, cx) else {
+            return;
+        };
+        let brief = self.brief_for(&note, todo);
+        let label = {
+            let store = self.runtime.store.read().expect("store");
+            let Some(record) = store.sessions().get(&SessionId::new(session.to_owned())) else {
+                return;
+            };
+            diri_notes::mention::session_label("", crate::switcher::display_title_str(record))
+        };
+        let command = crate::notifications::SendTextCommand {
+            session_id: SessionId::new(session.to_owned()),
+            text: brief.prompt,
+            submit: true,
+        };
+        #[cfg(test)]
+        self.sent_for_test.push(command.clone());
+        let _ = self.runtime.notification_action_sender().send(command);
+        let super::PaneState::Open(open) = &self.state else {
+            return;
+        };
+        open.editor.update(cx, |view, cx| {
+            let Some(index) = view.block_index(block) else {
+                return;
+            };
+            if view.editor.add_update(
+                index,
+                &diri_notes::handoff::entry_stamp(),
+                &label,
+                session,
+                "Asked to take this on",
+                super::editor_view_now_ms(),
+            ) {
+                cx.emit(EditorEvent::Changed);
+            }
+            if view.editor.has_children(index) {
+                view.set_folded(index, true, cx);
+            }
+        });
+        self.save(cx);
+        self.push_work(cx);
     }
 
     pub(crate) fn on_work(&mut self, request: &WorkRequest, cx: &mut Context<Self>) {
@@ -963,8 +1149,14 @@ impl super::NotePane {
             WorkRequest::Prepare { block } => self.prepare_work(*block, cx),
             WorkRequest::Start {
                 block,
+                session: Some(session),
+                ..
+            } => self.hand_off_work(*block, session, cx),
+            WorkRequest::Start {
+                block,
                 kind,
                 agent_name,
+                session: None,
             } => self.start_work(*block, kind.clone(), agent_name, cx),
             WorkRequest::Open { session } => {
                 let id = SessionId::new(session.clone());
@@ -1064,6 +1256,7 @@ impl super::NotePane {
                 is_default: option.kind == default,
                 kind: option.kind,
                 name: option.display_name,
+                session: None,
             })
             .collect();
         if !agents.iter().any(|a| a.is_default)
@@ -1080,10 +1273,17 @@ impl super::NotePane {
             return;
         };
         let brief = self.brief_for(&note, todo);
-        let agents = self.work_agents();
+        let mut agents = self.work_agents();
         let super::PaneState::Open(open) = &self.state else {
             return;
         };
+        let mentioned = open.editor.read(cx).work.handoff(block).map(str::to_owned);
+        if let Some(choice) = mentioned.and_then(|id| self.mentioned_choice(&id)) {
+            for agent in &mut agents {
+                agent.is_default = false;
+            }
+            agents.insert(0, choice);
+        }
         open.editor.update(cx, |view, cx| {
             if let Some(index) = view.editor.blocks().iter().position(|b| b.id == block) {
                 let end = view.editor.block(index).text.len();

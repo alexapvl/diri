@@ -351,6 +351,8 @@ tokio::spawn(async move { clone_repository(request).await });
                 reason: ExitReason::Archived,
                 code: None,
                 signal: None,
+                system_restart: false,
+                interrupted: false,
             }),
             Some("composition-notes"),
             now - hours(48.0),
@@ -391,6 +393,8 @@ tokio::spawn(async move { clone_repository(request).await });
                         reason: ExitReason::Exited,
                         code: Some(0),
                         signal: None,
+                        system_restart: false,
+                        interrupted: false,
                     }),
                     Some("accessibility"),
                     now - hours(7.0),
@@ -451,14 +455,23 @@ tokio::spawn(async move { clone_repository(request).await });
 #[cfg(all(test, target_os = "macos"))]
 impl SidebarPreviewFixture {
     pub(crate) fn bench_fleet(total: usize, working: usize) -> Self {
+        Self::bench_fleet_across(total, working, 5)
+    }
+
+    /// [`Self::bench_fleet`] spread over `projects` projects (the first five
+    /// keep their names; the rest are numbered).
+    pub(crate) fn bench_fleet_across(total: usize, working: usize, projects: usize) -> Self {
         let now = 1_750_000_000_000.0;
-        let projects: Vec<Project> = ["dirijor", "anara", "settings-kit", "infra", "notes"]
-            .iter()
-            .map(|name| {
+        let names = ["dirijor", "anara", "settings-kit", "infra", "notes"];
+        let projects: Vec<Project> = (0..projects.max(1))
+            .map(|index| {
+                let name = names
+                    .get(index)
+                    .map_or_else(|| format!("project-{index}"), |name| (*name).to_owned());
                 project(
                     &format!("bench-{name}"),
                     &format!("/Users/preview/Projects/{name}"),
-                    name,
+                    &name,
                 )
             })
             .collect();
@@ -617,9 +630,11 @@ fn session(
         listening_ports: None,
         foreground_agent: None,
         terminal_cwd: None,
+        agent_workspace: None,
         note_id: None,
         foreground_ports: None,
         terminal_progress: None,
+        scheduled_run: None,
     })
 }
 
@@ -629,6 +644,66 @@ const fn minutes(value: f64) -> f64 {
 
 const fn hours(value: f64) -> f64 {
     value * 3_600_000.0
+}
+
+/// The state file an Engine before PR #764 wrote after an Agent spawned seven
+/// worktree Agents on `forge`: each Session's project is its own worktree.
+/// The sidebar screenshot loads it through the Engine's `Registry`, so the
+/// picture is whatever that build's load does with it.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn remote_worktree_state() -> serde_json::Value {
+    let now = 1_750_000_000_000.0;
+    let anara = project("p_local_anara", "/Users/preview/fun/anara", "anara");
+    let parent = session(
+        "preview-slop-parent",
+        AgentKind::CLAUDE_CODE,
+        &anara,
+        "Slack slop complaints",
+        SessionStatus::Idle,
+        Some("main"),
+        now - hours(1.0),
+    )
+    .seen(now);
+    let mut projects = vec![serde_json::to_value(&anara).expect("project")];
+    let mut sessions = vec![SessionRecord::from(parent)];
+    for (index, (branch, title)) in [
+        ("slop/reader-settings-menu", "slop-reader-menu"),
+        ("slop/shimmer-budget", "slop-shimmer"),
+        ("slop/chat-search-field", "slop-chat-search"),
+        ("slop/invite-flow", "slop-invite"),
+        ("slop/folder-members", "slop-members"),
+        ("slop/trash-popover", "slop-trash"),
+        ("slop/settings-devices", "slop-devices"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let root = format!("/home/cristi/code/anara-{}", branch.replace('/', "-"));
+        let name = root.rsplit('/').next().unwrap_or_default().to_owned();
+        let id = format!("p_forge_{index}");
+        projects.push(serde_json::json!({
+            "id": id, "root": root, "name": name, "host": "forge",
+        }));
+        let mut record = session(
+            &format!("preview-slop-{index}"),
+            AgentKind::CLAUDE_CODE,
+            &project(&id, &root, &name),
+            title,
+            if index < 3 {
+                SessionStatus::Working
+            } else {
+                SessionStatus::Idle
+            },
+            Some(branch),
+            now - minutes(50.0 - index as f64),
+        )
+        .seen(now)
+        .child_of(&SessionId::new("preview-slop-parent"));
+        record.0.host = Some("forge".into());
+        record.0.worktree_path = Some(root);
+        sessions.push(SessionRecord::from(record));
+    }
+    serde_json::json!({ "version": 1, "projects": projects, "sessions": sessions })
 }
 
 #[cfg(test)]

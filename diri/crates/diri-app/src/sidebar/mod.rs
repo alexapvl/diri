@@ -4,6 +4,7 @@ mod disclosure;
 mod filter;
 mod fixture;
 mod row_motion;
+mod row_window;
 mod state;
 mod title_settle;
 mod view;
@@ -15,7 +16,7 @@ pub use state::{
 };
 pub(crate) use view::DraggedSidebarItem;
 pub use view::Sidebar;
-pub(crate) use view::SidebarEvent;
+pub(crate) use view::{AccountRequest, SidebarEvent};
 // Only the macOS frame fixture drives the title clock from outside the view.
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) use view::render_probe;

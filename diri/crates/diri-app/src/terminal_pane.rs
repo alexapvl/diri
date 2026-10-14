@@ -12,6 +12,9 @@ mod find_overlay;
 pub(crate) mod find_workflow_tests;
 #[cfg(all(test, target_os = "macos"))]
 mod keystroke_latency_tests;
+mod messages;
+#[cfg(all(test, target_os = "macos"))]
+mod messages_tests;
 mod path_picker;
 mod qol;
 mod reconnect;
@@ -53,7 +56,7 @@ use gpui::{
     AnyElement, ClipboardEntry, ClipboardItem, Context, Entity, EventEmitter, ExternalPaths,
     FocusHandle, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent, MouseButton, Render, Role,
     ScrollDelta, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Task, Window, div,
-    font, prelude::*, px,
+    prelude::*, px,
 };
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
@@ -61,10 +64,11 @@ use tokio::sync::mpsc;
 use crate::clipboard_transfer::{StagedClipboardImage, upload_dropped_file};
 use crate::commands::{
     CloseFind, CopySelection, FindNext, FindPrevious, OpenFind, Paste, ResetZoom, TERMINAL_CONTEXT,
-    ToggleInspector, ToggleSidebar, ZoomIn, ZoomOut,
+    ToggleSidebar, ZoomIn, ZoomOut,
 };
 use crate::external_drop::{TerminalDropAction, plan_terminal_drop, terminal_drop_text};
 use crate::haptics::{self, Haptic};
+use crate::i18n::{t, tf};
 use crate::icons::{SymbolWeight, sf_symbol, sf_symbol_weighted};
 use crate::navigation::NavigationOverlay;
 use crate::window_chrome::TitlebarDragArea as _;
@@ -74,14 +78,20 @@ use crate::session_surfaces::switcher_key;
 use crate::store::StoreRuntime;
 use crate::surface_shell::UtilitySurfaces;
 
-const GRID_HORIZONTAL_PADDING: f32 = 24.0;
-const GRID_VERTICAL_PADDING: f32 = 12.0;
+pub(crate) const GRID_HORIZONTAL_PADDING: f32 = 24.0;
+pub(crate) const GRID_VERTICAL_PADDING: f32 = 12.0;
 // The outer terminal card has a one-pixel border on both sides and the pane
 // adds its own left divider. These pixels are outside TerminalElement's actual
 // paint bounds and therefore cannot be offered to the PTY as a text column.
 const GRID_LAYOUT_HORIZONTAL_CHROME: f32 = 3.0;
 const GRID_LAYOUT_VERTICAL_CHROME: f32 = 2.0;
 const REATTACH_DELAY: Duration = Duration::from_millis(500);
+/// Ceiling for retrying while the Engine socket cannot be reached at all; an
+/// Engine restart should still be picked up within a few seconds.
+const REATTACH_MAX_UNREACHABLE: Duration = Duration::from_secs(4);
+/// Ceiling for retrying attaches the Engine accepts and then closes before
+/// sending anything, for a reason it did not name.
+const REATTACH_MAX_EMPTY: Duration = Duration::from_secs(30);
 const PANE_EVENT_QUEUE_CAPACITY: usize = 256;
 /// How often a live drag is allowed to push a new PTY geometry. Matched to the
 /// daemon's coalesced grid flush (also 8ms): resizing faster produces frames
@@ -98,6 +108,12 @@ const MOUSE_MOTION_CADENCE: Duration = Duration::from_millis(8);
 /// whose reflow is held still by [`REFLOW_HOLD`]. Matched to the window the
 /// daemon uses to infer the same thing (`AgentSession.resizeDragWindow`).
 const RESIZE_GESTURE_GAP: Duration = Duration::from_millis(200);
+/// How long the pointer must rest mid seam drag before the PTY hears the size
+/// it rests at. Shorter than this is still the drag; a full-screen TUI (Claude
+/// Code, Codex) clears and repaints on every SIGWINCH, so a resize per frame
+/// strobes the whole pane. Matches [`RESIZE_GESTURE_GAP`]: a pause this long
+/// already counts as the end of a gesture.
+const SEAM_DRAG_SETTLE: Duration = RESIZE_GESTURE_GAP;
 /// Ceiling on how long the grid is held still across a column change.
 ///
 /// A cols-only resize comes back in two stages: the daemon re-wraps its
@@ -118,6 +134,49 @@ const ANCHOR_SLACK: f32 = 1.0;
 /// caches are rebuilt on promotion — so the ceiling is a memory bound, not a
 /// residency one.
 const PARKED_GRID_CAP: usize = 12;
+
+/// The window whose sidebar, inspector, or split seam is being dragged,
+/// published by its `RootView`. Panes in that window keep their PTY at its
+/// current size until the drag ends or rests (see [`SEAM_DRAG_SETTLE`]).
+#[derive(Default)]
+pub(crate) struct SeamDrag {
+    /// Each in-flight drag, by window and by the view that owns its seam: the
+    /// root's panel seams and a workspace's dividers publish independently.
+    active: HashSet<(gpui::WindowId, &'static str)>,
+}
+
+impl gpui::Global for SeamDrag {}
+
+impl SeamDrag {
+    /// Records whether `source` has a seam drag in flight in `window`. Only a
+    /// change is written, since every write wakes every pane.
+    pub(crate) fn publish(
+        window: gpui::WindowId,
+        source: &'static str,
+        dragging: bool,
+        cx: &mut gpui::App,
+    ) {
+        let key = (window, source);
+        let current = cx
+            .try_global::<Self>()
+            .is_some_and(|state| state.active.contains(&key));
+        if current == dragging {
+            return;
+        }
+        let state = cx.default_global::<Self>();
+        if dragging {
+            state.active.insert(key);
+        } else {
+            state.active.remove(&key);
+        }
+    }
+
+    fn active_in(window: &Window, cx: &gpui::App) -> bool {
+        let window = window.window_handle().window_id();
+        cx.try_global::<Self>()
+            .is_some_and(|state| state.active.iter().any(|(owner, _)| *owner == window))
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TerminalPaneEvent {
     ContinueAccount(SessionId),
@@ -142,6 +201,10 @@ enum AttachmentState {
     Attaching,
     Live,
     Reconnecting,
+    /// The Engine refused the attach for good (a note, an unknown id, a
+    /// keyboard this client cannot drive). Nothing retries until the
+    /// session's record changes.
+    Unavailable,
 }
 
 /// A reconnect has no trustworthy child modes until its fresh seed arrives.
@@ -317,10 +380,59 @@ enum PaneEvent {
     HistoryExtent(SessionId, AttachmentGeneration, Option<i64>),
     /// The scroller knob moved the viewport; fetch whatever it now shows.
     ScrollbackPump(SessionId, usize),
-    ClipboardUploadFinished(SessionId, Result<String, String>),
+    ClipboardUploadFinished(UploadTarget, Result<String, String>),
     /// Files dropped on a remote session finished copying; on success the
     /// remote paths are ready to paste in drop order.
-    DroppedFilesUploaded(SessionId, Result<Vec<String>, String>),
+    DroppedFilesUploaded(UploadTarget, Result<Vec<String>, String>),
+}
+
+/// The session an upload was started for. An id outlives a restart and a
+/// migration, so the run and the host it copied to travel with it: a path on
+/// one host is no use to a session that has since moved or started over.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct UploadTarget {
+    id: SessionId,
+    /// `created_at` bits, the app's session incarnation.
+    incarnation: u64,
+    host: String,
+}
+
+impl UploadTarget {
+    fn of(session: &SessionRecord) -> Option<Self> {
+        Some(Self {
+            id: session.id.clone(),
+            incarnation: session.created_at.0.to_bits(),
+            host: session.host.clone()?,
+        })
+    }
+}
+
+/// What a finished upload pastes. Kept unencoded: the framing depends on the
+/// modes of whichever attachment finally takes it.
+#[derive(Debug)]
+enum UploadedPaste {
+    ClipboardImage(String),
+    DroppedFiles(String),
+}
+
+fn upload_held_for_return() -> &'static str {
+    t("terminal.upload.held_for_return")
+}
+fn upload_held_for_reconnect() -> &'static str {
+    t("terminal.upload.held_for_reconnect")
+}
+fn upload_target_changed() -> &'static str {
+    t("terminal.upload.target_changed")
+}
+
+/// The id still names the run the upload was started for, on the host the
+/// files were copied to. A resume keeps the id and `created_at`, so having
+/// seen the run exit is the only evidence of that restart.
+fn upload_target_is_current(store: &crate::store::SessionStore, target: &UploadTarget) -> bool {
+    store.sessions().get(&target.id).is_some_and(|session| {
+        !matches!(session.status, SessionStatus::Exited(_))
+            && UploadTarget::of(session).as_ref() == Some(target)
+    })
 }
 
 /// Identifies one view residency, not the durable session or shared transport.
@@ -517,6 +629,28 @@ impl PaneMailboxState {
     }
 }
 
+/// What a refused or dropped attach waits to see change. A remote session's
+/// keyboard modes are unknown until its Bridge connects, so the Engine refuses
+/// a legacy controller until then; the connection coming up is the moment to
+/// try again, which no status change marks.
+#[derive(Clone, Debug, PartialEq)]
+struct RetryKey {
+    status: SessionStatus,
+    remote: Option<diri_proto::RemoteConnectionState>,
+}
+
+impl RetryKey {
+    fn of(session: &SessionRecord) -> Self {
+        Self {
+            status: session.status.clone(),
+            remote: session
+                .remote_connection
+                .as_ref()
+                .map(|connection| connection.state),
+        }
+    }
+}
+
 struct ResidentTerminal {
     controller: ControllerLease,
     keyboard: Option<diri_proto::terminal_input::KeyboardState>,
@@ -526,6 +660,10 @@ struct ResidentTerminal {
     /// predecessor was detached.
     attachment_generation: AttachmentGeneration,
     attachment_state: AttachmentState,
+    /// The record's status and remote connection when the attach was last
+    /// refused or dropped; a change (resumed, relaunched, a remote Bridge
+    /// that came up) asks the transport to retry.
+    retry_after: Option<RetryKey>,
     /// Last mode advertised by this attachment generation. Reset while the
     /// transport is not live so paste never trusts state from a dead child.
     bracketed_paste: bool,
@@ -540,7 +678,7 @@ struct ResidentTerminal {
     /// The editable text behind `find`'s query, so ⌘F gets the same caret,
     /// selection, and readline keys as the other query fields.
     find_query: QueryEditor,
-    find_composition: find_input::Composition,
+    find_composition: crate::text_input::Composition,
     last_size: (u16, u16),
     pointer_owner: Option<(MouseButton, PointerOwner)>,
     mouse_motion: MouseMotionLimiter,
@@ -565,6 +703,8 @@ struct BlankReport {
     state: &'static str,
     got_grid: bool,
     content: bool,
+    /// Grid updates that changed the screen ([`TerminalElement::grid_changes`]).
+    changes: u64,
     frames: u64,
     ms: Duration,
     /// The element's paint count once the frame was requested; unchanged
@@ -818,12 +958,21 @@ pub struct TerminalPane {
     /// rescheduling (which is what used to starve the flush during a drag).
     resize_flush_armed: bool,
     last_resize_sent: Option<Instant>,
+    /// The size a seam drag is resting at, and the timer that releases it to
+    /// the PTY once the rest outlasts [`SEAM_DRAG_SETTLE`].
+    drag_settle: Option<((u16, u16), Task<()>)>,
+    /// A mid-drag size that has rested long enough to send.
+    drag_settled: Option<(u16, u16)>,
     started_at: Instant,
     session_source: SessionSource,
     /// Last selection observed by the primary pane. Spawn responses select the
     /// daemon-created id asynchronously, so this transition is also the
     /// reliable point at which keyboard focus can leave the picker.
     observed_selected_id: Option<SessionId>,
+    /// A saved workspace is painted in this pane's place. Selection still
+    /// moves as workspace panes take focus, but this pane must not follow it
+    /// with the keyboard: keys sent to an unrendered pane reach nothing.
+    covered: bool,
     #[cfg(test)]
     input_observer: Option<InputObserver>,
     /// Every `pane.blank` this pane recorded, for tests.
@@ -835,6 +984,10 @@ pub struct TerminalPane {
     /// Space in the title bar reserved for workbench-owned controls painted
     /// above this pane, such as the auxiliary terminal's close button.
     header_trailing_inset: f32,
+    /// The pane is a comfortable-density island: its fills round their outer
+    /// corners, because GPUI clips children to rectangles, not to the
+    /// island's rounded edge.
+    island_corners: bool,
     /// This frame's hold-⌘ hint opacity, sampled at render.
     held_hint: f32,
     /// This frame's title-row opacity (`window_chrome::title_row_opacity`).
@@ -846,6 +999,10 @@ pub struct TerminalPane {
     navigation: Option<Entity<NavigationOverlay>>,
     utility_surfaces: Option<Entity<UtilitySurfaces>>,
     local_clipboard_images: Vec<StagedClipboardImage>,
+    /// Uploads that finished while their session had no live terminal here
+    /// (a residency of one evicts it on every switch). Each waits for that
+    /// session's next live attachment; see [`Self::deliver_held_uploads`].
+    held_uploads: Vec<(UploadTarget, UploadedPaste)>,
     /// Secure Keyboard Entry, held only while this pane is where a password
     /// is being typed. See [`Self::reconcile_secure_input`].
     secure_input: crate::secure_input::SecureInputLease,
@@ -952,6 +1109,9 @@ impl TerminalPane {
     ) -> Self {
         cx.observe_global::<crate::held_hints::HeldHintsState>(|_, cx| cx.notify())
             .detach();
+        // A drag ending leaves the viewport unchanged, so nothing else would
+        // re-measure and send the size the drag was released at.
+        cx.observe_global::<SeamDrag>(|_, cx| cx.notify()).detach();
         let focus = cx.focus_handle();
         if matches!(session_source, SessionSource::FollowSelection) {
             window.focus(&focus, cx);
@@ -1074,6 +1234,7 @@ impl TerminalPane {
             pane_tx,
             next_attachment_generation: 1,
             focus,
+            covered: false,
             glyphs: HashMap::new(),
             session_links: SessionLinks::new(cx),
             main_viewport: gpui::Size::default(),
@@ -1086,6 +1247,8 @@ impl TerminalPane {
             resize_flush: None,
             resize_flush_armed: false,
             last_resize_sent: None,
+            drag_settle: None,
+            drag_settled: None,
             started_at: Instant::now(),
             session_source,
             observed_selected_id,
@@ -1097,12 +1260,14 @@ impl TerminalPane {
             sidebar_visible: true,
             inspector_open: false,
             header_trailing_inset: 0.0,
+            island_corners: false,
             held_hint: 0.0,
             title_opacity: 1.0,
             header_hidden: false,
             navigation: None,
             utility_surfaces: None,
             local_clipboard_images: Vec::new(),
+            held_uploads: Vec::new(),
             secure_input: crate::secure_input::SecureInputLease::system(),
             external_drag: haptics::Crossing::default(),
             _secure_input_quit: secure_input_quit,
@@ -1138,19 +1303,42 @@ impl TerminalPane {
                             store
                                 .sessions()
                                 .get(id)
-                                .is_some_and(|session| !session.is_archived())
+                                .is_some_and(|session| !session.is_archived() && !session.is_note())
                         })
                         .into_iter()
                         .collect()
                 } else {
-                    store.terminal_residency().resident().cloned().collect()
+                    // A note has no terminal: attaching one is refused, and a
+                    // resident note used to retry that every half second.
+                    store
+                        .terminal_residency()
+                        .resident()
+                        .filter(|id| {
+                            !store
+                                .sessions()
+                                .get(id)
+                                .is_some_and(|session| session.is_note())
+                        })
+                        .cloned()
+                        .collect()
                 }
             }
-            SessionSource::Fixed(id) if store.sessions().contains_key(id) => {
+            SessionSource::Fixed(id)
+                if store
+                    .sessions()
+                    .get(id)
+                    .is_some_and(|session| !session.is_note()) =>
+            {
                 HashSet::from([id.clone()])
             }
             SessionSource::Fixed(_) => HashSet::new(),
         };
+        // A note has no terminal: the Engine closes its attach at once, and
+        // the transport retried that twice a second for as long as it showed.
+        let resident_ids: HashSet<_> = resident_ids
+            .into_iter()
+            .filter(|id| !store.sessions().get(id).is_some_and(|s| s.is_note()))
+            .collect();
         // A parked terminal for a session the store no longer lists is dead
         // weight; one for a session that just became resident is superseded
         // below by promotion.
@@ -1183,7 +1371,15 @@ impl TerminalPane {
             if self.residents.contains_key(&id) {
                 continue;
             }
-            let mono = crate::fonts::terminal_font();
+            let mono = crate::fonts::terminal_font(
+                &self
+                    .runtime
+                    .store
+                    .read()
+                    .expect("session store lock poisoned")
+                    .preferences()
+                    .terminal_font_family,
+            );
             let generation = self.next_attachment_generation;
             self.next_attachment_generation = self.next_attachment_generation.wrapping_add(1);
             let parked = self
@@ -1226,7 +1422,9 @@ impl TerminalPane {
                 element.set_text_input_enabled(true);
                 element
             } else {
-                TerminalElement::new(buffer)
+                let element = TerminalElement::new(buffer);
+                self.fetch_inline_images(&id, &element, cx);
+                element
             };
             let element = element
                 .font(mono)
@@ -1254,12 +1452,13 @@ impl TerminalPane {
                     attachment,
                     attachment_generation: generation,
                     attachment_state: AttachmentState::Attaching,
+                    retry_after: None,
                     bracketed_paste: false,
                     secret_input: false,
                     find: None,
                     find_scheduler: FindSearchScheduler::default(),
                     find_query: QueryEditor::default(),
-                    find_composition: find_input::Composition::default(),
+                    find_composition: crate::text_input::Composition::default(),
                     last_size,
                     pointer_owner: None,
                     mouse_motion: MouseMotionLimiter::default(),
@@ -1268,6 +1467,70 @@ impl TerminalPane {
                 },
             );
         }
+    }
+
+    /// Gives a new terminal's image cache its fetcher: a key the grid shows
+    /// for the first time is read from the Engine, decoded off the main
+    /// thread and painted. A remote session's come from its Holder through
+    /// the Engine; with a Holder from before `inline-images-v1` none are
+    /// placed, so the task just waits out the element.
+    fn fetch_inline_images(
+        &self,
+        id: &SessionId,
+        element: &TerminalElement,
+        cx: &mut Context<Self>,
+    ) {
+        let cache = element.inline_images();
+        let (requests, mut keys) = mpsc::unbounded_channel::<String>();
+        cache.set_requester(move |key| {
+            let _ = requests.send(key);
+        });
+        // The cache owns the sender; a strong cache here would keep the
+        // channel, and this task, alive forever.
+        let cache = Arc::downgrade(&cache);
+        let client = Arc::clone(self.runtime.client());
+        let tokio = self.tokio.clone();
+        let id = id.clone();
+        cx.spawn(async move |this, cx| {
+            while let Some(key) = keys.recv().await {
+                let read = {
+                    let (client, id, key) = (Arc::clone(&client), id.clone(), key.clone());
+                    tokio.spawn(async move { client.read_image(&id, &key).await })
+                };
+                let decoded = match read.await {
+                    Ok(Ok(image)) => cx
+                        .background_executor()
+                        .spawn(async move {
+                            diri_term::inline_images::decode(
+                                image.format,
+                                image.compressed,
+                                image.width,
+                                image.height,
+                                &image.data,
+                            )
+                        })
+                        .await
+                        .map_err(|_| "decode"),
+                    // Evicted or deleted since it was drawn, most often.
+                    Ok(Err(_)) | Err(_) => Err("read"),
+                };
+                let Some(cache) = cache.upgrade() else {
+                    return;
+                };
+                match decoded {
+                    Ok(image) => cache.insert(&key, image),
+                    Err(stage) => {
+                        diri_telemetry::debug_event!("terminal.image_unavailable", stage = stage);
+                        cache.fail(&key);
+                    }
+                }
+                drop(cache);
+                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                    return;
+                }
+            }
+        })
+        .detach();
     }
 
     fn reconcile_store_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1287,6 +1550,7 @@ impl TerminalPane {
         self.observed_selected_id = selected_id.clone();
 
         self.reconcile_residency(cx);
+        self.retry_changed_sessions();
         if selection_changed {
             self.qol.clear_feedback();
             self.session_links.close();
@@ -1295,17 +1559,38 @@ impl TerminalPane {
                 resident.mouse_motion.reset();
             }
         }
+        self.discard_stale_held_uploads(window, cx);
         self.sync_status_glyphs(self.current_colors(), window, cx);
 
         // Explicit sidebar clicks already focus through SessionActivated, but
         // successful spawns select their daemon-assigned id on the async store
         // path. Following the selection here covers both RPC/event orderings
         // and avoids trying to focus a terminal before its id exists.
-        if selection_changed && selected_id.is_some() {
+        if selection_changed && selected_id.is_some() && !self.covered {
             self.focus(window, cx);
         }
         self.reconcile_secure_input(window);
         cx.notify();
+    }
+
+    /// A detached resident whose session record changed status (a resume, a
+    /// relaunch, an Engine that came back) reattaches at once instead of
+    /// waiting out its backoff, or its refusal.
+    fn retry_changed_sessions(&mut self) {
+        let store = self.runtime.store.read().expect("store");
+        for (id, resident) in &mut self.residents {
+            let Some(waiting) = &resident.retry_after else {
+                continue;
+            };
+            let Some(session) = store.sessions().get(id) else {
+                continue;
+            };
+            let key = RetryKey::of(session);
+            if &key != waiting {
+                resident.retry_after = Some(key);
+                resident.attachment.retry();
+            }
+        }
     }
 
     /// Holds macOS Secure Keyboard Entry exactly while keystrokes typed here
@@ -1562,6 +1847,13 @@ impl TerminalPane {
         cx.notify();
     }
 
+    pub fn set_island_corners(&mut self, island: bool, cx: &mut Context<Self>) {
+        if self.island_corners != island {
+            self.island_corners = island;
+            cx.notify();
+        }
+    }
+
     /// Drop the pane's own title bar because the workbench hosts its actions
     /// in the horizontal tab strip. Grid geometry follows on the next layout.
     pub fn set_header_hidden(&mut self, hidden: bool, cx: &mut Context<Self>) {
@@ -1576,14 +1868,36 @@ impl TerminalPane {
         self.header_hidden
     }
 
+    pub(crate) fn set_covered(&mut self, covered: bool) {
+        self.covered = covered;
+    }
+
     /// Height of the chrome painted above the terminal surface, which every
     /// grid-space calculation must subtract from the viewport.
     pub(crate) fn header_height(&self) -> f32 {
         if self.header_hidden {
             0.0
         } else {
+            self.title_bar_height()
+        }
+    }
+
+    /// The pane's title bar. An island is inset by the gap at the top, so its
+    /// bar gives up the gap twice and stays centred on the window's toolbar
+    /// line, level with the traffic lights and the sidebar's buttons.
+    fn title_bar_height(&self) -> f32 {
+        if self.island_corners {
+            island_title_bar()
+        } else {
             Metrics::TITLE_BAR
         }
+    }
+
+    /// Where the pane sat last frame and the chrome above its grid, which is
+    /// where the overview zoom picks the page up and puts it back down.
+    pub(crate) fn page_geometry(&self) -> Option<(TerminalViewport, f32)> {
+        self.viewport
+            .map(|viewport| (viewport, self.header_height()))
     }
 
     pub fn is_focused(&self, window: &Window) -> bool {
@@ -1716,6 +2030,20 @@ impl TerminalPane {
                         resident.keyboard = None;
                     }
                     resident.attachment_state = state;
+                    resident.retry_after = matches!(
+                        state,
+                        AttachmentState::Reconnecting | AttachmentState::Unavailable
+                    )
+                    .then(|| {
+                        self.runtime
+                            .store
+                            .read()
+                            .expect("store")
+                            .sessions()
+                            .get(&id)
+                            .map(|session| RetryKey::of(session))
+                    })
+                    .flatten();
                 }
                 self.reconcile_secure_input(window);
                 if self.selected_id().as_ref() == Some(&id) {
@@ -1748,6 +2076,7 @@ impl TerminalPane {
                 if !self.attachment_is_current(&id, generation) {
                     return;
                 }
+                let mut live = false;
                 if let Some(resident) = self.residents.get_mut(&id) {
                     if (resident.element.mouse_modes() != mouse
                         || resident.element.alt_screen() != alt_screen)
@@ -1773,13 +2102,17 @@ impl TerminalPane {
                     resident.bracketed_paste = bracketed_paste;
                     resident.secret_input = secret_input;
                     resident.element.set_modes(alt_screen, mouse);
+                    live = resident.attachment_state == AttachmentState::Live;
+                }
+                if live {
+                    self.deliver_held_uploads(&id, window, cx);
                 }
                 self.reconcile_secure_input(window);
                 if self.selected_id().as_ref() == Some(&id) {
                     cx.notify();
                 }
             }
-            PaneEvent::Chunk(_, _, TerminalChunk::Pong) => {}
+            PaneEvent::Chunk(_, _, TerminalChunk::Pong | TerminalChunk::Rejected(_)) => {}
             PaneEvent::FindSnapshot(id, generation, request, snapshot) => {
                 if !self.attachment_is_current(&id, generation) {
                     return;
@@ -1897,14 +2230,14 @@ impl TerminalPane {
                     cx.notify();
                 }
             }
-            PaneEvent::ClipboardUploadFinished(id, result) => match result {
+            PaneEvent::ClipboardUploadFinished(target, result) => match result {
                 Ok(remote_path) => {
-                    if let Some(resident) = self.residents.get(&id)
-                        && resident
-                            .send_user_input(terminal_paste(&remote_path, resident.bracketed_paste))
-                    {
-                        cx.notify();
-                    }
+                    self.finish_upload(
+                        target,
+                        UploadedPaste::ClipboardImage(remote_path),
+                        window,
+                        cx,
+                    );
                 }
                 Err(error) => {
                     // scp's stderr can name hosts, users and key paths; it
@@ -1912,35 +2245,127 @@ impl TerminalPane {
                     eprintln!("diri: clipboard image upload failed: {error}");
                     diri_telemetry::error_event!(
                         "clipboard.image_upload_failed",
-                        session = diri_telemetry::id(&id.0)
+                        session = diri_telemetry::id(&target.id.0)
                     );
-                    self.show_terminal_feedback(
-                        "Couldn't copy the clipboard image to the session's host",
-                        window,
-                        cx,
-                    );
+                    self.show_terminal_feedback(t("terminal.upload.image_failed"), window, cx);
                 }
             },
-            PaneEvent::DroppedFilesUploaded(id, result) => match result {
+            PaneEvent::DroppedFilesUploaded(target, result) => match result {
                 Ok(remote_paths) => {
                     let text = terminal_drop_text(remote_paths.iter().map(String::as_str));
-                    if self.paste_into_session(&id, &text) {
-                        cx.notify();
-                    }
+                    self.finish_upload(target, UploadedPaste::DroppedFiles(text), window, cx);
                 }
                 Err(error) => {
                     eprintln!("diri: dropped file upload failed: {error}");
                     diri_telemetry::error_event!(
                         "pane.drop_upload_failed",
-                        session = diri_telemetry::id(&id.0)
+                        session = diri_telemetry::id(&target.id.0)
                     );
                     cx.emit(TerminalPaneEvent::ExternalDropFeedback {
-                        message: format!(
-                            "Couldn't copy the dropped files to the session's host: {error}"
-                        ),
+                        message: tf("terminal.upload.files_failed", &[("error", &error)]),
                     });
                 }
             },
+        }
+    }
+
+    /// A remote upload finished. The upload outlives the terminal that started
+    /// it, so the path goes out only to a live terminal of the same run on the
+    /// same host; with none here it is held, and said to be, rather than lost.
+    fn finish_upload(
+        &mut self,
+        target: UploadTarget,
+        paste: UploadedPaste,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.upload_target_is_current(&target) {
+            self.show_terminal_feedback(upload_target_changed(), window, cx);
+            return;
+        }
+        match self.residents.get(&target.id) {
+            Some(resident) if resident.attachment_state == AttachmentState::Live => {
+                if self.paste_upload(&target.id, &paste) {
+                    cx.notify();
+                }
+            }
+            resident => {
+                let held = if resident.is_some() {
+                    upload_held_for_reconnect()
+                } else {
+                    upload_held_for_return()
+                };
+                self.held_uploads.push((target, paste));
+                self.show_terminal_feedback(held, window, cx);
+            }
+        }
+    }
+
+    /// Called once a resident's live attachment has reported the child's
+    /// modes, the first point at which a paste can be framed correctly.
+    fn deliver_held_uploads(
+        &mut self,
+        id: &SessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.held_uploads.iter().any(|(target, _)| &target.id == id) {
+            return;
+        }
+        let (due, held) = std::mem::take(&mut self.held_uploads)
+            .into_iter()
+            .partition(|(target, _)| &target.id == id);
+        self.held_uploads = held;
+        let due: Vec<(UploadTarget, UploadedPaste)> = due;
+        for (target, paste) in due {
+            if !self.upload_target_is_current(&target) {
+                self.show_terminal_feedback(upload_target_changed(), window, cx);
+            } else if self.paste_upload(id, &paste) {
+                cx.notify();
+            }
+        }
+    }
+
+    fn upload_target_is_current(&self, target: &UploadTarget) -> bool {
+        let store = self
+            .runtime
+            .store
+            .read()
+            .expect("session store lock poisoned");
+        upload_target_is_current(&store, target)
+    }
+
+    /// A held upload does not outlive the run it was aimed at, and says so
+    /// unless the session itself is gone and there is no one left to tell.
+    fn discard_stale_held_uploads(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.held_uploads.is_empty() {
+            return;
+        }
+        let changed = {
+            let store = self
+                .runtime
+                .store
+                .read()
+                .expect("session store lock poisoned");
+            let mut changed = false;
+            self.held_uploads.retain(|(target, _)| {
+                let current = upload_target_is_current(&store, target);
+                changed |= !current && store.sessions().contains_key(&target.id);
+                current
+            });
+            changed
+        };
+        if changed {
+            self.show_terminal_feedback(upload_target_changed(), window, cx);
+        }
+    }
+
+    fn paste_upload(&self, id: &SessionId, paste: &UploadedPaste) -> bool {
+        match paste {
+            UploadedPaste::ClipboardImage(path) => self.residents.get(id).is_some_and(|resident| {
+                resident.send_user_input(terminal_paste(path, resident.bracketed_paste))
+            }),
+            UploadedPaste::DroppedFiles(text) => self.paste_into_session(id, text),
         }
     }
 
@@ -1961,6 +2386,19 @@ impl TerminalPane {
         resident.send_user_input(terminal_file_paste(text, resident.bracketed_paste, kind))
     }
 
+    /// For a session on another host: where its uploads are copied, and the
+    /// identity a finished upload is checked against before anything is pasted.
+    fn upload_destination(&self, id: &SessionId) -> Option<(UploadTarget, String)> {
+        let store = self
+            .runtime
+            .store
+            .read()
+            .expect("session store lock poisoned");
+        let target = UploadTarget::of(store.sessions().get(id)?)?;
+        let ssh = store.host(&target.host)?.ssh.clone();
+        Some((target, ssh))
+    }
+
     /// Finder released files over the grid. Behaves like a desktop terminal:
     /// the paths are pasted into the foreground program, which is how Claude
     /// Code, Codex and Cursor attach dropped images. Sessions on another host
@@ -1977,9 +2415,9 @@ impl TerminalPane {
         if !self.residents.contains_key(&id) {
             return;
         }
-        let ssh = self.drop_destination(&id);
+        let destination = self.upload_destination(&id);
 
-        let plan = plan_terminal_drop(paths.paths(), ssh.is_some());
+        let plan = plan_terminal_drop(paths.paths(), destination.is_some());
         diri_telemetry::event!(
             "pane.drop",
             session = diri_telemetry::id(&id.0),
@@ -1990,7 +2428,7 @@ impl TerminalPane {
                 Some(TerminalDropAction::Upload(_)) => "upload",
             },
             partial = plan.action.is_some() && plan.feedback().is_some(),
-            remote = ssh.is_some()
+            remote = destination.is_some()
         );
         if let Some(message) = plan.feedback() {
             cx.emit(TerminalPaneEvent::ExternalDropFeedback { message });
@@ -2014,11 +2452,10 @@ impl TerminalPane {
                 self.paste_into_session(&id, &text);
             }
             Some(TerminalDropAction::Upload(files)) => {
-                let Some(ssh) = ssh else {
+                let Some((target, ssh)) = destination else {
                     return;
                 };
                 let pane_tx = self.pane_tx.clone();
-                let upload_id = id.clone();
                 self.tokio.spawn(async move {
                     let result = tokio::task::spawn_blocking(move || {
                         files
@@ -2028,27 +2465,11 @@ impl TerminalPane {
                     })
                     .await
                     .unwrap_or_else(|error| Err(format!("upload task failed: {error}")));
-                    let _ = pane_tx.send(PaneEvent::DroppedFilesUploaded(upload_id, result));
+                    let _ = pane_tx.send(PaneEvent::DroppedFilesUploaded(target, result));
                 });
             }
         }
         cx.notify();
-    }
-
-    /// Where a drop on `id` has to be copied to first, for a session on
-    /// another host.
-    fn drop_destination(&self, id: &SessionId) -> Option<String> {
-        let store = self
-            .runtime
-            .store
-            .read()
-            .expect("session store lock poisoned");
-        store
-            .sessions()
-            .get(id)
-            .and_then(|session| session.host.as_deref())
-            .and_then(|host_id| store.host(host_id))
-            .map(|host| host.ssh.clone())
     }
 
     /// One tick as dragged files arrive over this pane, if releasing them
@@ -2066,7 +2487,7 @@ impl TerminalPane {
             .filter(|id| {
                 // Staging stats every path, so decide once, on the way in.
                 self.external_drag.is_over_target()
-                    || plan_terminal_drop(paths.paths(), self.drop_destination(id).is_some())
+                    || plan_terminal_drop(paths.paths(), self.upload_destination(id).is_some())
                         .action
                         .is_some()
             })
@@ -2147,6 +2568,7 @@ impl TerminalPane {
             AttachmentState::Attaching => "attaching",
             AttachmentState::Live => "live",
             AttachmentState::Reconnecting => "reconnecting",
+            AttachmentState::Unavailable => "unavailable",
         };
         let suspect = BlankReport {
             generation,
@@ -2154,6 +2576,7 @@ impl TerminalPane {
             state,
             got_grid: resident.trace.first_grid.get().is_some(),
             content: resident.element.has_content(),
+            changes: resident.element.grid_changes(),
             frames: resident.element.stats().frames,
             ms: resident.trace.mounted_at.elapsed(),
             paints: resident.element.paint_count(),
@@ -2195,6 +2618,7 @@ impl TerminalPane {
                 state = report.state,
                 got_grid = report.got_grid,
                 content = report.content,
+                changes = report.changes,
                 frames = report.frames,
                 ms = report.ms
             );
@@ -2207,6 +2631,7 @@ impl TerminalPane {
                 got_grid = report.got_grid,
                 content = report.content,
                 redrawn = report.redrawn,
+                changes = report.changes,
                 frames = report.frames,
                 ms = report.ms
             );
@@ -2402,27 +2827,27 @@ impl TerminalPane {
                                     }
                                 })
                                 .await
-                                .unwrap_or_else(|_| FindSnapshot::failure("Search interrupted")),
+                                .unwrap_or_else(|_| {
+                                    FindSnapshot::failure(t("terminal.find.interrupted"))
+                                }),
                             ),
-                            Ok(_) => Some(FindSnapshot::failure("Search session changed")),
+                            Ok(_) => {
+                                Some(FindSnapshot::failure(t("terminal.find.session_changed")))
+                            }
                             // A remote Helper that cannot serve its history
                             // still has a screen to search; see `apply_result`.
                             Err(_) if remote => {
                                 client.read_scrollback(&id).await.ok().map(Into::into)
                             }
-                            Err(_) => Some(FindSnapshot::failure(
-                                "Search unavailable. Refresh results to retry",
-                            )),
+                            Err(_) => Some(FindSnapshot::failure(t("terminal.find.unavailable"))),
                         }
                     } else {
-                        Some(FindSnapshot::failure(
-                            "Search busy. Refresh results to retry",
-                        ))
+                        Some(FindSnapshot::failure(t("terminal.find.busy")))
                     }
                 }
-                Some((true, None, None)) => Some(FindSnapshot::failure(
-                    "Close another Find view to search here",
-                )),
+                Some((true, None, None)) => {
+                    Some(FindSnapshot::failure(t("terminal.find.another_view")))
+                }
                 Some((false, _, _)) => client.read_scrollback(&id).await.ok().map(Into::into),
                 None => None,
             };
@@ -2458,6 +2883,10 @@ impl TerminalPane {
             crate::empty_workbench::EmptyWorkbench {
                 has_sessions: !store.sessions().is_empty(),
                 agents: crate::agent_setup::AgentSetupState::from_catalog(
+                    store.agent_catalog(None),
+                ),
+                default_agent: crate::agent_catalog::resolved_target_agent(
+                    &store.preferences().default_agent,
                     store.agent_catalog(None),
                 ),
                 installing: store.installing_agent().cloned(),
@@ -2505,7 +2934,7 @@ impl TerminalPane {
                 files: false,
                 directories: true,
                 multiple: false,
-                prompt: Some("Start Here".into()),
+                prompt: Some(t("terminal.start_here").into()),
             });
             let canonical = Arc::clone(&canonical);
             let window_store = window_store.clone();
@@ -2555,6 +2984,23 @@ impl TerminalPane {
                 cx.refresh_windows();
             });
         });
+        let canonical = Arc::clone(&self.runtime.store);
+        let window_store = self.window_store.clone();
+        let start_agent: crate::empty_workbench::AgentHandler = Rc::new(move |kind, _, cx| {
+            let options = crate::store::SpawnOptions::default();
+            if let Some(window_store) = &window_store {
+                window_store
+                    .write()
+                    .expect("window navigation lock poisoned")
+                    .spawn_kind(kind.clone(), options);
+            } else {
+                canonical
+                    .write()
+                    .expect("session store lock poisoned")
+                    .spawn_kind(kind.clone(), options);
+            }
+            cx.refresh_windows();
+        });
         crate::empty_workbench::render(
             state,
             crate::empty_workbench::EmptyWorkbenchActions {
@@ -2562,6 +3008,7 @@ impl TerminalPane {
                 check_again,
                 start_in_folder,
                 import_herdr,
+                start_agent,
             },
             colors,
         )
@@ -2646,8 +3093,9 @@ impl TerminalPane {
         self.pending_note_block = Some((Some(note_id), block));
     }
 
-    /// Only the macOS window screenshots host a fixture note pane.
-    #[cfg(all(test, target_os = "macos"))]
+    /// Hosts a fixture note pane: the macOS window screenshots, and the
+    /// cross-platform note-selection tests.
+    #[cfg(test)]
     pub(crate) fn set_note_pane_for_test(&mut self, pane: Entity<crate::notes::NotePane>) {
         self.note = Some(pane);
     }
@@ -2889,13 +3337,9 @@ impl TerminalPane {
             .store
             .read()
             .expect("session store lock poisoned");
-        let font_size = store.preferences().terminal_font_size;
+        let typeface = TerminalType::from_prefs(store.preferences());
         drop(store);
-        let metrics = CellMetrics::measure(
-            window.text_system(),
-            &font(crate::fonts::mono_family()),
-            px(font_size),
-        );
+        let metrics = typeface.metrics(window);
         let viewport = self.viewport.unwrap_or_default();
         let grid_x = viewport.x + GRID_HORIZONTAL_PADDING / 2.0;
         // An overflowing grid is bottom-anchored (see render_grid_and_overlays),
@@ -2906,7 +3350,7 @@ impl TerminalPane {
             .and_then(|id| self.residents.get(&id))
             .map_or(0, |resident| resident.element.grid_rows());
         let anchor = self
-            .grid_row_overflow(grid_rows, font_size, window)
+            .grid_row_overflow(grid_rows, &typeface, window)
             .map_or(0.0, |grid_height| self.grid_inner_height() - grid_height);
         let grid_y = viewport.y + self.header_height() + 2.0 + anchor;
         let col = ((f32::from(position.x) - grid_x) / f32::from(metrics.cell_width))
@@ -3022,6 +3466,7 @@ impl TerminalPane {
                 let Some(button) = terminal_mouse_button(event.button) else {
                     return;
                 };
+                resident.element.note_pointer_input();
                 if let Some(bytes) = encode_mouse_event(
                     resident.element.mouse_modes(),
                     TerminalMouseEvent::Press(button),
@@ -3266,17 +3711,13 @@ impl TerminalPane {
     fn grid_row_overflow(
         &self,
         grid_rows: u16,
-        font_size: f32,
+        typeface: &TerminalType,
         window: &mut Window,
     ) -> Option<f32> {
         if grid_rows == 0 || self.viewport.is_none() {
             return None;
         }
-        let metrics = CellMetrics::measure(
-            window.text_system(),
-            &font(crate::fonts::mono_family()),
-            px(font_size),
-        );
+        let metrics = typeface.metrics(window);
         // A pixel of slack on top of the exact row height: the element derives
         // its row count back out with `floor(height / line_height)`, and an
         // exactly-sized box loses its last row to float error or to layout
@@ -3328,7 +3769,7 @@ impl TerminalPane {
             ms = started.elapsed(),
             session = diri_telemetry::id(&id.0)
         );
-        self.show_terminal_feedback("Copied", window, cx);
+        self.show_terminal_feedback(t("terminal.copied"), window, cx);
     }
 
     /// Captures terminal text together with the stable absolute scrollback
@@ -3356,35 +3797,20 @@ impl TerminalPane {
                 // The kind says what went wrong ("storage full") without the
                 // temp path the full error may carry.
                 self.show_terminal_feedback(
-                    format!("Couldn't paste the clipboard image: {}", error.kind()),
+                    tf("terminal.paste_image_failed", &[("error", &error.kind())]),
                     window,
                     cx,
                 );
                 return;
             }
         };
-        let ssh = {
-            let store = self
-                .runtime
-                .store
-                .read()
-                .expect("session store lock poisoned");
-            store
-                .sessions()
-                .get(id)
-                .and_then(|session| session.host.as_deref())
-                .and_then(|host_id| store.host(host_id))
-                .map(|host| host.ssh.clone())
-        };
-
-        if let Some(ssh) = ssh {
+        if let Some((target, ssh)) = self.upload_destination(id) {
             let pane_tx = self.pane_tx.clone();
-            let upload_id = id.clone();
             self.tokio.spawn(async move {
                 let result = tokio::task::spawn_blocking(move || staged.upload(&ssh))
                     .await
                     .unwrap_or_else(|error| Err(format!("upload task failed: {error}")));
-                let _ = pane_tx.send(PaneEvent::ClipboardUploadFinished(upload_id, result));
+                let _ = pane_tx.send(PaneEvent::ClipboardUploadFinished(target, result));
             });
         } else {
             let local_path = staged.path().to_string_lossy().into_owned();
@@ -3412,7 +3838,7 @@ impl TerminalPane {
         };
         if self.qol.copy_mode.is_some() {
             record("copy_mode", "none", 0, false);
-            self.show_terminal_feedback("Exit copy mode before pasting", window, cx);
+            self.show_terminal_feedback(t("terminal.copy_mode.exit_before_paste"), window, cx);
             cx.stop_propagation();
             return;
         }
@@ -3663,15 +4089,10 @@ impl TerminalPane {
             cx.propagate();
             return;
         }
-        let Some(term_event) = terminal_key_event(event) else {
+        let option = OptionKey::for_layout(cx.keyboard_layout().id());
+        let Some((term_event, modifiers)) = terminal_key_event(event, option) else {
             cx.propagate();
             return;
-        };
-        let modifiers = TermModifiers {
-            shift: event.keystroke.modifiers.shift,
-            ctrl: event.keystroke.modifiers.control,
-            alt: event.keystroke.modifiers.alt,
-            cmd: event.keystroke.modifiers.platform,
         };
         let bytes = match diri_term::keys::encode_interactive_action(
             &term_event,
@@ -3825,15 +4246,14 @@ impl TerminalPane {
         let Some(id) = self.selected_id() else {
             return;
         };
-        let font_size = self
-            .runtime
-            .store
-            .read()
-            .expect("session store lock poisoned")
-            .preferences()
-            .terminal_font_size;
-        let font = font(crate::fonts::mono_family());
-        let metrics = CellMetrics::measure(window.text_system(), &font, px(font_size));
+        let typeface = TerminalType::from_prefs(
+            self.runtime
+                .store
+                .read()
+                .expect("session store lock poisoned")
+                .preferences(),
+        );
+        let metrics = typeface.metrics(window);
         let viewport = self.viewport.unwrap_or_default();
         let grid_x = viewport.x + GRID_HORIZONTAL_PADDING / 2.0;
         let grid_y = viewport.y + self.header_height() + 2.0;
@@ -3878,13 +4298,13 @@ impl TerminalPane {
         let Some(session) = self.selected_session() else {
             return;
         };
-        let font_size = self
-            .runtime
-            .store
-            .read()
-            .expect("session store lock poisoned")
-            .preferences()
-            .terminal_font_size;
+        let typeface = TerminalType::from_prefs(
+            self.runtime
+                .store
+                .read()
+                .expect("session store lock poisoned")
+                .preferences(),
+        );
         let already_sized = self
             .residents
             .get(&session.id)
@@ -3906,11 +4326,7 @@ impl TerminalPane {
         }) else {
             return;
         };
-        let metrics = CellMetrics::measure(
-            window.text_system(),
-            &font(crate::fonts::mono_family()),
-            px(font_size),
-        );
+        let metrics = typeface.metrics(window);
         let size = estimated_grid_size(
             viewport.width,
             viewport.height,
@@ -3928,6 +4344,9 @@ impl TerminalPane {
             // An unchanged pane must not send a resize at all. Recording that
             // size would let the next attach replay it. A view that regains
             // the lease after another view resized the PTY still sends.
+            return;
+        }
+        if self.defer_for_seam_drag(&session.id, size, window, cx) {
             return;
         }
         if let Some(resident) = self.residents.get_mut(&session.id)
@@ -3999,11 +4418,73 @@ impl TerminalPane {
         })
     }
 
+    /// Holds a geometry change back while a seam is dragged. Every PTY resize
+    /// makes a full-screen agent clear and repaint, so a drag that resized
+    /// per frame made the pane flash for its whole length. The grid keeps its
+    /// size meanwhile -- clipped or with a margin -- and the PTY hears one
+    /// size when the drag ends or rests.
+    fn defer_for_seam_drag(
+        &mut self,
+        id: &SessionId,
+        size: (u16, u16),
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let sized = self
+            .residents
+            .get(id)
+            .is_some_and(|resident| resident.last_size != (0, 0));
+        if !sized || !SeamDrag::active_in(window, cx) {
+            // A release with a size still held back is one discrete change,
+            // however recently a rest sent another: let it go out now and
+            // hold its reflow into a single paint.
+            if self.drag_settle.take().is_some() {
+                self.last_resize_sent = None;
+            }
+            self.drag_settled = None;
+            return false;
+        }
+        if self.drag_settled == Some(size) {
+            return false;
+        }
+        if self
+            .drag_settle
+            .as_ref()
+            .is_none_or(|(resting, _)| *resting != size)
+        {
+            let timer = cx.background_executor().timer(SEAM_DRAG_SETTLE);
+            let task = cx.spawn(async move |this, cx| {
+                timer.await;
+                let _ = this.update(cx, |this, cx| {
+                    if let Some((size, task)) = this.drag_settle.take() {
+                        // A rest is a discrete change: send it now and hold
+                        // its reflow, rather than riding the drag cadence.
+                        this.drag_settled = Some(size);
+                        this.last_resize_sent = None;
+                        task.detach();
+                    }
+                    cx.notify();
+                });
+            });
+            self.drag_settle = Some((size, task));
+        }
+        true
+    }
+
     /// The top-left pane owns the native window-button lane when navigation
     /// chrome is hidden, including panes mounted by a saved split layout.
-    fn occupies_window_titlebar(&self) -> bool {
+    /// How far in from the window's left edge the pane starts when its
+    /// title bar shares the traffic lights' row: 0 when flush (compact),
+    /// the island gap in comfortable. `None` when the lights are elsewhere.
+    fn window_titlebar_inset(&self) -> Option<f32> {
+        // The lights start 20 pt in and are centred on the title bar.
         self.viewport
-            .is_some_and(|viewport| viewport.x < 0.5 && viewport.y < 0.5)
+            .filter(|viewport| viewport.x < 20.0 && viewport.y < Metrics::TITLE_BAR / 2.0)
+            .map(|viewport| viewport.x)
+    }
+
+    fn occupies_window_titlebar(&self) -> bool {
+        self.window_titlebar_inset().is_some()
     }
 
     fn shows_navigation_control(&self) -> bool {
@@ -4031,13 +4512,15 @@ impl TerminalPane {
             .gap(px(Metrics::TOOLBAR_ITEM_GAP))
             // The visible lights need more breathing room than their native
             // frames imply, so this is an intentional optical safe area.
-            .when(
-                self.occupies_window_titlebar()
-                    && crate::window_chrome::leading_lane() > 0.0,
-                |control| {
+            .when_some(
+                self.window_titlebar_inset()
+                    .filter(|_| crate::window_chrome::leading_lane() > 0.0),
+                |control, inset| {
+                    // Clear the lights (or the Windows icon) at the same
+                    // window x in every density.
                     control.child(
                         div()
-                            .w(px(crate::window_chrome::leading_lane()))
+                            .w(px((crate::window_chrome::leading_lane() - inset).max(0.0)))
                             .flex_none(),
                     )
                 },
@@ -4048,9 +4531,9 @@ impl TerminalPane {
                     .debug_selector(|| "show-sidebar".into())
                     .role(gpui::Role::Button)
                     .aria_label(if horizontal {
-                        "Toggle top bar"
+                        t("terminal.toggle_top_bar")
                     } else {
-                        "Show sidebar"
+                        t("terminal.show_sidebar")
                     })
                     .size(px(Metrics::TOOLBAR_CONTROL_SIZE))
                     .flex_none()
@@ -4101,7 +4584,7 @@ impl TerminalPane {
             .map_or(f32::INFINITY, |viewport| viewport.width);
         div()
             .titlebar_drag_area()
-            .h(px(Metrics::TITLE_BAR))
+            .h(px(self.title_bar_height()))
             .flex_none()
             .pl(px(Metrics::TOOLBAR_EDGE_INSET))
             .pr(px(Metrics::TOOLBAR_EDGE_INSET + header_trailing_inset))
@@ -4109,6 +4592,9 @@ impl TerminalPane {
             .items_center()
             .justify_between()
             .bg(colors.work_surface_nested())
+            .when(self.island_corners, |header| {
+                header.rounded_t(px(Radius::CARD))
+            })
             .child(
                 div()
                     .min_w(px(0.0))
@@ -4160,8 +4646,8 @@ impl TerminalPane {
                     .opacity(self.title_opacity)
                     .when(shell_controls, |trailing| {
                         trailing
-                            .child(self.render_inspector_toggle(colors, self.held_hint, cx))
                             .child(self.render_notification_button(colors, self.held_hint))
+                            .children(self.render_inspector_toggle(colors, self.held_hint))
                     }),
             )
             .into_any_element()
@@ -4180,7 +4666,7 @@ impl TerminalPane {
             let note = store.sessions().get(&parent).filter(|p| p.is_note())?;
             let title = note.title.trim();
             if title.is_empty() {
-                "Untitled".to_owned()
+                t("nav.title.untitled").to_owned()
             } else {
                 title.to_owned()
             }
@@ -4213,49 +4699,17 @@ impl TerminalPane {
         )
     }
 
+    /// The right sidebar toggle, drawn only while the panel is closed: an
+    /// open panel carries its own at the same trailing edge (see
+    /// `crate::right_panel::toggle_button`).
     fn render_inspector_toggle(
         &self,
         colors: SemanticColors,
         held_hint: f32,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let inspector_open = self.inspector_open;
-        let toggle = div()
-            .id("toggle-inspector")
-            .debug_selector(|| "toggle-inspector".into())
-            .role(gpui::Role::Button)
-            .aria_label("Toggle inspector")
-            .size(px(Metrics::TOOLBAR_CONTROL_SIZE))
-            .flex_none()
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded(px(Radius::BADGE))
-            .cursor_pointer()
-            .when(inspector_open, |button| button.bg(Fill::subtle(colors)))
-            .hover(move |button| button.bg(Fill::subtle(colors)))
-            .child(sf_symbol(
-                "sidebar.right",
-                15.0,
-                if inspector_open {
-                    colors.primary
-                } else {
-                    colors.secondary
-                },
-            ))
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_click(cx.listener(|_, _, window, cx| {
-                window.dispatch_action(Box::new(ToggleInspector), cx);
-                cx.stop_propagation();
-            }))
-            .into_any_element();
-        crate::held_hints::below(
-            toggle,
-            "toggle-inspector",
-            crate::held_hints::label(crate::commands::CommandId::ToggleInspector),
-            held_hint,
-            colors,
-        )
+    ) -> Option<AnyElement> {
+        (!self.inspector_open).then(|| {
+            crate::right_panel::dispatching_toggle("toggle-inspector", false, colors, held_hint)
+        })
     }
 
     fn render_notification_button(&self, colors: SemanticColors, held_hint: f32) -> AnyElement {
@@ -4270,7 +4724,7 @@ impl TerminalPane {
             .id("notification-inbox-button")
             .debug_selector(|| "notification-inbox-button".into())
             .role(gpui::Role::Button)
-            .aria_label("Notifications")
+            .aria_label(t("terminal.notifications"))
             .relative()
             .size(px(Metrics::TOOLBAR_CONTROL_SIZE))
             .flex_none()
@@ -4341,8 +4795,8 @@ impl TerminalPane {
                 .when_some(session, |actions, session| {
                     actions.child(self.render_session_links_trigger(&session, colors, cx))
                 })
-                .child(self.render_inspector_toggle(colors, held_hint, cx))
                 .child(self.render_notification_button(colors, held_hint))
+                .children(self.render_inspector_toggle(colors, held_hint))
                 .into_any_element(),
         )
     }
@@ -4352,7 +4806,7 @@ impl TerminalPane {
         session: &SessionRecord,
         theme: TermTheme,
         colors: SemanticColors,
-        font_size: f32,
+        typeface: &TerminalType,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -4375,7 +4829,16 @@ impl TerminalPane {
         if session.is_archived() {
             return self.render_archived_overlay(session, colors, cx);
         }
-        let exited = matches!(session.status, SessionStatus::Exited(_));
+        // A session on its way out (a clean `exit` closes it) keeps its last
+        // screen, bare, until the window moves on: an exit card or pill would
+        // flash for the frames its tab takes to switch.
+        let closing = !self
+            .runtime
+            .store
+            .read()
+            .expect("store")
+            .is_open(&session.id);
+        let exited = matches!(session.status, SessionStatus::Exited(_)) && !closing;
         // An exited agent leaves its last screen behind in the daemon, and that
         // output is exactly what people want to read after closing an agent --
         // so only take the pane over when there is no terminal left to show.
@@ -4384,7 +4847,10 @@ impl TerminalPane {
         }
         self.probe_history_extent(&session.id);
         let Some(resident) = self.residents.get(&session.id) else {
-            return centered_message("Preparing terminal…", "", colors).into_any_element();
+            if closing {
+                return div().size_full().into_any_element();
+            }
+            return centered_message(t("terminal.preparing"), "", colors).into_any_element();
         };
         let element = resident
             .element
@@ -4396,7 +4862,9 @@ impl TerminalPane {
                 diri_ui::Material::Opaque => 1.0,
                 diri_ui::Material::Glass => 0.0,
             })
-            .font_size(px(font_size))
+            .font(typeface.font.clone())
+            .font_size(px(typeface.size))
+            .line_height_scale(typeface.line_height)
             .focus_handle(self.focus.clone())
             .reduce_motion(cx.reduce_motion())
             .hovered_reference(self.qol.hit.clone());
@@ -4413,18 +4881,11 @@ impl TerminalPane {
         let show_attaching =
             attachment_state == AttachmentState::Attaching && !resident.element.has_content();
         let secret_input = resident.secret_input && attachment_state == AttachmentState::Live;
-        let overflow = self.grid_row_overflow(resident.element.grid_rows(), font_size, window);
+        let overflow = self.grid_row_overflow(resident.element.grid_rows(), typeface, window);
         let scroll_target = TerminalScrollTarget {
             element: resident.element.clone(),
             visible_rows: usize::from(resident.last_size.1.max(1)),
-            line_height: f32::from(
-                CellMetrics::measure(
-                    window.text_system(),
-                    &font(crate::fonts::mono_family()),
-                    px(font_size),
-                )
-                .line_height,
-            ),
+            line_height: f32::from(typeface.metrics(window).line_height),
             session: session.id.clone(),
             pane_tx: self.pane_tx.clone(),
         };
@@ -4516,6 +4977,8 @@ impl TerminalPane {
                         ),
                     },
                 )
+                // Shell command marks sit in the grid's left padding.
+                .bleed_left(px(diri_term::element::COMMAND_MARK_GUTTER))
                 .size_full(),
             );
 
@@ -4543,17 +5006,21 @@ impl TerminalPane {
                     .items_center()
                     .gap(px(5.0))
                     .child(sf_symbol("arrow.down", 11.5, colors.secondary))
-                    .child(format!("{view_offset} lines · Return to live"))
+                    .child(tf("terminal.return_to_live", &[("lines", &view_offset)]))
                     .on_click(cx.listener(move |this, _, _window, cx| {
                         this.return_to_live(&return_id, cx);
                     })),
             );
         }
-        if show_attaching || attachment_state == AttachmentState::Reconnecting {
-            let message = if attachment_state == AttachmentState::Reconnecting {
-                "Reconnecting terminal…"
-            } else {
-                "Attaching…"
+        // An exited session's own pill already says it ended and offers Resume.
+        let unavailable = attachment_state == AttachmentState::Unavailable && !exited;
+        if !closing
+            && (show_attaching || attachment_state == AttachmentState::Reconnecting || unavailable)
+        {
+            let message = match attachment_state {
+                AttachmentState::Reconnecting => t("terminal.attach.reconnecting"),
+                AttachmentState::Unavailable => t("terminal.attach.unavailable"),
+                _ => t("terminal.attach.attaching"),
             };
             body = body.child(
                 div()
@@ -4589,9 +5056,9 @@ impl TerminalPane {
     /// facility, does not.
     fn render_secret_input_badge(&self, colors: SemanticColors) -> AnyElement {
         let label = if self.secure_input.is_held() {
-            "Secure input"
+            t("terminal.secure_input")
         } else {
-            "Password prompt"
+            t("terminal.password_prompt")
         };
         div()
             .debug_selector(|| "terminal-secret-input".into())
@@ -4626,6 +5093,7 @@ impl TerminalPane {
         let resumable = session.can_resume();
         let mut pill = div()
             .id("exit-pill")
+            .debug_selector(|| "exit-pill".into())
             .rounded(px(999.0))
             .pl(px(12.0))
             .pr(if resumable { px(4.0) } else { px(12.0) })
@@ -4652,9 +5120,9 @@ impl TerminalPane {
                     .cursor_pointer()
                     .text_color(colors.primary)
                     .child(if is_local_shell(session) {
-                        "Restart"
+                        t("terminal.exit.restart")
                     } else {
-                        "Resume"
+                        t("terminal.exit.resume")
                     })
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.runtime
@@ -4665,8 +5133,26 @@ impl TerminalPane {
                         cx.notify();
                     })),
             );
+            if let Some(count) = self.resume_all_offer(session) {
+                pill = pill.child(
+                    div()
+                        .id("exit-pill-resume-all")
+                        .rounded(px(999.0))
+                        .px(px(9.0))
+                        .py(px(3.0))
+                        .hover(move |style| style.bg(colors.primary.alpha(0.08)))
+                        .cursor_pointer()
+                        .text_color(colors.primary)
+                        .child(resume_all_label(count))
+                        .on_click(cx.listener(|this, _, _, cx| this.resume_all(cx))),
+                );
+            }
         } else if session.resumability == Resumability::TranscriptMissing {
-            pill = pill.child(div().text_color(colors.tertiary).child("· transcript gone"));
+            pill = pill.child(
+                div()
+                    .text_color(colors.tertiary)
+                    .child(t("terminal.exit.transcript_gone")),
+            );
         }
         // Centered by a full-width row rather than a guessed half-width offset,
         // since the description's length varies with the exit reason.
@@ -4694,7 +5180,7 @@ impl TerminalPane {
             if find.query().is_empty() {
                 String::new()
             } else {
-                "No matches".to_owned()
+                t("nav.no_matches").to_owned()
             }
         } else {
             format!("{}/{}", find.current_index() + 1, find.matches().len())
@@ -4704,16 +5190,16 @@ impl TerminalPane {
         let search_status = find.error().map(str::to_owned).or_else(|| {
             if find.is_paused() {
                 Some(
-                    match (find.is_partial(), find.has_newer_output()) {
-                        (true, true) => "Paused · Recent output · New output",
-                        (true, false) => "Paused · Recent output",
-                        (false, true) => "Paused · New output available",
-                        (false, false) => "Paused",
-                    }
+                    t(match (find.is_partial(), find.has_newer_output()) {
+                        (true, true) => "terminal.find.paused_recent_new",
+                        (true, false) => "terminal.find.paused_recent",
+                        (false, true) => "terminal.find.paused_new",
+                        (false, false) => "terminal.find.paused",
+                    })
                     .to_owned(),
                 )
             } else if find.is_partial() {
-                Some("Searching recent output".to_owned())
+                Some(t("terminal.find.searching_recent").to_owned())
             } else {
                 None
             }
@@ -4753,7 +5239,7 @@ impl TerminalPane {
                                     FindButtonSpec {
                                         id: "find-previous",
                                         system_image: "chevron.up",
-                                        label: "Previous match",
+                                        label: t("terminal.find.previous"),
                                         shortcut: "Shift+Enter",
                                     },
                                     colors,
@@ -4767,7 +5253,7 @@ impl TerminalPane {
                                     FindButtonSpec {
                                         id: "find-next",
                                         system_image: "chevron.down",
-                                        label: "Next match",
+                                        label: t("terminal.find.next"),
                                         shortcut: "Enter",
                                     },
                                     colors,
@@ -4782,7 +5268,7 @@ impl TerminalPane {
                                         FindButtonSpec {
                                             id: "find-refresh",
                                             system_image: "arrow.clockwise.circle",
-                                            label: "Refresh results",
+                                            label: t("terminal.find.refresh"),
                                             shortcut: "",
                                         },
                                         colors,
@@ -4795,7 +5281,7 @@ impl TerminalPane {
                                     FindButtonSpec {
                                         id: "find-close",
                                         system_image: "xmark",
-                                        label: "Close find",
+                                        label: t("terminal.find.close"),
                                         shortcut: "Escape",
                                     },
                                     colors,
@@ -4823,12 +5309,37 @@ impl TerminalPane {
                                     .pl(px(20.0))
                                     .text_size(px(Typo::META.size))
                                     .text_color(colors.tertiary)
-                                    .child("full-screen app — screen only"),
+                                    .child(t("terminal.find.screen_only")),
                             )
                         }),
                 ))
                 .into_any_element(),
         ))
+    }
+
+    /// How many sessions "Resume all" would bring back, offered only over a
+    /// session a restart ended, alongside its own Resume.
+    fn resume_all_offer(&self, session: &SessionRecord) -> Option<usize> {
+        let SessionStatus::Exited(info) = &session.status else {
+            return None;
+        };
+        if !info.ended_by_interruption() || !session.can_resume() {
+            return None;
+        }
+        self.runtime
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .resume_all_offer()
+    }
+
+    fn resume_all(&mut self, cx: &mut Context<Self>) {
+        self.runtime
+            .store
+            .write()
+            .expect("session store lock poisoned")
+            .resume_all();
+        cx.notify();
     }
 
     /// The pane-filling card for an exited session, or `None` when the terminal
@@ -4839,7 +5350,7 @@ impl TerminalPane {
         colors: SemanticColors,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let (auto_resuming, migrating) = {
+        let (auto_resuming, migrating, batch) = {
             let store = self
                 .runtime
                 .store
@@ -4848,20 +5359,28 @@ impl TerminalPane {
             (
                 store.auto_resuming().contains(&session.id),
                 store.migrating().contains(&session.id),
+                store.resume_all_progress(),
             )
         };
         // Mid-migration the source agent is briefly down; show the busy state
         // instead of an exit card with a doomed Resume button.
         if migrating {
-            return Some(centered_message("◌", "Moving session…", colors).into_any_element());
+            return Some(
+                centered_message("◌", t("terminal.moving_session"), colors).into_any_element(),
+            );
         }
         if auto_resuming {
-            let message = if is_local_shell(session) {
-                "Restarting terminal…"
+            let message = if let Some(batch) = batch {
+                tf(
+                    "terminal.resuming_all",
+                    &[("finished", &batch.finished), ("total", &batch.total)],
+                )
+            } else if is_local_shell(session) {
+                t("terminal.restarting").to_owned()
             } else {
-                "Resuming conversation…"
+                t("terminal.resuming_conversation").to_owned()
             };
-            return Some(centered_message("◌", message, colors).into_any_element());
+            return Some(centered_message("◌", &message, colors).into_any_element());
         }
         if self
             .residents
@@ -4880,27 +5399,45 @@ impl TerminalPane {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let id = session.id.clone();
-        let content = centered_message("", &exit_description(session), colors);
+        let content = centered_message("", &exit_description(session), colors)
+            .debug_selector(|| "exited-card".into());
         if session.can_resume() {
+            let resume = primary_button(
+                "resume-conversation",
+                if is_local_shell(session) {
+                    t("terminal.exit.restart_terminal")
+                } else {
+                    t("terminal.exit.resume_conversation")
+                },
+                colors,
+                cx,
+                move |this, cx| {
+                    this.runtime
+                        .store
+                        .read()
+                        .expect("session store lock poisoned")
+                        .resume(id.clone());
+                    cx.notify();
+                },
+            );
+            let Some(count) = self.resume_all_offer(session) else {
+                return content.child(resume).into_any_element();
+            };
             content
-                .child(primary_button(
-                    "resume-conversation",
-                    if is_local_shell(session) {
-                        "Restart Terminal"
-                    } else {
-                        "Resume Conversation"
-                    },
-                    colors,
-                    cx,
-                    move |this, cx| {
-                        this.runtime
-                            .store
-                            .read()
-                            .expect("session store lock poisoned")
-                            .resume(id.clone());
-                        cx.notify();
-                    },
-                ))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(resume)
+                        .child(secondary_button(
+                            "resume-all",
+                            resume_all_label(count),
+                            colors,
+                            cx,
+                            |this, cx| this.resume_all(cx),
+                        )),
+                )
                 .into_any_element()
         } else if session.resumability == Resumability::TranscriptMissing {
             content
@@ -4908,7 +5445,7 @@ impl TerminalPane {
                     div()
                         .text_size(px(11.5))
                         .text_color(colors.tertiary)
-                        .child("Transcript is gone — start a fresh session in the same folder."),
+                        .child(t("terminal.exit.transcript_gone_detail")),
                 )
                 .into_any_element()
         } else {
@@ -4928,7 +5465,7 @@ impl TerminalPane {
                 div()
                     .text_size(px(13.0))
                     .text_color(colors.secondary)
-                    .child("Archived"),
+                    .child(t("terminal.archived")),
             );
         if session.resumability == Resumability::NotResumable {
             content = content.child(
@@ -4936,15 +5473,13 @@ impl TerminalPane {
                     .max_w(px(320.0))
                     .text_size(px(11.5))
                     .text_color(colors.tertiary)
-                    .child(
-                        "This session can't resume its conversation; revive restores it as ended.",
-                    ),
+                    .child(t("terminal.archived.not_resumable")),
             );
         }
         content
             .child(primary_button(
                 "revive-session",
-                "Revive Session",
+                t("terminal.archived.revive"),
                 colors,
                 cx,
                 move |this, cx| {
@@ -4996,6 +5531,7 @@ fn quote_from_terminal_element(session_id: SessionId, element: &TerminalElement)
 
 impl Render for TerminalPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::perf_overlay::rendered("terminal");
         #[cfg(test)]
         {
             self.render_count += 1;
@@ -5006,16 +5542,24 @@ impl Render for TerminalPane {
                 Some((Some(wanted), _)) if *wanted != note_id => None,
                 _ => self.pending_note_block.take().map(|(_, block)| block),
             };
+            let inset = self.header_trailing_inset;
             pane.update(cx, |pane, cx| {
+                pane.set_trailing_inset(inset, cx);
                 pane.show(&session, &note_id, window, cx);
                 if let Some(block) = reveal {
                     pane.reveal_block(block, window, cx);
                 }
             });
+            // The note sits on the terminal's own fill, painted here once as
+            // the terminal pane paints it; the note pane inside stays nested
+            // so the glass tint does not compound.
+            let colors = crate::app_theme::colors_in(&self.runtime.store.read().expect("store"));
             return div()
                 .id("terminal-note")
                 .track_focus(&self.focus)
                 .size_full()
+                .bg(colors.terminal_surface())
+                .when(self.island_corners, |note| note.rounded(px(Radius::CARD)))
                 .child(pane)
                 .into_any_element();
         }
@@ -5033,7 +5577,7 @@ impl TerminalPane {
         if crate::alerts::enabled(cx) {
             self.sync_paste_prompt(window, cx);
         }
-        let (theme, colors, sidebar_colors, font_size) = {
+        let (theme, colors, sidebar_colors, typeface) = {
             let store = self
                 .runtime
                 .store
@@ -5043,7 +5587,7 @@ impl TerminalPane {
                 crate::app_theme::terminal_theme_in(&store),
                 crate::app_theme::colors_in(&store),
                 crate::app_theme::sidebar_colors_in(&store),
-                store.preferences().terminal_font_size,
+                TerminalType::from_prefs(store.preferences()),
             )
         };
         self.sync_status_glyphs(colors, window, cx);
@@ -5062,8 +5606,11 @@ impl TerminalPane {
                 .flex_1()
                 .h_full()
                 .overflow_hidden()
-                .border_l_1()
-                .border_color(sidebar_colors.primary.alpha(0.08))
+                .when(!self.island_corners, |pane| {
+                    pane.border_l_1()
+                        .border_color(sidebar_colors.primary.alpha(0.08))
+                })
+                .when(self.island_corners, |pane| pane.rounded(px(Radius::CARD)))
                 .bg(colors.terminal_surface())
                 .when(!self.header_hidden, |pane| {
                     pane.child(self.render_header(&session, sidebar_colors, cx))
@@ -5074,15 +5621,20 @@ impl TerminalPane {
                 .flex_1()
                 .flex()
                 .flex_col()
-                .when(!self.header_hidden, |surface| {
+                .when(!self.header_hidden || self.island_corners, |surface| {
                     surface
                         .rounded_tl(px(Radius::CARD))
                         .rounded_tr(px(Radius::CARD))
                 })
+                .when(self.island_corners, |surface| {
+                    surface
+                        .rounded_bl(px(Radius::CARD))
+                        .rounded_br(px(Radius::CARD))
+                })
                 .overflow_hidden()
                 .bg(colors.work_surface_nested())
                 .child(
-                    self.render_grid_and_overlays(&session, theme, colors, font_size, window, cx),
+                    self.render_grid_and_overlays(&session, theme, colors, &typeface, window, cx),
                 );
             if let Some(find) = self.render_find_bar(&session, colors, cx) {
                 terminal_surface = terminal_surface.child(find);
@@ -5102,23 +5654,39 @@ impl TerminalPane {
             let show_sidebar = self.shows_navigation_control() && !self.header_hidden;
             let sidebar_reveal =
                 show_sidebar.then(|| self.render_sidebar_reveal_control(sidebar_colors, cx));
+            // With no session there is no title bar to carry the right sidebar
+            // toggle, so this empty one does.
+            let inspector_toggle = (matches!(self.session_source, SessionSource::FollowSelection)
+                && !self.header_hidden)
+                .then(|| self.render_inspector_toggle(sidebar_colors, self.held_hint))
+                .flatten();
+            let has_header = sidebar_reveal.is_some() || inspector_toggle.is_some();
             div()
                 .flex_1()
                 .h_full()
                 .flex()
                 .flex_col()
                 .bg(colors.terminal_surface())
-                .when_some(sidebar_reveal, |pane, control| {
+                .when(self.island_corners, |pane| pane.rounded(px(Radius::CARD)))
+                .when(has_header, |pane| {
                     pane.child(
                         div()
                             .titlebar_drag_area()
-                            .h(px(Metrics::TITLE_BAR))
+                            .h(px(self.title_bar_height()))
                             .flex_none()
                             .px(px(Metrics::TOOLBAR_EDGE_INSET))
                             .flex()
                             .items_center()
+                            .justify_between()
                             .bg(colors.work_surface_nested())
-                            .child(div().opacity(self.title_opacity).child(control)),
+                            .child(
+                                div()
+                                    .opacity(self.title_opacity)
+                                    .flex()
+                                    .items_center()
+                                    .children(sidebar_reveal),
+                            )
+                            .child(div().opacity(self.title_opacity).children(inspector_toggle)),
                     )
                 })
                 .child(self.render_empty_workbench(colors))
@@ -5179,6 +5747,12 @@ impl TerminalPane {
                     cx.stop_propagation();
                 }),
             )
+            .on_action(cx.listener(
+                |this, _: &crate::commands::CopyLastCommandOutput, window, cx| {
+                    this.copy_last_command_output(window, cx);
+                    cx.stop_propagation();
+                },
+            ))
             .on_action(
                 cx.listener(|this, _: &crate::commands::NextPrompt, window, cx| {
                     this.read_terminal_history(Some(true), window, cx);
@@ -5190,6 +5764,7 @@ impl TerminalPane {
             .on_modifiers_changed(cx.listener(Self::handle_modifiers_changed))
             .child(content)
             .children(drop_overlay)
+            .children(crate::perf_overlay::badge("terminal"))
     }
 }
 
@@ -5314,9 +5889,9 @@ fn find_icon_button(
         .aria_label(spec.label)
         .aria_keyshortcuts(spec.shortcut)
         .aria_description(if enabled {
-            "Activate this terminal find action"
+            t("terminal.find.activate")
         } else {
-            "Unavailable because there are no matches"
+            t("terminal.find.no_matches_unavailable")
         })
         .text_size(px(11.0))
         .text_color(if enabled {
@@ -5367,6 +5942,36 @@ fn primary_button(
         .child(label)
         .on_click(cx.listener(move |this, _, _, cx| handler(this, cx)))
         .into_any_element()
+}
+
+/// The quieter companion to [`primary_button`], for a second choice beside it.
+fn secondary_button(
+    id: &'static str,
+    label: String,
+    colors: SemanticColors,
+    cx: &mut Context<TerminalPane>,
+    handler: impl Fn(&mut TerminalPane, &mut Context<TerminalPane>) + 'static,
+) -> AnyElement {
+    div()
+        .id(id)
+        .mt(px(2.0))
+        .rounded(px(7.0))
+        .px(px(14.0))
+        .py(px(7.0))
+        .bg(colors.primary.alpha(0.08))
+        .text_size(px(13.0))
+        .font_weight(Typo::ROW_EMPHASIZED.weight)
+        .text_color(colors.primary)
+        .hover(move |style| style.bg(colors.primary.alpha(0.14)))
+        .active(move |style| style.bg(colors.primary.alpha(0.2)))
+        .cursor_pointer()
+        .child(label)
+        .on_click(cx.listener(move |this, _, _, cx| handler(this, cx)))
+        .into_any_element()
+}
+
+pub(crate) fn resume_all_label(count: usize) -> String {
+    tf("terminal.resume_all", &[("count", &count)])
 }
 
 fn centered_message(icon: &str, message: &str, colors: SemanticColors) -> gpui::Div {
@@ -5440,10 +6045,70 @@ fn terminal_command_navigation(key: &gpui::Keystroke) -> Option<&'static [u8]> {
     }
 }
 
-fn terminal_key_event(event: &KeyDownEvent) -> Option<TermKeyEvent> {
+/// What a held Option key means for a character key.
+///
+/// macOS has no Alt key: Option is how many layouts type ordinary ASCII
+/// (German ⌥7 = `|`, ⌥L = `@`, ⌥5 = `[`; French, Swiss, Nordic and Polish
+/// likewise), while US users expect it to be Meta (⌥B = `ESC b`). This follows
+/// Ghostty's unset `macos-option-as-alt`: Meta on US layouts, composed text on
+/// every other layout. Named keys (arrows, Backspace, Enter) are Meta either
+/// way, and an Option chord that composes nothing new is Meta either way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OptionKey {
+    /// `ESC` + the key's unmodified character, as readline's `M-b`.
+    Meta,
+    /// The character the layout composes, as typed, with no `ESC`.
+    Compose,
+}
+
+impl OptionKey {
+    fn for_layout(layout_id: &str) -> Self {
+        // Off macOS, Alt is a real Alt key; AltGr composition arrives without
+        // the alt modifier.
+        if !cfg!(target_os = "macos") {
+            return Self::Meta;
+        }
+        // Layouts whose Option characters are a novelty (∫, ƒ, ∂) rather than
+        // how ASCII is typed. ABC is the US layout under its newer name.
+        match layout_id {
+            "com.apple.keylayout.US"
+            | "com.apple.keylayout.ABC"
+            | "com.apple.keylayout.USInternational"
+            | "com.apple.keylayout.USInternational-PC" => Self::Meta,
+            _ => Self::Compose,
+        }
+    }
+}
+
+/// The text a Meta chord prefixes with `ESC`: the key itself, not the
+/// character Option would have composed (`ESC b`, never `ESC ∫`).
+fn option_meta_text(keystroke: &gpui::Keystroke) -> String {
+    let key = keystroke.key.as_str();
+    if key == "space" {
+        return " ".to_owned();
+    }
+    // GPUI keeps Shift only for letters (`shift-b`); other shifted keys arrive
+    // already resolved (`&`) with Shift cleared.
+    if keystroke.modifiers.shift && key.len() == 1 && key.chars().all(|c| c.is_ascii_lowercase()) {
+        return key.to_ascii_uppercase();
+    }
+    key.to_owned()
+}
+
+fn terminal_key_event(
+    event: &KeyDownEvent,
+    option: OptionKey,
+) -> Option<(TermKeyEvent, TermModifiers)> {
+    let keystroke = &event.keystroke;
+    let mut modifiers = TermModifiers {
+        shift: keystroke.modifiers.shift,
+        ctrl: keystroke.modifiers.control,
+        alt: keystroke.modifiers.alt,
+        cmd: keystroke.modifiers.platform,
+    };
     #[cfg(target_os = "macos")]
     if let Some(keypad) = crate::macos::terminal_keys::keypad_event(event) {
-        return Some(keypad);
+        return Some((keypad, modifiers));
     }
     let named = match event.keystroke.key.as_str() {
         "up" => Some(NamedKey::ArrowUp),
@@ -5475,18 +6140,42 @@ fn terminal_key_event(event: &KeyDownEvent) -> Option<TermKeyEvent> {
         _ => None,
     };
     if let Some(named) = named {
-        return Some(TermKeyEvent::named(named));
+        return Some((TermKeyEvent::named(named), modifiers));
     }
-    let logical = event.keystroke.key.clone();
-    let text = event
-        .keystroke
+    let logical = keystroke.key.clone();
+    if logical.is_empty() {
+        return None;
+    }
+    let mut text = keystroke
         .key_char
         .clone()
         .unwrap_or_else(|| logical.clone());
-    (!logical.is_empty()).then_some(TermKeyEvent {
-        key: TermKey::Character(logical),
-        text: Some(text),
-    })
+    // GPUI only fills `key_char` for Option chords without Control/Command, so
+    // this is exactly "Option produced a character".
+    if modifiers.alt
+        && !modifiers.ctrl
+        && !modifiers.cmd
+        && let Some(composed) = keystroke.key_char.as_ref()
+    {
+        let meta = option_meta_text(keystroke);
+        let composes =
+            !composed.is_empty() && *composed != meta && composed.chars().all(|c| !c.is_control());
+        if option == OptionKey::Compose && composes {
+            // Option was consumed by the layout: the composed character is
+            // the input, exactly as a text field would insert it.
+            text = composed.clone();
+            modifiers.alt = false;
+        } else {
+            text = meta;
+        }
+    }
+    Some((
+        TermKeyEvent {
+            key: TermKey::Character(logical),
+            text: Some(text),
+        },
+        modifiers,
+    ))
 }
 
 fn ui_agent_kind(kind: &ProtoAgentKind) -> UiAgentKind {
@@ -5498,7 +6187,7 @@ fn ui_agent_kind(kind: &ProtoAgentKind) -> UiAgentKind {
         ProtoAgentKind::CURSOR_ID => UiAgentKind::Cursor,
         ProtoAgentKind::GEMINI_ID => UiAgentKind::Gemini,
         ProtoAgentKind::SHELL_ID => UiAgentKind::Shell,
-        _ => UiAgentKind::Generic,
+        id => UiAgentKind::from_agent_id(id),
     }
 }
 
@@ -5623,16 +6312,54 @@ fn is_local_shell(session: &SessionRecord) -> bool {
 
 fn exit_description(session: &SessionRecord) -> String {
     let SessionStatus::Exited(info) = &session.status else {
-        return "Session ended".to_owned();
+        return t("terminal.exit.session_ended").to_owned();
     };
+    if info.interrupted {
+        // Killed from outside (a force-quit, memory pressure), not finished:
+        // the session comes back on its own, so don't blame the Agent.
+        return "Agent was interrupted".to_owned();
+    }
     match info.reason {
-        ExitReason::DaemonRestart => "Session ended when the daemon restarted".to_owned(),
-        ExitReason::Signaled => "Agent was stopped".to_owned(),
-        ExitReason::Exited if info.code == Some(0) => "Agent exited".to_owned(),
-        ExitReason::Exited => format!("Agent exited (code {})", info.code.unwrap_or(-1)),
-        ExitReason::External => "Imported session — not started yet".to_owned(),
-        ExitReason::Archived => "Archived".to_owned(),
-        ExitReason::Unknown => "Session ended".to_owned(),
+        ExitReason::DaemonRestart if info.system_restart => {
+            if cfg!(target_os = "macos") {
+                t("terminal.exit.mac_restarted").to_owned()
+            } else {
+                t("terminal.exit.computer_restarted").to_owned()
+            }
+        }
+        ExitReason::DaemonRestart => t("terminal.exit.daemon_restarted").to_owned(),
+        ExitReason::Signaled => t("terminal.exit.stopped").to_owned(),
+        ExitReason::Exited if info.code == Some(0) => t("terminal.exit.exited").to_owned(),
+        ExitReason::Exited => tf(
+            "terminal.exit.exited_code",
+            &[("code", &info.code.unwrap_or(-1))],
+        ),
+        ExitReason::External => t("terminal.exit.imported").to_owned(),
+        ExitReason::Archived => t("terminal.archived").to_owned(),
+        ExitReason::Unknown => t("terminal.exit.session_ended").to_owned(),
+    }
+}
+
+/// The terminal typography preferences, resolved once per use so sizing,
+/// painting and hit-testing measure the same cell.
+struct TerminalType {
+    font: gpui::Font,
+    size: f32,
+    line_height: f32,
+}
+
+impl TerminalType {
+    fn from_prefs(prefs: &crate::store::Prefs) -> Self {
+        Self {
+            font: crate::fonts::terminal_font(&prefs.terminal_font_family),
+            size: prefs.terminal_font_size,
+            line_height: prefs.terminal_line_height,
+        }
+    }
+
+    fn metrics(&self, window: &Window) -> CellMetrics {
+        CellMetrics::measure(window.text_system(), &self.font, px(self.size))
+            .with_line_height_scale(self.line_height)
     }
 }
 
@@ -5688,6 +6415,12 @@ impl diri_ui::ScrollTarget for TerminalScrollTarget {
     fn bounce_edges(&self) -> (bool, bool) {
         (true, false)
     }
+}
+
+/// Title bar height of a comfortable-density island; see
+/// [`TerminalPane::title_bar_height`].
+pub(crate) fn island_title_bar() -> f32 {
+    Metrics::TITLE_BAR - 2.0 * crate::store::PaneDensity::Comfortable.island_gap()
 }
 
 #[cfg(test)]
@@ -6431,6 +7164,25 @@ mod tests {
         assert!(!hold.park(grid_frame(120, false)));
     }
 
+    /// A new remote tab's first attach is refused until its Bridge connects
+    /// (keyboard modes unknown). The record's status does not change then, so
+    /// keyed on status alone the pane sat blank until the Agent next changed
+    /// status: ~3 s for every new remote Claude tab.
+    #[test]
+    fn a_remote_connection_coming_up_retries_a_refused_attach() {
+        use diri_proto::{RemoteConnection, RemoteConnectionState};
+        let mut session = fixture_session();
+        let connection = |state| RemoteConnection {
+            state,
+            since: DateMillis(0.0),
+        };
+        session.remote_connection = Some(connection(RemoteConnectionState::Connecting));
+        let refused = RetryKey::of(&session);
+        assert_eq!(RetryKey::of(&session), refused);
+        session.remote_connection = Some(connection(RemoteConnectionState::Connected));
+        assert_ne!(RetryKey::of(&session), refused);
+    }
+
     pub(super) fn fixture_session() -> SessionRecord {
         let envelope: serde_json::Value = serde_json::from_str(include_str!(
             "../../diri-proto/tests/fixtures/session_list_response.json"
@@ -6914,6 +7666,13 @@ mod tests {
         use diri_proto::grid::{ChangedRow, GridCell, LinkSpan};
         use gpui::{AppContext as _, HeadlessAppContext};
         let output = std::env::var("DIRI_QOL_SCREENSHOT").expect("output path");
+        // DIRI_VISUAL_LANGUAGE=zh-Hans renders the page in that catalog.
+        if let Some(language) = std::env::var("DIRI_VISUAL_LANGUAGE")
+            .ok()
+            .and_then(|tag| crate::i18n::Language::from_tag(&tag))
+        {
+            diri_i18n::set_language(language);
+        }
         let scene = std::env::var("DIRI_QOL_SCENE").unwrap_or_default();
         let width: f32 = std::env::var("DIRI_QOL_WIDTH")
             .ok()
@@ -6961,6 +7720,15 @@ mod tests {
                         prefs.terminal_theme = theme;
                     }
                     prefs.terminal_file_editor = crate::store::FileEditor::Cursor;
+                    if let Ok(family) = std::env::var("DIRI_QOL_FONT") {
+                        prefs.terminal_font_family = family;
+                    }
+                    if let Some(scale) = std::env::var("DIRI_QOL_LINE_HEIGHT")
+                        .ok()
+                        .and_then(|value| value.parse().ok())
+                    {
+                        prefs.terminal_line_height = scale;
+                    }
                 })
                 .unwrap();
             store.upsert_session(session);
@@ -7030,6 +7798,59 @@ mod tests {
                         }
                         grid.cursor_row = 11;
                         grid.cursor_col = 2;
+                    }
+                    if scene == "typography" {
+                        // An agent transcript with box drawing, shades and
+                        // colour: what a font or line-height change touches.
+                        let mut screen = diri_engine::HeadlessScreen::new(80, 18);
+                        screen.feed(concat!(
+                            "\x1b[38;5;173m╭────────────────────────────────────────────╮\x1b[0m\r\n",
+                            "\x1b[38;5;173m│\x1b[0m \x1b[38;5;173m✻\x1b[0m Welcome to \x1b[1mClaude Code\x1b[0m                   \x1b[38;5;173m│\x1b[0m\r\n",
+                            "\x1b[38;5;173m│\x1b[0m   \x1b[2mcwd: ~/work/diri\x1b[0m                         \x1b[38;5;173m│\x1b[0m\r\n",
+                            "\x1b[38;5;173m╰────────────────────────────────────────────╯\x1b[0m\r\n",
+                            "\r\n",
+                            "\x1b[2m>\x1b[0m Let me pick the terminal font in Settings\r\n",
+                            "\r\n",
+                            "\x1b[32m●\x1b[0m \x1b[1mRead\x1b[0m(crates/diri-app/src/fonts.rs)\r\n",
+                            "  ⎿  Read 196 lines\r\n",
+                            "\x1b[32m●\x1b[0m \x1b[1mUpdate\x1b[0m(crates/diri-term/src/metrics.rs)\r\n",
+                            "  ⎿  \x1b[32m+ pub fn with_line_height_scale(self, scale: f32)\x1b[0m\r\n",
+                            "     \x1b[31m- line_height: px(raw_height.round())\x1b[0m\r\n",
+                            "\r\n",
+                            "┌──────┬──────────┬────────┐  \x1b[36m█▓▒░\x1b[0m 0O 1lI {}[]() => != ->\r\n",
+                            "│ size │ 13 pt    │ \x1b[33mok\x1b[0m     │  \x1b[7m inverse \x1b[0m \x1b[4munderline\x1b[0m \x1b[3mitalic\x1b[0m\r\n",
+                            "└──────┴──────────┴────────┘\r\n",
+                            "\x1b[32m$\x1b[0m cargo test -p diri-term\r\n",
+                            "test result: \x1b[32mok\x1b[0m. 278 passed; 0 failed",
+                        ).as_bytes());
+                        grid = screen.full_snapshot();
+                    }
+                    if scene.starts_with("commands") {
+                        // A shell with OSC 133 marks: two commands that
+                        // passed, one that failed, and one still running.
+                        let mut screen = diri_engine::HeadlessScreen::new(80, 16);
+                        let run = |command: &str, output: &str, status: u8| {
+                            format!(
+                                "\x1b]133;A\x07\x1b[36m~/work/diri\x1b[0m $ \x1b]133;B\x07{command}\r\n\
+                                 \x1b]133;C\x07{output}\x1b]133;D;{status}\x07"
+                            )
+                        };
+                        screen.feed(run("ls", "Cargo.toml  README.md  crates  docs\r\n", 0).as_bytes());
+                        screen.feed(run(
+                            "cargo test -p diri-term command_marks",
+                            "running 3 tests\r\ntest a_prompt_shows_how_its_own_command_ended ... ok\r\n\
+                             test command_output_runs_from_its_output_mark_to_its_end ... ok\r\n\
+                             test the_last_finished_output_is_kept_while_reading_forward ... ok\r\n\r\n\
+                             test result: \x1b[32mok\x1b[0m. 3 passed; 0 failed\r\n",
+                            0,
+                        ).as_bytes());
+                        screen.feed(run(
+                            "git push origin HEAD",
+                            "\x1b[31merror:\x1b[0m failed to push some refs to 'origin'\r\n",
+                            1,
+                        ).as_bytes());
+                        screen.feed(b"\x1b]133;A\x07\x1b[36m~/work/diri\x1b[0m $ \x1b]133;B\x07sleep 5\r\n\x1b]133;C\x07");
+                        grid = screen.full_snapshot();
                     }
                     let find_fixture = if scene == "find-unicode" {
                         let mut screen = diri_engine::HeadlessScreen::new(80, 28);
@@ -7137,6 +7958,18 @@ mod tests {
                                 cx,
                             );
                         }
+                        "commands-select" => {
+                            let resident = pane.residents.get(&id).unwrap();
+                            let output = resident.element.command_output_at(10, 4).unwrap();
+                            resident.element.select_range(output.start, output.end);
+                        }
+                        "commands-menu" => pane.open_terminal_menu(
+                            gpui::point(px(220.0), px(110.0)),
+                            10,
+                            4,
+                            window,
+                            cx,
+                        ),
                         "menu" => pane.open_terminal_menu(
                             gpui::point(px(260.0), px(180.0)),
                             2,
@@ -7154,7 +7987,7 @@ mod tests {
                             );
                         }
                         "controller-feedback" => pane.handle_pane_event(
-                            PaneEvent::InputFeedback(id.clone(), "Terminal input queue is full. The latest input was not accepted.".into()), window, cx),
+                            PaneEvent::InputFeedback(id.clone(), "Input queue full; that keystroke was dropped".into()), window, cx),
                         "copy" => pane.enter_copy_mode(window, cx),
                         scene if scene.starts_with("insert-path") => {
                             pane.open_path_picker(&crate::commands::InsertPath, window, cx);
@@ -8075,6 +8908,25 @@ mod tests {
                     "compatibility must not invent observed state"
                 );
             }
+            // #670: the pane consults the active layout. The test platform's
+            // layout is not a US one, so Option composes as on German.
+            let mut keystroke = Keystroke::parse("alt-7").unwrap();
+            keystroke.key_char = Some("|".into());
+            pane.handle_key_down(
+                &KeyDownEvent {
+                    keystroke,
+                    is_held: false,
+                    prefer_character_input: false,
+                },
+                window,
+                cx,
+            );
+            let expected: &[u8] = if cfg!(target_os = "macos") {
+                b"|"
+            } else {
+                b"\x1b7"
+            };
+            assert_eq!(input.try_recv().unwrap(), (id.clone(), expected.to_vec()));
         });
     }
 
@@ -8334,8 +9186,10 @@ mod tests {
                 .build()
                 .unwrap(),
         );
-        let session = fixture_session();
+        let mut session = fixture_session();
+        session.host = Some("forge".into());
         let id = session.id.clone();
+        let target = UploadTarget::of(&session).unwrap();
         {
             let mut store = runtime.store.write().unwrap();
             store.upsert_session(session);
@@ -8375,7 +9229,7 @@ mod tests {
             // The uploader fails with whatever scp wrote to stderr.
             pane.handle_pane_event(
                 PaneEvent::ClipboardUploadFinished(
-                    id.clone(),
+                    target.clone(),
                     Err("scp failed: deploy@forge.internal: Permission denied (publickey)".into()),
                 ),
                 window,
@@ -8388,12 +9242,13 @@ mod tests {
             &*shown.lock().unwrap(),
             &[
                 "Couldn't paste the clipboard image: permission denied",
-                "Couldn't copy the clipboard image to the session's host",
+                "Couldn’t copy the image to the remote host",
             ],
             "each failure is shown once, without paths, hosts or subprocess output"
         );
 
         pane.update_in(cx, |pane, window, cx| {
+            pane.residents.get_mut(&id).unwrap().attachment_state = AttachmentState::Live;
             let staged = StagedClipboardImage::stage(b"png bytes", "png").unwrap();
             let local_path = staged.path().to_string_lossy().into_owned();
             pane.paste_staged_clipboard_image(&id, Ok(staged), window, cx);
@@ -8405,7 +9260,7 @@ mod tests {
 
             pane.handle_pane_event(
                 PaneEvent::ClipboardUploadFinished(
-                    id.clone(),
+                    target.clone(),
                     Ok("/tmp/dirijor-clipboard-x.png".into()),
                 ),
                 window,
@@ -8418,6 +9273,276 @@ mod tests {
             assert!(input.try_recv().is_err(), "the remote path was pasted once");
         });
         assert_eq!(shown.lock().unwrap().len(), 2, "success shows no failure");
+    }
+
+    /// The attach seed of a session that just became resident again: live,
+    /// then the child's modes.
+    fn seed_returned_resident(
+        pane: &mut TerminalPane,
+        id: &SessionId,
+        window: &mut Window,
+        cx: &mut Context<TerminalPane>,
+    ) {
+        let resident = pane.residents.get(id).unwrap();
+        resident.attachment.claim();
+        let generation = resident.attachment_generation;
+        pane.handle_pane_event(
+            PaneEvent::AttachmentState(id.clone(), generation, AttachmentState::Live),
+            window,
+            cx,
+        );
+        pane.handle_pane_event(
+            PaneEvent::Chunk(
+                id.clone(),
+                generation,
+                TerminalChunk::Modes {
+                    keyboard: None,
+                    alt_screen: false,
+                    bracketed_paste: true,
+                    mouse: Default::default(),
+                    secret_input: false,
+                },
+            ),
+            window,
+            cx,
+        );
+    }
+
+    /// A selected note never mounts a terminal: the Engine refuses the attach
+    /// and the transport used to retry it twice a second while it showed.
+    #[gpui::test]
+    fn a_selected_note_never_attaches_a_terminal(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let mut note = fixture_session();
+        note.kind = diri_proto::AgentKind::new(diri_proto::AgentKind::NOTE_ID);
+        note.note_id = Some("n-1".into());
+        let mut agent = fixture_session();
+        agent.id = SessionId::new("agent");
+        let (note_id, agent_id) = (note.id.clone(), agent.id.clone());
+        {
+            let mut store = runtime.store.write().unwrap();
+            store.upsert_session(note);
+            store.upsert_session(agent);
+            store.select(agent_id.clone());
+        }
+        let store_runtime = Arc::clone(&runtime);
+        let (pane, cx) = cx.add_window_view({
+            let runtime = Arc::clone(&runtime);
+            move |window, cx| TerminalPane::new(runtime, tokio, window, cx)
+        });
+        // No file watcher and no real notes folder under the test scheduler.
+        pane.update(cx, |pane, cx| {
+            let notes = cx.new(|cx| crate::notes::NotePane::with_store(runtime, None, false, cx));
+            pane.set_note_pane_for_test(notes);
+        });
+        let select = |id: &SessionId| store_runtime.store.write().unwrap().select(id.clone());
+        select(&note_id);
+        pane.update_in(cx, |pane, window, cx| {
+            pane.reconcile_store_change(window, cx);
+            assert!(
+                pane.residents.is_empty(),
+                "a note has no terminal to attach"
+            );
+        });
+        select(&agent_id);
+        pane.update_in(cx, |pane, window, cx| {
+            pane.reconcile_store_change(window, cx);
+            assert!(pane.residents.contains_key(&agent_id));
+            assert!(!pane.residents.contains_key(&note_id));
+        });
+    }
+
+    #[gpui::test]
+    fn an_upload_that_finishes_while_its_session_is_away_is_pasted_on_return(
+        cx: &mut TestAppContext,
+    ) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let mut uploading = fixture_session();
+        uploading.host = Some("forge".into());
+        let mut other = fixture_session();
+        other.id = SessionId::new("other");
+        let (id, other_id) = (uploading.id.clone(), other.id.clone());
+        let target = UploadTarget::of(&uploading).unwrap();
+        {
+            let mut store = runtime.store.write().unwrap();
+            store.upsert_session(uploading.clone());
+            store.upsert_session(other);
+            store.select(id.clone());
+        }
+        let store_runtime = Arc::clone(&runtime);
+        let (pane, cx) =
+            cx.add_window_view(move |window, cx| TerminalPane::new(runtime, tokio, window, cx));
+        let shown = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = Arc::clone(&shown);
+        cx.update(|_, cx| {
+            cx.subscribe(&pane, move |_, event: &TerminalPaneEvent, _| {
+                if let TerminalPaneEvent::Feedback { message } = event {
+                    sink.lock().unwrap().push(message.clone());
+                }
+            })
+            .detach();
+        });
+        let select = |id: &SessionId| store_runtime.store.write().unwrap().select(id.clone());
+        let (tx, mut input) = mpsc::unbounded_channel();
+
+        // Both uploads start on the session, then the user looks elsewhere:
+        // with a residency of one, its terminal is gone when they finish.
+        select(&other_id);
+        pane.update_in(cx, |pane, window, cx| {
+            pane.input_observer = Some(tx);
+            pane.reconcile_store_change(window, cx);
+            assert!(!pane.residents.contains_key(&id));
+            pane.residents[&other_id].attachment.claim();
+            pane.handle_pane_event(
+                PaneEvent::ClipboardUploadFinished(target.clone(), Ok("/tmp/image.png".into())),
+                window,
+                cx,
+            );
+            pane.handle_pane_event(
+                PaneEvent::DroppedFilesUploaded(target.clone(), Ok(vec!["/tmp/notes.txt".into()])),
+                window,
+                cx,
+            );
+            assert!(
+                input.try_recv().is_err(),
+                "an upload for one session was pasted into another"
+            );
+        });
+        assert_eq!(
+            &*shown.lock().unwrap(),
+            &[upload_held_for_return()],
+            "a held paste is announced rather than lost"
+        );
+
+        select(&id);
+        pane.update_in(cx, |pane, window, cx| {
+            pane.reconcile_store_change(window, cx);
+            assert!(
+                input.try_recv().is_err(),
+                "a paste went out before the returned terminal was live"
+            );
+            seed_returned_resident(pane, &id, window, cx);
+            assert_eq!(
+                input.try_recv().unwrap(),
+                (id.clone(), b"\x1b[200~/tmp/image.png\x1b[201~".to_vec())
+            );
+            assert_eq!(
+                input.try_recv().unwrap(),
+                (id.clone(), b"\x1b[200~/tmp/notes.txt \x1b[201~".to_vec())
+            );
+            seed_returned_resident(pane, &id, window, cx);
+            assert!(
+                input.try_recv().is_err(),
+                "a held paste was delivered twice"
+            );
+        });
+
+        // The run ends while its upload is held. A resume keeps the id and
+        // `created_at`, so the exit is all that tells the two runs apart. (A
+        // failing exit: a clean `exit 0` closes the tab outright.)
+        select(&other_id);
+        pane.update_in(cx, |pane, window, cx| {
+            pane.reconcile_store_change(window, cx);
+            pane.handle_pane_event(
+                PaneEvent::ClipboardUploadFinished(target.clone(), Ok("/tmp/image.png".into())),
+                window,
+                cx,
+            );
+        });
+        let mut exited = uploading.clone();
+        exited.status = SessionStatus::Exited(ExitInfo {
+            reason: ExitReason::Exited,
+            code: Some(1),
+            signal: None,
+            system_restart: false,
+            interrupted: false,
+        });
+        store_runtime.store.write().unwrap().upsert_session(exited);
+        shown.lock().unwrap().clear();
+        pane.update_in(cx, |pane, window, cx| {
+            pane.reconcile_store_change(window, cx)
+        });
+        assert_eq!(&*shown.lock().unwrap(), &[upload_target_changed()]);
+        store_runtime
+            .store
+            .write()
+            .unwrap()
+            .upsert_session(uploading.clone());
+        select(&id);
+        pane.update_in(cx, |pane, window, cx| {
+            pane.reconcile_store_change(window, cx);
+            seed_returned_resident(pane, &id, window, cx);
+            assert!(
+                input.try_recv().is_err(),
+                "an upload was replayed into a resumed session"
+            );
+        });
+
+        // The same id started over, and then moved host, while an upload for
+        // the old run was held: the path belongs to neither.
+        select(&other_id);
+        pane.update_in(cx, |pane, window, cx| {
+            pane.reconcile_store_change(window, cx);
+            pane.handle_pane_event(
+                PaneEvent::ClipboardUploadFinished(target.clone(), Ok("/tmp/image.png".into())),
+                window,
+                cx,
+            );
+        });
+        let mut restarted = uploading.clone();
+        restarted.created_at = diri_proto::DateMillis(uploading.created_at.0 + 1.0);
+        store_runtime
+            .store
+            .write()
+            .unwrap()
+            .upsert_session(restarted);
+        select(&id);
+        shown.lock().unwrap().clear();
+        pane.update_in(cx, |pane, window, cx| {
+            pane.reconcile_store_change(window, cx);
+            seed_returned_resident(pane, &id, window, cx);
+            assert!(
+                input.try_recv().is_err(),
+                "an upload was replayed into a restarted session"
+            );
+        });
+        assert_eq!(&*shown.lock().unwrap(), &[upload_target_changed()],);
+
+        let mut migrated = uploading.clone();
+        migrated.host = Some("anvil".into());
+        store_runtime
+            .store
+            .write()
+            .unwrap()
+            .upsert_session(migrated);
+        shown.lock().unwrap().clear();
+        pane.update_in(cx, |pane, window, cx| {
+            pane.reconcile_store_change(window, cx);
+            pane.qol.clear_feedback();
+            pane.residents.get_mut(&id).unwrap().attachment_state = AttachmentState::Live;
+            pane.handle_pane_event(
+                PaneEvent::DroppedFilesUploaded(target.clone(), Ok(vec!["/tmp/notes.txt".into()])),
+                window,
+                cx,
+            );
+            assert!(
+                input.try_recv().is_err(),
+                "an upload was pasted into a migrated session"
+            );
+        });
+        assert_eq!(&*shown.lock().unwrap(), &[upload_target_changed()],);
     }
 
     #[gpui::test]
@@ -9283,6 +10408,101 @@ mod tests {
     }
 
     #[gpui::test]
+    fn seam_drag_sends_one_resize_when_it_rests_or_ends(cx: &mut TestAppContext) {
+        let runtime = Arc::new(StoreRuntime::inert());
+        let tokio = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime"),
+        );
+        let session = fixture_session();
+        let id = session.id.clone();
+        {
+            let mut store = runtime.store.write().expect("session store lock poisoned");
+            store.upsert_session(session);
+            store.select(id.clone());
+        }
+        let runtime_for_view = Arc::clone(&runtime);
+        let (pane, cx) = cx.add_window_view(move |window, cx| {
+            TerminalPane::new(runtime_for_view, tokio, window, cx)
+        });
+        let viewport = |width: f32| TerminalViewport {
+            width,
+            height: 600.0,
+            ..Default::default()
+        };
+        pane.update_in(cx, |pane, window, cx| {
+            pane.set_viewport(viewport(900.0), cx);
+            window.activate_window();
+            pane.focus(window, cx);
+            pane.update_selected_geometry(window, cx);
+        });
+        cx.run_until_parked();
+        let (sized, sends) = pane.read_with(cx, |pane, _| {
+            let resident = &pane.residents[&id];
+            (
+                resident.last_size,
+                resident.attachment.resize_sends_for_test(),
+            )
+        });
+        assert_ne!(sized, (0, 0));
+
+        pane.update_in(cx, |pane, window, cx| {
+            SeamDrag::publish(window.window_handle().window_id(), "root", true, cx);
+            for step in 1..=40 {
+                pane.set_viewport(viewport(900.0 - 8.0 * step as f32), cx);
+                pane.update_selected_geometry(window, cx);
+            }
+            let resident = &pane.residents[&id];
+            assert_eq!(
+                resident.attachment.resize_sends_for_test(),
+                sends,
+                "a drag in motion never resizes the PTY: each resize makes a TUI repaint"
+            );
+            assert_eq!(resident.last_size, sized);
+        });
+
+        cx.executor().advance_clock(SEAM_DRAG_SETTLE);
+        cx.run_until_parked();
+        pane.update_in(cx, |pane, window, cx| {
+            pane.update_selected_geometry(window, cx);
+            let resident = &pane.residents[&id];
+            assert_eq!(
+                resident.attachment.resize_sends_for_test(),
+                sends + 1,
+                "a drag at rest sends the size it rests at, once"
+            );
+            assert_ne!(resident.last_size, sized);
+            pane.update_selected_geometry(window, cx);
+            assert_eq!(
+                pane.residents[&id].attachment.resize_sends_for_test(),
+                sends + 1
+            );
+
+            pane.set_viewport(viewport(1200.0), cx);
+            pane.update_selected_geometry(window, cx);
+            assert_eq!(
+                pane.residents[&id].attachment.resize_sends_for_test(),
+                sends + 1,
+                "moving again defers again"
+            );
+            SeamDrag::publish(window.window_handle().window_id(), "root", false, cx);
+            pane.update_selected_geometry(window, cx);
+            let resident = &pane.residents[&id];
+            assert_eq!(
+                resident.attachment.resize_sends_for_test(),
+                sends + 2,
+                "releasing the drag sends the final size"
+            );
+            assert!(
+                resident.controller.reflow_held_for_test(),
+                "the release lands as one held reflow, not a stepped one"
+            );
+        });
+    }
+
+    #[gpui::test]
     fn switching_back_keeps_an_unchanged_pty_size_and_holds_a_real_column_change(
         cx: &mut TestAppContext,
     ) {
@@ -9839,11 +11059,26 @@ mod tests {
             reason: ExitReason::DaemonRestart,
             code: None,
             signal: None,
+            system_restart: false,
+            interrupted: false,
         });
         assert_eq!(
             exit_description(&session),
             "Session ended when the daemon restarted"
         );
+    }
+
+    /// A reboot is the computer's doing, not Diri's: the copy says so.
+    #[test]
+    fn system_restart_exit_blames_the_computer() {
+        let mut session = fixture_session();
+        session.status = SessionStatus::Exited(ExitInfo::restart(true));
+        let expected = if cfg!(target_os = "macos") {
+            "Ended when your Mac restarted"
+        } else {
+            "Ended when your computer restarted"
+        };
+        assert_eq!(exit_description(&session), expected);
     }
 
     #[test]
@@ -9873,7 +11108,7 @@ mod tests {
             is_held: false,
             prefer_character_input: false,
         };
-        let mapped = terminal_key_event(&event).unwrap();
+        let (mapped, _) = terminal_key_event(&event, OptionKey::Meta).unwrap();
         assert_eq!(
             encode_key(&mapped, TermModifiers::default(), TermInputModes::default()),
             b"\x1b[A"
@@ -9891,18 +11126,166 @@ mod tests {
             is_held: false,
             prefer_character_input: false,
         };
-        let mapped = terminal_key_event(&command_backspace).unwrap();
+        let (mapped, modifiers) = terminal_key_event(&command_backspace, OptionKey::Meta).unwrap();
         assert_eq!(
-            encode_key(
-                &mapped,
-                TermModifiers {
-                    cmd: true,
-                    ..TermModifiers::default()
-                },
-                TermInputModes::default()
-            ),
+            modifiers,
+            TermModifiers {
+                cmd: true,
+                ..TermModifiers::default()
+            }
+        );
+        assert_eq!(
+            encode_key(&mapped, modifiers, TermInputModes::default()),
             [0x15]
         );
+    }
+
+    /// A macOS key-down as GPUI delivers it: `key` is the unmodified key
+    /// (Shift already resolved for non-letters), `key_char` what the layout
+    /// typed with Option held.
+    fn option_key(chord: &str, key_char: Option<&str>) -> KeyDownEvent {
+        let mut keystroke = Keystroke::parse(chord).unwrap();
+        keystroke.key_char = key_char.map(str::to_owned);
+        KeyDownEvent {
+            keystroke,
+            is_held: false,
+            prefer_character_input: false,
+        }
+    }
+
+    fn option_bytes(event: &KeyDownEvent, option: OptionKey) -> Vec<u8> {
+        let (mapped, modifiers) = terminal_key_event(event, option).unwrap();
+        diri_term::keys::encode_interactive_action(
+            &mapped,
+            modifiers,
+            Some(diri_term::keys::KeyboardState::default()),
+            diri_term::keys::KeyAction::Press,
+        )
+        .unwrap()
+    }
+
+    /// #670: German, French, Swiss, Nordic and Polish users type ASCII with
+    /// Option. The composed character must reach the PTY as typed, not as an
+    /// `ESC`-prefixed Meta chord the shell or agent silently drops.
+    #[test]
+    fn option_composed_characters_type_on_non_us_layouts() {
+        let german = OptionKey::Compose;
+        #[cfg(target_os = "macos")]
+        assert_eq!(OptionKey::for_layout("com.apple.keylayout.German"), german);
+        for (chord, composed, expected) in [
+            ("alt-7", "|", b"|".as_slice()),
+            ("alt-l", "@", b"@"),
+            ("alt-5", "[", b"["),
+            ("alt-6", "]", b"]"),
+            ("alt-8", "{", b"{"),
+            ("alt-9", "}", b"}"),
+            // ⌥⇧7: GPUI resolves Shift into the key (`/`) and clears it.
+            ("alt-/", "\\", b"\\"),
+            ("alt-n", "~", b"~"),
+            ("alt-e", "€", "€".as_bytes()),
+        ] {
+            assert_eq!(
+                option_bytes(&option_key(chord, Some(composed)), german),
+                expected,
+                "{chord} -> {composed}"
+            );
+        }
+        // Other non-US layouts, including ones macOS names per variant.
+        #[cfg(target_os = "macos")]
+        for layout in [
+            "com.apple.keylayout.French",
+            "com.apple.keylayout.SwissFrench",
+            "com.apple.keylayout.Norwegian",
+            "com.apple.keylayout.PolishPro",
+            "com.apple.keylayout.ABC-QWERTZ",
+            "com.apple.keylayout.ABC-Extended",
+        ] {
+            assert_eq!(
+                OptionKey::for_layout(layout),
+                OptionKey::Compose,
+                "{layout}"
+            );
+        }
+        // Held keys repeat the composed character, not a Meta chord.
+        let mut held = option_key("alt-7", Some("|"));
+        held.is_held = true;
+        let (mapped, modifiers) = terminal_key_event(&held, german).unwrap();
+        assert_eq!(
+            diri_term::keys::encode_interactive_action(
+                &mapped,
+                modifiers,
+                Some(diri_term::keys::KeyboardState::default()),
+                diri_term::keys::KeyAction::Repeat,
+            )
+            .unwrap(),
+            b"|"
+        );
+    }
+
+    /// An Option chord that composes nothing new, or that is a named key,
+    /// stays Meta on every layout: word motion keeps working in shells.
+    #[test]
+    fn option_stays_meta_where_nothing_is_composed() {
+        for option in [OptionKey::Meta, OptionKey::Compose] {
+            for (chord, key_char, expected) in [
+                ("alt-left", None, b"\x1b[1;3D".as_slice()),
+                ("alt-right", None, b"\x1b[1;3C"),
+                ("alt-backspace", None, b"\x1b\x7f"),
+                ("alt-enter", Some("\n"), b"\x1b\r"),
+                ("alt-escape", None, b"\x1b\x1b"),
+                ("alt-space", Some(" "), b"\x1b "),
+                // A layout whose Option leaves the key unchanged.
+                ("alt-b", Some("b"), b"\x1bb"),
+                // Control claims the chord before Option can compose.
+                ("ctrl-alt-a", None, b"\x01"),
+            ] {
+                assert_eq!(
+                    option_bytes(&option_key(chord, key_char), option),
+                    expected,
+                    "{chord} under {option:?}"
+                );
+            }
+        }
+    }
+
+    /// US layouts keep Option as Meta, and Meta now means the key itself:
+    /// ⌥B is `ESC b` (readline backward-word), never `ESC ∫`.
+    #[test]
+    fn option_is_meta_on_us_layouts() {
+        for layout in [
+            "com.apple.keylayout.US",
+            "com.apple.keylayout.ABC",
+            "com.apple.keylayout.USInternational-PC",
+        ] {
+            let option = OptionKey::for_layout(layout);
+            assert_eq!(option, OptionKey::Meta, "{layout}");
+            for (chord, key_char, expected) in [
+                ("alt-b", "∫", b"\x1bb".as_slice()),
+                ("alt-f", "ƒ", b"\x1bf"),
+                ("alt-d", "∂", b"\x1bd"),
+                ("alt-.", "≥", b"\x1b."),
+                ("alt-shift-b", "ı", b"\x1bB"),
+                // ⌥⇧7 on US: GPUI reports `&` with Shift cleared.
+                ("alt-&", "‡", b"\x1b&"),
+                // Dead keys report their no-dead-key character.
+                ("alt-e", "´", b"\x1be"),
+            ] {
+                assert_eq!(
+                    option_bytes(&option_key(chord, Some(key_char)), option),
+                    expected,
+                    "{layout} {chord}"
+                );
+            }
+        }
+        // Without Option nothing about plain typing changes.
+        for option in [OptionKey::Meta, OptionKey::Compose] {
+            assert_eq!(option_bytes(&option_key("a", Some("a")), option), b"a");
+            assert_eq!(
+                option_bytes(&option_key("shift-a", Some("A")), option),
+                b"A"
+            );
+            assert_eq!(option_bytes(&option_key("ctrl-c", None), option), b"\x03");
+        }
     }
 
     #[test]

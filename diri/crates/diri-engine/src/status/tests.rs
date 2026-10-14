@@ -25,6 +25,8 @@ fn observation(state: ManifestState, seq: u64) -> ScreenObservation {
         content_seq: seq,
         prompt_excerpt: None,
         options: None,
+        stale_after_submit: false,
+        turn_started: false,
     }
 }
 
@@ -125,6 +127,8 @@ fn blocker(seq: u64, excerpt: &str) -> ScreenObservation {
         content_seq: seq,
         prompt_excerpt: Some(excerpt.into()),
         options: Some(vec!["Yes".into(), "No".into()]),
+        stale_after_submit: false,
+        turn_started: false,
     }
 }
 
@@ -591,6 +595,7 @@ fn a_process_only_agent_goes_working_on_first_output_then_exits() {
         StatusSignal::ProcessExit {
             code: Some(0),
             signal: None,
+            interrupted: false,
         },
         now + Duration::from_secs(2),
     );
@@ -687,6 +692,111 @@ fn a_shell_lends_its_status_to_an_agent_in_its_foreground() {
     assert_eq!(evidence.manifest_id.as_deref(), Some("shell"));
     let outcome = reducer.reduce(StatusSignal::ForegroundJob { running: true }, at);
     assert_eq!(outcome.status_change, Some(SessionStatus::Working));
+}
+
+/// Streams output every 100 ms from `from` for `span`, then ticks; returns
+/// the time of the last frame and whether any reduction finished a turn.
+fn stream(reducer: &mut StatusReducer, from: SystemTime, span: Duration) -> (SystemTime, bool) {
+    let mut at = from;
+    let mut completed = false;
+    while at < from + span {
+        completed |= reducer
+            .reduce(StatusSignal::PtyOutputActivity, at)
+            .turn_completed;
+        completed |= reducer.reduce(StatusSignal::Tick, at).turn_completed;
+        at += Duration::from_millis(100);
+    }
+    (at, completed)
+}
+
+/// An Agent the catalog knows only by name (`goose`) has no screen rules:
+/// while it holds the shell's foreground, sustained output is Working and a
+/// still terminal is Idle. A turn the user asked for ends with an
+/// announcement; being recognised, or redrawing on its own, does not.
+#[test]
+fn an_agent_known_by_name_is_read_from_its_output() {
+    let mut reducer =
+        StatusReducer::new(Authority::ProcessOnly, t0()).with_manifest("shell", Some("1"));
+    let now = t0() + Duration::from_secs(1);
+    reducer.reduce(StatusSignal::ForegroundJob { running: true }, now);
+    let outcome = reducer.lend_to_activity("goose", now);
+    assert_eq!(outcome.status_change, Some(SessionStatus::Idle));
+    assert_eq!(reducer.foreground_agent(), Some("goose"));
+    assert_eq!(
+        reducer.lend_to_activity("goose", now),
+        ReducerOutcome::default()
+    );
+
+    // Its banner and composer paint in one short burst: not work.
+    let (at, _) = stream(&mut reducer, now, Duration::from_millis(300));
+    assert_eq!(reducer.status(), &SessionStatus::Idle);
+
+    // Typing echoes; that is not work either, however long it goes on.
+    let mut at = at + Duration::from_secs(5);
+    for _ in 0..20 {
+        reducer.reduce(StatusSignal::UserKeystroke, at);
+        reducer.reduce(
+            StatusSignal::PtyOutputActivity,
+            at + Duration::from_millis(20),
+        );
+        at += Duration::from_millis(100);
+    }
+    assert_eq!(reducer.status(), &SessionStatus::Idle);
+
+    // Enter, then a reply streams: Working, then Idle with an announcement.
+    reducer.reduce(StatusSignal::UserSubmission, at);
+    let (at, completed) = stream(
+        &mut reducer,
+        at + Duration::from_millis(300),
+        Duration::from_secs(4),
+    );
+    assert_eq!(reducer.status(), &SessionStatus::Working);
+    assert!(!completed);
+    // A silent wait between chunks keeps it Working.
+    let outcome = reducer.reduce(StatusSignal::Tick, at + Duration::from_secs(2));
+    assert_eq!(outcome.status_change, None);
+    let outcome = reducer.reduce(StatusSignal::Tick, at + Duration::from_secs(3));
+    assert_eq!(outcome.status_change, Some(SessionStatus::Idle));
+    assert!(outcome.turn_completed, "the turn the user asked for ends");
+    let evidence = reducer.evidence().expect("evidence");
+    assert_eq!(evidence.manifest_id.as_deref(), Some("goose"));
+    assert_eq!(evidence.status, SessionStatus::Idle);
+
+    // Output nobody asked for (a background refresh) is work, not a turn.
+    let at = at + Duration::from_secs(10);
+    let (at, _) = stream(&mut reducer, at, Duration::from_secs(1));
+    assert_eq!(reducer.status(), &SessionStatus::Working);
+    let outcome = reducer.reduce(StatusSignal::Tick, at + Duration::from_secs(4));
+    assert_eq!(outcome.status_change, Some(SessionStatus::Idle));
+    assert!(!outcome.turn_completed);
+
+    // Leaving hands the shell back its job tracking.
+    reducer.return_from_agent(false, at + Duration::from_secs(5));
+    assert_eq!(reducer.foreground_agent(), None);
+    assert_eq!(reducer.authority(), Authority::ProcessOnly);
+    let outcome = reducer.reduce(
+        StatusSignal::ForegroundJob { running: true },
+        at + Duration::from_secs(6),
+    );
+    assert_eq!(outcome.status_change, Some(SessionStatus::Working));
+}
+
+/// An Agent with screen rules recognised after one read by its output (a
+/// new job in the same shell) is read by its rules, not by its output.
+#[test]
+fn a_screen_agent_replaces_an_activity_reading() {
+    let mut reducer =
+        StatusReducer::new(Authority::ProcessOnly, t0()).with_manifest("shell", Some("1"));
+    let now = t0() + Duration::from_secs(1);
+    reducer.lend_to_activity("goose", now);
+    reducer.lend_to_agent("kimi", Some("1"), now);
+    assert_eq!(reducer.foreground_agent(), Some("kimi"));
+    let (_, _) = stream(&mut reducer, now, Duration::from_secs(2));
+    assert_eq!(
+        reducer.status(),
+        &SessionStatus::Idle,
+        "bytes alone are not a screen Agent's work"
+    );
 }
 
 fn shell_running_a_job(now: SystemTime) -> StatusReducer {
@@ -873,6 +983,7 @@ fn a_signalled_exit_is_reported_as_signalled() {
         StatusSignal::ProcessExit {
             code: None,
             signal: Some(9),
+            interrupted: false,
         },
         t0(),
     );
@@ -886,12 +997,33 @@ fn a_signalled_exit_is_reported_as_signalled() {
 }
 
 #[test]
+fn an_interrupted_exit_carries_the_flag_to_the_status() {
+    let mut reducer = StatusReducer::new(Authority::HooksPrimary, t0());
+    let outcome = reducer.reduce(
+        StatusSignal::ProcessExit {
+            code: None,
+            signal: None,
+            interrupted: true,
+        },
+        t0(),
+    );
+    match outcome.status_change {
+        Some(SessionStatus::Exited(info)) => {
+            assert!(info.interrupted);
+            assert!(info.ended_by_interruption());
+        }
+        other => panic!("expected an interrupted exit, got {other:?}"),
+    }
+}
+
+#[test]
 fn exited_is_absorbing() {
     let mut reducer = StatusReducer::new(Authority::HooksPrimary, t0());
     reducer.reduce(
         StatusSignal::ProcessExit {
             code: Some(0),
             signal: None,
+            interrupted: false,
         },
         t0(),
     );
@@ -963,7 +1095,7 @@ fn cursor_transcript_idle_commits_even_when_the_osc_still_says_working() {
         now,
     );
     now += Duration::from_millis(100);
-    reducer.reduce(StatusSignal::CursorTranscriptIdle, now);
+    reducer.reduce(StatusSignal::CursorTranscriptIdle { bytes: 100 }, now);
     now += Duration::from_millis(100);
     let still_working = reducer.reduce(
         StatusSignal::Screen(observation(ManifestState::Working, 2)),
@@ -986,7 +1118,7 @@ fn cursor_transcript_idle_commits_even_when_the_osc_still_says_working() {
     assert_eq!(*reducer.status(), SessionStatus::Idle);
 
     now += Duration::from_millis(100);
-    reducer.reduce(StatusSignal::CursorTranscriptWorking, now);
+    reducer.reduce(StatusSignal::CursorTranscriptWorking { bytes: 200 }, now);
     assert_eq!(*reducer.status(), SessionStatus::Working);
 }
 
@@ -1230,6 +1362,7 @@ fn unavailable_transport_is_not_a_process_exit_and_cannot_complete_a_turn() {
         StatusSignal::ProcessExit {
             code: Some(126),
             signal: None,
+            interrupted: false,
         },
         t0(),
     );
@@ -1277,18 +1410,490 @@ fn a_reappearing_blocker_cancels_the_quiet_idle_frame() {
     assert!(matches!(reducer.status(), SessionStatus::NeedsInput(_)));
 }
 
+/// Cursor's composer after Enter: the previous turn's follow-up arrow.
+fn submit_chrome(seq: u64) -> ScreenObservation {
+    ScreenObservation {
+        matched_rule_id: "idle-prompt-arrow".into(),
+        stale_after_submit: true,
+        ..observation(ManifestState::Idle, seq)
+    }
+}
+
+/// Cursor's Generating/Thinking line.
+fn turn_started(seq: u64) -> ScreenObservation {
+    ScreenObservation {
+        matched_rule_id: "working-status-line".into(),
+        turn_started: true,
+        ..observation(ManifestState::Working, seq)
+    }
+}
+
+/// A Cursor reducer that has finished one turn (transcript at 100 bytes) and
+/// just had the next prompt submitted at the returned time.
+fn cursor_submitted() -> (StatusReducer, SystemTime) {
+    let mut reducer = StatusReducer::new(Authority::ScreenPrimary, t0())
+        .with_manifest("cursor", Some("2026.10.01"));
+    let now = settled(&mut reducer, t0());
+    reducer.reduce(StatusSignal::Screen(turn_started(1)), now);
+    reducer.reduce(
+        StatusSignal::CursorTranscriptWorking { bytes: 100 },
+        now + Duration::from_millis(10),
+    );
+    assert_eq!(reducer.status(), &SessionStatus::Working);
+    let submitted = now + Duration::from_millis(50);
+    reducer.reduce(StatusSignal::UserSubmission, submitted);
+    (reducer, submitted)
+}
+
+/// Submitting and leaving Diri used to post "Cursor finished" or "needs you"
+/// while the agent was still working. cursor-agent 2026.10.01-14929f9 keeps
+/// the follow-up arrow up until Generating/Thinking paints, and the transcript
+/// tail can still be the previous turn.
+#[test]
+fn cursor_follow_up_arrow_after_submit_does_not_finish_or_ask() {
+    let (mut reducer, submitted) = cursor_submitted();
+
+    let arrow_at = submitted + Duration::from_millis(20);
+    let outcome = reducer.reduce(StatusSignal::Screen(submit_chrome(2)), arrow_at);
+    assert!(outcome.needs_input.is_none());
+    assert!(!outcome.turn_completed);
+    assert_eq!(reducer.status(), &SessionStatus::Working);
+
+    let stale = reducer.reduce(
+        StatusSignal::CursorTranscriptIdle { bytes: 100 },
+        arrow_at + Duration::from_millis(10),
+    );
+    assert!(!stale.turn_completed);
+    assert_eq!(reducer.status(), &SessionStatus::Working);
+
+    let tick = reducer.reduce(StatusSignal::Tick, arrow_at + Duration::from_millis(800));
+    assert!(
+        !tick.turn_completed,
+        "leftover follow-up chrome must not finish the turn"
+    );
+    assert!(tick.needs_input.is_none());
+    assert_eq!(reducer.status(), &SessionStatus::Working);
+}
+
+#[test]
+fn cursor_ready_title_blocker_and_later_idle_still_notify_after_submit() {
+    // A Ready title is not composer chrome.
+    let (mut ready, at) = cursor_submitted();
+    ready.reduce(
+        StatusSignal::Screen(submit_chrome(2)),
+        at + Duration::from_millis(10),
+    );
+    let title = ScreenObservation {
+        matched_rule_id: "idle-osc-title".into(),
+        ..observation(ManifestState::Idle, 3)
+    };
+    ready.reduce(StatusSignal::Screen(title), at + Duration::from_millis(20));
+    let finished = ready.reduce(StatusSignal::Tick, at + Duration::from_millis(800));
+    assert_eq!(ready.status(), &SessionStatus::Idle);
+    assert!(finished.turn_completed);
+
+    let (mut blocked, at) = cursor_submitted();
+    let outcome = blocked.reduce(
+        StatusSignal::Screen(blocker(2, "Run this command?")),
+        at + Duration::from_millis(10),
+    );
+    assert!(matches!(
+        outcome.status_change,
+        Some(SessionStatus::NeedsInput(_))
+    ));
+    assert!(outcome.needs_input.is_some());
+
+    // The transcript grew past the submit: this turn's own end.
+    let (mut transcript, at) = cursor_submitted();
+    transcript.reduce(
+        StatusSignal::CursorTranscriptIdle { bytes: 100 },
+        at + Duration::from_millis(10),
+    );
+    assert_eq!(transcript.status(), &SessionStatus::Working);
+    transcript.reduce(
+        StatusSignal::Screen(submit_chrome(2)),
+        at + Duration::from_millis(20),
+    );
+    let ended = transcript.reduce(
+        StatusSignal::CursorTranscriptIdle { bytes: 180 },
+        at + Duration::from_millis(30),
+    );
+    let finished = transcript.reduce(StatusSignal::Tick, at + Duration::from_millis(140));
+    assert_eq!(transcript.status(), &SessionStatus::Idle);
+    assert!(ended.turn_completed || finished.turn_completed);
+
+    let (mut later, at) = cursor_submitted();
+    later.reduce(
+        StatusSignal::Screen(turn_started(2)),
+        at + Duration::from_millis(10),
+    );
+    later.reduce(
+        StatusSignal::Screen(submit_chrome(3)),
+        at + Duration::from_millis(20),
+    );
+    let finished = later.reduce(StatusSignal::Tick, at + Duration::from_millis(800));
+    assert_eq!(later.status(), &SessionStatus::Idle);
+    assert!(finished.turn_completed);
+}
+
+/// Rejecting a permission prompt raised before any Generating frame returns
+/// to the follow-up arrow. That must clear the blocker, not hold it forever.
+#[test]
+fn cursor_blocker_dismissed_after_submit_returns_to_idle() {
+    let (mut reducer, at) = cursor_submitted();
+    reducer.reduce(
+        StatusSignal::Screen(blocker(2, "Run this command?")),
+        at + Duration::from_millis(10),
+    );
+    assert!(matches!(reducer.status(), SessionStatus::NeedsInput(_)));
+    reducer.reduce(
+        StatusSignal::Screen(submit_chrome(3)),
+        at + Duration::from_millis(20),
+    );
+    reducer.reduce(
+        StatusSignal::Screen(submit_chrome(4)),
+        at + Duration::from_millis(30),
+    );
+    assert_eq!(reducer.status(), &SessionStatus::Idle);
+}
+
+/// A reply too quick to show Generating or a working transcript still ends,
+/// once the submit hold runs out, from the arrow it leaves on screen.
+#[test]
+fn cursor_turn_without_working_evidence_ends_after_the_submit_hold() {
+    let (mut reducer, at) = cursor_submitted();
+    reducer.reduce(
+        StatusSignal::Screen(submit_chrome(2)),
+        at + Duration::from_millis(10),
+    );
+    let hold = ReducerTiming::default().submit_chrome_hold;
+    let mut now = at + Duration::from_millis(20);
+    while now < at + hold {
+        let outcome = reducer.reduce(StatusSignal::Tick, now);
+        assert!(!outcome.turn_completed);
+        now += Duration::from_millis(500);
+    }
+    assert_eq!(reducer.status(), &SessionStatus::Working);
+    let mut completed = false;
+    for _ in 0..4 {
+        completed |= reducer.reduce(StatusSignal::Tick, now).turn_completed;
+        now += Duration::from_millis(500);
+    }
+    assert_eq!(reducer.status(), &SessionStatus::Idle);
+    assert!(completed);
+}
+
+/// Agents whose rules carry no `stale_after_submit` flag are unaffected.
+#[test]
+fn submit_chrome_hold_needs_the_rule_flag() {
+    let mut reducer =
+        StatusReducer::new(Authority::ScreenPrimary, t0()).with_manifest("codex", Some("8"));
+    let now = settled(&mut reducer, t0());
+    reducer.reduce(
+        StatusSignal::Screen(observation(ManifestState::Working, 1)),
+        now,
+    );
+    reducer.reduce(
+        StatusSignal::UserSubmission,
+        now + Duration::from_millis(10),
+    );
+    reducer.reduce(
+        StatusSignal::Screen(observation(ManifestState::Idle, 2)),
+        now + Duration::from_millis(20),
+    );
+    let outcome = reducer.reduce(StatusSignal::Tick, now + Duration::from_millis(800));
+    assert_eq!(reducer.status(), &SessionStatus::Idle);
+    assert!(outcome.turn_completed);
+}
+
 #[test]
 fn cursor_transcript_cannot_finish_a_live_spinner() {
     let mut reducer = StatusReducer::new(Authority::ScreenPrimary, t0());
     let now = settled(&mut reducer, t0());
     let mut working = observation(ManifestState::Working, 1);
-    working.matched_rule_id = "working-status-line".into();
+    working.turn_started = true;
     reducer.reduce(StatusSignal::Screen(working), now);
     reducer.reduce(
-        StatusSignal::CursorTranscriptIdle,
+        StatusSignal::CursorTranscriptIdle { bytes: 100 },
         now + Duration::from_millis(100),
     );
     let outcome = reducer.reduce(StatusSignal::Tick, now + Duration::from_secs(1));
     assert_eq!(reducer.status(), &SessionStatus::Working);
     assert!(!outcome.turn_completed);
+}
+
+fn program(state: ProgramState) -> StatusSignal {
+    StatusSignal::ProgramStatus(Some(ProgramRecord {
+        state,
+        kind: None,
+        progress: None,
+        app: None,
+        title: None,
+        msg: None,
+    }))
+}
+
+/// `OSC 7501` is the program saying what it is doing. While it reports work,
+/// a screen that happens to read idle (a spinner between frames, a finished
+/// sub-step) does not end the turn; its own `done` does, exactly once.
+#[test]
+fn a_program_reporting_work_outranks_the_screen_until_it_reports_done() {
+    let mut reducer =
+        StatusReducer::new(Authority::ScreenPrimary, t0()).with_manifest("codex", Some("1"));
+    let now = settled(&mut reducer, t0());
+
+    let outcome = reducer.reduce(program(ProgramState::Working), now);
+    assert_eq!(outcome.status_change, Some(SessionStatus::Working));
+    assert_eq!(
+        outcome.status_evidence.map(|evidence| evidence.source),
+        Some(StatusEvidenceSource::ProgramStatus)
+    );
+
+    for seq in 1..=5 {
+        let at = now + Duration::from_secs(seq);
+        reducer.reduce(
+            StatusSignal::Screen(observation(ManifestState::Idle, seq)),
+            at,
+        );
+        reducer.reduce(StatusSignal::Tick, at);
+    }
+    // Quiet for longer than staleness allows, and still working.
+    reducer.reduce(StatusSignal::Tick, now + Duration::from_secs(600));
+    assert_eq!(*reducer.status(), SessionStatus::Working);
+
+    let outcome = reducer.reduce(program(ProgramState::Done), now + Duration::from_secs(601));
+    assert_eq!(outcome.status_change, Some(SessionStatus::Idle));
+    assert!(outcome.turn_completed);
+    let again = reducer.reduce(program(ProgramState::Idle), now + Duration::from_secs(602));
+    assert!(!again.turn_completed);
+    // A stale prompt still on screen does not outvote the program's result.
+    reducer.reduce(
+        StatusSignal::Screen(observation(ManifestState::BlockedQuestion, 98)),
+        now + Duration::from_secs(602),
+    );
+    assert_eq!(*reducer.status(), SessionStatus::Idle);
+
+    // Once the program stops reporting, the screen is read again.
+    reducer.reduce(
+        StatusSignal::ProgramStatus(None),
+        now + Duration::from_secs(603),
+    );
+    let outcome = reducer.reduce(
+        StatusSignal::Screen(observation(ManifestState::BlockedQuestion, 99)),
+        now + Duration::from_secs(603),
+    );
+    assert_eq!(
+        outcome.status_change,
+        Some(SessionStatus::NeedsInput(NeedsInputKind::Question))
+    );
+}
+
+#[test]
+fn a_blocked_program_needs_input_with_its_own_message() {
+    let mut reducer =
+        StatusReducer::new(Authority::ProcessOnly, t0()).with_manifest("aider", Some("1"));
+    reducer.reduce(StatusSignal::PtyOutputActivity, t0());
+    let report = StatusSignal::ProgramStatus(Some(ProgramRecord {
+        state: ProgramState::Blocked,
+        kind: Some(BlockedKind::Permission),
+        progress: None,
+        app: Some("terraform".into()),
+        title: None,
+        msg: Some("Apply 3 to add, 1 to change, 0 to destroy?".into()),
+    }));
+    let outcome = reducer.reduce(report.clone(), t0());
+    assert_eq!(
+        outcome.status_change,
+        Some(SessionStatus::NeedsInput(NeedsInputKind::Permission))
+    );
+    let detail = outcome.needs_input.expect("a needs-input detail");
+    assert_eq!(detail.source, NeedsInputSource::ProgramStatus);
+    assert_eq!(detail.summary, "Apply 3 to add, 1 to change, 0 to destroy?");
+    assert_eq!(detail.tool_name.as_deref(), Some("terraform"));
+
+    // The same report again is not a second question.
+    assert_eq!(reducer.reduce(report, t0()).needs_input, None);
+
+    // A process-only agent that stops reporting is running, not idle.
+    let outcome = reducer.reduce(StatusSignal::ProgramStatus(None), t0());
+    assert_eq!(outcome.status_change, Some(SessionStatus::Working));
+    assert!(!outcome.turn_completed);
+}
+
+#[test]
+fn a_shell_follows_a_reporting_job_and_returns_to_idle_when_it_stops() {
+    let mut reducer =
+        StatusReducer::new(Authority::ProcessOnly, t0()).with_manifest("shell", Some("1"));
+    let now = t0() + Duration::from_secs(1);
+    reducer.reduce(StatusSignal::PtyOutputActivity, now);
+    reducer.reduce(StatusSignal::ForegroundJob { running: true }, now);
+
+    let outcome = reducer.reduce(
+        StatusSignal::ProgramStatus(Some(ProgramRecord {
+            state: ProgramState::Blocked,
+            kind: Some(BlockedKind::Auth),
+            progress: None,
+            app: None,
+            title: None,
+            msg: None,
+        })),
+        now,
+    );
+    assert_eq!(outcome.needs_input.unwrap().summary, "Waiting for sign-in");
+    // The job is still in the foreground and not reading a line, which on
+    // its own would read as Working.
+    reducer.reduce(StatusSignal::TerminalLine(None), now);
+    reducer.reduce(StatusSignal::ForegroundJob { running: true }, now);
+    assert_eq!(
+        *reducer.status(),
+        SessionStatus::NeedsInput(NeedsInputKind::Question)
+    );
+
+    // The job ended without a result: the Engine drops its records.
+    let outcome = reducer.reduce(StatusSignal::ProgramStatus(None), now);
+    assert_eq!(outcome.status_change, Some(SessionStatus::Idle));
+    assert!(!outcome.turn_completed);
+
+    // Inference is back.
+    let outcome = reducer.reduce(StatusSignal::ForegroundJob { running: true }, now);
+    assert_eq!(outcome.status_change, Some(SessionStatus::Working));
+}
+
+#[test]
+fn a_program_error_is_a_result_that_ends_the_turn() {
+    let mut reducer =
+        StatusReducer::new(Authority::ProcessOnly, t0()).with_manifest("aider", Some("1"));
+    reducer.reduce(StatusSignal::PtyOutputActivity, t0());
+    reducer.reduce(program(ProgramState::Working), t0());
+    let outcome = reducer.reduce(program(ProgramState::Error), t0() + Duration::from_secs(1));
+    assert_eq!(outcome.status_change, Some(SessionStatus::Idle));
+    assert!(outcome.turn_completed);
+    // Still running and no longer reporting: process-only reads as working.
+    let outcome = reducer.reduce(
+        StatusSignal::ProgramStatus(None),
+        t0() + Duration::from_secs(2),
+    );
+    assert_eq!(outcome.status_change, Some(SessionStatus::Working));
+    assert!(!outcome.turn_completed);
+}
+
+/// Claude Code and Codex are adding `OSC 7501` while keeping their hooks and
+/// notify events. Two sources racing would flip a tab between working and
+/// idle; the program's report is the one it keeps current, so it decides.
+#[test]
+fn hooks_do_not_race_a_program_that_reports_its_status() {
+    let mut reducer =
+        StatusReducer::new(Authority::HooksPrimary, t0()).with_manifest("claude-code", Some("4"));
+    let now = settled(&mut reducer, t0());
+    reducer.reduce(program(ProgramState::Working), now);
+
+    // A Stop for the foreground response while background work still runs.
+    let outcome = reducer.reduce(hook(ClaudeHook::Stop), now + Duration::from_millis(10));
+    assert_eq!(outcome.status_change, None);
+    assert!(!outcome.turn_completed);
+    reducer.reduce(StatusSignal::Tick, now + Duration::from_secs(5));
+    assert_eq!(*reducer.status(), SessionStatus::Working);
+
+    let outcome = reducer.reduce(program(ProgramState::Done), now + Duration::from_secs(6));
+    assert_eq!(outcome.status_change, Some(SessionStatus::Idle));
+    assert!(outcome.turn_completed);
+
+    // A late tool hook from the finished turn does not reopen it.
+    let outcome = reducer.reduce(hook(ClaudeHook::PostToolUse), now + Duration::from_secs(7));
+    assert_eq!(outcome.status_change, None);
+    let outcome = reducer.reduce(
+        StatusSignal::CodexTurnComplete,
+        now + Duration::from_secs(7),
+    );
+    assert_eq!(outcome.status_change, None);
+    assert_eq!(*reducer.status(), SessionStatus::Idle);
+}
+
+/// A permission hook names the tool and command; a report that follows says
+/// only that the program is blocked. The richer detail stays.
+#[test]
+fn a_blocking_hook_keeps_its_detail_under_the_programs_report() {
+    let mut reducer =
+        StatusReducer::new(Authority::HooksPrimary, t0()).with_manifest("claude-code", Some("4"));
+    let now = settled(&mut reducer, t0());
+    reducer.reduce(program(ProgramState::Working), now);
+
+    let outcome = reducer.reduce(
+        hook(ClaudeHook::PermissionRequest {
+            tool_name: Some("Bash".into()),
+            input_summary: Some("rm -rf build".into()),
+        }),
+        now + Duration::from_millis(5),
+    );
+    assert_eq!(
+        outcome.status_change,
+        Some(SessionStatus::NeedsInput(NeedsInputKind::Permission))
+    );
+
+    let blocked = StatusSignal::ProgramStatus(Some(ProgramRecord {
+        state: ProgramState::Blocked,
+        kind: Some(BlockedKind::Permission),
+        progress: None,
+        app: Some("claude-code".into()),
+        title: None,
+        msg: Some("Allow Bash?".into()),
+    }));
+    let outcome = reducer.reduce(blocked, now + Duration::from_millis(10));
+    assert_eq!(outcome.status_change, None);
+    assert_eq!(outcome.needs_input, None, "not a second request");
+
+    // Approved: the program says it is working again.
+    let outcome = reducer.reduce(program(ProgramState::Working), now + Duration::from_secs(1));
+    assert_eq!(outcome.status_change, Some(SessionStatus::Working));
+}
+
+/// A report says the program waits; the screen says what it offers. The
+/// choices reach the request whichever arrives first.
+#[test]
+fn a_blocked_report_borrows_the_choices_on_screen() {
+    let choices = vec!["Yes".to_owned(), "No".to_owned()];
+    let blocked = || {
+        StatusSignal::ProgramStatus(Some(ProgramRecord {
+            state: ProgramState::Blocked,
+            kind: Some(BlockedKind::Permission),
+            progress: None,
+            app: None,
+            title: None,
+            msg: Some("Run the migration?".into()),
+        }))
+    };
+    let dialog = |seq| {
+        let mut shown = observation(ManifestState::BlockedPermission, seq);
+        shown.options = Some(vec!["Yes".to_owned(), "No".to_owned()]);
+        StatusSignal::Screen(shown)
+    };
+
+    // The dialog renders first.
+    let mut reducer =
+        StatusReducer::new(Authority::ScreenPrimary, t0()).with_manifest("codex", Some("1"));
+    let now = settled(&mut reducer, t0());
+    reducer.reduce(program(ProgramState::Working), now);
+    assert_eq!(reducer.reduce(dialog(1), now).status_change, None);
+    let outcome = reducer.reduce(blocked(), now);
+    let detail = outcome.needs_input.expect("a request");
+    assert_eq!(detail.summary, "Run the migration?");
+    assert_eq!(detail.options.as_ref(), Some(&choices));
+
+    // The report arrives first.
+    let mut reducer =
+        StatusReducer::new(Authority::ScreenPrimary, t0()).with_manifest("codex", Some("1"));
+    let now = settled(&mut reducer, t0());
+    reducer.reduce(program(ProgramState::Working), now);
+    assert_eq!(
+        reducer.reduce(blocked(), now).needs_input.unwrap().options,
+        None
+    );
+    let outcome = reducer.reduce(dialog(2), now);
+    assert_eq!(outcome.status_change, None);
+    assert_eq!(
+        outcome.needs_input.unwrap().options.as_ref(),
+        Some(&choices)
+    );
+    // Once only.
+    assert_eq!(reducer.reduce(dialog(3), now).needs_input, None);
 }

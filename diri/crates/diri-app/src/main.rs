@@ -1,37 +1,46 @@
 mod agent_catalog;
 mod agent_setup;
 mod alerts;
+mod api_client;
 mod app_theme;
 mod application_notifications;
 mod clipboard_transfer;
+mod code_editor;
 mod code_intelligence;
 mod code_viewer;
 mod commands;
 mod composer;
 mod daemon_launch;
+mod default_terminal;
 mod delegation;
+mod details_ui;
 mod dev_build;
 mod diagnostics;
 pub mod diff;
 mod empty_workbench;
 mod external_drop;
 mod file_links;
+mod file_tree;
 mod floating;
 pub mod fonts;
 pub mod fuzzy;
 #[cfg(test)]
 mod gesture_delivery;
 mod git_review;
+mod git_ui;
 #[cfg(test)]
 mod gpui_view_cache_tests;
 mod haptics;
 mod held_hints;
 mod herdr_import;
 pub mod history;
+mod i18n;
 mod icons;
+mod imported_themes;
 mod inspector;
 mod launch_recipe;
 mod launcher;
+mod login_item;
 pub mod markdown;
 mod markdown_view;
 #[cfg(any(target_os = "macos", test))]
@@ -43,13 +52,19 @@ mod notes;
 mod notification_feed;
 pub mod notifications;
 mod number_flow;
+mod open_handler;
+#[cfg(test)]
+mod overview_fixture;
+mod overview_zoom;
 pub mod palette;
 mod palette_chrome;
 mod palette_workspace;
 mod path_picker;
 mod peek_settle;
+mod perf_overlay;
 mod phone_access;
 mod platform;
+mod pr_card;
 mod progress_mark;
 mod project_hue;
 pub mod query_editor;
@@ -57,7 +72,9 @@ pub mod quick_open;
 pub mod quote;
 mod recovery;
 pub mod review_prompt;
+mod right_panel;
 pub mod root;
+mod schedules_page;
 pub mod seam;
 mod secure_input;
 mod session_presentation;
@@ -67,6 +84,7 @@ pub mod sidebar;
 mod skills_catalog;
 mod skills_page;
 pub mod sounds;
+mod stall_stack;
 mod status_debug;
 mod surface_shell;
 pub mod switcher;
@@ -75,6 +93,8 @@ mod tab_peek;
 mod tab_preview;
 mod telemetry;
 pub mod terminal_pane;
+mod text_input;
+mod toast;
 mod tooltip_warmth;
 pub mod transcript;
 pub mod updates;
@@ -87,6 +107,7 @@ mod windows_notifications;
 mod workbench;
 #[cfg(all(test, target_os = "macos"))]
 mod workspace_fixture;
+mod workspace_follow;
 #[cfg_attr(not(test), allow(dead_code))]
 mod workspace_geometry;
 #[cfg_attr(not(test), allow(dead_code))]
@@ -162,54 +183,57 @@ fn install_app_menus(cx: &mut App) {
 /// Rebuild native menu shortcut labels after the user edits the live keymap.
 /// Action handlers are installed only once by `install_app_menus`.
 pub(crate) fn refresh_app_menus(cx: &mut App) {
+    use crate::i18n::t;
     #[cfg(target_os = "macos")]
     cx.set_menus([
         Menu::new("diri").items([
-            MenuItem::os_submenu("Services", SystemMenuType::Services),
+            MenuItem::os_submenu(t("menu.services"), SystemMenuType::Services),
             MenuItem::separator(),
-            MenuItem::action("Hide diri", HideApp),
+            MenuItem::action(t("menu.hide_diri"), HideApp),
             MenuItem::separator(),
-            MenuItem::action("Quit diri", Quit),
+            MenuItem::action(t("menu.quit_diri"), Quit),
         ]),
-        Menu::new("File").items([
-            MenuItem::action("New Session", OpenLauncher),
-            MenuItem::action("New Window", commands::NewWindow),
+        Menu::new(t("menu.file")).items([
+            MenuItem::action(t("menu.new_session"), OpenLauncher),
+            MenuItem::action(t("menu.new_window"), commands::NewWindow),
         ]),
-        Menu::new("Edit").items([
-            MenuItem::os_action("Copy", CopySelection, OsAction::Copy),
-            MenuItem::os_action("Paste", Paste, OsAction::Paste),
+        Menu::new(t("menu.edit")).items([
+            MenuItem::os_action(t("menu.copy"), CopySelection, OsAction::Copy),
+            MenuItem::os_action(t("menu.paste"), Paste, OsAction::Paste),
         ]),
-        Menu::new("Window").items([
-            MenuItem::action("Close Session", CloseSession),
-            MenuItem::action("Reopen Closed Session", ReopenSession),
-            MenuItem::action("Close Window", CloseWindow),
+        Menu::new(t("menu.window")).items([
+            MenuItem::action(t("menu.close_session"), CloseSession),
+            MenuItem::action(t("menu.reopen_closed_session"), ReopenSession),
+            MenuItem::action(t("menu.close_window"), CloseWindow),
         ]),
-        Menu::new("Help").items([MenuItem::action(
-            "Report a Problem…",
-            commands::ReportProblem,
-        )]),
+        Menu::new(t("menu.help")).items([
+            MenuItem::action(t("menu.whats_new"), commands::ShowWhatsNew),
+            MenuItem::separator(),
+            MenuItem::action(t("menu.report_problem"), commands::ReportProblem),
+        ]),
     ]);
     #[cfg(not(target_os = "macos"))]
     cx.set_menus([
-        Menu::new("File").items([
-            MenuItem::action("New Session", OpenLauncher),
-            MenuItem::action("New Window", commands::NewWindow),
+        Menu::new(t("menu.file")).items([
+            MenuItem::action(t("menu.new_session"), OpenLauncher),
+            MenuItem::action(t("menu.new_window"), commands::NewWindow),
             MenuItem::separator(),
-            MenuItem::action("Quit diri", Quit),
+            MenuItem::action(t("menu.quit_diri"), Quit),
         ]),
-        Menu::new("Edit").items([
-            MenuItem::os_action("Copy", CopySelection, OsAction::Copy),
-            MenuItem::os_action("Paste", Paste, OsAction::Paste),
+        Menu::new(t("menu.edit")).items([
+            MenuItem::os_action(t("menu.copy"), CopySelection, OsAction::Copy),
+            MenuItem::os_action(t("menu.paste"), Paste, OsAction::Paste),
         ]),
-        Menu::new("Window").items([
-            MenuItem::action("Close Session", CloseSession),
-            MenuItem::action("Reopen Closed Session", ReopenSession),
-            MenuItem::action("Close Window", CloseWindow),
+        Menu::new(t("menu.window")).items([
+            MenuItem::action(t("menu.close_session"), CloseSession),
+            MenuItem::action(t("menu.reopen_closed_session"), ReopenSession),
+            MenuItem::action(t("menu.close_window"), CloseWindow),
         ]),
-        Menu::new("Help").items([MenuItem::action(
-            "Report a Problem…",
-            commands::ReportProblem,
-        )]),
+        Menu::new(t("menu.help")).items([
+            MenuItem::action(t("menu.whats_new"), commands::ShowWhatsNew),
+            MenuItem::separator(),
+            MenuItem::action(t("menu.report_problem"), commands::ReportProblem),
+        ]),
     ]);
 }
 
@@ -227,6 +251,10 @@ pub(crate) struct AppServices {
 }
 
 fn main() {
+    // An Agent's launchd helper: before anything else, so it never touches
+    // the window server, telemetry or a single-instance check.
+    #[cfg(target_os = "macos")]
+    diri_pty::detached::run_helper_if_requested();
     if cfg!(test) {
         #[cfg(all(test, target_os = "macos"))]
         if std::env::var_os("DIRI_TEST_NATIVE_FIND").is_some() {
@@ -360,6 +388,11 @@ fn main() {
             .unwrap_or_else(|| PathBuf::from("/nonexistent"));
         tokio.spawn(async move {
             let mut last_request: Option<std::time::Instant> = None;
+            // Beside the Engine's state, so dev builds keep their own. Not
+            // the socket's directory: on Linux that is cleared at logout.
+            let mut memory = usage::limits::LimitsMemory::load(
+                diri_proto::paths::DirijorPaths::state_dir(&home).join("account-limits.json"),
+            );
             while limits_requests.recv().await.is_some() {
                 if last_request.is_some_and(|last| last.elapsed() < Duration::from_secs(10)) {
                     continue;
@@ -374,18 +407,26 @@ fn main() {
                 {
                     continue;
                 }
-                let Ok(accounts) = client.account_profiles().await else {
+                let Ok(accounts) = client.account_overview().await else {
                     continue;
                 };
-                let limits = usage::limits::refresh(&home, &accounts).await;
+                let limits = usage::limits::refresh(&home, &accounts, &mut memory).await;
                 usage_tx.send_modify(|snapshot| snapshot.limits = limits);
             }
         });
     }
+    {
+        let store = store_runtime
+            .store
+            .read()
+            .expect("session store lock poisoned");
+        perf_overlay::apply_prefs(store.preferences());
+        i18n::apply_prefs(store.preferences());
+    }
     let updates = if preview {
         updates::inert()
     } else {
-        let (automatic_updates, skipped_update) = {
+        let (automatic_updates, skipped_update, update_channel) = {
             let store = store_runtime
                 .store
                 .read()
@@ -394,9 +435,10 @@ fn main() {
             (
                 prefs.automatic_updates,
                 Some(prefs.skipped_update_version.clone()),
+                prefs.effective_update_channel(),
             )
         };
-        updates::spawn(&tokio, automatic_updates, skipped_update)
+        updates::spawn(&tokio, automatic_updates, skipped_update, update_channel)
     };
     let services = Arc::new(AppServices {
         store: store_runtime,
@@ -427,6 +469,15 @@ fn main() {
         }
         cx.activate(true);
     });
+    // Links and files macOS sends diri as the default terminal (`ssh://`,
+    // `x-man-page://`, `.command`, …). They can arrive before the first window
+    // exists, so they queue until the app below is ready for them.
+    let (open_links_tx, mut open_links_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<String>>();
+    if !preview {
+        app.on_open_urls(move |links| {
+            let _ = open_links_tx.send(links);
+        });
+    }
     app.run(move |cx: &mut App| {
         load_system_fonts(cx);
         telemetry::install(cx);
@@ -464,6 +515,62 @@ fn main() {
             .clone();
         commands::bind_keys(cx, &shortcut_overrides);
         install_app_menus(cx);
+        let activation_services = Arc::clone(&services);
+        cx.on_action(move |_: &commands::ShowApp, cx| {
+            let activation_services = Arc::clone(&activation_services);
+            // Action dispatch may hold the active window's mutable borrow.
+            // Wait until it is returned before inspecting or updating windows.
+            cx.defer(move |cx| {
+                let mut windows = cx.windows();
+                if let Some(active) = cx.active_window() {
+                    windows.retain(|handle| *handle != active);
+                    windows.insert(0, active);
+                }
+                // Handle metadata is available even while a window is borrowed;
+                // a failed update must never mean that the main window is absent.
+                let main = windows
+                    .into_iter()
+                    .find(|handle| handle.downcast::<RootView>().is_some());
+                if let Some(handle) = main {
+                    #[cfg(target_os = "macos")]
+                    if handle
+                        .update(cx, |_, window, _| {
+                            macos::global_shortcut::should_hide(window)
+                        })
+                        .unwrap_or(false)
+                    {
+                        cx.hide();
+                        return;
+                    }
+                    let _ = handle.update(cx, |_, window, _| {
+                        #[cfg(target_os = "macos")]
+                        macos::global_shortcut::reveal(window);
+                        #[cfg(not(target_os = "macos"))]
+                        window.activate_window();
+                    });
+                } else {
+                    open_main_window(
+                        cx,
+                        Arc::clone(&activation_services),
+                        preview,
+                        scenario,
+                        RestorePolicy::FRAME_ONLY,
+                    );
+                }
+                cx.activate(true);
+            });
+        });
+        #[cfg(target_os = "macos")]
+        {
+            let prefs = services
+                .store
+                .store
+                .read()
+                .expect("session store lock poisoned")
+                .preferences()
+                .clone();
+            macos::global_shortcut::install(cx, &prefs);
+        }
         let window_services = services.clone();
         cx.on_action(move |_: &commands::NewWindow, cx| {
             let context = cx.active_window().and_then(|handle| {
@@ -584,6 +691,13 @@ fn main() {
         if let Some(startup) = services.daemon_startup.as_ref() {
             startup.after_window_open(&services.tokio, Arc::clone(services.store.client()));
         }
+        let open_services = Arc::clone(&services);
+        cx.spawn(async move |cx| {
+            while let Some(links) = open_links_rx.recv().await {
+                cx.update(|cx| open_links(cx, &open_services, scenario, &links));
+            }
+        })
+        .detach();
         if smoke_test {
             cx.spawn(async move |cx| {
                 cx.background_executor()
@@ -746,6 +860,56 @@ enum WindowOpen {
     Context(NativeWindowContext),
 }
 
+/// Opens each link in a new terminal tab of the frontmost diri window,
+/// opening a window first when none is left.
+fn open_links(
+    cx: &mut App,
+    services: &Arc<AppServices>,
+    scenario: PreviewScenario,
+    links: &[String],
+) {
+    let requests: Vec<_> = links
+        .iter()
+        .map(|link| open_handler::request_for(link, &open_handler::LocalSystem))
+        .collect();
+    let mut windows = cx.windows();
+    if let Some(active) = cx.active_window() {
+        windows.retain(|handle| *handle != active);
+        windows.insert(0, active);
+    }
+    let opened = windows.into_iter().any(|handle| {
+        handle
+            .update(cx, |root, window, cx| {
+                let Ok(root) = root.downcast::<RootView>() else {
+                    return false;
+                };
+                window.activate_window();
+                root.update(cx, |root, cx| {
+                    for request in &requests {
+                        root.open_external(request.clone(), cx);
+                    }
+                });
+                true
+            })
+            .unwrap_or(false)
+    });
+    if !opened {
+        let handle = open_main_window(
+            cx,
+            Arc::clone(services),
+            false,
+            scenario,
+            RestorePolicy::FRAME_ONLY,
+        );
+        let _ = handle.update(cx, |root, _, cx| {
+            for request in requests {
+                root.open_external(request, cx);
+            }
+        });
+    }
+    cx.activate(true);
+}
+
 fn open_main_window(
     cx: &mut App,
     services: Arc<AppServices>,
@@ -852,9 +1016,10 @@ fn open_window(
                 // the caption buttons into its own toolbar (`window_chrome`).
                 appears_transparent: cfg!(any(target_os = "macos", windows)),
                 // GPUI uses top/left insets here: AppKit's native 8 pt origin plus the
-                // spec's +12 x / -6 frame-origin nudge maps to 20 pt left and 14 pt top.
+                // spec's +12 x / -6 frame-origin nudge maps to 20 pt left and 14 pt top,
+                // plus 3 pt so the 14 pt buttons centre on the 48 pt title bar.
                 traffic_light_position: cfg!(target_os = "macos")
-                    .then_some(point(px(20.0), px(14.0))),
+                    .then_some(point(px(20.0), px(17.0))),
             }),
             ..Default::default()
         },

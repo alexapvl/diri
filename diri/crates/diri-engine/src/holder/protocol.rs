@@ -42,6 +42,12 @@ pub const DEFAULT_DISK_CAPACITY: i64 = 32 << 20;
 pub const HOLDER_STREAM_VERSION: u16 = 1;
 pub const HOLDER_STREAM_INPUT: u8 = 1;
 pub const HOLDER_STREAM_RESIZE: u8 = 2;
+/// Version 2 adds [`HOLDER_STREAM_RESIZE_PIXELS`]. A Holder that predates it
+/// refuses the version, and its client asks again for version 1.
+pub const HOLDER_STREAM_VERSION_PIXELS: u16 = 2;
+/// `[cols u16][rows u16][width px u16][height px u16]`: a resize that also
+/// sets the PTY's pixel size. Version 2 streams only.
+pub const HOLDER_STREAM_RESIZE_PIXELS: u8 = 3;
 pub const HOLDER_STREAM_ACK: u8 = 0;
 pub const HOLDER_STREAM_MAX_PAYLOAD: usize = 1 << 20;
 
@@ -315,6 +321,11 @@ pub struct HolderManagerRequest {
     pub op: HolderManagerOperation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spec: Option<HolderLaunchSpec>,
+    /// The sending Engine's pid: its check-in with a manager that retires
+    /// abandoned sessions (development builds). Additive; older managers
+    /// ignore it.
+    #[serde(rename = "enginePID", default, skip_serializing_if = "Option::is_none")]
+    pub engine_pid: Option<i32>,
 }
 
 impl HolderManagerRequest {
@@ -323,6 +334,7 @@ impl HolderManagerRequest {
             version: MANAGER_PROTOCOL_VERSION,
             op: HolderManagerOperation::Ping,
             spec: None,
+            engine_pid: Some(std::process::id() as i32),
         }
     }
 
@@ -331,6 +343,7 @@ impl HolderManagerRequest {
             version: MANAGER_PROTOCOL_VERSION,
             op: HolderManagerOperation::Launch,
             spec: Some(spec),
+            engine_pid: Some(std::process::id() as i32),
         }
     }
 
@@ -339,6 +352,7 @@ impl HolderManagerRequest {
             version: MANAGER_PROTOCOL_VERSION,
             op: HolderManagerOperation::ShutdownIfIdle,
             spec: None,
+            engine_pid: Some(std::process::id() as i32),
         }
     }
 }
@@ -370,6 +384,84 @@ impl HolderManagerResponse {
             ok: false,
             error: Some(message.into()),
             manager_pid: None,
+        }
+    }
+}
+
+/// What a Holder forked, written beside its pid file the moment the child
+/// exists and before any output is pumped. The socket and pid file vanish
+/// with the Holder; this stays, so an Engine whose first stat arrives after a
+/// millisecond-long child has already exited can still bind the run to the
+/// same verified birth identity a live stat would have carried.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HolderChildRecord {
+    #[serde(rename = "childPID")]
+    pub child_pid: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_identity: Option<diri_proto::process::ProcessIdentity>,
+    pub epoch_offset: u64,
+}
+
+impl HolderChildRecord {
+    const MAX_BYTES: u64 = 4096;
+
+    /// Owner-only and atomic; a torn record must never be read as a run.
+    pub fn write(&self, path: &std::path::Path) -> std::io::Result<()> {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let temp = path.with_extension(format!("child.{}", std::process::id()));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&temp)?;
+        let result = serde_json::to_writer(&mut file, self)
+            .map_err(std::io::Error::other)
+            .and_then(|()| file.sync_all())
+            .and_then(|()| std::fs::rename(&temp, path));
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temp);
+        }
+        result
+    }
+
+    pub fn read(path: &std::path::Path) -> std::io::Result<Self> {
+        use std::io::Read as _;
+        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?;
+        let metadata = file.metadata()?;
+        // SAFETY: geteuid has no preconditions.
+        if !metadata.is_file()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.len() > Self::MAX_BYTES
+        {
+            return Err(std::io::Error::other(
+                "child record is not a private regular file",
+            ));
+        }
+        let mut bytes = Vec::new();
+        file.take(Self::MAX_BYTES).read_to_end(&mut bytes)?;
+        serde_json::from_slice(&bytes).map_err(std::io::Error::other)
+    }
+
+    /// The stat an Engine would have seen had it asked while this child was
+    /// still alive, minus liveness: enough to bind, never enough to inspect.
+    pub fn as_stat(&self) -> HolderStat {
+        HolderStat {
+            child_identity: self.child_identity,
+            child_pid: self.child_pid,
+            alive: false,
+            log_offset: self.epoch_offset,
+            foreground_pid: None,
+            cols: None,
+            rows: None,
+            epoch_offset: Some(self.epoch_offset),
+            secret_input: None,
+            awaiting_line: None,
         }
     }
 }
@@ -629,11 +721,23 @@ mod tests {
 
     #[test]
     fn manager_messages_round_trip_with_swift_keys() {
+        // The sender's pid rides along as an additive key (an older manager
+        // ignores it), and a request without it still decodes.
+        let pid = std::process::id();
         let ping = serde_json::to_string(&HolderManagerRequest::ping()).expect("encode");
-        assert_eq!(ping, r#"{"version":1,"op":"ping"}"#);
+        assert_eq!(
+            ping,
+            format!(r#"{{"version":2,"op":"ping","enginePID":{pid}}}"#)
+        );
         let shutdown =
             serde_json::to_string(&HolderManagerRequest::shutdown_if_idle()).expect("encode");
-        assert_eq!(shutdown, r#"{"version":1,"op":"shutdown-if-idle"}"#);
+        assert_eq!(
+            shutdown,
+            format!(r#"{{"version":2,"op":"shutdown-if-idle","enginePID":{pid}}}"#)
+        );
+        let older: HolderManagerRequest =
+            serde_json::from_str(r#"{"version":1,"op":"ping"}"#).expect("decode");
+        assert_eq!(older.engine_pid, None);
 
         let response: HolderManagerResponse =
             serde_json::from_str(r#"{"ok":true,"managerPID":4242}"#).expect("decode");

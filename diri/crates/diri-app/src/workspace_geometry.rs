@@ -9,6 +9,9 @@ use diri_proto::{
 use std::collections::HashSet;
 
 pub(crate) const DIVIDER: f32 = 5.0;
+/// The narrowest and shortest a pane gets while its split has room.
+pub(crate) const MIN_PANE_WIDTH: f32 = 160.0;
+pub(crate) const MIN_PANE_HEIGHT: f32 = 100.0;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct Rect {
@@ -68,6 +71,13 @@ impl WorkspaceGeometry {
     /// Resolve the durable focus target separately from its presentation. No
     /// session is spawned, selected, attached or resized by this projection.
     pub(crate) fn settled(tab: &WorkspaceTab, bounds: Rect) -> Option<Self> {
+        Self::settled_with_seam(tab, bounds, DIVIDER)
+    }
+
+    /// [`Self::settled`] with `seam` points between neighbouring panes: the
+    /// divider's hit area when compact, the chrome between islands when
+    /// comfortable.
+    pub(crate) fn settled_with_seam(tab: &WorkspaceTab, bounds: Rect, seam: f32) -> Option<Self> {
         if !bounds.valid() {
             return None;
         }
@@ -77,6 +87,7 @@ impl WorkspaceGeometry {
         place(
             &tab.layout,
             bounds,
+            seam,
             0,
             &mut panes,
             &mut dividers,
@@ -202,6 +213,7 @@ pub(crate) fn preview_demand(
 fn place(
     node: &LayoutNode,
     bounds: Rect,
+    seam: f32,
     depth: usize,
     panes: &mut Vec<PanePlacement>,
     dividers: &mut Vec<DividerPlacement>,
@@ -240,9 +252,14 @@ fn place(
             } else {
                 bounds.height
             };
-            let seam = DIVIDER.min(total.max(0.0));
+            let seam = seam.min(total.max(0.0));
             let available = (total - seam).max(0.0);
-            let minimum = if horizontal { 160.0_f32 } else { 100.0 }.min(available / 2.0);
+            let minimum = if horizontal {
+                MIN_PANE_WIDTH
+            } else {
+                MIN_PANE_HEIGHT
+            }
+            .min(available / 2.0);
             let a = (available * fraction).clamp(minimum, available - minimum);
             let (left, right, divider) = if horizontal {
                 (
@@ -283,8 +300,8 @@ fn place(
                 bounds: divider,
                 parent: bounds,
             });
-            place(first, left, depth + 1, panes, dividers, identities)?;
-            place(second, right, depth + 1, panes, dividers, identities)?;
+            place(first, left, seam, depth + 1, panes, dividers, identities)?;
+            place(second, right, seam, depth + 1, panes, dividers, identities)?;
         }
     }
     Some(())
@@ -320,6 +337,37 @@ mod tests {
             },
         }
     }
+    #[test]
+    fn island_seams_leave_the_chosen_gap_between_panes() {
+        let tab = WorkspaceTab {
+            id: TabId::new("t"),
+            title: None,
+            focused_pane: PaneId::new("a"),
+            zoomed_pane: None,
+            layout: LayoutNode::Split {
+                id: SplitId::new("s"),
+                axis: LayoutAxis::Horizontal,
+                fraction: 0.5,
+                first: Box::new(pane("a")),
+                second: Box::new(pane("b")),
+            },
+        };
+        let bounds = Rect {
+            width: 806.0,
+            height: 400.0,
+            ..Rect::default()
+        };
+        let geometry = WorkspaceGeometry::settled_with_seam(&tab, bounds, 6.0).unwrap();
+        let (a, b) = (geometry.panes[0].bounds, geometry.panes[1].bounds);
+        assert_eq!(b.x - (a.x + a.width), 6.0);
+        assert_eq!(a.width, 400.0);
+        assert_eq!(geometry.dividers[0].bounds.width, 6.0);
+        assert_eq!(
+            WorkspaceGeometry::settled(&tab, bounds),
+            WorkspaceGeometry::settled_with_seam(&tab, bounds, DIVIDER)
+        );
+    }
+
     #[test]
     fn thumbnail_retains_uneven_nested_geometry_and_exact_focus_identity() {
         let tab = tab();

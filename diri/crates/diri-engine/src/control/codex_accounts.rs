@@ -22,7 +22,7 @@ fn directory(path: &Path) -> Result<(), ControlError> {
     diri_platform::security::validate_directory(path, 0o022).map_err(|_| failure())?;
     Ok(())
 }
-fn read(path: &Path) -> Result<Option<Vec<u8>>, ControlError> {
+pub(super) fn read(path: &Path) -> Result<Option<Vec<u8>>, ControlError> {
     let file = match diri_platform::security::open_regular(path, false, false, false) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -41,7 +41,7 @@ fn read(path: &Path) -> Result<Option<Vec<u8>>, ControlError> {
     }
     Ok(Some(bytes))
 }
-fn login(path: &Path) -> Result<Vec<u8>, ControlError> {
+pub(super) fn login(path: &Path) -> Result<Vec<u8>, ControlError> {
     let bytes = read(path)?.ok_or_else(|| {
         ControlError::bad_request(
             "Sign in to this profile, or save its current login, before switching.",
@@ -68,7 +68,7 @@ fn identity(bytes: &[u8]) -> Option<(String, String)> {
         claims["sub"].as_str()?.into(),
     ))
 }
-fn write(path: &Path, bytes: &[u8]) -> Result<(), ControlError> {
+pub(super) fn write(path: &Path, bytes: &[u8]) -> Result<(), ControlError> {
     directory(path.parent().ok_or_else(failure)?)?;
     let expected = read(path)?;
     let temp = path.with_file_name(format!(".auth-{}.tmp", crate::inject::uuid_v4()));
@@ -126,7 +126,7 @@ impl ControlServer {
             .resolve(Some(id), AgentKind::CODEX_ID, None)?
             .ok_or_else(failure)
     }
-    fn codex_home(&self) -> Result<PathBuf, ControlError> {
+    pub(super) fn codex_home(&self) -> Result<PathBuf, ControlError> {
         let home = PathBuf::from(
             diri_platform::home_dir()
                 .map(|p| p.to_string_lossy().into_owned())
@@ -138,7 +138,7 @@ impl ControlServer {
         file_backend(&home)?;
         Ok(home)
     }
-    fn codex_slot(&self, id: &str) -> Result<PathBuf, ControlError> {
+    pub(super) fn codex_slot(&self, id: &str) -> Result<PathBuf, ControlError> {
         if id.is_empty()
             || !id
                 .bytes()
@@ -195,11 +195,25 @@ impl ControlServer {
         let title = format!("Codex sign in · {}", profile.label);
         self.ensure_login_finished(&slot)?;
         let binary = self.resolve_local_agent_executable("codex", "codex")?;
-        // Fixed script; profile paths and executable are positional arguments, never shell code.
-        let script = "exec /usr/bin/env -u OPENAI_API_KEY -u OPENAI_BASE_URL -u CODEX_API_KEY CODEX_HOME=\"$1\" \"$2\" -c 'cli_auth_credentials_store=\"file\"' login";
+        let argv = super::account_switch::sign_in_argv(
+            std::env::var("SHELL").ok(),
+            &[
+                "/usr/bin/env".into(),
+                "-u".into(),
+                "OPENAI_API_KEY".into(),
+                "-u".into(),
+                "OPENAI_BASE_URL".into(),
+                "-u".into(),
+                "CODEX_API_KEY".into(),
+                format!("CODEX_HOME={}", slot.display()),
+                binary,
+                "-c".into(),
+                "cli_auth_credentials_store=\"file\"".into(),
+                "login".into(),
+            ],
+        );
         self.session_spawn(Some(
-            json!({"kind": AgentKind::SHELL, "cwd": slot, "title": title,
-            "argv": ["/bin/zsh", "-lc", script, "diri-codex-login", slot, binary]}),
+            json!({"kind": AgentKind::SHELL, "cwd": slot, "title": title, "argv": argv}),
         ))
     }
     pub(super) fn switch_codex(&self, profile: AgentAccountProfile) -> Result<Value, ControlError> {
@@ -440,6 +454,7 @@ mod tests {
                 crate::agent_catalog::AgentPreference {
                     executable_path: Some("/usr/bin/false".into()),
                     show_in_quick_create: Some(true),
+                    launch_args: Vec::new(),
                 },
             )
             .unwrap();
@@ -498,6 +513,7 @@ mod tests {
                 crate::agent_catalog::AgentPreference {
                     executable_path: Some(executable.to_string_lossy().into_owned()),
                     show_in_quick_create: Some(true),
+                    launch_args: Vec::new(),
                 },
             )
             .unwrap();
@@ -660,6 +676,7 @@ mod tests {
                 crate::agent_catalog::AgentPreference {
                     executable_path: Some(executable.to_string_lossy().into_owned()),
                     show_in_quick_create: Some(true),
+                    launch_args: Vec::new(),
                 },
             )
             .unwrap();

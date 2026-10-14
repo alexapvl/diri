@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use base64::Engine as _;
 
+use crate::holder::HolderPaths;
 use crate::log::OutputLog;
 use crate::pty::{Pty, PtySpec};
 
@@ -24,7 +25,8 @@ use super::guard::GroupGuard;
 use super::process_tree;
 use super::protocol::{
     HOLDER_OUTPUT_STREAM_VERSION, HOLDER_STREAM_ACK, HOLDER_STREAM_INPUT,
-    HOLDER_STREAM_MAX_PAYLOAD, HOLDER_STREAM_RESIZE, HOLDER_STREAM_VERSION, HolderExitMarker,
+    HOLDER_STREAM_MAX_PAYLOAD, HOLDER_STREAM_RESIZE, HOLDER_STREAM_RESIZE_PIXELS,
+    HOLDER_STREAM_VERSION, HOLDER_STREAM_VERSION_PIXELS, HolderChildRecord, HolderExitMarker,
     HolderExitReason, HolderExitStatus, HolderLaunchSpec, HolderOperation, HolderRequest,
     HolderResponse, HolderStat,
 };
@@ -58,6 +60,21 @@ const OUTPUT_WRITE_BUFFER: usize = 256 << 10;
 static RUNNING: Mutex<Vec<Weak<Shared>>> = Mutex::new(Vec::new());
 
 pub struct HolderServer;
+
+/// How a hosted Agent is started on macOS; nothing elsewhere.
+#[cfg(target_os = "macos")]
+pub use diri_pty::detached::{DetachedLeader, Launcher as AgentLauncher};
+/// Placeholders off macOS, where every Agent is the Holder's child.
+#[cfg(not(target_os = "macos"))]
+pub enum AgentLauncher {}
+#[cfg(not(target_os = "macos"))]
+pub enum DetachedLeader {}
+#[cfg(not(target_os = "macos"))]
+impl DetachedLeader {
+    fn wait(&self) -> std::io::Result<diri_pty::Exit> {
+        match *self {}
+    }
+}
 
 struct Shared {
     spec: HolderLaunchSpec,
@@ -138,6 +155,17 @@ impl HolderServer {
     /// [`Self::run`], registering the session's process group with the
     /// manager's [`GroupGuard`] for as long as its leader is unreaped.
     pub fn run_guarded(spec: HolderLaunchSpec, guard: Option<Arc<GroupGuard>>) -> HolderResult<()> {
+        Self::run_hosted(spec, guard, None)
+    }
+
+    /// [`Self::run_guarded`], starting the Agent through `launcher` when one
+    /// is given: on macOS that makes it a launchd job of its own, so no other
+    /// session shares its process coalition (see [`diri_pty::detached`]).
+    pub fn run_hosted(
+        spec: HolderLaunchSpec,
+        guard: Option<Arc<GroupGuard>>,
+        launcher: Option<&AgentLauncher>,
+    ) -> HolderResult<()> {
         // Never double-run: a second holder for the same session would
         // interleave two writers into one output log and stack a second child.
         // If a live holder already serves this socket, defer to it — bail
@@ -174,7 +202,7 @@ impl HolderServer {
             rows: spec.rows.max(2),
         };
         let spawned_at = std::time::Instant::now();
-        let pty = Pty::spawn(&pty_spec).map_err(|error| {
+        let pty = spawn_agent(&pty_spec, launcher, &spec.session_id).map_err(|error| {
             diri_telemetry::incident!(
                 "holder.spawn_failed",
                 session = diri_telemetry::id(&spec.session_id),
@@ -193,6 +221,21 @@ impl HolderServer {
         // Armed at once: registering after the child has exited fails on
         // macOS, which the exit path treats as "already exited".
         let exit_watcher = diri_pty::ExitWatcher::new(child_pid as u32).ok();
+        #[cfg(target_os = "macos")]
+        let detached = pty.detached_leader();
+        #[cfg(not(target_os = "macos"))]
+        let detached: Option<Arc<DetachedLeader>> = None;
+        // Recorded before the socket exists, so anyone who can reach this
+        // Holder, or finds only its log, can also learn which child it forked.
+        // Failure is not fatal: the run is then bindable only by a live stat.
+        let _ = HolderChildRecord {
+            child_pid,
+            child_identity: pty.child_identity(),
+            epoch_offset,
+        }
+        .write(&HolderPaths::child_record_beside(Path::new(
+            &spec.pid_file_path,
+        )));
 
         // Nonblocking master: the reader drains in bursts, and writes bound
         // their patience with poll rather than blocking the control loop.
@@ -265,7 +308,7 @@ impl HolderServer {
             let shared = Arc::clone(&shared);
             std::thread::Builder::new()
                 .name(format!("holder-exit-{}", shared.spec.session_id))
-                .spawn(move || watch_exit(&shared, pump, exit_watcher))
+                .spawn(move || watch_exit(&shared, pump, exit_watcher, detached))
                 .map_err(|error| {
                     if let Some(guard) = &guard {
                         guard.release(child_pid);
@@ -316,10 +359,12 @@ impl HolderServer {
                     }
                 }
                 Ok(request) if request.op == HolderOperation::Stream => {
-                    if request.stream_version != Some(HOLDER_STREAM_VERSION) {
-                        HolderResponse::failure("unsupported Holder input stream version")
-                    } else {
-                        let response = HolderResponse::stream(HOLDER_STREAM_VERSION);
+                    let version = request.stream_version.filter(|version| {
+                        *version == HOLDER_STREAM_VERSION
+                            || *version == HOLDER_STREAM_VERSION_PIXELS
+                    });
+                    if let Some(version) = version {
+                        let response = HolderResponse::stream(version);
                         if socket::write_json_line(&mut client, &response).is_ok() {
                             let client = Arc::new(client);
                             let mut streams = shared.input_streams.lock().expect("input streams");
@@ -332,6 +377,8 @@ impl HolderServer {
                                 .spawn(move || serve_input_stream(&shared, client));
                         }
                         continue;
+                    } else {
+                        HolderResponse::failure("unsupported Holder input stream version")
                     }
                 }
                 Ok(request) => handle(&shared, &request)
@@ -673,11 +720,20 @@ fn watch_exit(
     shared: &Shared,
     pump: std::thread::JoinHandle<()>,
     exit_watcher: Option<diri_pty::ExitWatcher>,
+    detached: Option<Arc<DetachedLeader>>,
 ) {
     // The leader stays an unreaped zombie until the sweep is done: that is
     // what keeps its pid, and so the group id the sweep and the guard both
-    // name, from being handed to anyone else.
-    wait_for_exit_unreaped(shared.child_pid, exit_watcher);
+    // name, from being handed to anyone else. A detached leader is launchd's
+    // child and reaped by it, but a group id is never reissued while any
+    // member is alive, and the sweep only signals live members.
+    let detached_exit = match &detached {
+        Some(leader) => Some(wait_for_detached_exit(leader, shared.child_pid)),
+        None => {
+            wait_for_exit_unreaped(shared.child_pid, exit_watcher);
+            None
+        }
+    };
     let mut frozen = shared.frozen.lock().expect("frozen");
     process_tree::kill_stragglers(shared.child_pid, &frozen);
     if let Some(guard) = &shared.guard {
@@ -688,10 +744,17 @@ fn watch_exit(
     drop(frozen);
 
     let mut status: libc::c_int = 0;
-    // SAFETY: waitpid on our own child; EINTR retried.
-    while unsafe { libc::waitpid(shared.child_pid, &mut status, 0) } < 0 {
-        if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
-            break;
+    match detached_exit {
+        // Re-encoded so the one decode below feeds the marker either way.
+        Some(diri_pty::Exit::Code(code)) => status = (code & 0xFF) << 8,
+        Some(diri_pty::Exit::Signal(signal)) => status = signal & 0x7F,
+        // SAFETY: waitpid on our own child; EINTR retried.
+        None => {
+            while unsafe { libc::waitpid(shared.child_pid, &mut status, 0) } < 0 {
+                if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                    break;
+                }
+            }
         }
     }
     // The same decode Swift used, bit for bit, because it feeds the marker.
@@ -822,7 +885,12 @@ fn handle(shared: &Shared, request: &HolderRequest) -> HolderResult<HolderRespon
                     "signal requires a valid sig".into(),
                 ));
             }
-            let tree = process_tree::signal(shared.child_pid, signal);
+            let tree = if signal == libc::SIGCONT {
+                let frozen = shared.frozen.lock().expect("frozen").clone();
+                process_tree::resume(shared.child_pid, &frozen)
+            } else {
+                process_tree::signal(shared.child_pid, signal)
+            };
             if matches!(signal, libc::SIGSTOP | libc::SIGCONT) {
                 let mut frozen = shared.frozen.lock().expect("frozen");
                 if let Some(guard) = &shared.guard {
@@ -878,15 +946,31 @@ fn serve_input_stream(shared: &Shared, stream: Arc<diri_platform::ipc::UnixStrea
         }
         let result = match header[0] {
             HOLDER_STREAM_INPUT => write_pty(shared, &payload),
-            HOLDER_STREAM_RESIZE if payload.len() == 4 => {
-                let cols = u16::from_be_bytes([payload[0], payload[1]]);
-                let rows = u16::from_be_bytes([payload[2], payload[3]]);
+            HOLDER_STREAM_RESIZE | HOLDER_STREAM_RESIZE_PIXELS
+                if payload.len()
+                    == if header[0] == HOLDER_STREAM_RESIZE {
+                        4
+                    } else {
+                        8
+                    } =>
+            {
+                let word = |at: usize| u16::from_be_bytes([payload[at], payload[at + 1]]);
+                let (cols, rows) = (word(0), word(2));
+                let pixels = if payload.len() == 8 {
+                    (word(4), word(6))
+                } else {
+                    (0, 0)
+                };
                 if cols < 2 || rows < 2 {
                     Err(HolderError::InvalidRequest(
                         "resize requires cols/rows >= 2".into(),
                     ))
                 } else {
-                    let _ = shared.pty.lock().expect("pty").resize(cols, rows);
+                    let _ = shared
+                        .pty
+                        .lock()
+                        .expect("pty")
+                        .resize_with_pixels(cols, rows, pixels);
                     Ok(())
                 }
             }
@@ -979,15 +1063,28 @@ fn write_pty(shared: &Shared, data: &[u8]) -> HolderResult<()> {
 }
 
 fn current_stat(shared: &Shared) -> HolderStat {
-    if let Some(expected) = shared.child_identity
-        && let Ok(mut stat) = diri_pty::process_identity::inspect_verified(&expected, || {
-            Ok(current_stat_without_identity(shared))
-        })
-    {
+    let Some(expected) = shared.child_identity else {
+        return current_stat_without_identity(shared);
+    };
+    if let Ok(mut stat) = diri_pty::process_identity::inspect_verified(&expected, || {
+        Ok(current_stat_without_identity(shared))
+    }) {
         stat.child_identity = Some(expected);
         return stat;
     }
-    current_stat_without_identity(shared)
+    // The child can no longer be inspected: it exited, or a stranger now
+    // occupies its PID. Neither changes which child this Holder spawned, and
+    // the identity it recorded at birth is the Engine's only way to bind the
+    // run's retained terminal. A child that exits within a millisecond, as
+    // `sh -c 'exit 3'` does on Linux, is gone before the Engine's first stat.
+    // Keep vouching for the birth identity while `alive` says the process
+    // itself cannot be read; a stranger on the PID never reads as alive here
+    // because `finished` is already set once the child was reaped.
+    let mut stat = current_stat_without_identity(shared);
+    if !stat.alive {
+        stat.child_identity = Some(expected);
+    }
+    stat
 }
 
 fn current_stat_without_identity(shared: &Shared) -> HolderStat {
@@ -1070,6 +1167,99 @@ fn wait_for_exit_unreaped(pid: i32, watcher: Option<diri_pty::ExitWatcher>) {
     }
 }
 
+/// The exit of a launchd-started leader. Its watch was armed before it could
+/// run, so it reports the real status; should the watch itself fail, the pid
+/// is polled until it is gone and the status is unknown (a code of 255).
+fn wait_for_detached_exit(leader: &DetachedLeader, pid: i32) -> diri_pty::Exit {
+    if let Ok(exit) = leader.wait() {
+        return exit;
+    }
+    // SAFETY: signal 0 only probes.
+    while unsafe { libc::kill(pid, 0) } == 0
+        || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    {
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    diri_pty::Exit::Code(255)
+}
+
+/// How long Agents start directly after a launchd handoff timed out, so a
+/// launchd that stopped running jobs costs one tab the wait, not every tab.
+#[cfg(target_os = "macos")]
+const DETACHED_RETRY_AFTER: Duration = Duration::from_secs(600);
+
+#[cfg(target_os = "macos")]
+static DETACHED_TIMED_OUT_AT: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+#[cfg(target_os = "macos")]
+fn detached_allowed(timed_out_at: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    timed_out_at.is_none_or(|at| now.saturating_duration_since(at) >= DETACHED_RETRY_AFTER)
+}
+
+/// Starts the Agent through `launcher` when there is one, else (and whenever
+/// the launcher provably started nothing) as this process's child.
+fn spawn_agent(
+    spec: &diri_pty::PtySpec,
+    launcher: Option<&AgentLauncher>,
+    session_id: &str,
+) -> std::io::Result<Pty> {
+    #[cfg(target_os = "macos")]
+    if let Some(launcher) = launcher.filter(|launcher| {
+        !super::launcher::launchd_unavailable(&launcher.rendezvous, &holder_executable())
+    }) {
+        let started = std::time::Instant::now();
+        let timed_out_at = *DETACHED_TIMED_OUT_AT.lock().expect("detached timeout");
+        if !detached_allowed(timed_out_at, started) {
+            diri_telemetry::debug_event!(
+                "holder.detached_skipped",
+                session = diri_telemetry::id(session_id),
+            );
+            return Pty::spawn(spec);
+        }
+        match diri_pty::detached::spawn(spec, launcher) {
+            Ok(pty) => {
+                diri_telemetry::event!(
+                    "holder.detached_spawn",
+                    session = diri_telemetry::id(session_id),
+                    ms = started.elapsed(),
+                );
+                return Ok(pty);
+            }
+            Err(diri_pty::detached::DetachedError::Spawn(error)) => return Err(error),
+            Err(diri_pty::detached::DetachedError::Unavailable(error)) => {
+                eprintln!("diri-holder: detached launch unavailable, spawning directly: {error}");
+                // One job launchd never ran is enough: later sessions, in
+                // this manager and the next, skip the wait.
+                if error.kind() == std::io::ErrorKind::TimedOut {
+                    *DETACHED_TIMED_OUT_AT.lock().expect("detached timeout") =
+                        Some(std::time::Instant::now());
+                    super::launcher::mark_launchd_unavailable(
+                        &launcher.rendezvous,
+                        &holder_executable(),
+                    );
+                }
+                diri_telemetry::incident!(
+                    "holder.detached_unavailable",
+                    session = diri_telemetry::id(session_id),
+                    io = diri_telemetry::io_error(&error),
+                    ms = started.elapsed(),
+                );
+            }
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (launcher, session_id);
+    Pty::spawn(spec)
+}
+
+/// This Holder's own executable, the one the Engine launched managers from.
+#[cfg(target_os = "macos")]
+fn holder_executable() -> std::path::PathBuf {
+    std::env::current_exe()
+        .and_then(|exe| exe.canonicalize())
+        .unwrap_or_default()
+}
+
 /// Whether `pid`, our child, has exited (it stays unreaped). Stops and
 /// continues are reported by macOS even without `WSTOPPED`, so the reason is
 /// checked rather than trusted.
@@ -1114,6 +1304,16 @@ fn set_nonblocking(fd: i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_timed_out_launchd_handoff_starts_agents_directly_until_the_retry() {
+        let at = std::time::Instant::now();
+        assert!(detached_allowed(None, at));
+        assert!(!detached_allowed(Some(at), at));
+        assert!(!detached_allowed(Some(at), at + DETACHED_RETRY_AFTER / 2));
+        assert!(detached_allowed(Some(at), at + DETACHED_RETRY_AFTER));
+    }
 
     #[test]
     fn a_missing_exit_watcher_never_reads_a_live_agent_as_exited() {
@@ -1480,6 +1680,158 @@ mod tests {
         }
     }
 
+    /// A terminal tab: interactive zsh running an agent as its foreground
+    /// job, and the agent's own children (MCP servers, tool shells) started
+    /// after it. Every wake must leave the agent in the foreground; a zsh
+    /// that resumes first reaps it as suspended and takes the tab, and the
+    /// agent's mouse tracking then types into the prompt. macOS-only because
+    /// `/bin/zsh` is the default shell there.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_woken_job_control_shell_keeps_its_job_in_the_foreground() {
+        let root = tempfile::tempdir().unwrap();
+        let pids = root.path().join("pids");
+        let mut spec = held(root.path(), "s_job", "");
+        spec.argv = vec!["/bin/zsh".into(), "-f".into(), "-i".into()];
+        let client = HolderClient::new(&spec.socket_path);
+        let server = std::thread::spawn(move || HolderServer::run(spec));
+        // A timed-out wait must not leave zsh and 150 stopped sleeps behind.
+        let _cleanup = KillTreeOnDrop(&client);
+        wait_until("holder ready", || client.is_alive());
+        client
+            .write(
+                format!(
+                    "/bin/sh -c 'i=0; while [ $i -lt 150 ]; do sleep 1000 & i=$((i+1)); done; echo $$ > {pids}.tmp && mv {pids}.tmp {pids} && wait'\n",
+                    pids = pids.display()
+                )
+                .as_bytes(),
+            )
+            .expect("start the job");
+        let mut job = 0;
+        wait_until("job running", || {
+            job = read_pids(&pids).map_or(0, |pids| pids[0]);
+            job > 0 && process_state(job).is_some_and(|state| state.contains('+'))
+        });
+
+        let taken = (0..20).find_map(|round| {
+            client.signal(libc::SIGSTOP).expect("hibernate");
+            wait_until("job stopped", || {
+                process_state(job).is_some_and(|state| state.starts_with('T'))
+            });
+            client.signal(libc::SIGCONT).expect("wake");
+            // There is no event for "zsh left it alone", so watch long
+            // enough for a loaded zsh to have reaped the job and taken the
+            // terminal if it was going to.
+            let deadline = std::time::Instant::now() + Duration::from_millis(250);
+            loop {
+                let state = process_state(job).unwrap_or_default();
+                if !state.contains('+') || state.starts_with('T') {
+                    break Some((round, state));
+                }
+                if std::time::Instant::now() >= deadline {
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+
+        client.kill_tree().expect("kill-tree");
+        wait_until("holder finished", || server.is_finished());
+        server.join().expect("join").expect("clean holder exit");
+        assert_eq!(taken, None, "the shell took the terminal from its job");
+    }
+
+    /// A hibernated agent's helper that left the group (an MCP watchdog in
+    /// its own session) loses its parent while stopped, so the wake's walk
+    /// from the leader no longer reaches it. The wake must still continue
+    /// it: it was frozen, and after the wake nothing remembers it.
+    #[test]
+    fn a_wake_continues_a_frozen_process_the_tree_lost() {
+        let root = tempfile::tempdir().unwrap();
+        let pids = root.path().join("pids");
+        let agent = root.path().join("agent.sh");
+        std::fs::write(
+            &agent,
+            format!(
+                "perl -e 'use POSIX; POSIX::setsid(); sleep 1000' &\n\
+                 echo $$ $! > {pids}.tmp && mv {pids}.tmp {pids}\n\
+                 wait\n",
+                pids = pids.display()
+            ),
+        )
+        .unwrap();
+        let spec = held(
+            root.path(),
+            "s_lost",
+            &format!("/bin/sh {}", agent.display()),
+        );
+        let client = HolderClient::new(&spec.socket_path);
+        let server = std::thread::spawn(move || HolderServer::run(spec));
+        let _cleanup = KillTreeOnDrop(&client);
+        wait_until("holder ready", || client.is_alive());
+        let mut tree = Vec::new();
+        wait_until("agent tree", || {
+            tree = read_pids(&pids).unwrap_or_default();
+            tree.len() == 2
+        });
+        let (agent, helper) = (tree[0], tree[1]);
+        let _helper = KillOnDrop(helper);
+        wait_until("helper in its own session", || {
+            // SAFETY: getpgid on a pid we started; read-only.
+            unsafe { libc::getpgid(helper) == helper }
+        });
+
+        client.signal(libc::SIGSTOP).expect("hibernate");
+        wait_until("helper stopped", || {
+            process_state(helper).is_some_and(|state| state.starts_with('T'))
+        });
+        // SAFETY: plain kill(2) on this test's own process.
+        unsafe { libc::kill(agent, libc::SIGKILL) };
+        wait_until("helper orphaned", || {
+            // SAFETY: plain kill(2) probe of this test's own process.
+            dead(agent) && unsafe { libc::kill(helper, 0) } == 0
+        });
+
+        client.signal(libc::SIGCONT).expect("wake");
+        wait_until("helper continued", || {
+            process_state(helper).is_some_and(|state| !state.starts_with('T'))
+        });
+
+        // The leader's death may already have ended the session (Linux
+        // reports it at once), taking the socket with it; then there is
+        // nothing left to kill.
+        if let Err(error) = client.kill_tree() {
+            assert!(
+                server.is_finished() || !client.is_alive(),
+                "kill-tree on a live holder: {error:?}"
+            );
+        }
+        wait_until("holder finished", || server.is_finished());
+        server.join().expect("join").expect("clean holder exit");
+    }
+
+    /// Kills a test's held tree if the test panics before its own cleanup.
+    struct KillTreeOnDrop<'a>(&'a HolderClient);
+
+    impl Drop for KillTreeOnDrop<'_> {
+        fn drop(&mut self) {
+            let _ = self.0.kill_tree();
+        }
+    }
+
+    /// Kills a process the held tree no longer reaches.
+    struct KillOnDrop(i32);
+
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            // SAFETY: cleanup of this test's own process.
+            unsafe {
+                libc::kill(self.0, libc::SIGKILL);
+                libc::kill(self.0, libc::SIGCONT);
+            }
+        }
+    }
+
     /// The Codex shape that leaked on a real machine: `fish -c codex` leads the
     /// session, codex's node wrapper forwards TERM/HUP to the native binary and
     /// waits for it, and the agent has a helper that left the group (Codex's
@@ -1580,9 +1932,9 @@ mod tests {
             pids = pids.display()
         );
         let spec = held(root.path(), "s_group", &script);
-        let client = HolderClient::new(&spec.socket_path);
         let server = std::thread::spawn(move || HolderServer::run(spec));
-        wait_until("holder ready", || client.is_alive());
+        // No "holder ready" wait: the leader lives 0.3 s, so a loaded runner
+        // can miss the whole window. The pid file proves the session ran.
         let mut straggler = Vec::new();
         wait_until("background job", || {
             straggler = read_pids(&pids).unwrap_or_default();

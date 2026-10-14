@@ -11,6 +11,38 @@ use crate::launch_recipe::{LaunchRecipeBook, deserialize_recipe_book};
 
 const DEFAULT_THEME: &str = "dirijor-dark";
 
+/// The interface language. `System` follows the reader's preferred languages
+/// (see `crate::i18n`); a pick persists as its tag. A tag this build has no
+/// catalog for, written by a newer diri, reads as `System`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum UiLanguage {
+    #[default]
+    System,
+    Fixed(diri_i18n::Language),
+}
+
+impl UiLanguage {
+    pub const fn tag(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Fixed(language) => language.tag(),
+        }
+    }
+}
+
+impl Serialize for UiLanguage {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.tag())
+    }
+}
+
+impl<'de> Deserialize<'de> for UiLanguage {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let tag = String::deserialize(deserializer)?;
+        Ok(diri_i18n::Language::from_tag(&tag).map_or(Self::System, Self::Fixed))
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum WindowMode {
@@ -31,6 +63,116 @@ pub enum WindowMaterial {
     Glass,
     /// A solid window. Cheaper for the compositor: no backdrop is retained.
     Opaque,
+}
+
+/// How the whole interface is painted: where chrome takes its hues from and
+/// how much desktop shows through. The palette's Change Interface Style page
+/// and Settings › Appearance offer these four, in this order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum InterfaceStyle {
+    /// Clear glass in neutral hues: the desktop reads through every surface,
+    /// the terminal included.
+    Modern,
+    /// Solid neutral grays, as native macOS windows paint. The terminal keeps
+    /// its theme's text colors on a system background.
+    System,
+    /// Solid, with the color theme tinting every surface.
+    Themed,
+    /// The color theme's tints laid over a blurred desktop.
+    Blended,
+}
+
+impl InterfaceStyle {
+    pub const ALL: [Self; 4] = [Self::Modern, Self::System, Self::Themed, Self::Blended];
+
+    /// The platform window material the style needs.
+    pub const fn material(self) -> WindowMaterial {
+        match self {
+            Self::Modern | Self::Blended => WindowMaterial::Glass,
+            Self::System | Self::Themed => WindowMaterial::Opaque,
+        }
+    }
+
+    /// The style a preferences file written before styles existed meant.
+    pub const fn from_material(material: WindowMaterial) -> Self {
+        match material {
+            WindowMaterial::Glass => Self::Blended,
+            WindowMaterial::Opaque => Self::Themed,
+        }
+    }
+
+    /// Chrome hues come from neutral system grays rather than the theme.
+    pub const fn neutral(self) -> bool {
+        matches!(self, Self::Modern | Self::System)
+    }
+
+    pub const fn clear_glass(self) -> bool {
+        matches!(self, Self::Modern)
+    }
+
+    pub fn title(self) -> &'static str {
+        crate::i18n::t(match self {
+            Self::Modern => "interface_style.modern",
+            Self::System => "interface_style.system",
+            Self::Themed => "interface_style.themed",
+            Self::Blended => "interface_style.blended",
+        })
+    }
+}
+
+/// How terminal panes sit in the window. Comfortable is the default, for
+/// files written before density existed too.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PaneDensity {
+    /// Panes fill the window edge to edge, split by single hairlines.
+    Compact,
+    /// Each pane is a rounded island with a gap of window chrome around it.
+    /// Last because serde only takes `other` on the final variant.
+    #[default]
+    #[serde(other)]
+    Comfortable,
+}
+
+impl PaneDensity {
+    pub const ALL: [Self; 2] = [Self::Comfortable, Self::Compact];
+
+    /// Chrome between neighbouring islands and between an island and the
+    /// window or sidebar edge; zero when compact.
+    pub const fn island_gap(self) -> f32 {
+        match self {
+            Self::Comfortable => 6.0,
+            Self::Compact => 0.0,
+        }
+    }
+
+    pub const fn islands(self) -> bool {
+        matches!(self, Self::Comfortable)
+    }
+
+    pub fn title(self) -> &'static str {
+        crate::i18n::t(match self {
+            Self::Comfortable => "density.comfortable",
+            Self::Compact => "density.compact",
+        })
+    }
+}
+
+/// Where a new Agent opened from a project (⌘T, New Agent) starts. Stored
+/// per project; a missing entry, or a name this build does not know, is the
+/// current checkout, which is what every project did before the choice.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum NewAgentStart {
+    /// A fresh Diri worktree and branch from the remote default branch,
+    /// fetched first (`origin/HEAD`, else `origin/main`, `origin/master`).
+    FreshWorktree,
+    /// The checkout the source Session works in. Last because serde's
+    /// catch-all must be.
+    #[default]
+    #[serde(other)]
+    CurrentCheckout,
 }
 
 /// Where a terminal `file:line` link opens. Stored by name; a name this
@@ -191,11 +333,46 @@ fn sidebar_lineage_highlights_default() -> bool {
     true
 }
 
+/// A channel this build does not know (written by a newer one) reads as unset
+/// rather than failing the whole preferences file.
+fn deserialize_update_channel<'de, D>(
+    deserializer: D,
+) -> Result<Option<diri_updater::UpdateChannel>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| serde_json::from_value(value).ok()))
+}
+
+impl Prefs {
+    /// The chosen update channel, or the one this build came from: a nightly
+    /// build keeps following nightlies until the user says otherwise.
+    pub fn effective_update_channel(&self) -> diri_updater::UpdateChannel {
+        self.update_channel.unwrap_or_else(|| {
+            diri_updater::UpdateChannel::for_version(crate::updates::CURRENT_VERSION)
+        })
+    }
+}
+
 fn terminal_follows_last_directory_default() -> bool {
     true
 }
 
+/// A style this build does not know, written by a newer diri, reads as
+/// unset (the material decides) rather than failing the whole file.
+fn deserialize_interface_style<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<InterfaceStyle>, D::Error> {
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| serde_json::from_value(value).ok()))
+}
+
 const fn window_transparency_default() -> f32 {
+    1.0
+}
+
+const fn terminal_line_height_default() -> f32 {
     1.0
 }
 
@@ -213,16 +390,31 @@ pub struct Prefs {
     #[serde(alias = "lastSpawnHost")]
     pub default_spawn_host: Option<String>,
     pub start_at_login: bool,
+    /// Interface language, persisted as `"system"` or a catalog tag such as
+    /// `"en"`, `"zh-Hans"` or `"es"`.
+    pub ui_language: UiLanguage,
     pub confirm_before_closing_session: bool,
     pub status_sounds: bool,
     pub status_notifications: bool,
     pub muted_notification_sessions: std::collections::BTreeSet<String>,
+    /// Names the user gave conversations, by the Agent's own conversation id.
+    /// History reads them after the tab that carried the rename has closed:
+    /// provider transcripts never learn a Diri rename.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub conversation_titles: BTreeMap<String, String>,
     /// Check, download, and verify releases in the background. A staged update
     /// installs on quit or when the user requests a restart.
     pub automatic_updates: bool,
     /// A release the user chose not to install. Persisted so "Skip" outlives
     /// the session that clicked it; empty means nothing is skipped.
     pub skipped_update_version: String,
+    /// The feed updates follow. `None` until the user picks one; read it
+    /// through [`Prefs::effective_update_channel`].
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_update_channel"
+    )]
+    pub update_channel: Option<diri_updater::UpdateChannel>,
     pub hibernate_after_minutes: u32,
     pub memory_hard_limit_gb: u64,
     /// Which generation of hibernation defaults this file was last brought
@@ -238,11 +430,21 @@ pub struct Prefs {
     /// Follow native appearance changes; terminal_theme stores the resolved palette.
     pub follow_system_theme: bool,
     pub terminal_font_size: f32,
+    /// Terminal font family by name. Empty follows diri's platform default,
+    /// so a file never pins a font that only existed on another Mac.
+    #[serde(default)]
+    pub terminal_font_family: String,
+    /// Row height as a multiple of the font's own line height.
+    #[serde(default = "terminal_line_height_default")]
+    pub terminal_line_height: f32,
     pub terminal_copy_on_select: bool,
     /// Open a terminal URL on a plain click. When off, links still open with
     /// Command- or Control-click.
     pub terminal_open_links_on_click: bool,
     pub terminal_hide_pointer: bool,
+    /// Give new zsh and bash terminals Diri's OSC 133 prompt and command
+    /// marks. The Engine applies it; the store pushes it on every change.
+    pub terminal_shell_integration: bool,
     /// Where a clicked `file:line` reference in terminal output opens.
     #[serde(default)]
     pub terminal_file_editor: FileEditor,
@@ -259,6 +461,19 @@ pub struct Prefs {
     /// tint (1.0). Missing files keep the shipped look.
     #[serde(default = "window_transparency_default")]
     pub window_transparency: f32,
+    /// The chosen interface style. `None` in files written before styles
+    /// existed; read it through [`Prefs::interface_style`], which falls back
+    /// to `window_material`. Stored beside the material rather than in place
+    /// of it so an older diri reading this file keeps the right blur.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_interface_style"
+    )]
+    pub interface_style: Option<InterfaceStyle>,
+    /// Islands (comfortable) or flush panes (compact).
+    #[serde(default)]
+    pub pane_density: PaneDensity,
     /// Last size, position, and presentation mode of the key window.
     pub window_placement: Option<WindowPlacement>,
     /// The other windows open at the last quit, in no particular order. They
@@ -312,6 +527,9 @@ pub struct Prefs {
     /// Unknown ids are retained so opening these preferences in an older diri
     /// build does not erase settings written by a newer one.
     pub shortcut_overrides: BTreeMap<String, Option<String>>,
+    /// Physical macOS key code recorded with the global Show App binding.
+    /// Keeping the native code avoids assuming a US keyboard layout.
+    pub global_shortcut_key_code: Option<u16>,
     /// Session that should regain focus after the daemon's initial hydrate.
     pub last_selected_session: Option<SessionId>,
     /// herdr panes and conversations already brought over, so importing
@@ -323,6 +541,16 @@ pub struct Prefs {
     /// empty, so an update from those versions shows them once.
     #[serde(default)]
     pub whats_new_seen_version: String,
+    /// Per-project [`NewAgentStart`], keyed by project id. Only opted-in
+    /// projects are written; everything else starts in the current checkout.
+    #[serde(default)]
+    pub new_agent_start: BTreeMap<String, NewAgentStart>,
+    /// Developer frame meter overlay (⌥⌘P). See `crate::perf_overlay`.
+    #[serde(default)]
+    pub perf_overlay: bool,
+    /// Developer per-view render counters (⌥⌘R).
+    #[serde(default)]
+    pub render_counters: bool,
 }
 
 impl Default for Prefs {
@@ -331,26 +559,34 @@ impl Default for Prefs {
             default_agent: AgentKind::CLAUDE_CODE,
             default_spawn_host: None,
             start_at_login: false,
+            ui_language: UiLanguage::System,
             confirm_before_closing_session: true,
             status_sounds: true,
             status_notifications: true,
             muted_notification_sessions: Default::default(),
+            conversation_titles: BTreeMap::new(),
             automatic_updates: true,
             skipped_update_version: String::new(),
+            update_channel: None,
             hibernate_after_minutes: 60,
             memory_hard_limit_gb: 16,
             hibernation_defaults_revision: Self::HIBERNATION_DEFAULTS_REVISION,
             terminal_theme: DEFAULT_THEME.to_owned(),
             follow_system_theme: false,
             terminal_font_size: 13.0,
+            terminal_font_family: String::new(),
+            terminal_line_height: terminal_line_height_default(),
             terminal_copy_on_select: false,
             terminal_open_links_on_click: true,
             terminal_hide_pointer: true,
+            terminal_shell_integration: true,
             terminal_file_editor: FileEditor::Automatic,
             terminal_follows_last_directory: true,
             terminal_paste_protection: false,
             window_material: WindowMaterial::Glass,
             window_transparency: window_transparency_default(),
+            interface_style: None,
+            pane_density: PaneDensity::Comfortable,
             window_placement: None,
             additional_windows: Vec::new(),
             sidebar_visible: false,
@@ -377,16 +613,39 @@ impl Default for Prefs {
             sidebar_expanded_archives: Vec::new(),
             launch_recipes: LaunchRecipeBook::default(),
             shortcut_overrides: BTreeMap::new(),
+            global_shortcut_key_code: None,
             last_selected_session: None,
             herdr_imported: Default::default(),
             whats_new_seen_version: crate::updates::CURRENT_VERSION.to_owned(),
+            new_agent_start: BTreeMap::new(),
+            perf_overlay: false,
+            render_counters: false,
         }
     }
 }
 
 impl Prefs {
+    pub fn new_agent_start(&self, project: &ProjectId) -> NewAgentStart {
+        self.new_agent_start
+            .get(&project.0)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Stores `start` for `project`, dropping the default so the file only
+    /// lists projects that opted in.
+    pub fn set_new_agent_start(&mut self, project: &ProjectId, start: NewAgentStart) {
+        if start == NewAgentStart::CurrentCheckout {
+            self.new_agent_start.remove(&project.0);
+        } else {
+            self.new_agent_start.insert(project.0.clone(), start);
+        }
+    }
+
     pub const MIN_TERMINAL_FONT_SIZE: f32 = 10.0;
     pub const MAX_TERMINAL_FONT_SIZE: f32 = 20.0;
+    pub const MIN_TERMINAL_LINE_HEIGHT: f32 = 1.0;
+    pub const MAX_TERMINAL_LINE_HEIGHT: f32 = 2.0;
 
     pub fn path() -> PathBuf {
         let home = diri_platform::home_dir()
@@ -457,6 +716,21 @@ impl Prefs {
         self.hibernation_defaults_revision = Self::HIBERNATION_DEFAULTS_REVISION;
     }
 
+    /// The interface style in effect. A stored style whose material no
+    /// longer matches `window_material` lost to a later material change (an
+    /// older diri, or a direct write), so the material decides.
+    pub fn interface_style(&self) -> InterfaceStyle {
+        match self.interface_style {
+            Some(style) if style.material() == self.window_material => style,
+            _ => InterfaceStyle::from_material(self.window_material),
+        }
+    }
+
+    pub fn set_interface_style(&mut self, style: InterfaceStyle) {
+        self.interface_style = Some(style);
+        self.window_material = style.material();
+    }
+
     pub fn apply_system_theme(&mut self, dark: bool) -> bool {
         if !self.follow_system_theme {
             return false;
@@ -486,6 +760,19 @@ impl Prefs {
         self.terminal_font_size = self
             .terminal_font_size
             .clamp(Self::MIN_TERMINAL_FONT_SIZE, Self::MAX_TERMINAL_FONT_SIZE);
+        self.terminal_line_height = if self.terminal_line_height.is_finite() {
+            // Tenths, so stepping by 0.1 never accumulates float drift.
+            ((self.terminal_line_height * 10.0).round() / 10.0).clamp(
+                Self::MIN_TERMINAL_LINE_HEIGHT,
+                Self::MAX_TERMINAL_LINE_HEIGHT,
+            )
+        } else {
+            terminal_line_height_default()
+        };
+        let family = self.terminal_font_family.trim();
+        if family.len() != self.terminal_font_family.len() {
+            self.terminal_font_family = family.to_owned();
+        }
         if self
             .window_placement
             .as_mut()
@@ -525,6 +812,88 @@ mod tests {
     use crate::launch_recipe::{LaunchRecipe, RecipeProject};
 
     #[test]
+    fn files_from_before_interface_styles_keep_their_material() {
+        let glass: Prefs = serde_json::from_str("{}").unwrap();
+        assert_eq!(glass.interface_style(), InterfaceStyle::Blended);
+        assert_eq!(glass.pane_density, PaneDensity::Comfortable);
+        let opaque: Prefs = serde_json::from_str(r#"{"windowMaterial":"opaque"}"#).unwrap();
+        assert_eq!(opaque.interface_style(), InterfaceStyle::Themed);
+    }
+
+    #[test]
+    fn a_chosen_style_round_trips_and_carries_its_material() {
+        for style in InterfaceStyle::ALL {
+            let mut prefs = Prefs::default();
+            prefs.set_interface_style(style);
+            prefs.pane_density = PaneDensity::Compact;
+            assert_eq!(prefs.window_material, style.material());
+            let read: Prefs =
+                serde_json::from_str(&serde_json::to_string(&prefs).unwrap()).unwrap();
+            assert_eq!(read.interface_style(), style);
+            assert_eq!(read.pane_density, PaneDensity::Compact);
+        }
+    }
+
+    #[test]
+    fn a_later_material_change_outranks_a_stale_style() {
+        // An older diri only knows the material; flipping it there must win.
+        let mut prefs = Prefs::default();
+        prefs.set_interface_style(InterfaceStyle::Modern);
+        prefs.window_material = WindowMaterial::Opaque;
+        assert_eq!(prefs.interface_style(), InterfaceStyle::Themed);
+    }
+
+    #[test]
+    fn unknown_density_and_style_names_fall_back() {
+        let prefs: Prefs = serde_json::from_str(r#"{"paneDensity":"airy"}"#).unwrap();
+        assert_eq!(prefs.pane_density, PaneDensity::Comfortable);
+        let prefs: Prefs = serde_json::from_str(r#"{"interfaceStyle":"neon"}"#).unwrap();
+        assert_eq!(prefs.interface_style(), InterfaceStyle::Blended);
+    }
+
+    #[test]
+    fn new_agents_start_in_the_current_checkout_unless_a_project_opts_in() {
+        let project = ProjectId("p".into());
+        let legacy: Prefs = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            legacy.new_agent_start(&project),
+            NewAgentStart::CurrentCheckout
+        );
+        assert_eq!(
+            Prefs::default().new_agent_start(&project),
+            NewAgentStart::CurrentCheckout
+        );
+
+        let mut prefs = Prefs::default();
+        prefs.set_new_agent_start(&project, NewAgentStart::FreshWorktree);
+        let json = serde_json::to_value(&prefs).unwrap();
+        assert_eq!(
+            json["newAgentStart"],
+            serde_json::json!({ "p": "freshWorktree" })
+        );
+        let restored: Prefs = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            restored.new_agent_start(&project),
+            NewAgentStart::FreshWorktree
+        );
+        assert_eq!(
+            restored.new_agent_start(&ProjectId("other".into())),
+            NewAgentStart::CurrentCheckout
+        );
+
+        // Turning it off removes the entry instead of writing the default.
+        prefs.set_new_agent_start(&project, NewAgentStart::CurrentCheckout);
+        assert!(prefs.new_agent_start.is_empty());
+        // A value from a newer build reads as the current checkout.
+        let future: Prefs =
+            serde_json::from_str(r#"{"newAgentStart":{"p":"somethingNew"}}"#).unwrap();
+        assert_eq!(
+            future.new_agent_start(&project),
+            NewAgentStart::CurrentCheckout
+        );
+    }
+
+    #[test]
     fn system_appearance_is_opt_in_persisted_and_only_changes_with_the_os() {
         let mut prefs: Prefs = serde_json::from_str(r#"{"terminalTheme":"vesper"}"#).unwrap();
         assert!(!prefs.follow_system_theme);
@@ -544,6 +913,53 @@ mod tests {
         restored.follow_system_theme = false;
         assert!(!restored.apply_system_theme(false));
         assert_eq!(restored.terminal_theme, "dirijor-dark");
+    }
+
+    #[test]
+    fn ui_language_persists_as_a_tag_and_unknown_tags_follow_the_system() {
+        let legacy: Prefs = serde_json::from_str("{}").unwrap();
+        assert_eq!(legacy.ui_language, UiLanguage::System);
+        let chinese = Prefs {
+            ui_language: UiLanguage::Fixed(diri_i18n::Language::SimplifiedChinese),
+            ..Prefs::default()
+        };
+        let json = serde_json::to_value(&chinese).unwrap();
+        assert_eq!(json["uiLanguage"], "zh-Hans");
+        let restored: Prefs = serde_json::from_value(json).unwrap();
+        assert_eq!(restored.ui_language, chinese.ui_language);
+        // A language a newer diri added reads as System here, not an error
+        // that would discard every other preference.
+        let newer: Prefs =
+            serde_json::from_str(r#"{"uiLanguage":"ja","statusSounds":false}"#).unwrap();
+        assert_eq!(newer.ui_language, UiLanguage::System);
+        assert!(!newer.status_sounds);
+    }
+
+    #[test]
+    fn terminal_typography_defaults_round_trips_and_repairs() {
+        let legacy: Prefs = serde_json::from_str(r#"{"terminalFontSize":14}"#).unwrap();
+        assert_eq!(legacy.terminal_font_family, "");
+        assert_eq!(legacy.terminal_line_height, 1.0);
+
+        let mut prefs = Prefs {
+            terminal_font_family: "  JetBrains Mono ".to_owned(),
+            terminal_line_height: 1.2999,
+            ..legacy
+        };
+        prefs.normalize();
+        assert_eq!(prefs.terminal_font_family, "JetBrains Mono");
+        assert_eq!(prefs.terminal_line_height, 1.3);
+        let restored: Prefs = serde_json::from_slice(&serde_json::to_vec(&prefs).unwrap()).unwrap();
+        assert_eq!(restored, prefs);
+
+        for (stored, repaired) in [(f32::NAN, 1.0), (0.4, 1.0), (9.0, 2.0)] {
+            let mut prefs = Prefs {
+                terminal_line_height: stored,
+                ..Prefs::default()
+            };
+            prefs.normalize();
+            assert_eq!(prefs.terminal_line_height, repaired);
+        }
     }
 
     #[test]
@@ -705,6 +1121,41 @@ mod tests {
         assert_eq!(
             restored.launch_recipes.items(),
             prefs.launch_recipes.items()
+        );
+    }
+
+    #[test]
+    fn update_channel_defaults_to_the_build_and_persists_a_choice() {
+        use diri_updater::UpdateChannel;
+
+        let legacy: Prefs = serde_json::from_str("{}").unwrap();
+        assert_eq!(legacy.update_channel, None);
+        assert_eq!(
+            legacy.effective_update_channel(),
+            UpdateChannel::for_version(crate::updates::CURRENT_VERSION)
+        );
+        assert!(
+            serde_json::to_value(&legacy)
+                .unwrap()
+                .get("updateChannel")
+                .is_none()
+        );
+
+        let prefs = Prefs {
+            update_channel: Some(UpdateChannel::Nightly),
+            ..Prefs::default()
+        };
+        let json = serde_json::to_value(&prefs).unwrap();
+        assert_eq!(json["updateChannel"], "nightly");
+        let restored: Prefs = serde_json::from_value(json).unwrap();
+        assert_eq!(restored.effective_update_channel(), UpdateChannel::Nightly);
+
+        let future: Prefs =
+            serde_json::from_str(r#"{"updateChannel":"beta","automaticUpdates":false}"#).unwrap();
+        assert_eq!(future.update_channel, None);
+        assert!(
+            !future.automatic_updates,
+            "the rest of the file still loads"
         );
     }
 }

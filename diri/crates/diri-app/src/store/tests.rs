@@ -14,9 +14,10 @@ use tokio::sync::mpsc;
 use crate::notifications::NotificationSound;
 
 use super::{
-    ClickModifiers, ClientStartup, EventEnvelope, InspectorTab, Prefs, SavedWindow, SessionStore,
-    SidebarOrdering, SidebarProjection, StoreEffect, StoreEventChange, StoreRuntime,
-    TerminalResidency, WindowMode, WindowPlacement, event_publication_policy, now_millis,
+    ClickModifiers, ClientStartup, EventEnvelope, InspectorTab, Prefs, ResumeAllProgress,
+    SavedWindow, SessionStore, SidebarOrdering, SidebarProjection, StoreEffect, StoreEventChange,
+    StoreRuntime, TerminalResidency, WindowMode, WindowPlacement, event_publication_policy,
+    now_millis,
 };
 use crate::switcher::{OverviewFilter, OverviewLane, SwitcherKey};
 
@@ -65,9 +66,11 @@ pub(super) fn session(value: &str, project: &str, created: f64) -> SessionRecord
         listening_ports: None,
         foreground_agent: None,
         terminal_cwd: None,
+        agent_workspace: None,
         note_id: None,
         foreground_ports: None,
         terminal_progress: None,
+        scheduled_run: None,
     }
 }
 
@@ -252,6 +255,8 @@ fn overview_store_integration_filters_selects_and_bulk_closes() {
         reason: ExitReason::Exited,
         code: Some(0),
         signal: None,
+        system_restart: false,
+        interrupted: false,
     });
     let (mut store, mut effects) =
         hydrated(vec![live, ended], vec![project("a", "A")], Prefs::default());
@@ -1043,6 +1048,8 @@ fn auto_resume_is_attempted_once_per_run() {
         reason: ExitReason::DaemonRestart,
         code: None,
         signal: None,
+        system_restart: false,
+        interrupted: false,
     });
     record.resumability = Resumability::Resumable;
     let (mut store, mut effects) = hydrated(
@@ -1069,6 +1076,57 @@ fn auto_resume_is_attempted_once_per_run() {
     assert!(drain(&mut effects).is_empty());
 }
 
+/// 2026-10-04: force-quitting a Chrome an Agent had launched killed every
+/// session; each read as an ordinary exit and needed its own Resume click.
+/// An interrupted exit comes back like a restart-ended one, and joins Resume
+/// all; the Agent's own exit does neither.
+#[test]
+fn an_interrupted_session_auto_resumes_and_joins_resume_all() {
+    let ended = |value: &str, created: f64, interrupted: bool| {
+        let mut record = session(value, "p", created);
+        record.status = SessionStatus::Exited(ExitInfo {
+            reason: ExitReason::Signaled,
+            code: None,
+            signal: Some(15),
+            system_restart: false,
+            interrupted,
+        });
+        record.resumability = Resumability::Resumable;
+        record
+    };
+    // Rows arrive at the bottom, so the cold-boot selection is the oldest.
+    let (mut store, mut effects) = hydrated(
+        vec![
+            ended("killed", 1.0, true),
+            ended("other", 2.0, true),
+            ended("finished", 3.0, false),
+        ],
+        vec![project("p", "P")],
+        Prefs::default(),
+    );
+    let automatic = |effects: &mut _| -> Vec<SessionId> {
+        drain(effects)
+            .into_iter()
+            .filter_map(|effect| match effect {
+                StoreEffect::Resume {
+                    id,
+                    automatic: true,
+                } => Some(id),
+                _ => None,
+            })
+            .collect()
+    };
+
+    assert_eq!(store.selected_session_id(), Some(&id("killed")));
+    assert_eq!(automatic(&mut effects), vec![id("killed")]);
+    assert_eq!(store.restart_ended_resumable(), vec![id("other")]);
+
+    store.select(id("finished"));
+    assert!(automatic(&mut effects).is_empty());
+    store.select(id("other"));
+    assert_eq!(automatic(&mut effects), vec![id("other")]);
+}
+
 #[test]
 fn cold_boot_only_auto_resumes_the_selected_session() {
     let restart_session = |value: &str, created: f64| {
@@ -1077,6 +1135,8 @@ fn cold_boot_only_auto_resumes_the_selected_session() {
             reason: ExitReason::DaemonRestart,
             code: None,
             signal: None,
+            system_restart: false,
+            interrupted: false,
         });
         record.resumability = Resumability::Resumable;
         record
@@ -1136,6 +1196,8 @@ fn close_confirmation_only_gates_running_sessions() {
         reason: ExitReason::Exited,
         code: Some(0),
         signal: None,
+        system_restart: false,
+        interrupted: false,
     });
     let (mut store, mut effects) = hydrated(
         vec![running, exited],
@@ -1163,6 +1225,8 @@ fn exited_parent_with_terminal(terminal_running: bool) -> Vec<SessionRecord> {
         reason: ExitReason::Exited,
         code: Some(1),
         signal: None,
+        system_restart: false,
+        interrupted: false,
     });
     let mut parent = session("parent", "p", 2.0);
     parent.status = exit.clone();
@@ -1278,6 +1342,8 @@ fn a_real_process_exit_immediately_detaches_and_removes_the_agent() {
         reason: ExitReason::Exited,
         code: Some(0),
         signal: None,
+        system_restart: false,
+        interrupted: false,
     });
     store.upsert_session(exited);
 
@@ -1304,6 +1370,8 @@ fn a_clean_exit_with_a_conversation_keeps_its_row() {
         reason: ExitReason::Exited,
         code: Some(0),
         signal: None,
+        system_restart: false,
+        interrupted: false,
     });
     exited.agent_session_id = Some("conversation".into());
     exited.resumability = Resumability::NotResumable;
@@ -1331,6 +1399,8 @@ fn a_signalled_agent_keeps_its_row_and_its_scrollback() {
         reason: ExitReason::Signaled,
         code: None,
         signal: Some(15),
+        system_restart: false,
+        interrupted: false,
     });
     store.upsert_session(killed);
 
@@ -1342,11 +1412,11 @@ fn a_signalled_agent_keeps_its_row_and_its_scrollback() {
     assert_eq!(store.ordered_sessions().len(), 1);
 }
 
-/// A conversation that can be re-entered is the case every Resume affordance
-/// exists for. Removing the row on exit makes the exit pill, the resume card
-/// and the sidebar entry unreachable.
+/// Quitting a running agent (`/exit`, ^D) is the user ending the session, the
+/// way `exit` ends a shell's. Its record goes to the Engine's recently closed
+/// list, where ⇧⌘T reopens it and Resume continues the conversation.
 #[test]
-fn an_exited_but_resumable_agent_stays_listed_for_resume() {
+fn quitting_a_resumable_agent_closes_its_tab() {
     let (mut store, mut effects) = hydrated(
         vec![session("one", "p", 1.0)],
         vec![project("p", "P")],
@@ -1359,6 +1429,67 @@ fn an_exited_but_resumable_agent_stays_listed_for_resume() {
         reason: ExitReason::Exited,
         code: Some(0),
         signal: None,
+        system_restart: false,
+        interrupted: false,
+    });
+    exited.agent_session_id = Some("conversation".into());
+    exited.resumability = Resumability::Resumable;
+    store.upsert_session(exited);
+
+    let emitted = drain(&mut effects);
+    assert!(emitted.contains(&StoreEffect::Remove(id("one"))));
+    assert!(store.ordered_sessions().is_empty());
+}
+
+/// Closing a tab closes its ⌘J terminals with it, so quitting the agent must
+/// not take a running one (a dev server) along without asking.
+#[test]
+fn quitting_an_agent_keeps_its_tab_while_a_terminal_under_it_runs() {
+    let mut terminal = session("terminal", "p", 2.0);
+    terminal.kind = AgentKind::SHELL;
+    terminal.parent = Some(id("one"));
+    let (mut store, mut effects) = hydrated(
+        vec![session("one", "p", 1.0), terminal],
+        vec![project("p", "P")],
+        Prefs::default(),
+    );
+    drain(&mut effects);
+
+    let mut exited = session("one", "p", 1.0);
+    exited.status = SessionStatus::Exited(ExitInfo {
+        reason: ExitReason::Exited,
+        code: Some(0),
+        signal: None,
+        system_restart: false,
+        interrupted: false,
+    });
+    exited.agent_session_id = Some("conversation".into());
+    exited.resumability = Resumability::Resumable;
+    store.upsert_session(exited);
+
+    let emitted = drain(&mut effects);
+    assert!(!emitted.contains(&StoreEffect::Remove(id("one"))));
+    assert!(!emitted.contains(&StoreEffect::Remove(id("terminal"))));
+}
+
+/// An agent that exits 0 before it ever reached a prompt did not get quit:
+/// the launch failed quietly, and its screen is the only explanation. It stays
+/// listed with its exit pill and Resume button.
+#[test]
+fn a_resumable_agent_that_exits_while_starting_stays_listed_for_resume() {
+    let mut starting = session("one", "p", 1.0);
+    starting.status = SessionStatus::Starting;
+    let (mut store, mut effects) =
+        hydrated(vec![starting], vec![project("p", "P")], Prefs::default());
+    drain(&mut effects);
+
+    let mut exited = session("one", "p", 1.0);
+    exited.status = SessionStatus::Exited(ExitInfo {
+        reason: ExitReason::Exited,
+        code: Some(0),
+        signal: None,
+        system_restart: false,
+        interrupted: false,
     });
     exited.resumability = Resumability::Resumable;
     store.upsert_session(exited);
@@ -1366,7 +1497,7 @@ fn an_exited_but_resumable_agent_stays_listed_for_resume() {
     let emitted = drain(&mut effects);
     assert!(
         !emitted.contains(&StoreEffect::Remove(id("one"))),
-        "a resumable conversation must stay listed"
+        "a launch that never started must stay listed"
     );
     assert_eq!(store.ordered_sessions().len(), 1);
 }
@@ -1387,6 +1518,8 @@ fn a_nonzero_exit_keeps_its_row() {
         reason: ExitReason::Exited,
         code: Some(1),
         signal: None,
+        system_restart: false,
+        interrupted: false,
     });
     store.upsert_session(crashed);
 
@@ -1412,6 +1545,8 @@ fn daemon_restart_exit_remains_available_for_automatic_resume() {
         reason: ExitReason::DaemonRestart,
         code: None,
         signal: None,
+        system_restart: false,
+        interrupted: false,
     });
     restart.resumability = Resumability::Resumable;
     store.upsert_session(restart);
@@ -1713,6 +1848,7 @@ fn a_configure_issued_during_an_inflight_scan_still_reaches_the_engine() {
         kind: AgentKind::CLAUDE_CODE,
         executable_path: None,
         show_in_quick_create: false,
+        launch_args: None,
     });
     assert!(matches!(
         effects.try_recv(),
@@ -2243,6 +2379,7 @@ fn remote_spawn_uses_host_default_cwd_and_drops_worktree() {
             worktree: Some(super::WorktreeSpawn {
                 create: true,
                 branch: None,
+                base: None,
             }),
             ..super::SpawnOptions::default()
         },
@@ -2714,6 +2851,9 @@ struct FakeRemoveEngine {
     _home: tempfile::TempDir,
     socket: std::path::PathBuf,
     removes: Arc<std::sync::atomic::AtomicUsize>,
+    /// A `host.locate_repo` request the Engine has read and not yet answered,
+    /// the way a lookup against a slow host sits while other requests flow.
+    held_lookup: Arc<std::sync::Mutex<Option<(u64, std::os::unix::net::UnixStream)>>>,
 }
 
 impl FakeRemoveEngine {
@@ -2729,6 +2869,8 @@ impl FakeRemoveEngine {
         let removes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let sessions = Arc::new(std::sync::Mutex::new(sessions));
         let remove_count = Arc::clone(&removes);
+        let held_lookup = Arc::new(std::sync::Mutex::new(None));
+        let holding = Arc::clone(&held_lookup);
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { return };
@@ -2777,6 +2919,11 @@ impl FakeRemoveEngine {
                                 }
                             }
                         }
+                        Method::HOST_LOCATE_REPO => {
+                            let writer = writer.try_clone().expect("clone fake Engine stream");
+                            *holding.lock().expect("held lookup") = Some((id, writer));
+                            continue;
+                        }
                         _ => Err(ControlError::bad_request("unsupported by the fake Engine")),
                     };
                     let mut bytes = serde_json::to_vec(&ControlMessage::Response { id, result })
@@ -2792,7 +2939,32 @@ impl FakeRemoveEngine {
             _home: home,
             socket,
             removes,
+            held_lookup,
         }
+    }
+
+    fn is_holding_a_lookup(&self) -> bool {
+        self.held_lookup.lock().expect("held lookup").is_some()
+    }
+
+    fn answer_held_lookup(&self, path: &str) {
+        use std::io::Write as _;
+
+        let (id, mut writer) = self
+            .held_lookup
+            .lock()
+            .expect("held lookup")
+            .take()
+            .expect("a held lookup");
+        let result = Ok(serde_json::to_value(diri_proto::HostLocateRepoResult {
+            path: Some(path.to_owned()),
+            origin_url: None,
+        })
+        .expect("locate result"));
+        let mut bytes = serde_json::to_vec(&diri_proto::ControlMessage::Response { id, result })
+            .expect("encode response");
+        bytes.push(b'\n');
+        writer.write_all(&bytes).expect("answer the held lookup");
     }
 
     async fn runtime(&self) -> StoreRuntime {
@@ -2868,6 +3040,65 @@ async fn a_rejected_close_restores_the_retained_session_and_allows_a_retry() {
     }
     eventually("the second close reaches the Engine", || {
         engine.removes.load(Ordering::SeqCst) == 2
+    })
+    .await;
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slow_repository_lookup_does_not_hold_up_an_unrelated_close() {
+    use std::sync::atomic::Ordering;
+
+    let engine = FakeRemoveEngine::start(
+        vec![session("one", "p", 2.0), session("two", "p", 1.0)],
+        FakeRemove::Reject,
+    );
+    let runtime = engine.runtime().await;
+    let store = Arc::clone(&runtime.store);
+    let forge = Some("forge".to_owned());
+
+    {
+        let mut store = store.write().unwrap();
+        store.select(id("two"));
+        store.begin_repo_targeting();
+        store.request_repo_target(forge.clone());
+    }
+    eventually("the lookup reaches the Engine", || {
+        engine.is_holding_a_lookup()
+    })
+    .await;
+
+    // Every control below is queued behind the lookup the Engine is sitting on.
+    let mut detachments = runtime.detachments();
+    {
+        let mut store = store.write().unwrap();
+        store.select(id("one"));
+        store.request_close(vec![id("one")]);
+    }
+    eventually("the close reaches the Engine and is settled", || {
+        engine.removes.load(Ordering::SeqCst) == 1
+            && store.read().unwrap().action_failure().is_some()
+    })
+    .await;
+    let mut detached = Vec::new();
+    while let Ok(id) = detachments.try_recv() {
+        detached.push(id);
+    }
+    assert!(
+        detached.contains(&id("one")),
+        "the closed session's terminal was not told to detach: {detached:?}"
+    );
+    assert!(engine.is_holding_a_lookup(), "the lookup was never slow");
+    assert_eq!(
+        store.read().unwrap().repo_target(forge.as_deref()),
+        Some(&super::RepoTarget::Pending)
+    );
+
+    engine.answer_held_lookup("/srv/code/diri");
+    eventually("the lookup still lands once the host answers", || {
+        store.read().unwrap().repo_target(forge.as_deref())
+            == Some(&super::RepoTarget::Resolved("/srv/code/diri".to_owned()))
     })
     .await;
 
@@ -3435,11 +3666,11 @@ async fn herdr_import_runner_remembers_only_what_opened_and_reports_failures() {
         .expect("summary banner")
         .in_app_banner
         .expect("in-app banner");
-    assert_eq!(banner.title, "Moved 5 of 6 sessions from herdr");
+    assert_eq!(banner.message, "Moved 5 of 6 sessions from herdr");
+    let detail = banner.detail.expect("first failure");
     assert!(
-        banner.body.contains("no manifest for agent opencode"),
-        "{}",
-        banner.body
+        detail.contains("no manifest for agent opencode"),
+        "{detail}"
     );
 }
 
@@ -3448,8 +3679,10 @@ fn a_new_terminal_starts_where_the_last_terminal_in_its_project_was() {
     let terminal = |value: &str, project: &str, cwd: &str| SessionRecord {
         kind: AgentKind::SHELL,
         terminal_cwd: Some(cwd.to_owned()),
+        agent_workspace: None,
         note_id: None,
         terminal_progress: None,
+        scheduled_run: None,
         ..session(value, project, 2.0)
     };
     let (mut store, mut effects) = hydrated(
@@ -3507,8 +3740,10 @@ fn only_terminals_carry_a_location_for_their_hover() {
     let mut terminal = SessionRecord {
         kind: AgentKind::SHELL,
         terminal_cwd: Some("/work/p/web".into()),
+        agent_workspace: None,
         note_id: None,
         terminal_progress: None,
+        scheduled_run: None,
         ..session("term", "p", 1.0)
     };
     assert_eq!(
@@ -3557,6 +3792,39 @@ fn a_reveal_request_selects_the_session() {
 }
 
 #[test]
+fn an_agents_api_request_waits_for_the_window_to_open_it() {
+    let agent = session("codex", "p", 1.0);
+    let (mut store, _effects) = hydrated(
+        vec![agent.clone()],
+        vec![project("p", "P")],
+        Prefs::default(),
+    );
+    let event = |session: &str, method: &str| EventEnvelope {
+        name: diri_proto::EventName::SESSION_API_REQUEST.into(),
+        params: serde_json::json!({
+            "sessionID": session,
+            "request": {"method": method, "url": "http://localhost:3000/items"}
+        }),
+        seq: 2,
+    };
+    store.handle_event(event(&agent.id.0, "POST"));
+    // Unknown sessions and invalid drafts never reach the UI.
+    store.handle_event(event("s_gone", "GET"));
+    store.handle_event(event(&agent.id.0, "TRACE"));
+    assert!(store.has_pending_ui_request());
+    let requests = store.take_api_requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].session_id, agent.id);
+    assert_eq!(requests[0].request.method, "POST");
+    assert!(!store.has_pending_ui_request());
+    // A burst keeps only the newest few.
+    for _ in 0..20 {
+        store.handle_event(event(&agent.id.0, "GET"));
+    }
+    assert_eq!(store.take_api_requests().len(), 8);
+}
+
+#[test]
 fn opening_a_note_file_spawns_a_note_session_that_adopts_it() {
     let (mut store, mut effects) = SessionStore::headless(Prefs::default());
     store.open_note_file(
@@ -3568,4 +3836,468 @@ fn opening_a_note_file_spawns_a_note_session_that_adopts_it() {
     };
     assert_eq!(params.kind, AgentKind::NOTE);
     assert_eq!(params.note_id.as_deref(), Some("20261001-090000-abcd"));
+}
+
+/// A note an agent wrote is the user's, not the agent's: closing, archiving,
+/// or losing the agent leaves the note in the sidebar at the agent's place.
+#[test]
+fn a_note_outlives_the_agent_that_wrote_it() {
+    let mut note = session("note", "p", 2.0);
+    note.kind = AgentKind::new(AgentKind::NOTE_ID);
+    note.note_id = Some("n-1".into());
+    note.parent = Some(id("agent"));
+    let visible = |store: &mut SessionStore| {
+        let projection = store.sidebar_projection();
+        projection
+            .projects
+            .iter()
+            .flat_map(|group| group.sessions.iter())
+            .map(|row| (row.id().clone(), row.depth))
+            .collect::<Vec<_>>()
+    };
+
+    let (mut store, mut effects) = hydrated(
+        vec![session("agent", "p", 1.0), note.clone()],
+        vec![project("p", "P")],
+        Prefs::default(),
+    );
+    drain(&mut effects);
+    store.request_close(vec![id("agent")]);
+    store.confirm_pending_close();
+    let removed: Vec<_> = drain(&mut effects)
+        .into_iter()
+        .filter_map(|effect| match effect {
+            StoreEffect::Remove(id) => Some(id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        removed,
+        vec![id("agent")],
+        "closing the agent never closes its note"
+    );
+    assert_eq!(visible(&mut store), vec![(id("note"), 0)]);
+    store.remove_session_record(&id("agent"));
+    assert_eq!(visible(&mut store), vec![(id("note"), 0)]);
+
+    let (mut store, _) = hydrated(
+        vec![session("agent", "p", 1.0), note.clone()],
+        vec![project("p", "P")],
+        Prefs::default(),
+    );
+    store.archive_sessions(vec![id("agent")]);
+    assert_eq!(visible(&mut store), vec![(id("note"), 0)]);
+
+    let mut exited = session("agent", "p", 1.0);
+    exited.status = SessionStatus::Exited(ExitInfo {
+        reason: ExitReason::Signaled,
+        code: None,
+        signal: Some(9),
+        system_restart: false,
+        interrupted: false,
+    });
+    let (mut store, _) = hydrated(
+        vec![exited, note],
+        vec![project("p", "P")],
+        Prefs::default(),
+    );
+    assert!(visible(&mut store).contains(&(id("note"), 1)));
+}
+
+fn restart_ended(value: &str, created: f64, system_restart: bool) -> SessionRecord {
+    let mut record = session(value, "p", created);
+    record.status = SessionStatus::Exited(ExitInfo::restart(system_restart));
+    record.resumability = Resumability::Resumable;
+    record
+}
+
+/// "Resume all" brings back exactly the sessions a restart ended that can
+/// resume, newest first, in one batch effect; a second request while it runs,
+/// or selecting a queued tab, resumes nothing twice.
+#[test]
+fn resume_all_batches_every_restart_ended_session_once() {
+    let mut selected = session("selected", "p", 0.5);
+    selected.status = SessionStatus::Idle;
+    let mut archived = restart_ended("archived", 2.0, true);
+    archived.archived_at = Some(DateMillis(9.0));
+    let mut crashed = restart_ended("crashed", 3.0, false);
+    crashed.status = SessionStatus::Exited(ExitInfo {
+        reason: ExitReason::Exited,
+        code: Some(1),
+        signal: None,
+        system_restart: false,
+        interrupted: false,
+    });
+    let mut no_conversation = restart_ended("no-conversation", 4.0, true);
+    no_conversation.resumability = Resumability::NotResumable;
+    let (mut store, mut effects) = hydrated(
+        vec![
+            selected,
+            restart_ended("rebooted", 5.0, true),
+            restart_ended("daemon", 6.0, false),
+            archived,
+            crashed,
+            no_conversation,
+        ],
+        vec![project("p", "P")],
+        Prefs::default(),
+    );
+    assert_eq!(store.selected_session_id(), Some(&id("selected")));
+    drain(&mut effects);
+
+    assert_eq!(store.resume_all_offer(), Some(2));
+    assert_eq!(store.resume_all(), 2);
+    let batches: Vec<_> = drain(&mut effects)
+        .into_iter()
+        .filter_map(|effect| match effect {
+            StoreEffect::ResumeAll(ids) => Some(ids),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(batches, vec![vec![id("daemon"), id("rebooted")]]);
+    assert!(store.auto_resuming().contains(&id("rebooted")));
+    assert_eq!(
+        store.resume_all_progress(),
+        Some(ResumeAllProgress {
+            total: 2,
+            finished: 0
+        })
+    );
+
+    assert_eq!(store.resume_all_offer(), None, "one batch at a time");
+    assert_eq!(store.resume_all(), 0);
+    store.select(id("rebooted"));
+    assert!(!store.auto_resume_if_needed(&id("rebooted")));
+    assert!(
+        drain(&mut effects)
+            .iter()
+            .all(|effect| !matches!(effect, StoreEffect::Resume { .. })),
+        "a queued tab is not resumed a second time"
+    );
+
+    store.finish_resume_all_one(&id("daemon"));
+    assert!(!store.auto_resuming().contains(&id("daemon")));
+    assert_eq!(store.resume_all_progress().map(|p| p.finished), Some(1));
+}
+
+/// One restart-ended session already has its own Resume; "all" is offered
+/// only when there is more than one, and never for one being auto-resumed.
+#[test]
+fn resume_all_is_offered_only_for_several_sessions() {
+    let (store, mut effects) = hydrated(
+        vec![
+            restart_ended("first", 1.0, true),
+            restart_ended("second", 2.0, true),
+        ],
+        vec![project("p", "P")],
+        Prefs::default(),
+    );
+    // Selecting `first` auto-resumed it, which leaves one for the batch.
+    assert!(store.auto_resuming().contains(&id("first")));
+    drain(&mut effects);
+    assert_eq!(store.restart_ended_resumable(), vec![id("second")]);
+    assert_eq!(store.resume_all_offer(), None);
+}
+
+/// A session counts as back once it has left both `Starting` and the exit it
+/// was resumed from; a fresh exit of its own also frees the batch.
+#[test]
+fn a_resumed_session_settles_once_it_reports_a_new_state() {
+    let (mut store, _effects) = hydrated(
+        vec![restart_ended("rebooted", 1.0, true)],
+        vec![project("p", "P")],
+        Prefs::default(),
+    );
+    assert!(!store.resume_settled(&id("rebooted")));
+    let mut record = (**store.sessions().get(&id("rebooted")).unwrap()).clone();
+    record.status = SessionStatus::Starting;
+    store.upsert_session(record.clone());
+    assert!(!store.resume_settled(&id("rebooted")));
+    record.status = SessionStatus::Idle;
+    store.upsert_session(record);
+    assert!(store.resume_settled(&id("rebooted")));
+    assert!(store.resume_settled(&id("gone")));
+}
+
+#[test]
+fn new_agents_start_in_the_launch_checkout_and_carry_a_worktree_base() {
+    let (mut store, mut effects) = hydrated(
+        vec![session("one", "p", 1.0)],
+        vec![project("p", "Project")],
+        Prefs::default(),
+    );
+    store.select(id("one"));
+    drain(&mut effects);
+    let spawned_cwd =
+        |effects: &mut mpsc::UnboundedReceiver<StoreEffect>| match drain(effects).first() {
+            Some(StoreEffect::Spawn(params)) => params.clone(),
+            other => panic!("expected spawn effect, got {other:?}"),
+        };
+
+    // New Sessions start where the source was launched.
+    store.spawn_kind(AgentKind::CLAUDE_CODE, super::SpawnOptions::default());
+    assert_eq!(spawned_cwd(&mut effects).cwd, "/work/p");
+
+    // Fresh worktrees are opt-in per project and pass their base through.
+    assert_eq!(store.fresh_worktree_repo(Some(&id("one"))), None);
+    store
+        .toggle_project_fresh_worktree(pid("p"))
+        .expect("prefs");
+    assert_eq!(
+        store.fresh_worktree_repo(Some(&id("one"))).as_deref(),
+        Some("/work/p")
+    );
+    store.spawn_kind(
+        AgentKind::CLAUDE_CODE,
+        super::SpawnOptions {
+            cwd: Some("/work/p".into()),
+            worktree: Some(super::WorktreeSpawn {
+                create: true,
+                branch: None,
+                base: Some("origin/main".into()),
+            }),
+            ..super::SpawnOptions::default()
+        },
+    );
+    let params = spawned_cwd(&mut effects);
+    assert_eq!(params.new_worktree, Some(true));
+    assert_eq!(params.worktree_base.as_deref(), Some("origin/main"));
+}
+
+/// A closed row stays in `sessions` until the Engine confirms the removal.
+/// Selecting it in that window (a late click, a view still pointing at it)
+/// must not focus it or send `session.mark_seen` for a session the Engine has
+/// already dropped.
+#[test]
+fn a_closing_session_cannot_be_selected_or_marked_seen() {
+    let (mut store, mut effects) = hydrated(
+        vec![session("a", "p", 2.0), session("b", "p", 1.0)],
+        vec![project("p", "P")],
+        Prefs::default(),
+    );
+    store.select(id("a"));
+    store.remove_sessions(vec![id("a")]);
+    drain(&mut effects);
+
+    store.select(id("a"));
+
+    assert_ne!(store.selected_session_id(), Some(&id("a")));
+    assert!(
+        !drain(&mut effects).contains(&StoreEffect::MarkSeen(id("a"))),
+        "a closing session must not be marked seen"
+    );
+}
+
+/// #721: History finds a conversation by the name the user gave it after the
+/// tab closes, and the Agent's own later titles never take that name back.
+#[test]
+fn a_user_rename_outlives_its_tab_for_history() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("prefs.json");
+    let (mut store, _effects) = SessionStore::load(&path).unwrap();
+    let mut record = session("a", "p", 1.0);
+    record.agent_session_id = Some("conversation".into());
+    store.upsert_session(record.clone());
+    assert!(store.preferences().conversation_titles.is_empty());
+
+    store.rename(id("a"), "  Billing refactor ");
+    store.remove_session_record(&id("a"));
+    record.title = "Agent title".into();
+    record.title_source = TitleSource::AgentProvided;
+    store.upsert_session(record);
+
+    let titles = Prefs::load(&path).unwrap().conversation_titles;
+    assert_eq!(
+        titles.get("conversation").map(String::as_str),
+        Some("Billing refactor")
+    );
+}
+
+#[test]
+fn an_opened_link_runs_its_argv_in_a_local_terminal_even_with_a_remote_default() {
+    let (mut store, mut effects) = hydrated(
+        vec![session("local", "p", 1.0)],
+        vec![project("p", "P")],
+        Prefs {
+            default_spawn_host: Some("forge".into()),
+            ..Prefs::default()
+        },
+    );
+    drain(&mut effects);
+
+    // What `RootView::open_external` sends for `ssh://me@host`.
+    store.spawn_shell(super::SpawnOptions {
+        cwd: Some("/Users/me".into()),
+        title: Some("ssh me@host".into()),
+        argv: Some(vec![
+            "/usr/bin/ssh".into(),
+            "-l".into(),
+            "me".into(),
+            "--".into(),
+            "host".into(),
+        ]),
+        ..super::SpawnOptions::default()
+    });
+
+    let params = match effects.try_recv() {
+        Ok(StoreEffect::Spawn(params)) => params,
+        other => panic!("expected spawn effect, got {other:?}"),
+    };
+    assert_eq!(params.kind, AgentKind::SHELL);
+    assert_eq!(params.host, None, "a link names a program on this Mac");
+    assert_eq!(params.cwd, "/Users/me");
+    assert_eq!(params.initial_prompt, None, "nothing is typed into a shell");
+    assert_eq!(
+        params.argv.as_deref(),
+        Some(&["/usr/bin/ssh", "-l", "me", "--", "host"].map(String::from)[..])
+    );
+}
+
+#[test]
+fn an_unopenable_link_is_reported_without_spawning() {
+    let (mut store, mut effects) = SessionStore::headless(Prefs::default());
+    store.report_open_failure("bad host".into());
+    let failure = store.action_failure().expect("failure shown");
+    assert_eq!(failure.detail, "bad host");
+    assert!(!failure.can_retry());
+    assert!(!matches!(effects.try_recv(), Ok(StoreEffect::Spawn(_))));
+}
+
+mod split_panes {
+    use super::*;
+    use diri_proto::workspace::{
+        DockEdge, LayoutAxis, LayoutNode, PaneId, SpawnPane, SplitId, TabId, WorkspaceId,
+        WorkspaceRecord, WorkspaceSnapshot, WorkspaceTab,
+    };
+
+    fn pane_shell(value: &str, parent: &str, created: f64) -> SessionRecord {
+        let mut shell = session(value, "p", created);
+        shell.kind = AgentKind::SHELL;
+        shell.parent = Some(id(parent));
+        shell
+    }
+
+    fn leaf(pane: &str, session: &str) -> LayoutNode {
+        LayoutNode::Pane {
+            id: PaneId::new(pane),
+            session_id: id(session),
+        }
+    }
+
+    /// Agent "one" with "shown" docked below it; "hidden" runs unplaced.
+    fn split_store() -> (SessionStore, mpsc::UnboundedReceiver<StoreEffect>) {
+        let (mut store, effects) = hydrated(
+            vec![
+                session("one", "p", 1.0),
+                pane_shell("shown", "one", 2.0),
+                pane_shell("hidden", "one", 3.0),
+                session("two", "p", 4.0),
+            ],
+            vec![project("p", "Project")],
+            Prefs::default(),
+        );
+        store.seed_workspace_snapshot_for_test(WorkspaceSnapshot {
+            revision: 1,
+            workspaces: vec![WorkspaceRecord {
+                project_id: None,
+                id: WorkspaceId::new("w"),
+                name: "Project".into(),
+                selected_tab: Some(TabId::new("t")),
+                tabs: vec![WorkspaceTab {
+                    id: TabId::new("t"),
+                    title: None,
+                    focused_pane: PaneId::new("agent"),
+                    zoomed_pane: None,
+                    layout: LayoutNode::Split {
+                        id: SplitId::new("s"),
+                        axis: LayoutAxis::Vertical,
+                        fraction: 0.6,
+                        first: Box::new(leaf("agent", "one")),
+                        second: Box::new(leaf("terminal", "shown")),
+                    },
+                }],
+            }],
+            ..Default::default()
+        });
+        (store, effects)
+    }
+
+    #[test]
+    fn a_pane_shell_belongs_to_its_parent_row() {
+        let (mut store, _) = split_store();
+        assert_eq!(store.pane_owner(&id("shown")), id("one"));
+        assert_eq!(store.pane_owner(&id("one")), id("one"));
+        assert_eq!(store.pane_owner(&id("two")), id("two"));
+        // One row per tab: pane shells never become rows.
+        let rows: Vec<_> = store
+            .sidebar_projection()
+            .projects
+            .iter()
+            .flat_map(|group| &group.sessions)
+            .map(|row| row.id().0.clone())
+            .collect();
+        assert!(!rows.contains(&"shown".to_owned()) && !rows.contains(&"hidden".to_owned()));
+    }
+
+    #[test]
+    fn the_row_counts_its_tab_panes_and_folds_in_its_shells() {
+        let (store, _) = split_store();
+        let (panes, shells) = store.pane_group(&id("one")).unwrap();
+        assert_eq!(panes, 2);
+        assert_eq!(
+            shells.iter().map(|s| s.id.clone()).collect::<Vec<_>>(),
+            vec![id("shown")]
+        );
+        assert!(store.pane_group(&id("two")).is_none());
+    }
+
+    #[test]
+    fn hidden_pane_shell_is_the_newest_running_unplaced_one() {
+        let (mut store, _) = split_store();
+        assert_eq!(store.hidden_pane_shell(&id("one")), Some(id("hidden")));
+        // The inspector terminal never adopts a shell a tab shows.
+        assert_eq!(
+            store
+                .auxiliary_terminal_for(&id("one"))
+                .map(|s| s.id.clone()),
+            Some(id("hidden"))
+        );
+        let mut exited = pane_shell("hidden", "one", 3.0);
+        exited.status = SessionStatus::Exited(ExitInfo {
+            reason: ExitReason::Exited,
+            code: Some(1),
+            signal: None,
+            system_restart: false,
+            interrupted: false,
+        });
+        store.upsert_session(exited);
+        assert_eq!(store.hidden_pane_shell(&id("one")), None);
+    }
+
+    #[test]
+    fn a_split_spawns_a_shell_owned_by_the_tab_in_the_panes_directory() {
+        let (mut store, mut effects) = split_store();
+        let mut shown = pane_shell("shown", "one", 2.0);
+        shown.terminal_cwd = Some("/work/p/crates".into());
+        store.upsert_session(shown);
+        drain(&mut effects);
+        let placement = SpawnPane::Beside {
+            tab_id: TabId::new("t"),
+            target: PaneId::new("terminal"),
+            edge: DockEdge::Right,
+        };
+        assert!(store.spawn_pane_shell(&id("shown"), placement.clone()));
+        let effects = drain(&mut effects);
+        let Some(StoreEffect::SpawnPane { params, pane }) = effects.first() else {
+            panic!("expected a pane spawn, got {effects:?}");
+        };
+        assert_eq!(*pane, placement);
+        assert_eq!(params.kind, AgentKind::SHELL);
+        // Split from a shell: the new pane still belongs to the agent's row.
+        assert_eq!(params.parent, Some(id("one")));
+        assert_eq!(params.start_directory.as_deref(), Some("/work/p/crates"));
+        assert_eq!(params.host, None);
+        // Selection stays on the tab's row.
+        assert_ne!(store.selected_session_id(), Some(&id("shown")));
+    }
 }

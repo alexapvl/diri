@@ -28,8 +28,8 @@ button:disabled { cursor: default; }
 [hidden] { display: none !important; }
 p, h1, h2 { margin: 0; }
 .icon, .agent-logo, .brand-mark { display: inline-block; width: 16px; height: 16px; flex: 0 0 auto; background: currentColor; mask: var(--icon) center / contain no-repeat; -webkit-mask: var(--icon) center / contain no-repeat; }
-.agent-logo { --icon: url('assets/brand/claude.svg'); }
-.brand-mark { --icon: url('assets/brand/diri.svg'); width: 23px; height: 18px; }
+.agent-logo { --icon: url('/assets/brand/claude.svg'); }
+.brand-mark { --icon: url('/assets/brand/diri.svg'); width: 23px; height: 18px; }
 .site-wrap { max-width: 1024px; padding: 0 32px; margin: 0 auto; }
 .site-header { height: 106px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--line); }
 .wordmark { display: inline-flex; align-items: center; gap: 9px; font-size: 29px; font-weight: 680; letter-spacing: -1.5px; line-height: 1; }
@@ -891,3 +891,335 @@ html { overflow-x: clip; }
 .compatible .agent-switch[aria-pressed="true"] { background: #ffffff24; }
 .compatible .agent-more { border-color: #ffffff47; }
 @media (hover: hover) and (pointer: fine) { .compatible .agent-switch:hover, .compatible .agent-more:hover { color: #fff; background: #ffffff1c; } }
+
+/* Swarm scene: lines appear as the lead produces them, helper rows slide in. */
+.scene-hidden { display: none !important; }
+.scene-running [data-step], .scene-running [data-child-row] { animation: scene-line 320ms var(--ease) both; }
+@keyframes scene-line { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+.composer-typed { color: #f1edf7; }
+.swarm-state.run { color: #f1edf7a8; }
+@media (prefers-reduced-motion: reduce) { .scene-running [data-step], .scene-running [data-child-row] { animation: none; } }
+.composer-typed { white-space: nowrap; overflow: hidden; text-overflow: clip; min-width: 0; }
+
+/* Live repo signals: stars beside the GitHub mark, commit cadence above the headline. */
+.github-link { width: auto; min-width: 28px; gap: 5px; padding: 0 6px; }
+.star-count { font-size: 12px; font-variant-numeric: tabular-nums; color: #cfc8de; }
+.cadence { display: inline-flex; align-items: center; gap: 8px; margin: 0 auto 22px; padding: 5px 12px 5px 10px; border-radius: 999px; font-size: 13px; color: #cfc8de; background: #ffffff08; border: 1px solid #ffffff14; transition: border-color 140ms ease, color 140ms ease; }
+.cadence-dot { width: 7px; height: 7px; border-radius: 50%; background: #8fd3a3; box-shadow: 0 0 0 3px #8fd3a326; }
+@media (hover: hover) and (pointer: fine) { .cadence:hover { color: var(--rp-text); border-color: #ffffff2e; } }
+@media (max-width: 600px) { .cadence { font-size: 12px; margin-bottom: 16px; } }
+
+/* Live numbers reserve their space and fade in, so nothing moves when they arrive. */
+.cadence { opacity: 0; transition: opacity 260ms ease, border-color 140ms ease, color 140ms ease; }
+.cadence.loaded { opacity: 1; }
+.star-count { display: inline-block; min-width: 3ch; opacity: 0; transition: opacity 260ms ease; }
+.star-count.loaded { opacity: 1; }
+@media (prefers-reduced-motion: reduce) { .cadence, .star-count { transition: none; } }
+
+/* Swarm lines fade in only when revealed during playback. */
+.scene-running [data-step], .scene-running [data-child-row] { animation: none; }
+.scene-in { animation: scene-line 320ms var(--ease) both; }
+@media (prefers-reduced-motion: reduce) { .scene-in { animation: none; } }
+
+/* Sidebar rows that only fill out the workspace: same look, no pointer affordance. */
+.chat-row.static { cursor: default; }
+
+
+/* A long-running session: the swarm transcript is pinned to its end, earlier work scrolls off the top. */
+.terminal.tail { display: flex; flex-direction: column; justify-content: flex-end; }
+.terminal.tail .terminal-scene { flex: none; }
+.terminal.tail .claude-user { margin-block: 14px 10px; }
+.terminal.tail .claude-tool, .terminal.tail .claude-answer { margin-block: 8px; }
+.terminal.tail .claude-answer p { margin-bottom: 0; }
+.claude-worked { margin: 10px 0 4px; color: #a196b2; font-size: .92em; }
+.swarm-child small { margin-left: 4px; color: #a196b2; font-size: .9em; }
+.changes-summary { display: flex; align-items: center; gap: 10px; height: 34px; padding-inline: 12px; font: 11px Menlo, monospace; color: #cbc3dc; }
+.changes-summary span:first-child { margin-right: auto; }
+.added-text { color: #8fd3a3; }
+.removed-text { color: #e59ab0; }
+.diff-stat { margin-left: auto; color: #a196b2; font-size: .92em; }
+.diff-lines .removed { background: #eb6f9214; }
+.diff-lines .removed code { color: #e3a9bb; }
+/* The fuller sidebar runs under its footer; the footer keeps a solid base so rows never show through. */
+/* The window keeps its proportions; its one grid row must not grow with a long transcript or sidebar. */
+.app-window { grid-template-rows: minmax(0, 1fr); }
+.app-sidebar, .app-main, .changes-panel { min-height: 0; }
+.app-sidebar > * { flex-shrink: 0; }
+/* Rows get their own clipped area that fades out above the footer; the footer stays on the sidebar's glass. */
+.sidebar-rows { flex: 1 1 0; min-height: 0; overflow: hidden; -webkit-mask-image: linear-gradient(#000 calc(100% - 36px), transparent); mask-image: linear-gradient(#000 calc(100% - 36px), transparent); }
+.sidebar-rows > * { flex-shrink: 0; }
+.app-sidebar .sidebar-bottom { position: static; flex: none; background: none; }
+
+/* Features as a bento: five cards that show a slice of the app, then a grid of short facts. */
+.bento, .bento-small { display: grid; gap: 14px; margin: 8px 0 0; }
+.bento { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+.bento-small { grid-template-columns: repeat(4, minmax(0, 1fr)); margin-top: 14px; }
+.bento-card { position: relative; display: flex; flex-direction: column; grid-column: span 2; padding: 26px 26px 28px; border-radius: 20px; background: #ffffff06; border: 1px solid #ffffff0d; }
+.bento-card.wide { grid-column: span 3; }
+.bento-card dt { margin-top: auto; font-size: 16.5px; font-weight: 500; letter-spacing: -.01em; color: #f4f0fa; }
+.bento-card dd { margin: 6px 0 0; font-size: 14px; line-height: 1.55; color: #a9a2bc; text-wrap: pretty; }
+.bento-visual { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; min-height: 230px; margin-bottom: 26px; }
+.bento-card.small { grid-column: auto; padding: 22px 22px 24px; border-radius: 16px; }
+.bento-card.small > .icon { width: 18px; height: 18px; margin-bottom: 18px; color: #c9c2d8; }
+.bento-card.small dt { margin-top: 0; font-size: 15px; }
+.bento-card.small dd { font-size: 13.5px; }
+
+.mini { width: min(330px, 100%); padding: 10px; border-radius: 13px; background: #211e2e; border: 1px solid #ffffff14; box-shadow: 0 1px 0 #ffffff0d inset, 0 18px 40px -18px #000c; font-size: 13px; color: #e9e4f2; text-align: left; }
+.mini .icon, .mini .agent-logo { width: 14px; height: 14px; color: #c9c2d8; }
+.mini-title { display: flex; align-items: center; gap: 7px; padding: 4px 8px 8px; font-size: 12.5px; color: #a9a2bc; }
+.mini-title .icon { width: 13px; height: 13px; }
+.mini-row { display: flex; align-items: center; gap: 9px; height: 34px; padding: 0 9px; border-radius: 8px; white-space: nowrap; }
+.mini-row span { overflow: hidden; text-overflow: ellipsis; }
+.mini-row small { margin-left: auto; padding-left: 10px; color: #8f87a3; font-size: 12px; }
+.mini-row.selected { background: #ffffff0f; }
+.mini-row > .icon[data-icon="check"], .mini-row.done .icon { color: #8fd3a3; }
+.mini-row.note .icon { color: #f6c177; }
+.mini-row.working .icon { animation: spin 1.2s linear infinite; }
+.mini-row > .agent-logo:last-child { margin-left: auto; }
+.mini-tree { margin-left: 15px; padding-left: 10px; border-left: 1px solid #ffffff14; }
+.mini-skeleton i { width: 14px; height: 14px; border-radius: 4px; background: #ffffff10; }
+.mini-skeleton b { width: 46%; height: 8px; border-radius: 4px; background: #ffffff10; }
+.mini-skeleton em { width: 18%; height: 8px; margin-left: auto; border-radius: 4px; background: #ffffff0b; }
+.mini-table { width: min(420px, 100%); padding: 0; overflow: hidden; }
+.mini-tr { display: grid; grid-template-columns: 1.6fr .6fr .8fr; align-items: center; height: 42px; padding: 0 14px; border-top: 1px solid #ffffff0d; }
+.mini-tr.head { height: 36px; border-top: 0; font-size: 12px; color: #8f87a3; background: #ffffff05; }
+.mini-tr span:first-child { display: flex; align-items: center; gap: 8px; font-family: Menlo, monospace; font-size: 12px; }
+.mini-tr b { font-weight: 500; color: #8fd3a3; } .mini-tr s { text-decoration: none; color: #e59ab0; }
+.mini-diff { width: min(420px, 100%); padding: 0 0 8px; overflow: hidden; font: 12px/26px Menlo, monospace; }
+.mini-file { display: flex; align-items: center; gap: 8px; height: 38px; padding: 0 12px; margin-bottom: 6px; border-bottom: 1px solid #ffffff0d; font-size: 12px; }
+.mini-file small { margin-left: auto; color: #8f87a3; }
+.mini-diff code { display: block; padding: 0 12px; font: inherit; white-space: pre; overflow: hidden; text-overflow: ellipsis; }
+.mini-diff .del { background: #eb6f9214; color: #e3a9bb; } .mini-diff .add { background: #8fd3a314; color: #cfe9d6; }
+.mini-pr { width: min(420px, 100%); display: flex; align-items: center; gap: 9px; padding: 11px 14px; }
+.mini-pr small { display: inline-flex; align-items: center; gap: 5px; margin-left: auto; color: #8fd3a3; font-size: 12px; }
+.mini-pr small .icon { width: 12px; height: 12px; color: #8fd3a3; }
+@media (max-width: 1050px) { .bento { grid-template-columns: repeat(2, minmax(0, 1fr)); } .bento-card, .bento-card.wide { grid-column: span 1; } .bento-card.wide:last-child { grid-column: span 2; } .bento-small { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 600px) { .bento, .bento-small { grid-template-columns: minmax(0, 1fr); } .bento-card, .bento-card.wide, .bento-card.wide:last-child { grid-column: auto; } .bento-visual { min-height: 0; } }
+@media (prefers-reduced-motion: reduce) { .mini-row.working .icon { animation: none; } }
+.bento-visual { height: 250px; min-height: 0; }
+.bento-card dt { margin-top: 0; }
+.mini-row.working { color: inherit; }
+@media (max-width: 600px) { .bento-visual { height: auto; } }
+.mini-tr span { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* Icons get their image from CSS, not app.js, so the first frame never shows bare squares. Regenerate when adding an icon. */
+[data-icon="apps"] { --icon: url('/assets/icons/apps.svg'); }
+[data-icon="archive"] { --icon: url('/assets/icons/archive.svg'); }
+[data-icon="bell"] { --icon: url('/assets/icons/bell.svg'); }
+[data-icon="branch"] { --icon: url('/assets/icons/branch.svg'); }
+[data-icon="check-circle"] { --icon: url('/assets/icons/check-circle.svg'); }
+[data-icon="check"] { --icon: url('/assets/icons/check.svg'); }
+[data-icon="chevron-down"] { --icon: url('/assets/icons/chevron-down.svg'); }
+[data-icon="chevron-left"] { --icon: url('/assets/icons/chevron-left.svg'); }
+[data-icon="chevron-right"] { --icon: url('/assets/icons/chevron-right.svg'); }
+[data-icon="chevron-up-down"] { --icon: url('/assets/icons/chevron-up-down.svg'); }
+[data-icon="clock"] { --icon: url('/assets/icons/clock.svg'); }
+[data-icon="close"] { --icon: url('/assets/icons/close.svg'); }
+[data-icon="code"] { --icon: url('/assets/icons/code.svg'); }
+[data-icon="copy"] { --icon: url('/assets/icons/copy.svg'); }
+[data-icon="download"] { --icon: url('/assets/icons/download.svg'); }
+[data-icon="expand"] { --icon: url('/assets/icons/expand.svg'); }
+[data-icon="external-link"] { --icon: url('/assets/icons/external-link.svg'); }
+[data-icon="file"] { --icon: url('/assets/icons/file.svg'); }
+[data-icon="folder"] { --icon: url('/assets/icons/folder.svg'); }
+[data-icon="github"] { --icon: url('/assets/icons/github.svg'); }
+[data-icon="keyboard"] { --icon: url('/assets/icons/keyboard.svg'); }
+[data-icon="lifebuoy"] { --icon: url('/assets/icons/lifebuoy.svg'); }
+[data-icon="local-agents"] { --icon: url('/assets/icons/local-agents.svg'); }
+[data-icon="markdown"] { --icon: url('/assets/icons/markdown.svg'); }
+[data-icon="monitor"] { --icon: url('/assets/icons/monitor.svg'); }
+[data-icon="moon"] { --icon: url('/assets/icons/moon.svg'); }
+[data-icon="more"] { --icon: url('/assets/icons/more.svg'); }
+[data-icon="new-agent"] { --icon: url('/assets/icons/new-agent.svg'); }
+[data-icon="note"] { --icon: url('/assets/icons/note.svg'); }
+[data-icon="plug"] { --icon: url('/assets/icons/plug.svg'); }
+[data-icon="plus"] { --icon: url('/assets/icons/plus.svg'); }
+[data-icon="pull-request"] { --icon: url('/assets/icons/pull-request.svg'); }
+[data-icon="refresh"] { --icon: url('/assets/icons/refresh.svg'); }
+[data-icon="return"] { --icon: url('/assets/icons/return.svg'); }
+[data-icon="search"] { --icon: url('/assets/icons/search.svg'); }
+[data-icon="server"] { --icon: url('/assets/icons/server.svg'); }
+[data-icon="settings"] { --icon: url('/assets/icons/settings.svg'); }
+[data-icon="shield"] { --icon: url('/assets/icons/shield.svg'); }
+[data-icon="sidebar-right"] { --icon: url('/assets/icons/sidebar-right.svg'); }
+[data-icon="sidebar"] { --icon: url('/assets/icons/sidebar.svg'); }
+[data-icon="split"] { --icon: url('/assets/icons/split.svg'); }
+[data-icon="terminal"] { --icon: url('/assets/icons/terminal.svg'); }
+[data-icon="user"] { --icon: url('/assets/icons/user.svg'); }
+[data-icon="warning"] { --icon: url('/assets/icons/warning.svg'); }
+[data-icon="working-0"] { --icon: url('/assets/icons/working-0.svg'); }
+[data-agent="apple"] { --icon: url('/assets/brand/apple.svg'); }
+[data-agent="claude"] { --icon: url('/assets/brand/claude.svg'); }
+[data-agent="codex"] { --icon: url('/assets/brand/codex.svg'); }
+[data-agent="copilot"] { --icon: url('/assets/brand/copilot.svg'); }
+[data-agent="cursor"] { --icon: url('/assets/brand/cursor.svg'); }
+[data-agent="diri-icon"] { --icon: url('/assets/brand/diri-icon.svg'); }
+[data-agent="diri"] { --icon: url('/assets/brand/diri.svg'); }
+[data-agent="gemini"] { --icon: url('/assets/brand/gemini.svg'); }
+[data-agent="kimi"] { --icon: url('/assets/brand/kimi.svg'); }
+[data-agent="linux"] { --icon: url('/assets/brand/linux.svg'); }
+[data-agent="opencode"] { --icon: url('/assets/brand/opencode.svg'); }
+[data-agent="pi"] { --icon: url('/assets/brand/pi.svg'); }
+[data-agent="windows"] { --icon: url('/assets/brand/windows.svg'); }
+
+/* Guides and questions follow the bento: a heading row, then cards or a two-column list. */
+.more-section { padding-top: 56px; }
+.guide-card { position: relative; padding-right: 44px; transition: border-color 140ms ease, background-color 140ms ease; }
+.guide-card dt a { color: #f4f0fa; }
+.guide-card dt a::after { content: ''; position: absolute; inset: 0; border-radius: inherit; }
+.guide-card > .icon { position: absolute; top: 24px; right: 20px; width: 14px; height: 14px; color: #8f87a3; transition: transform 140ms ease, color 140ms ease; }
+@media (hover: hover) and (pointer: fine) { .guide-card:hover { background: #ffffff0a; border-color: #ffffff1c; } .guide-card:hover > .icon { color: #f4f0fa; transform: translateX(2px); } }
+.guide-card:focus-within { outline: 2px solid var(--rp-rose); outline-offset: 2px; }
+.guide-card dt a:focus-visible { outline: none; }
+.faq-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 48px; margin: 8px 0 0; }
+.faq-grid > div { padding: 22px 0; border-top: 1px solid #ffffff0f; }
+.faq-grid dt { font-size: 15.5px; font-weight: 500; color: #f4f0fa; }
+.faq-grid dd { margin: 8px 0 0; font-size: 14px; line-height: 1.6; color: #a9a2bc; text-wrap: pretty; }
+@media (max-width: 850px) { .faq-grid { grid-template-columns: minmax(0, 1fr); } }
+
+/* Two-tone hero: release pill, the claim in white and the detail in grey at one size, agents named with their marks. */
+.release-pill { display: inline-flex; align-items: center; gap: 10px; margin: 0 auto 26px; padding: 4px 10px 4px 4px; border-radius: 999px; font-size: 13px; color: #cfc8de; background: #ffffff08; border: 1px solid #ffffff14; transition: border-color 140ms ease, color 140ms ease; }
+.release-pill-tag { padding: 2px 9px; border-radius: 999px; font-size: 12px; font-weight: 500; color: #241c26; background: #ebbcba; }
+.release-pill .icon { width: 12px; height: 12px; margin-left: -4px; opacity: .7; }
+@media (hover: hover) and (pointer: fine) { .release-pill:hover { color: var(--rp-text); border-color: #ffffff2e; } }
+.intro-heading h1, .intro-heading h1 { max-width: none; font-size: clamp(34px, 4.6vw, 50px); line-height: 1.08; letter-spacing: -.035em; font-weight: 520; }
+.intro-heading > p { max-width: 640px; margin-top: 18px; font-size: 17px; line-height: 1.6; color: #c4bdd4; text-wrap: balance; }
+.inline-agent { display: inline-flex; align-items: baseline; gap: 6px; color: var(--rp-text); white-space: nowrap; }
+.inline-agent .agent-logo { width: 15px; height: 15px; align-self: center; color: var(--rp-text); }
+.intro-proof { display: flex; justify-content: center; flex-wrap: wrap; gap: 6px 12px; margin-top: 22px; font-size: 12.5px; color: #a9a2bc; }
+.intro-proof span + span::before { content: '·'; margin-right: 12px; color: #a9a2bc99; }
+@media (min-width: 851px) {
+  .intro-heading h1 { font-size: 46px; }
+  .intro-heading > p { max-width: 760px; font-size: 18px; }
+  .intro-line { display: block; }
+}
+@media (max-width: 600px) {
+  .release-pill { font-size: 12px; margin-bottom: 18px; }
+  .release-pill-text { max-width: 190px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .intro-heading h1 { font-size: 34px; }
+  .intro-heading > p { font-size: 15.5px; }
+}
+
+
+/* Hero as one paragraph: the claim in full white, the detail in grey at the same size. Medium weight, normal tracking. */
+.intro-heading h1, .intro-heading > p { max-width: 780px !important; margin-inline: auto; font-size: 30px !important; line-height: 1.32 !important; letter-spacing: -.018em !important; font-weight: 500 !important; text-wrap: balance; }
+.intro-heading h1 { color: #f4f0fa; }
+.intro-heading > p { margin-top: 2px !important; color: #a9a2bc !important; }
+.intro-heading .inline-agent { color: #d9d3e6; gap: .28em; }
+.intro-heading .inline-agent .agent-logo { width: .8em; height: .8em; color: #d9d3e6; }
+.release-pill { margin-bottom: 30px; padding: 4px 12px 4px 5px; font-size: 13px; color: #b6afc9; background: #ffffff06; border-color: #ffffff12; }
+.release-pill-tag { color: #f4f0fa; background: #ffffff14; font-weight: 500; }
+.intro-actions { gap: 22px !important; margin-top: 34px !important; }
+.intro-actions .button.primary { color: #17151f; background: #f4f0fa; border-color: #f4f0fa; box-shadow: 0 1px 0 #ffffff inset, 0 10px 30px -12px #00000080; }
+.intro-actions .button.primary .button-mark { filter: brightness(0); }
+.intro-actions .button.secondary.text-link { height: auto; padding: 0; gap: 6px; background: none; border: 0; color: #cfc8de; font-weight: 450; }
+.intro-actions .button.secondary.text-link .icon { width: 12px; height: 12px; opacity: .7; }
+@media (hover: hover) and (pointer: fine) {
+  .intro-actions .button.primary:hover { background: #ffffff; border-color: #ffffff; }
+  .intro-actions .button.secondary.text-link:hover { color: #fff; background: none; }
+}
+@media (min-width: 851px) { .intro { padding-bottom: 72px !important; } }
+@media (max-width: 600px) {
+  .intro-heading h1, .intro-heading > p { font-size: 22px !important; }
+}
+
+/* Hero: agent names stay in the grey sentence so the white claim leads. */
+.intro-heading .inline-agent, .intro-heading .inline-agent .agent-logo { color: #c9c2d8; }
+
+
+.intro-heading > p, .intro-heading .inline-agent, .intro-heading .inline-agent .agent-logo { color: #9d96b1 !important; }
+@media (max-width: 600px) {
+  .intro-heading h1, .intro-heading > p { font-size: 21px !important; line-height: 1.35 !important; }
+  .intro-heading .inline-agent .agent-logo { display: none; }
+  .intro-heading .inline-agent { gap: 0; }
+}
+
+/* Headline and subtitle, not one run-on paragraph: a larger white claim, then a smaller grey line that names the agents with their marks. */
+.intro-heading h1 { max-width: none !important; font-size: 46px !important; font-weight: 550 !important; line-height: 1.1 !important; letter-spacing: -.03em !important; }
+.intro-heading > p { max-width: 640px !important; margin-top: 18px !important; font-size: 19px !important; font-weight: 400 !important; line-height: 1.6 !important; letter-spacing: -.005em !important; }
+.intro-heading .inline-agent { gap: .3em; }
+.intro-heading .inline-agent .agent-logo { width: .85em; height: .85em; }
+@media (max-width: 600px) {
+  .intro-heading h1 { font-size: 32px !important; }
+  .intro-heading > p { font-size: 16px !important; }
+  .intro-heading .inline-agent .agent-logo { display: inline-block; }
+}
+/* How the hero sits: a calmer headline, the subtitle broken after the agent list, less air above, the window closer. */
+.intro { padding-top: 64px !important; padding-bottom: 56px !important; }
+.release-pill { margin-bottom: 26px; }
+.intro-heading h1 { font-size: 42px !important; font-weight: 520 !important; letter-spacing: -.022em !important; line-height: 1.12 !important; }
+.intro-heading > p { max-width: none !important; margin-top: 14px !important; font-size: 18px !important; line-height: 1.55 !important; }
+.sub-line { display: block; }
+.intro-actions { margin-top: 30px !important; }
+@media (max-width: 600px) {
+  .intro { padding-top: 40px !important; padding-bottom: 36px !important; }
+  .intro-heading h1 { font-size: 30px !important; }
+  .intro-heading > p { font-size: 16px !important; }
+  .sub-line { display: inline; }
+}
+
+/* Craft pass on the hero.
+   One rhythm (24 / 16 / 32 / 72), a firmer headline with near-default tracking, a subtitle with real contrast,
+   logos seated on the text baseline at one optical size, a single hairline pill, and a crisp button instead of a glow. */
+.intro { padding-top: 72px !important; padding-bottom: 72px !important; }
+.release-pill { gap: 0; margin-bottom: 24px; padding: 5px 12px; font-size: 12.5px; color: #a9a2bc; background: transparent; border: 1px solid #ffffff17; }
+.release-pill-tag { padding: 0 10px 0 0; margin-right: 10px; border-radius: 0; background: none; border-right: 1px solid #ffffff1f; color: #f4f0fa; font-weight: 500; font-size: inherit; }
+.release-pill .icon { width: 11px; height: 11px; margin-left: 6px; opacity: .55; }
+.intro-heading h1 { font-size: 44px !important; font-weight: 600 !important; letter-spacing: -.012em !important; line-height: 1.1 !important; color: #fbf9ff; }
+.intro-heading > p { margin-top: 16px !important; font-size: 18px !important; line-height: 1.6 !important; letter-spacing: 0 !important; color: #b9b2ca !important; }
+.intro-heading .inline-agent, .intro-heading .inline-agent .agent-logo { color: #b9b2ca !important; }
+.intro-heading .inline-agent { display: inline; white-space: nowrap; }
+.intro-heading .inline-agent .agent-logo { display: inline-block; width: 15px; height: 15px; margin-right: 5px; vertical-align: -2px; }
+.intro-heading .inline-agent .agent-logo.gemini { width: 13px; height: 13px; vertical-align: -1px; }
+.intro-actions { gap: 24px !important; margin-top: 32px !important; }
+.intro-actions .button.primary { height: 42px; padding: 0 18px; border-radius: 10px; box-shadow: inset 0 1px 0 #fff, 0 1px 2px #0000004d !important; }
+@media (max-width: 600px) {
+  .intro { padding-top: 40px !important; padding-bottom: 40px !important; }
+  .intro-heading h1 { font-size: 31px !important; }
+  .intro-heading > p { font-size: 16px !important; }
+  .intro-heading .inline-agent .agent-logo { width: 13px; height: 13px; }
+}
+@media (min-width: 601px) { .intro-heading h1 { font-size: 40px !important; letter-spacing: -.014em !important; } }
+@media (max-width: 600px) { .intro-heading h1 { font-size: 30px !important; } }
+
+/* Precise scale: a small, firm headline and compact controls; the product carries the size. */
+@media (min-width: 601px) {
+  .intro { padding-top: 88px !important; padding-bottom: 80px !important; }
+  .release-pill { font-size: 12px; margin-bottom: 22px; padding: 4px 11px; }
+  .intro-heading h1 { font-size: 30px !important; font-weight: 600 !important; letter-spacing: -.01em !important; line-height: 1.2 !important; }
+  .intro-heading > p { margin-top: 10px !important; font-size: 16.5px !important; line-height: 1.6 !important; }
+  .intro-heading .inline-agent .agent-logo { width: 13px; height: 13px; vertical-align: -1.5px; margin-right: 4px; }
+  .intro-actions { margin-top: 28px !important; gap: 20px !important; }
+  .intro-actions .button.primary { height: 36px !important; padding: 0 14px !important; font-size: 13.5px !important; border-radius: 8px !important; }
+  .intro-actions .button.primary .button-mark { width: 13px; height: 13px; }
+  .intro-actions .button.secondary.text-link { font-size: 13.5px !important; }
+}
+
+/* Designer's call: no badge above the headline; one compact block that sits on the window, not floating above it. */
+@media (min-width: 601px) {
+  .intro { padding-top: 112px !important; padding-bottom: 48px !important; }
+  .intro-heading h1 { font-size: 34px !important; font-weight: 600 !important; letter-spacing: -.018em !important; line-height: 1.15 !important; }
+  .intro-heading > p { margin-top: 12px !important; font-size: 17px !important; color: #aea7bf !important; }
+  .intro-heading .inline-agent, .intro-heading .inline-agent .agent-logo { color: #aea7bf !important; }
+  .intro-actions { margin-top: 28px !important; }
+}
+@media (max-width: 600px) { .intro { padding-top: 56px !important; } }
+
+/* Display type: Geist (SIL OFL 1.1, assets/fonts/GEIST-OFL.txt) for headings only; body and UI stay on the system font. */
+@font-face { font-family: "Geist"; src: url("/assets/fonts/geist.woff2") format("woff2"); font-weight: 100 900; font-style: normal; font-display: swap; }
+.intro-heading h1, .features-heading h2, .more-section h2, .bento-card dt { font-family: "Geist", -apple-system, BlinkMacSystemFont, sans-serif; }
+@media (min-width: 601px) {
+  .intro-heading h1 { font-size: 40px !important; font-weight: 560 !important; letter-spacing: -.035em !important; line-height: 1.1 !important; }
+}
+@media (max-width: 600px) { .intro-heading h1 { font-size: 32px !important; font-weight: 560 !important; letter-spacing: -.03em !important; } }
+.features-heading h2, .more-section h2 { font-weight: 560; letter-spacing: -.03em; }
+.bento-card dt { font-weight: 540; letter-spacing: -.012em; }
+
+/* Balance: 104px from the nav to the headline, 72px from the buttons to the window. Subtitle as two short sentences, one per line. */
+@media (min-width: 601px) {
+  .intro { padding-top: 87px !important; padding-bottom: 65px !important; }
+  .intro-heading > p { margin-top: 14px !important; line-height: 1.55 !important; }
+  .sub-line { display: block; }
+}
+@media (max-width: 600px) { .sub-line { display: inline; } }
+.nowrap { white-space: nowrap; }

@@ -1,4 +1,5 @@
 use super::*;
+use crate::i18n::t;
 use crate::tab_peek::{
     GestureFrame, card_rect, preview_reveal_offset, preview_scroll_anchor, terminal_offset,
     visible_card_indices,
@@ -20,23 +21,23 @@ fn preview_caption(
     if matches!(session.status, SessionStatus::Exited(_))
         || remote == Some(RemoteConnectionState::Exited)
     {
-        return Some("Exited");
+        return Some(t("nav.peek.exited"));
     }
     if session.hibernation.is_some() {
-        return Some("Paused");
+        return Some(t("nav.peek.paused"));
     }
     if source == Some(PreviewState::Disconnected) {
-        return Some("Disconnected");
+        return Some(t("nav.peek.disconnected"));
     }
     session.host.as_ref()?;
-    Some(match remote {
-        Some(RemoteConnectionState::Connecting) => "Connecting",
-        Some(RemoteConnectionState::Connected) => "Connected",
-        Some(RemoteConnectionState::Reconnecting) => "Reconnecting",
-        Some(RemoteConnectionState::Failed) => "Connection failed",
-        Some(RemoteConnectionState::Exited) => "Exited",
-        Some(RemoteConnectionState::Unknown) | None => "Last received",
-    })
+    Some(t(match remote {
+        Some(RemoteConnectionState::Connecting) => "nav.peek.connecting",
+        Some(RemoteConnectionState::Connected) => "nav.peek.connected",
+        Some(RemoteConnectionState::Reconnecting) => "nav.peek.reconnecting",
+        Some(RemoteConnectionState::Failed) => "nav.peek.connection_failed",
+        Some(RemoteConnectionState::Exited) => "nav.peek.exited",
+        Some(RemoteConnectionState::Unknown) | None => "nav.peek.last_received",
+    }))
 }
 
 impl SessionSurfaces {
@@ -140,10 +141,6 @@ impl SessionSurfaces {
         }
     }
 
-    pub(crate) fn tab_peek_position(&mut self, now: std::time::Instant) -> f32 {
-        self.peek.advance_motion(now);
-        self.peek.position()
-    }
     pub(crate) fn tab_peek_visible(&self) -> bool {
         self.peek.visible()
     }
@@ -474,14 +471,14 @@ impl SessionSurfaces {
                     )
                     .child(
                         if matches!(session.status, diri_proto::SessionStatus::Exited(_)) {
-                            "Session exited"
+                            t("nav.peek.session_exited")
                         } else {
-                            match state {
+                            t(match state {
                                 Some(crate::tab_preview::PreviewState::Loading) => {
-                                    "Loading preview…"
+                                    "nav.peek.loading"
                                 }
-                                _ => "Preview unavailable",
-                            }
+                                _ => "nav.peek.unavailable",
+                            })
                         },
                     )
                     .into_any_element()
@@ -629,15 +626,15 @@ impl SessionSurfaces {
                     .text_size(px(11.0))
                     .text_color(colors.secondary)
                     .child(if blend > 0.5 {
-                        "Tab overview"
+                        t("nav.peek.overview")
                     } else {
-                        "Tab peek"
+                        t("nav.peek.title")
                     })
                     .child(
                         div()
                             .id("tab-peek-expand")
                             .cursor_pointer()
-                            .child(if blend > 0.5 { "Collapse" } else { "Show all" })
+                            .child(t("nav.peek.show_all"))
                             .when(self.peek.visible(), |element| {
                                 element.on_mouse_down(MouseButton::Left, |_, _, cx| {
                                     cx.stop_propagation()
@@ -647,11 +644,16 @@ impl SessionSurfaces {
                                 if !this.peek.visible() {
                                     return;
                                 }
-                                this.peek.animate_to(
-                                    if blend > 0.5 { 140.0 } else { 380.0 },
-                                    cx.background_executor().now(),
-                                    cx.reduce_motion(),
-                                );
+                                // There is one grid of sessions: the overview
+                                // (⇧⌘O). The peek hands over to it, and the
+                                // overview zooms in from the page as usual.
+                                this.cancel_tab_peek_immediately(cx);
+                                let mut store =
+                                    this.store.write().expect("session store lock poisoned");
+                                if !store.overview_state().is_visible() {
+                                    store.toggle_overview();
+                                }
+                                drop(store);
                                 cx.notify();
                                 cx.stop_propagation();
                             })),
@@ -760,6 +762,8 @@ mod tests {
             reason: ExitReason::Exited,
             code: Some(0),
             signal: None,
+            system_restart: false,
+            interrupted: false,
         });
         assert_eq!(
             preview_caption(&session, Some(PreviewState::Disconnected)),

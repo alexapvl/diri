@@ -3,6 +3,9 @@
 //! The behavior and per-agent answers carry over from the retired Swift client.
 
 use diri_proto::remote_pty::PersistenceCapability;
+
+use crate::i18n::{t, tf};
+use crate::toast::Toast;
 use diri_proto::{
     AgentDescriptor, AgentKind, HibernationReason, NeedsInputKind, SessionId, SessionRecord,
 };
@@ -72,13 +75,7 @@ pub struct StatusTransition {
     /// Foreground feedback for user-initiated operations. System
     /// notifications are not a reliable visible surface while the app is
     /// active or when notification permission is disabled.
-    pub in_app_banner: Option<InAppBanner>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct InAppBanner {
-    pub title: String,
-    pub body: String,
+    pub in_app_banner: Option<Toast>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -97,7 +94,9 @@ fn one_shot_identifier(prefix: &str) -> String {
     )
 }
 
-fn plain_banner(prefix: &str, title: String, body: String) -> StatusTransition {
+/// A system notification plus the in-app toast shown instead of it while
+/// the app is active. The toast carries its own, shorter copy.
+fn plain_banner(prefix: &str, title: String, body: String, toast: Toast) -> StatusTransition {
     StatusTransition {
         dismiss: Vec::new(),
         sound: None,
@@ -112,17 +111,16 @@ fn plain_banner(prefix: &str, title: String, body: String) -> StatusTransition {
             use_system_sound: true,
             reply: false,
         }),
-        in_app_banner: Some(InAppBanner { title, body }),
+        in_app_banner: Some(toast),
     }
 }
 
 /// Detection found an Agent the user asked Diri to install.
 pub fn agent_installed_transition(display_name: &str) -> StatusTransition {
-    plain_banner(
-        "agent-install",
-        format!("{display_name} is ready"),
-        "Start a session to give it a task. It asks you to sign in the first time.".to_owned(),
-    )
+    let title = tf("notify.agent_ready", &[("agent", &display_name)]);
+    let body = t("notify.agent_ready_body");
+    let toast = Toast::success(title.clone()).detail(t("toast.agent_ready_detail"));
+    plain_banner("agent-install", title, body.to_owned(), toast)
 }
 
 /// The one summary a herdr import posts: how many panes arrived, and the
@@ -132,25 +130,49 @@ pub fn herdr_import_transition(
     total: usize,
     first_failure: Option<&str>,
 ) -> StatusTransition {
-    let sessions = |count: usize| if count == 1 { "session" } else { "sessions" };
-    let title = if opened == total {
-        format!("Moved {opened} {} from herdr", sessions(opened))
-    } else {
-        format!("Moved {opened} of {total} {} from herdr", sessions(total))
+    let args: &[(&str, &dyn std::fmt::Display)] = &[("opened", &opened), ("total", &total)];
+    let title = match (opened == total, total == 1) {
+        (true, true) => tf("toast.herdr_moved_one", args),
+        (true, false) => tf("toast.herdr_moved_other", args),
+        (false, true) => tf("toast.herdr_moved_partial_one", args),
+        (false, false) => tf("toast.herdr_moved_partial_other", args),
     };
-    let body = match first_failure {
-        Some(reason) => format!("Some panes did not open: {reason}"),
-        None => "They are in the sidebar under their projects.".to_owned(),
-    };
-    foreground_banner(title, body)
+    foreground_banner(match first_failure {
+        Some(reason) => {
+            Toast::warning(title).detail(tf("toast.herdr_some_failed", &[("reason", &reason)]))
+        }
+        None => Toast::success(title),
+    })
 }
 
-fn foreground_banner(title: String, body: String) -> StatusTransition {
+/// The one summary a "Resume all" batch posts: how many sessions came back,
+/// and the first reason any did not.
+pub fn resume_all_transition(
+    resumed: usize,
+    total: usize,
+    first_failure: Option<&str>,
+) -> StatusTransition {
+    let args: &[(&str, &dyn std::fmt::Display)] = &[("resumed", &resumed), ("total", &total)];
+    let title = match (resumed == total, total == 1) {
+        (true, true) => tf("toast.resumed_one", args),
+        (true, false) => tf("toast.resumed_other", args),
+        (false, true) => tf("toast.resumed_partial_one", args),
+        (false, false) => tf("toast.resumed_partial_other", args),
+    };
+    foreground_banner(match first_failure {
+        Some(reason) => {
+            Toast::warning(title).detail(tf("toast.resume_some_failed", &[("reason", &reason)]))
+        }
+        None => Toast::success(title),
+    })
+}
+
+fn foreground_banner(toast: Toast) -> StatusTransition {
     StatusTransition {
         dismiss: Vec::new(),
         sound: None,
         notification: None,
-        in_app_banner: Some(InAppBanner { title, body }),
+        in_app_banner: Some(toast),
     }
 }
 
@@ -170,18 +192,19 @@ pub fn prefs_sync_transition(
                     .iter()
                     .map(|tool| {
                         if tool.synced.is_empty() {
-                            format!("{}: nothing to sync", tool.tool)
+                            tf("notify.prefs_sync_nothing", &[("tool", &tool.tool)])
                         } else {
-                            format!("{}: {} items", tool.tool, tool.synced.len())
+                            tf(
+                                "notify.prefs_sync_items",
+                                &[("tool", &tool.tool), ("count", &tool.synced.len())],
+                            )
                         }
                     })
                     .collect::<Vec<_>>()
                     .join(" · ");
-                plain_banner(
-                    "prefs-sync",
-                    format!("Prefs synced to {host_name}"),
-                    summary,
-                )
+                let title = tf("notify.prefs_synced", &[("host", &host_name)]);
+                let toast = Toast::success(title.clone()).detail(summary.clone());
+                plain_banner("prefs-sync", title, summary, toast)
             } else {
                 let detail = failed
                     .iter()
@@ -189,24 +212,29 @@ pub fn prefs_sync_transition(
                         format!(
                             "{}: {}",
                             tool.tool,
-                            tool.error.as_deref().unwrap_or("failed")
+                            tool.error
+                                .as_deref()
+                                .unwrap_or(t("notify.prefs_sync_tool_failed"))
                         )
                     })
                     .collect::<Vec<_>>()
                     .join(" · ");
-                plain_banner(
-                    "prefs-sync",
-                    format!("Prefs sync to {host_name} failed"),
-                    detail,
-                )
+                prefs_sync_failed(host_name, detail)
             }
         }
-        Err(error) => plain_banner(
-            "prefs-sync",
-            format!("Prefs sync to {host_name} failed"),
-            error.to_owned(),
-        ),
+        Err(error) => prefs_sync_failed(host_name, error.to_owned()),
     }
+}
+
+fn prefs_sync_failed(host_name: &str, detail: String) -> StatusTransition {
+    let toast =
+        Toast::error(tf("toast.prefs_sync_failed", &[("host", &host_name)])).detail(detail.clone());
+    plain_banner(
+        "prefs-sync",
+        tf("notify.prefs_sync_failed", &[("host", &host_name)]),
+        detail,
+        toast,
+    )
 }
 
 /// Transient feedback for `session.migrate`. A clean success is confirmed
@@ -218,24 +246,35 @@ pub fn migration_transition(
     result: Result<Option<&str>, &str>,
 ) -> Option<StatusTransition> {
     match result {
-        Ok(None) => Some(foreground_banner(
-            format!("Moved “{session_title}” to {destination}"),
-            format!("The conversation is now running on {destination}."),
-        )),
-        Ok(Some(warning)) => Some(plain_banner(
-            "migrate",
-            format!("Moved to {destination} with warnings"),
-            warning.to_owned(),
-        )),
-        Err(error) => Some(plain_banner(
-            "migrate",
-            if session_title.is_empty() {
-                format!("Move to {destination} failed")
+        Ok(None) => Some(foreground_banner(Toast::success(tf(
+            "toast.migrate_moved",
+            &[("session", &session_title), ("destination", &destination)],
+        )))),
+        Ok(Some(warning)) => {
+            let title = tf("notify.migrate_warnings", &[("destination", &destination)]);
+            let toast = Toast::warning(title.clone()).detail(warning);
+            Some(plain_banner("migrate", title, warning.to_owned(), toast))
+        }
+        Err(error) => {
+            let title = if session_title.is_empty() {
+                tf("notify.migrate_failed", &[("destination", &destination)])
             } else {
-                format!("Move “{session_title}” to {destination} failed")
-            },
-            error.to_owned(),
-        )),
+                tf(
+                    "notify.migrate_session_failed",
+                    &[("session", &session_title), ("destination", &destination)],
+                )
+            };
+            let toast = Toast::error(if session_title.is_empty() {
+                tf("toast.migrate_failed", &[("destination", &destination)])
+            } else {
+                tf(
+                    "toast.migrate_session_failed",
+                    &[("session", &session_title), ("destination", &destination)],
+                )
+            })
+            .detail(error);
+            Some(plain_banner("migrate", title, error.to_owned(), toast))
+        }
     }
 }
 
@@ -253,8 +292,8 @@ pub fn reach_failure_transition() -> StatusTransition {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0, |duration| duration.as_nanos())
             ),
-            title: "Couldn't reach session".to_owned(),
-            body: "diri couldn't deliver your answer. Open the session to respond.".to_owned(),
+            title: t("notify.reach_failure_title").to_owned(),
+            body: t("notify.reach_failure_body").to_owned(),
             thread_identifier: None,
             action_data: None,
             use_system_sound: true,
@@ -368,13 +407,16 @@ pub fn immediate_transitions_for_update(
         != Some(PersistenceCapability::NonPersistent)
         && current.remote_persistence == Some(PersistenceCapability::NonPersistent);
     if became_non_persistent {
-        let host = current.host.as_deref().unwrap_or("the remote host");
+        let host = current
+            .host
+            .as_deref()
+            .unwrap_or(t("notify.the_remote_host"));
         transitions.push(plain_banner(
             "remote-non-persistent",
-            "Remote session cannot survive disconnects".to_owned(),
-            format!(
-                "{host} does not preserve detached user processes. Keep SSH connected or the Agent may exit."
-            ),
+            t("notify.non_persistent_title").to_owned(),
+            tf("notify.non_persistent_body", &[("host", &host)]),
+            Toast::warning(tf("toast.non_persistent", &[("host", &host)]))
+                .detail(t("toast.non_persistent_detail")),
         ));
     }
 
@@ -405,17 +447,14 @@ fn memory_pressure_request(
     _status_sounds_enabled: bool,
 ) -> NotificationRequest {
     let body = session.memory_bytes.map_or_else(
-        || {
-            format!(
-                "{} was frozen to reclaim memory. Select it to wake.",
-                session.title
-            )
-        },
+        || tf("notify.memory_frozen_body", &[("session", &session.title)]),
         |bytes| {
-            format!(
-                "{} — {:.1} GB. Select it to wake.",
-                session.title,
-                bytes as f64 / 1_000_000_000.0
+            tf(
+                "notify.memory_frozen_body_size",
+                &[
+                    ("session", &session.title),
+                    ("gb", &format!("{:.1}", bytes as f64 / 1_000_000_000.0)),
+                ],
             )
         },
     );
@@ -423,7 +462,7 @@ fn memory_pressure_request(
         session_event: false,
         guard: None,
         identifier: format!("{}-memory-pressure", session.id.0),
-        title: "Session frozen — high memory".to_owned(),
+        title: t("notify.memory_frozen_title").to_owned(),
         body,
         thread_identifier: Some(session.id.0.clone()),
         action_data: None,
@@ -449,8 +488,10 @@ where
         AgentKind::CODEX_ID => "Codex",
         AgentKind::CURSOR_ID => "Cursor",
         AgentKind::GEMINI_ID => "Gemini",
-        AgentKind::SHELL_ID => "Terminal",
-        _ => "Agent",
+        AgentKind::SHELL_ID => t("notify.agent_terminal"),
+        // One recognised in a shell with no manifest: "Goose finished".
+        id => diri_proto::agent_names::recognized_agent_name(id)
+            .unwrap_or_else(|| t("notify.agent_generic")),
     }
 }
 
@@ -522,22 +563,48 @@ pub fn reply_refused_transition(
     session_title: Option<&str>,
     refusal: ReplyRefusal,
 ) -> StatusTransition {
-    let subject = session_title
-        .filter(|title| !title.is_empty())
-        .map_or_else(|| "The session".to_owned(), |title| format!("“{title}”"));
+    let subject = session_title.filter(|title| !title.is_empty()).map_or_else(
+        || t("notify.reply_the_session").to_owned(),
+        |title| tf("notify.reply_quoted_session", &[("title", &title)]),
+    );
+    let args: &[(&str, &dyn std::fmt::Display)] = &[("subject", &subject)];
     let body = match refusal {
-        ReplyRefusal::Gone => format!("{subject} is no longer open."),
-        ReplyRefusal::Exited => format!("{subject} has exited."),
-        ReplyRefusal::MovedOn => {
-            format!("{subject} is no longer waiting for an answer. Open it to continue.")
-        }
+        ReplyRefusal::Gone => tf("notify.reply_gone", args),
+        ReplyRefusal::Exited => tf("notify.reply_exited", args),
+        ReplyRefusal::MovedOn => tf("notify.reply_moved_on", args),
     };
-    plain_banner("reply-not-sent", "Reply not sent".to_owned(), body)
+    let toast = Toast::warning(t("toast.reply_not_sent")).detail(body.clone());
+    plain_banner(
+        "reply-not-sent",
+        t("notify.reply_not_sent").to_owned(),
+        body,
+        toast,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_agent_known_only_by_name_is_called_by_it() {
+        assert_eq!(display_name(&AgentKind::new("goose"), None), "Goose");
+        assert_eq!(
+            display_name(&AgentKind::new("command-code"), None),
+            "Command Code"
+        );
+        assert_eq!(display_name(&AgentKind::CLAUDE_CODE, None), "Claude Code");
+        // A manifest's Agent without its descriptor yet, and an id nobody
+        // knows, stay generic rather than guessing.
+        assert_eq!(
+            display_name(&AgentKind::new("aider"), None),
+            t("notify.agent_generic")
+        );
+        assert_eq!(
+            display_name(&AgentKind::new("some-future-agent"), None),
+            t("notify.agent_generic")
+        );
+    }
 
     #[test]
     fn replies_reach_only_the_same_session_still_waiting_on_a_question() {
@@ -637,13 +704,19 @@ mod tests {
     fn refused_reply_notice_names_the_session_not_the_text() {
         let notice = reply_refused_transition(Some("Refactor parser"), ReplyRefusal::Exited);
         let banner = notice.in_app_banner.expect("in-app notice");
-        assert_eq!(banner.title, "Reply not sent");
-        assert_eq!(banner.body, "“Refactor parser” has exited.");
+        assert_eq!(banner.message, "Reply not sent");
+        assert_eq!(
+            banner.detail.as_deref(),
+            Some("“Refactor parser” has exited.")
+        );
         assert!(notice.notification.is_some_and(|request| !request.reply));
         let banner = reply_refused_transition(None, ReplyRefusal::Gone)
             .in_app_banner
             .expect("in-app notice");
-        assert_eq!(banner.body, "The session is no longer open.");
+        assert_eq!(
+            banner.detail.as_deref(),
+            Some("The session is no longer open.")
+        );
     }
 
     #[test]
@@ -657,8 +730,8 @@ mod tests {
             .iter()
             .find_map(|transition| transition.in_app_banner.as_ref())
             .expect("non-persistent warning");
-        assert!(banner.title.contains("cannot survive"));
-        assert!(banner.body.contains("forge"));
+        assert_eq!(banner.message, "forge ends sessions when SSH drops");
+        assert_eq!(banner.tone, crate::toast::ToastTone::Warning);
 
         assert!(immediate_transitions_for_update(Some(&current), &current, false).is_empty());
     }
@@ -714,9 +787,11 @@ mod tests {
             listening_ports: None,
             foreground_agent: None,
             terminal_cwd: None,
+            agent_workspace: None,
             note_id: None,
             foreground_ports: None,
             terminal_progress: None,
+            scheduled_run: None,
         }
     }
 
@@ -760,7 +835,8 @@ mod tests {
             .expect("success banner")
             .in_app_banner
             .expect("foreground success");
-        assert_eq!(moved.title, "Moved “Refactor” to Forge");
+        assert_eq!(moved.message, "Moved “Refactor” to Forge");
+        assert_eq!(moved.detail, None);
         let warned = migration_transition("Refactor", "Forge", Ok(Some("transcript not found")))
             .expect("warning banner")
             .notification
@@ -777,7 +853,7 @@ mod tests {
             .expect("failure banner")
             .in_app_banner
             .expect("migration failures must be visible inside the active app");
-        assert_eq!(failed.title, "Move “Refactor” to local failed");
-        assert_eq!(failed.body, "repo not cloned locally");
+        assert_eq!(failed.message, "Couldn’t move “Refactor” to local");
+        assert_eq!(failed.detail.as_deref(), Some("repo not cloned locally"));
     }
 }

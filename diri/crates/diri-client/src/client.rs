@@ -135,14 +135,16 @@ impl ClientCore {
     /// IF YOU ADD AN EVENT KIND THAT DIRI NEEDS, ADD IT HERE TOO. Server-side
     /// filtering means an unlisted kind never reaches `route_message`, and the
     /// symptom is silence, not an error.
-    const EVENT_KINDS: [&'static str; 7] = [
+    const EVENT_KINDS: [&'static str; 9] = [
         EventName::SESSION_UPDATED,
+        EventName::SESSION_API_REQUEST,
         EventName::SESSION_NOTIFICATION,
         EventName::SESSION_CLIPBOARD,
         EventName::SESSION_RESOURCES,
         EventName::SESSION_REMOVED,
         EventName::PROJECT_UPDATED,
         EventName::WORKSPACE_UPDATED,
+        EventName::SCHEDULE_UPDATED,
     ];
 
     async fn request<P: Serialize + ?Sized>(
@@ -380,6 +382,10 @@ impl ClientCore {
 pub struct DaemonClient {
     core: Arc<ClientCore>,
     lifecycle: StdMutex<Option<JoinHandle<()>>>,
+    /// The runtime `connect` ran on. Synchronous callers such as GPUI views
+    /// built from a Dock reopen have no current runtime, and a bare
+    /// `tokio::spawn` there panics inside an Objective-C callback, which aborts.
+    runtime: StdMutex<Option<tokio::runtime::Handle>>,
 }
 
 impl Default for DaemonClient {
@@ -433,6 +439,7 @@ impl DaemonClient {
                 retry_tx,
             }),
             lifecycle: StdMutex::new(None),
+            runtime: StdMutex::new(None),
         }
     }
 
@@ -441,13 +448,25 @@ impl DaemonClient {
     }
 
     /// Starts the connect/reconnect loop. Repeated calls are idempotent.
+    ///
+    /// Runs on the calling thread's runtime, else on the one an earlier call
+    /// ran on. With neither it does nothing: a panic here would come from a
+    /// GPUI callback, where it cannot unwind and aborts the app.
     pub fn connect(&self) {
         let mut lifecycle = self.lifecycle.lock().expect("lifecycle mutex poisoned");
         if lifecycle.as_ref().is_some_and(|task| !task.is_finished()) {
             return;
         }
+        let mut stored = self.runtime.lock().expect("runtime mutex poisoned");
+        let Some(runtime) = tokio::runtime::Handle::try_current()
+            .ok()
+            .or_else(|| stored.clone())
+        else {
+            return;
+        };
         let core = Arc::clone(&self.core);
-        *lifecycle = Some(tokio::spawn(async move { run_lifecycle(core).await }));
+        *lifecycle = Some(runtime.spawn(async move { run_lifecycle(core).await }));
+        *stored = Some(runtime);
     }
 
     /// Synchronously asks the connect/reconnect loop to close its control
@@ -493,10 +512,18 @@ impl DaemonClient {
         self.core.want_events.store(true, Ordering::Release);
         let receiver = self.core.event_tx.subscribe();
         if self.core.state_tx.borrow().is_connected() {
-            let core = Arc::clone(&self.core);
-            tokio::spawn(async move {
-                let _ = core.subscribe_to_events().await;
-            });
+            // Connected implies `connect` stored its runtime. Without one, the
+            // lifecycle subscribes on its next connection because
+            // `want_events` is set.
+            let runtime = tokio::runtime::Handle::try_current()
+                .ok()
+                .or_else(|| self.runtime.lock().expect("runtime mutex poisoned").clone());
+            if let Some(runtime) = runtime {
+                let core = Arc::clone(&self.core);
+                runtime.spawn(async move {
+                    let _ = core.subscribe_to_events().await;
+                });
+            }
         }
         receiver
     }
@@ -581,6 +608,25 @@ impl DaemonClient {
         Ok(record.id)
     }
 
+    /// Spawns and places the session in a tab's split tree in one request.
+    /// An Engine without placement ignores `pane` and leaves it unplaced.
+    pub async fn spawn_placed(
+        &self,
+        params: SessionSpawnParams,
+        pane: diri_proto::workspace::SpawnPane,
+    ) -> Result<SessionId, ClientError> {
+        #[derive(Serialize)]
+        struct Placed {
+            #[serde(flatten)]
+            params: SessionSpawnParams,
+            pane: diri_proto::workspace::SpawnPane,
+        }
+        let record: SessionSpawnResult = self
+            .typed(Method::SESSION_SPAWN, &Placed { params, pane })
+            .await?;
+        Ok(record.id)
+    }
+
     pub async fn kill(&self, session_id: &SessionId) -> Result<(), ClientError> {
         self.empty(Method::SESSION_KILL, &session_params(session_id))
             .await
@@ -625,6 +671,39 @@ impl DaemonClient {
     ) -> Result<SessionTerminalTitleResult, ClientError> {
         self.typed(Method::SESSION_TERMINAL_TITLE, &session_params(session_id))
             .await
+    }
+
+    /// The whole of an inline image a terminal placed, read in chunks.
+    /// Errors with `image_not_found` once the Engine (or a remote session's
+    /// Holder) evicted it.
+    pub async fn read_image(
+        &self,
+        session_id: &SessionId,
+        key: &str,
+    ) -> Result<diri_proto::SessionReadImageResult, ClientError> {
+        let mut params = diri_proto::SessionReadImageParams {
+            session_id: session_id.clone(),
+            key: key.to_owned(),
+            offset: 0,
+        };
+        let mut image: diri_proto::SessionReadImageResult =
+            self.typed(Method::SESSION_READ_IMAGE, &params).await?;
+        let total = usize::try_from(image.total)
+            .unwrap_or(usize::MAX)
+            .min(diri_proto::inline_image::MAX_IMAGE_BYTES);
+        while image.data.len() < total {
+            params.offset = image.data.len() as u64;
+            let chunk: diri_proto::SessionReadImageResult =
+                self.typed(Method::SESSION_READ_IMAGE, &params).await?;
+            // A replaced image under the same key cannot happen (keys are
+            // never reused); an empty chunk would otherwise loop forever.
+            if chunk.data.is_empty() || chunk.offset != params.offset {
+                break;
+            }
+            image.data.extend_from_slice(&chunk.data);
+        }
+        image.data.truncate(total);
+        Ok(image)
     }
 
     pub async fn process_info(
@@ -906,6 +985,13 @@ impl DaemonClient {
         self.empty(Method::GOVERNOR_CONFIGURE, &params).await
     }
 
+    pub async fn configure_terminal(
+        &self,
+        params: TerminalConfigureParams,
+    ) -> Result<(), ClientError> {
+        self.empty(Method::TERMINAL_CONFIGURE, &params).await
+    }
+
     /// `agent.readiness`: PATH metadata locally, but a remote target crosses
     /// ssh and may install the Helper first, so the two carry very different
     /// bounds. Both are explicit: the settings page shows a spinner for the
@@ -964,6 +1050,45 @@ impl DaemonClient {
         params: WorktreeListParams,
     ) -> Result<Vec<WorktreeInfo>, ClientError> {
         self.typed(Method::WORKTREE_LIST, &params).await
+    }
+
+    pub async fn schedules(
+        &self,
+    ) -> Result<diri_proto::schedules::ScheduleListResult, ClientError> {
+        self.no_params(Method::SCHEDULE_LIST).await
+    }
+
+    pub async fn create_schedule(
+        &self,
+        spec: &diri_proto::schedules::ScheduleSpec,
+    ) -> Result<diri_proto::schedules::ScheduleRecord, ClientError> {
+        self.typed(Method::SCHEDULE_CREATE, spec).await
+    }
+
+    pub async fn update_schedule(
+        &self,
+        params: &diri_proto::schedules::ScheduleUpdateParams,
+    ) -> Result<diri_proto::schedules::ScheduleRecord, ClientError> {
+        self.typed(Method::SCHEDULE_UPDATE, params).await
+    }
+
+    pub async fn delete_schedule(&self, id: &str) -> Result<(), ClientError> {
+        self.empty(
+            Method::SCHEDULE_DELETE,
+            &diri_proto::schedules::ScheduleIdParams { id: id.to_owned() },
+        )
+        .await
+    }
+
+    pub async fn run_schedule_now(
+        &self,
+        id: &str,
+    ) -> Result<diri_proto::schedules::ScheduleRecord, ClientError> {
+        self.typed(
+            Method::SCHEDULE_RUN_NOW,
+            &diri_proto::schedules::ScheduleIdParams { id: id.to_owned() },
+        )
+        .await
     }
 
     pub async fn worktree_cleanup(&self, params: WorktreeCleanupParams) -> Result<(), ClientError> {
@@ -1080,6 +1205,43 @@ impl DaemonClient {
 
     pub async fn account_profiles(&self) -> Result<diri_proto::AgentAccountCatalog, ClientError> {
         self.no_params(Method::ACCOUNT_PROFILES_LIST).await
+    }
+
+    /// The catalog with who each local login belongs to. It may ask Claude
+    /// about a login it has not described yet, so it allows a few seconds.
+    pub async fn account_overview(&self) -> Result<diri_proto::AgentAccountOverview, ClientError> {
+        self.core
+            .request_typed::<EmptyParams, _>(
+                Method::ACCOUNT_OVERVIEW,
+                None,
+                Some(std::time::Duration::from_secs(30)),
+            )
+            .await
+    }
+
+    /// Save the login an Agent uses now as a profile named after its email.
+    pub async fn adopt_account(
+        &self,
+        agent: String,
+    ) -> Result<diri_proto::AgentAccountOverview, ClientError> {
+        self.core
+            .request_typed(
+                Method::ACCOUNT_ADOPT,
+                Some(&diri_proto::AgentAccountAgent { agent }),
+                Some(std::time::Duration::from_secs(60)),
+            )
+            .await
+    }
+
+    /// A new profile for the Agent and the sign-in tab that fills it.
+    pub async fn add_account(&self, agent: String) -> Result<SessionRecord, ClientError> {
+        self.core
+            .request_typed(
+                Method::ACCOUNT_ADD,
+                Some(&diri_proto::AgentAccountAgent { agent }),
+                Some(std::time::Duration::from_secs(60)),
+            )
+            .await
     }
 
     pub async fn login_codex_account(&self, id: String) -> Result<SessionRecord, ClientError> {
@@ -1586,6 +1748,46 @@ mod tests {
             .expect("reconnected");
     }
 
+    /// A Dock reopen builds views on the main thread, outside any runtime.
+    /// `events()` there used to `tokio::spawn` and abort the app (0.9.1).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn events_from_a_thread_without_a_runtime_subscribes_on_the_connect_runtime() {
+        let engine = FakeEngine::start(Some("engine-a"), 2);
+        let client = Arc::new(DaemonClient::with_socket_path(&engine.socket));
+        client.connect();
+        client
+            .wait_until_connected(Duration::from_secs(5))
+            .await
+            .expect("connected");
+
+        let off_runtime = Arc::clone(&client);
+        let mut events = std::thread::spawn(move || off_runtime.events())
+            .join()
+            .expect("events() must not panic off the runtime");
+
+        assert_eq!(engine.next_subscription().await.since_seq, None);
+        drain_events(&mut events, 2).await;
+    }
+
+    /// `connect` from a GPUI callback, off any runtime, must not panic: the
+    /// panic could not unwind out of the Objective-C callback and would abort.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn connect_from_a_thread_without_a_runtime_never_panics() {
+        let engine = FakeEngine::start(Some("engine-a"), 0);
+        let client = Arc::new(DaemonClient::with_socket_path(&engine.socket));
+        let off_runtime = Arc::clone(&client);
+        std::thread::spawn(move || off_runtime.connect())
+            .join()
+            .expect("connect() must not panic off the runtime");
+        assert!(!client.connection_state().borrow().is_connected());
+
+        client.connect();
+        client
+            .wait_until_connected(Duration::from_secs(5))
+            .await
+            .expect("a later connect on a runtime still starts the client");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn same_engine_instance_resumes_the_event_cursor_across_reconnect() {
         let engine = FakeEngine::start(Some("engine-a"), 3);
@@ -1717,6 +1919,7 @@ mod tests {
 
             let spawned_id = client
                 .spawn(SessionSpawnParams {
+                    appearance: None,
                     kind: AgentKind::SHELL,
                     cwd: scratch.to_string_lossy().into_owned(),
                     new_worktree: None,
@@ -1732,6 +1935,7 @@ mod tests {
                     same_repo_as: None,
                     start_directory: None,
                     note_id: None,
+                    argv: None,
                 })
                 .await?;
 

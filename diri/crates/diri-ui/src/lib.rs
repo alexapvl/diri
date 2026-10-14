@@ -6,8 +6,11 @@
 //! continuous-corner squircles, so radii use GPUI rounded corners as the
 //! documented approximation. See the gallery example for every supported state.
 
+mod agent_marks;
 mod brand;
 mod components;
+mod frame_loop;
+pub mod hover_trail;
 mod icon;
 pub mod motion;
 pub mod scroller;
@@ -16,6 +19,7 @@ mod svg;
 pub mod title_fade;
 mod tokens;
 
+pub use agent_marks::{AGENT_MARKS, AgentMark, agent_mark};
 pub use brand::{
     AgentKind, AgentLogo, BrandMark, BrandMarkKind, CLAUDE_PATH, CURSOR_PATH, GEMINI_PATH,
     MarkRasterizer, OPENAI_PATH, set_mark_rasterizer,
@@ -24,6 +28,8 @@ pub use components::{
     AlertChip, FloatingSurface, GlassMenuRow, GlassPill, HairlineDivider, HoverMarquee,
     LoadingIndicator, RowFill, StateChip,
 };
+pub use frame_loop::FrameLoop;
+pub use hover_trail::HoverTrail;
 pub use icon::{Icon, IconAssets, IconName, IconSize, icon_from_system_name};
 pub use scroller::{
     Overscroll, ScrollArea, ScrollTarget, ScrollerState, ScrollerStyle, ThumbGeometry,

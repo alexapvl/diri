@@ -1,16 +1,20 @@
 mod accounts;
 mod arrivals;
 mod filter;
+mod hover_linger;
 #[cfg(test)]
 mod hue_tests;
 mod lineage;
 mod project_picker;
+mod rename_input;
 mod rows;
 mod strip_tabs;
 mod tabs;
 mod titles;
+mod windowing;
 mod workspaces;
 
+pub(crate) use accounts::AccountRequest;
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) use titles::testing as title_clock_for_test;
 
@@ -46,6 +50,7 @@ use crate::commands::{CommandId, OpenSettings, ToggleHistory};
 use crate::delegation::{HandoffProposal, handoff_proposal, sibling_proposal, validate_handoff};
 use crate::external_drop::{ExternalDropPlan, ExternalDropTarget, plan_external_drop};
 use crate::haptics::{self, Haptic};
+use crate::i18n::{t, tf};
 use crate::icons::{SymbolWeight, sf_symbol, sf_symbol_weighted};
 use crate::navigation::query_label;
 use crate::query_editor::{self, ClipboardEdit, Edit};
@@ -63,6 +68,7 @@ use crate::usage::{UsageFormat, UsageSnapshot};
 use crate::session_presentation::{activity_mark, is_loading, status_state, ui_agent_kind};
 
 use super::disclosure::{Disclosure, Frame as DisclosureFrame};
+use super::row_window::{self, RowWindow, Slot, merge_skipped};
 use super::title_settle::{SettlingLabel, TitleSettles};
 
 use super::{
@@ -90,6 +96,10 @@ const SECTION_SHIFT_TIME: Duration = Duration::from_millis(220);
 /// Vertical gap between project sections in the list, mirrored here because
 /// the slide animation reconstructs slot positions from section heights.
 const SECTION_GAP: f32 = 8.0;
+/// The session list's top padding, where its content-space cursor starts.
+const LIST_TOP_PADDING: f32 = 8.0;
+/// A recency bucket's label row ("Today", "Yesterday", ...).
+const RECENCY_HEADER_HEIGHT: f32 = 24.0;
 /// Backstop for a motion whose display-link frames stop arriving (a covered
 /// window, or a floating panel that closed while it painted the sidebar): two
 /// 60 Hz frames, so the motion never stalls for longer than a hitch.
@@ -98,9 +108,22 @@ const MOTION_BACKSTOP: Duration = Duration::from_millis(33);
 /// agent mark, and the ✕ that stands on that column when a session or
 /// project row is hovered. One width keeps them on a single vertical line.
 const SIDEBAR_TRAILING_SLOT: f32 = 16.0;
+/// How far a trailing row control's hover square reaches past its 16px slot
+/// on each side. Every row control (⋯, +, ✕, revive, fold) shows the same
+/// 24px square while still sitting on the 16px column, so controls stand on
+/// one 24px pitch and the ✕ stays centred over the agent marks.
+/// Distance from the sidebar's right edge to the centre of the rows'
+/// trailing column (agent marks, ✕). Chrome outside the rows lines up on it.
+const TRAILING_COLUMN_CENTER: f32 = Space::INSET + Space::ROW_H + SIDEBAR_TRAILING_SLOT / 2.0;
+/// Width of the rows' leading column (activity marks, project chevrons).
+const LEADING_SLOT: f32 = 18.0;
+const SIDEBAR_ACTION_OUTSET: f32 = (SIDEBAR_ACTION_SLOT - SIDEBAR_TRAILING_SLOT) / 2.0;
+/// Width of a project header's hover strip: ⋯, +, and ✕ on one 24px pitch.
+const PROJECT_ACTION_STRIP: f32 = SIDEBAR_ACTION_SLOT * 3.0;
 
 /// Which hover control a point in a project header lands on.
-/// The strip sits `Space::ROW_H` in from the header's right edge.
+/// The strip's ✕ is centred on the trailing column `Space::ROW_H` in from
+/// the header's right edge, so its hover square reaches a little past it.
 enum ProjectHoverAction {
     Menu,
     Add,
@@ -114,8 +137,8 @@ fn project_hover_action(
     if !header.contains(&position) {
         return None;
     }
-    let strip_width = px(SIDEBAR_ACTION_SLOT * 2.0 + SIDEBAR_TRAILING_SLOT);
-    let strip_right = header.right() - px(Space::ROW_H);
+    let strip_width = px(PROJECT_ACTION_STRIP);
+    let strip_right = header.right() - px(Space::ROW_H - SIDEBAR_ACTION_OUTSET);
     let strip_left = strip_right - strip_width;
     if position.x < strip_left || position.x >= strip_right {
         return None;
@@ -196,7 +219,7 @@ pub(crate) enum SidebarEvent {
     /// Root-mounted header popup visibility changed; no sidebar layout change.
     ProjectPickerChanged,
     RefreshUsageLimits,
-    AccountAction(Option<String>),
+    AccountAction(AccountRequest),
     ManageAccounts,
     ContinueAccount(SessionId),
     VisibilityChanged,
@@ -728,6 +751,25 @@ pub struct Sidebar {
     /// Sessions that arrive grow into the list and ones that leave collapse
     /// out of it, sampled on the title clock.
     row_motion: super::row_motion::RowMotion<SessionId, crate::store::SidebarRow>,
+    hover_trails: hover_linger::HoverTrails,
+    /// This render's walk down the session list, which builds only the rows
+    /// near the viewport (see `row_window.rs`).
+    row_window: RowWindow,
+    /// Content-space slot of every row the latest render walked, built or
+    /// not, so the keyboard can reveal a row that has never been painted.
+    row_slots: Rc<RefCell<HashMap<SessionId, row_window::Span>>>,
+    /// The list's content height from the latest render's walk.
+    list_content_height: f32,
+    /// The band the latest render built rows for, checked against the scroll
+    /// the list actually painted at.
+    built_band: Rc<Cell<Option<row_window::Span>>>,
+    /// Rows outside the viewport are skipped; off only for tests that need
+    /// every row's bounds.
+    windowing: bool,
+    /// Rows built this render wherever they are (see `held_rows`).
+    held_rows: HashSet<SessionId>,
+    /// The latest render built every row because rows were in motion.
+    rows_built_for_motion: bool,
 }
 
 /// The sidebar state that asked for a native folder pick, captured when the
@@ -895,6 +937,14 @@ impl Sidebar {
             title_now: Instant::now(),
             title_tick: false,
             row_motion: Default::default(),
+            hover_trails: hover_linger::HoverTrails::default(),
+            row_window: RowWindow::default(),
+            row_slots: Rc::new(RefCell::new(HashMap::new())),
+            list_content_height: 0.0,
+            built_band: Rc::new(Cell::new(None)),
+            windowing: true,
+            held_rows: HashSet::new(),
+            rows_built_for_motion: false,
         };
         sidebar.ui.preview_account = preview;
         sidebar._self_observer = Some(cx.observe_self(|sidebar, _| sidebar.note_self_notified()));
@@ -1066,15 +1116,15 @@ impl Sidebar {
         let store = self.store.read().expect("session store lock poisoned");
         let pending = store.pending_close()?;
         let title = if let Some(project) = &pending.project {
-            format!("Close all sessions in “{project}”?")
+            tf("session.close.title_project", &[("project", project)])
         } else if pending.ids.len() == 1 {
             store
                 .sessions()
                 .get(&pending.ids[0])
-                .map(|session| format!("Close “{}”?", session.title))
-                .unwrap_or_else(|| "Close session?".into())
+                .map(|session| tf("session.close.title_one", &[("title", &session.title)]))
+                .unwrap_or_else(|| t("session.close.title_untitled").into())
         } else {
-            format!("Close {} sessions?", pending.ids.len())
+            tf("session.close.title_many", &[("count", &pending.ids.len())])
         };
         let running = pending
             .ids
@@ -1096,9 +1146,12 @@ impl Sidebar {
             })
             .count();
         let message = if pending.project.is_some() && archived > 0 {
-            format!("{running} still running, {archived} archived.")
+            tf(
+                "session.close.running_archived",
+                &[("running", &running), ("archived", &archived)],
+            )
         } else {
-            format!("{running} still running.")
+            tf("session.close.running", &[("running", &running)])
         };
         Some((title, message))
     }
@@ -1244,7 +1297,7 @@ impl Sidebar {
             files: false,
             directories: true,
             multiple: false,
-            prompt: Some("Start Here".into()),
+            prompt: Some(t("sidebar.start_here").into()),
         });
         // The panel is modeless: the sidebar stays live while it is up, so
         // pin the popover that asked for the pick. Every "never mind" gesture
@@ -1590,13 +1643,14 @@ impl Sidebar {
         };
         let scroll = self.list_scroll.clone();
         let row_bounds = Rc::clone(&self.row_bounds);
+        let row_slots = Rc::clone(&self.row_slots);
         // Keyboard movement changes the focused styling in the upcoming
         // frame. A row newly exposed by Right may not have bounds until that
         // frame has painted, so retry once on the following frame.
         window.on_next_frame(move |window, _cx| {
-            if !reveal_tracked_row(&scroll, &row_bounds, &id, window) {
+            if !reveal_tracked_row(&scroll, &row_bounds, &row_slots, &id, window) {
                 window.on_next_frame(move |window, _cx| {
-                    reveal_tracked_row(&scroll, &row_bounds, &id, window);
+                    reveal_tracked_row(&scroll, &row_bounds, &row_slots, &id, window);
                 });
             }
         });
@@ -1618,6 +1672,11 @@ impl Sidebar {
             // Rename remains a modal editor for every editing keystroke. A
             // non-editing application shortcut may continue through GPUI's
             // action dispatch, matching the existing command behavior.
+            if self.rename_composition_key(event.keystroke.key.as_str(), window, cx) {
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
             match event.keystroke.key.as_str() {
                 "enter" => self.commit_rename(),
                 "escape" => self.ui.cancel_rename(),
@@ -1997,6 +2056,9 @@ impl Sidebar {
                     .flex()
                     .items_center()
                     .justify_center()
+                    // The glyph's badge pokes out top right; its box is
+                    // the visual mass, so centre the box on the column.
+                    .pl(px(2.0))
                     .child(sf_symbol("square.and.pencil", 13.0, colors.secondary)),
             )
             .child(
@@ -2006,7 +2068,7 @@ impl Sidebar {
                     .whitespace_nowrap()
                     .overflow_hidden()
                     .text_ellipsis()
-                    .child("New Agent"),
+                    .child(t("sidebar.new_agent")),
             )
             // The agent about to launch is shown by its mark, the way session
             // rows show theirs, rather than spelled out beside the label.
@@ -2061,7 +2123,7 @@ impl Sidebar {
         let primary_button = if in_settings {
             icon_button(
                 "close-settings",
-                "Back to sessions",
+                t("sidebar.back_to_sessions"),
                 "chevron.left",
                 primary_hover,
                 colors,
@@ -2078,7 +2140,7 @@ impl Sidebar {
             crate::held_hints::below(
                 icon_button(
                     "sidebar-search",
-                    "Search sessions",
+                    t("sidebar.search_sessions"),
                     "magnifyingglass",
                     primary_hover,
                     colors,
@@ -2105,12 +2167,15 @@ impl Sidebar {
             .flex()
             .items_center()
             .justify_end()
-            .pr(px(Metrics::TOOLBAR_EDGE_INSET))
+            // The last toolbar control centres on the rows' trailing column.
+            .pr(px(
+                TRAILING_COLUMN_CENTER - Metrics::TOOLBAR_CONTROL_SIZE / 2.0
+            ))
             .gap(px(Metrics::TOOLBAR_COMPACT_GAP))
             .when(!in_settings, |bar| {
                 bar.child(icon_button(
                     "sidebar-layout",
-                    "Group and order sessions",
+                    t("sidebar.group_and_order"),
                     "gearshape",
                     layout_hover,
                     colors,
@@ -2134,9 +2199,9 @@ impl Sidebar {
                 icon_button(
                     "sidebar-toggle",
                     if self.peek_open {
-                        "Pin sidebar open"
+                        t("sidebar.pin_open")
                     } else {
-                        "Hide sidebar"
+                        t("sidebar.hide")
                     },
                     "sidebar.left",
                     toggle_hover,
@@ -2214,7 +2279,7 @@ impl Sidebar {
                     .pt(px(14.0))
                     .text_size(px(Typo::META.size))
                     .text_color(colors.tertiary)
-                    .child("No settings found"),
+                    .child(t("sidebar.settings_no_results")),
             );
         }
         div()
@@ -2326,7 +2391,7 @@ impl Sidebar {
         } else if nav.search.is_empty() {
             div()
                 .text_color(colors.tertiary)
-                .child("Search settings…")
+                .child(crate::i18n::t("settings.general.search_placeholder"))
                 .into_any_element()
         } else {
             div()
@@ -2502,9 +2567,9 @@ impl Sidebar {
                     .text_size(px(Typo::META.size))
                     .text_color(colors.secondary)
                     .child(if revive_offered {
-                        "Drop to revive session"
+                        t("sidebar.drop_revive")
                     } else {
-                        "Drop to fan out a sibling"
+                        t("sidebar.drop_sibling")
                     })
             })
             .drag_over::<DraggedSidebarItem>(move |element, dragged, _, _| {
@@ -2568,7 +2633,7 @@ impl Sidebar {
                 div()
                     .text_size(px(Typo::ROW.size))
                     .text_color(colors.tertiary)
-                    .child("No Sessions"),
+                    .child(t("sidebar.no_sessions")),
             )
             .into_any_element()
     }
@@ -2862,7 +2927,7 @@ impl Sidebar {
                     .font_weight(Typo::ROW_EMPHASIZED.weight)
                     .text_color(colors.primary.alpha(0.90))
                     .when(is_hovered, |title| {
-                        title.pr(px(SIDEBAR_ACTION_SLOT * 2.0 + SIDEBAR_TRAILING_SLOT))
+                        title.pr(px(PROJECT_ACTION_STRIP - SIDEBAR_ACTION_OUTSET))
                     })
                     .child(group.project.name.clone()),
             )
@@ -2877,8 +2942,8 @@ impl Sidebar {
                     div()
                         .absolute()
                         .top(px(0.0))
-                        .right(px(Space::ROW_H))
-                        .w(px(SIDEBAR_ACTION_SLOT * 2.0 + SIDEBAR_TRAILING_SLOT))
+                        .right(px(Space::ROW_H - SIDEBAR_ACTION_OUTSET))
+                        .w(px(PROJECT_ACTION_STRIP))
                         .h(px(SIDEBAR_NAV_ROW_HEIGHT))
                         .flex()
                         .items_center()
@@ -2897,13 +2962,7 @@ impl Sidebar {
                                     move || format!("PROJECT_MENU_{}", id.0)
                                 })
                                 .size(px(SIDEBAR_ACTION_SLOT))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded(px(Radius::BADGE))
-                                .text_color(colors.secondary)
-                                .hover(|button| button.bg(colors.primary.alpha(0.07)))
-                                .active(|button| button.opacity(0.72))
+                                .row_action(colors)
                                 .child(sf_symbol_weighted(
                                     "ellipsis",
                                     12.0,
@@ -2934,13 +2993,7 @@ impl Sidebar {
                                     move || format!("PROJECT_ADD_{}", id.0)
                                 })
                                 .size(px(SIDEBAR_ACTION_SLOT))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded(px(Radius::BADGE))
-                                .text_color(colors.secondary)
-                                .hover(|button| button.bg(colors.primary.alpha(0.07)))
-                                .active(|button| button.opacity(0.72))
+                                .row_action(colors)
                                 .child(sf_symbol_weighted(
                                     "plus",
                                     12.0,
@@ -2969,16 +3022,9 @@ impl Sidebar {
                                     move || format!("PROJECT_CLOSE_{}", id.0)
                                 })
                                 .role(Role::Button)
-                                .aria_label("Close all sessions")
-                                .size(px(SIDEBAR_TRAILING_SLOT))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded(px(Radius::CHIP))
-                                .cursor_pointer()
-                                .text_color(colors.secondary)
-                                .hover(move |button| button.bg(Fill::subtle(colors)))
-                                .active(|button| button.opacity(0.72))
+                                .aria_label(t("sidebar.close_all_sessions"))
+                                .size(px(SIDEBAR_ACTION_SLOT))
+                                .row_action(colors)
                                 // The row drags; a press that wanders 2px
                                 // becomes a drag that swallows the click.
                                 // Keeping mouse-down off the row makes
@@ -3003,6 +3049,7 @@ impl Sidebar {
                 )
             });
         section = section.child(header);
+        self.row_window.advance(SIDEBAR_NAV_ROW_HEIGHT);
 
         // Keep the last visible rows only for the close animation. The Store
         // remains authoritative for keyboard navigation and selection.
@@ -3049,9 +3096,25 @@ impl Sidebar {
         if collapsed && !frame.animating {
             retained.clear();
         }
+        let body_top = self.row_window.cursor();
+        // A body mid-disclosure clips and slides its rows, so they leave the
+        // walk's slots: build them all until it settles.
+        let settled = !frame.animating && frame.reveal >= 1.0;
         if frame.reveal > 0.0 {
             let mut children = Vec::new();
             for (row, presence, ghost) in super::row_motion::paint_order(&rows, &slots) {
+                let height = SIDEBAR_NAV_ROW_HEIGHT * presence.height;
+                let margin = 2.0 * presence.height;
+                let moving = presence != super::row_motion::Presence::FULL || ghost;
+                if !self.place_row(
+                    (!ghost).then(|| row.id()),
+                    margin,
+                    height,
+                    moving || !settled,
+                ) {
+                    children.push(Slot::Skipped { height, margin });
+                    continue;
+                }
                 let shortcut = (!ghost).then(|| self.shortcut_for(row.id())).flatten();
                 let id = row.id().clone();
                 let drop = if collapsed || ghost {
@@ -3082,16 +3145,28 @@ impl Sidebar {
                 } else {
                     self.track_row_bounds(id, rendered, marker)
                 };
-                children.push((
-                    rendered,
-                    SIDEBAR_NAV_ROW_HEIGHT * presence.height,
-                    presence.height,
-                ));
+                children.push(Slot::Built {
+                    row: rendered,
+                    height,
+                    margin,
+                });
             }
             if !group.archived.is_empty() {
+                self.row_window.advance(2.0);
                 let (bucket, height) = self.archived_bucket(group, !collapsed, colors, window, cx);
-                children.push((bucket, height, 1.0));
+                children.push(Slot::Built {
+                    row: bucket,
+                    height,
+                    margin: 2.0,
+                });
             }
+            let children = windowing::body_rows(children);
+            let natural: f32 = children
+                .iter()
+                .map(|(_, height, gap)| height + 2.0 * gap)
+                .sum();
+            self.row_window
+                .set_cursor(body_top + natural * frame.reveal);
             section = section.child(disclosure_body(children, &frame, !collapsed));
         }
         // The whole section rides with the pointer, sessions included,
@@ -3239,10 +3314,14 @@ impl Sidebar {
             if bucket_rows.is_empty() {
                 continue;
             }
+            if !sections.is_empty() {
+                self.row_window.advance(SECTION_GAP);
+            }
+            self.row_window.advance(RECENCY_HEADER_HEIGHT);
             let mut section = div().flex().flex_col().child(
                 div()
                     .px(px(Space::ROW_H))
-                    .h(px(24.0))
+                    .h(px(RECENCY_HEADER_HEIGHT))
                     .flex()
                     .items_center()
                     .text_size(px(Typo::SECTION_HEADER.size))
@@ -3252,14 +3331,21 @@ impl Sidebar {
             );
             let bucket_rows: Vec<_> = bucket_rows.into_iter().cloned().collect();
             let slots = self.arrange_rows(bucket.label(), &bucket_rows);
+            let mut children = Vec::new();
             for (row, presence, ghost) in super::row_motion::paint_order(&bucket_rows, &slots) {
+                let height = SIDEBAR_NAV_ROW_HEIGHT * presence.height;
+                let margin = 2.0 * presence.height;
+                let moving = presence != super::row_motion::Presence::FULL || ghost;
+                if !self.place_row((!ghost).then(|| row.id()), margin, height, moving) {
+                    children.push(Slot::Skipped { height, margin });
+                    continue;
+                }
                 let shortcut = (!ghost).then(|| self.shortcut_for(row.id())).flatten();
                 let id = row.id().clone();
                 let drop = (!ghost)
                     .then(|| self.row_drop_feedback(row, window, cx))
                     .flatten();
                 let working = self.working_row_rendered;
-                let moving = presence != super::row_motion::Presence::FULL || ghost;
                 let rendered =
                     self.mount_session_row(row, shortcut, drop, false, colors, moving, window, cx);
                 self.working_row_rendered &= !ghost || working;
@@ -3285,18 +3371,26 @@ impl Sidebar {
                 } else {
                     self.track_row_bounds(id, rendered, None)
                 };
-                // The 2 px above each row closes with its slot.
-                section = section.child(
-                    div()
-                        .flex_none()
-                        .mt(px(2.0 * presence.height))
-                        .child(rendered),
-                );
+                children.push(Slot::Built {
+                    row: rendered,
+                    height,
+                    margin,
+                });
+            }
+            // The 2 px above each row closes with its slot.
+            for (rendered, _, margin) in merge_skipped(children, windowing::skipped_spacer) {
+                section = section.child(div().flex_none().mt(px(margin)).child(rendered));
             }
             sections.push(section.into_any_element());
         }
-        if let Some(archives) = self.recency_archive_section(projection, colors, window, cx) {
-            sections.push(archives);
+        if !sections.is_empty() {
+            self.row_window.advance(SECTION_GAP);
+        }
+        match self.recency_archive_section(projection, colors, window, cx) {
+            Some(archives) => sections.push(archives),
+            // Nothing follows the last bucket after all.
+            None if !sections.is_empty() => self.row_window.advance(-SECTION_GAP),
+            None => {}
         }
         sections
     }
@@ -3336,11 +3430,11 @@ impl Sidebar {
                 .id("recency-archive-header")
                 .role(Role::Button)
                 .aria_label(if expanded {
-                    "Hide archived sessions"
+                    t("sidebar.archive.hide")
                 } else {
-                    "Show archived sessions"
+                    t("sidebar.archive.show")
                 })
-                .aria_description(format!("{count} archived sessions"))
+                .aria_description(tf("sidebar.archive.count", &[("count", &count)]))
                 .mt(px(4.0))
                 .pl(px(Space::ROW_H))
                 .pr(px(Space::ROW_H))
@@ -3366,7 +3460,7 @@ impl Sidebar {
                     cx.notify();
                 }))
                 .child(project_disclosure(!expanded, colors))
-                .child(div().min_w(px(0.0)).flex_1().child("Archived"))
+                .child(div().min_w(px(0.0)).flex_1().child(t("sidebar.archived")))
                 .child(archive_count(count, colors)),
         );
         let now = Instant::now();
@@ -3375,20 +3469,40 @@ impl Sidebar {
             .get_or_insert_with(|| Disclosure::new(expanded, count, now));
         let frame = motion.update(expanded, count, now, cx.reduce_motion());
         self.disclosure_animating |= frame.animating;
+        self.row_window.advance(4.0 + SIDEBAR_NAV_ROW_HEIGHT);
+        let body_top = self.row_window.cursor();
         if frame.reveal > 0.0 {
+            let settled = !frame.animating && frame.reveal >= 1.0 && expanded;
             let mut children = Vec::new();
             for session in archived {
                 let id = session.id.clone();
+                if !self.place_row(Some(&id), 2.0, SIDEBAR_NAV_ROW_HEIGHT, !settled) {
+                    children.push(Slot::Skipped {
+                        height: SIDEBAR_NAV_ROW_HEIGHT,
+                        margin: 2.0,
+                    });
+                    continue;
+                }
                 let rendered = self.archived_row(&session, colors, window, cx);
                 let rendered = if expanded {
                     self.track_row_bounds(id, rendered, None)
                 } else {
                     rendered
                 };
-                children.push((rendered, SIDEBAR_NAV_ROW_HEIGHT, 1.0));
+                children.push(Slot::Built {
+                    row: rendered,
+                    height: SIDEBAR_NAV_ROW_HEIGHT,
+                    margin: 2.0,
+                });
             }
-            section = section.child(disclosure_body(children, &frame, expanded));
+            section = section.child(disclosure_body(
+                windowing::body_rows(children),
+                &frame,
+                expanded,
+            ));
         }
+        self.row_window
+            .set_cursor(body_top + (SIDEBAR_NAV_ROW_HEIGHT + 2.0) * count as f32 * frame.reveal);
         Some(section.into_any_element())
     }
 
@@ -3452,7 +3566,7 @@ impl Sidebar {
     }
 
     /// Asks for the next frame of a finite motion (rows, disclosures, title
-    /// settles, number flows). Each is sampled from elapsed time, so the
+    /// settles, number flows, hover-out trails). Each is sampled from elapsed time, so the
     /// display link paces it: 120 Hz on ProMotion, where the 16 ms timers
     /// this replaces beat against vsync and landed at 40 to 53 fps.
     ///
@@ -3469,7 +3583,11 @@ impl Sidebar {
                 cx.background_executor().timer(MOTION_BACKSTOP).await;
                 let _ = this.update(cx, |this, cx| {
                     this.motion_backstop = None;
-                    if this.disclosure_tick || this.title_tick || this.number_flows.running() {
+                    if this.disclosure_tick
+                        || this.title_tick
+                        || this.number_flows.running()
+                        || this.hover_trails.is_fading()
+                    {
                         this.notify_without_staling_rows(cx);
                     }
                 });
@@ -3633,7 +3751,7 @@ impl Sidebar {
             ref drag_selection,
             migrating,
             activity_state,
-            activity_frame,
+            panes,
             progress,
             marked,
             hovered,
@@ -3643,6 +3761,7 @@ impl Sidebar {
             ref filter,
             renaming,
             held_hint,
+            hover_linger,
             ..
         } = *props;
         let drop = drop.clone();
@@ -3655,11 +3774,14 @@ impl Sidebar {
         let session_is_remote = session.host.is_some();
         let ended = matches!(session.status, diri_proto::SessionStatus::Exited(_)) && !archived;
         let remote_marked = session_is_remote && !host_marked_above;
+        let scheduled_run = session.scheduled_run.clone();
         let title = display_title(session);
         let non_persistent =
             session.remote_persistence == Some(PersistenceCapability::NonPersistent);
         // Read before the title moves into the marquee below.
-        let ended_chip = ended && title != ENDED_TITLE;
+        // `display_title` names a placeholder-titled exited session "Ended"; the
+        // chip stands down when the title already says it.
+        let ended_chip = ended && title != crate::i18n::t("nav.title.ended");
         let title_available_width = (session_title_available_width(
             width,
             row.depth,
@@ -3670,8 +3792,14 @@ impl Sidebar {
             row.pinned,
             !hovered && focused && shortcut.is_some(),
         ) - if loading { 60.0 } else { 0.0 }
+            - if scheduled_run.is_some() { 18.0 } else { 0.0 }
+            - if panes > 1 {
+                PANE_COUNT_WIDTH + 8.0
+            } else {
+                0.0
+            }
             - if row.has_children {
-                Space::INDENT + 8.0
+                SIDEBAR_TRAILING_SLOT + 8.0
             } else {
                 0.0
             })
@@ -3693,7 +3821,11 @@ impl Sidebar {
         } else {
             RowFill::Clear
         };
-        let fill_color = fill.color(colors);
+        let mut fill_color = fill.color(colors);
+        if fill == RowFill::Clear {
+            // The row the pointer just left keeps a fading hover fill.
+            fill_color.a = RowFill::Hover.color(colors).a * hover_linger;
+        }
 
         if renaming {
             return div()
@@ -3743,7 +3875,6 @@ impl Sidebar {
                 .children(indent_rails(row, colors))
                 .child(crate::progress_mark::leading_mark(
                     activity_state,
-                    activity_frame,
                     progress,
                     colors,
                 ))
@@ -3755,12 +3886,12 @@ impl Sidebar {
                         .overflow_hidden()
                         .text_size(px(Typo::ROW.size))
                         .text_color(colors.primary)
-                        .child(query_label(&self.ui.rename_draft)),
+                        .child(self.rename_field(&id, colors, cx)),
                 )
                 // Keep the trailing fold slot inert while editing, preserving
                 // the same title width as the non-editing row.
                 .when(row.has_children, |element| {
-                    element.child(div().w(px(Space::INDENT)).flex_none())
+                    element.child(div().w(px(SIDEBAR_TRAILING_SLOT)).flex_none())
                 })
                 .child(self.status_glyph(session, migrating, colors, window, cx))
                 .into_any_element();
@@ -3781,7 +3912,7 @@ impl Sidebar {
             }
         };
         let drag_label: SharedString = match &drag_item {
-            DragItem::Sessions(ids) => format!("{} sessions", ids.len()).into(),
+            DragItem::Sessions(ids) => tf("sidebar.drag_sessions", &[("count", &ids.len())]).into(),
             _ => title.clone().into(),
         };
         let drag_payload = DraggedSidebarItem(drag_item);
@@ -3798,9 +3929,11 @@ impl Sidebar {
                         .into()
                 })
             })
-            // Account for the selection border when aligning with project icons.
+            // Account for the selection border on both edges, so the leading
+            // mark and the trailing agent mark share columns with unbordered
+            // rows (New Agent, project headers).
             .pl(px(Space::ROW_H - 1.0))
-            .pr(px(Space::ROW_H))
+            .pr(px(Space::ROW_H - 1.0))
             .h(px(SIDEBAR_NAV_ROW_HEIGHT))
             .flex()
             .items_center()
@@ -3949,7 +4082,6 @@ impl Sidebar {
             // Hover keeps activity visible and swaps identity for the close action.
             .child(crate::progress_mark::leading_mark(
                 activity_state,
-                activity_frame,
                 progress,
                 colors,
             ))
@@ -3996,31 +4128,55 @@ impl Sidebar {
             )
             .when(row.pinned, |element| element.child(pin_mark(colors)))
             .when(marked, |element| {
-                element.child(StateChip::new("Delegating", Palette::CLAY, colors))
+                element.child(StateChip::new(
+                    t("session.chip.delegating"),
+                    Palette::CLAY,
+                    colors,
+                ))
             })
             // Chips, in descending order of how much they explain an otherwise
             // inert-looking row. Each is flex_none and the title absorbs the
             // remaining width, so a narrow sidebar truncates the title rather
             // than dropping the reason it is not moving.
             .when(migrating, |element| {
-                element.child(StateChip::new("Moving…", colors.secondary, colors))
+                element.child(StateChip::new(
+                    t("session.chip.moving"),
+                    colors.secondary,
+                    colors,
+                ))
             })
             .when(non_persistent, |element| {
                 // Louder than the rest of the lane on purpose: this session
                 // cannot survive a detach, so closing the window loses it.
-                element.child(AlertChip::new("No detach"))
+                element.child(AlertChip::new(t("session.chip.no_detach")))
             })
             .when(ended_chip, |element| {
                 // An exited session with a real title otherwise looks alive:
                 // the glyph goes quiet and nothing else says why.
-                element.child(StateChip::new("Ended", colors.tertiary, colors))
+                element.child(StateChip::new(
+                    t("session.chip.ended"),
+                    colors.tertiary,
+                    colors,
+                ))
             })
             .when(loading, |element| {
-                element.child(StateChip::new("Loading", colors.secondary, colors))
+                element.child(StateChip::new(
+                    t("session.chip.loading"),
+                    colors.secondary,
+                    colors,
+                ))
+            })
+            .when_some(scheduled_run, |element, run| {
+                // A schedule opened this session, perhaps after waking the Mac.
+                element.child(scheduled_mark(&id, &run, colors))
             })
             .when(remote_marked, |element| {
                 // This session's agent runs on another machine.
                 element.child(remote_mark(colors))
+            })
+            .when(panes > 1, |element| {
+                // A split tab is still one row; this says how many panes.
+                element.child(pane_count_mark(&id, panes, colors))
             })
             .when_some(lineage, |element, role| {
                 element.child(lineage_glyph(&id, role, colors))
@@ -4038,16 +4194,8 @@ impl Sidebar {
                             move || format!("session-close:{}", id.0)
                         })
                         .role(Role::Button)
-                        .aria_label("Close session")
-                        .size(px(16.0))
-                        .flex_none()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded(px(Radius::CHIP))
-                        .cursor_pointer()
-                        .text_color(colors.secondary)
-                        .hover(move |button| button.bg(Fill::subtle(colors)))
+                        .aria_label(t("session.close_session"))
+                        .trailing_row_action(colors)
                         // The row is draggable, and a press that wanders
                         // 2px turns into a drag that swallows the click.
                         // Keeping mouse-down off the row makes every press
@@ -4107,17 +4255,18 @@ impl Sidebar {
         });
 
         // A selection fill arrives on ROW_SELECT instead of switching between
-        // two frames. Hover deliberately does not animate: hover should feel
-        // like the cursor is touching the row, and a highlight that ramps in
-        // reads as lag rather than as polish.
+        // two frames. Hover-in deliberately does not animate: hover should
+        // feel like the cursor is touching the row, and a highlight that
+        // ramps in reads as lag rather than as polish. Hover-out lingers for
+        // HOVER_LINGER through the view's hover trail (see `hover_linger`),
+        // which is already folded into `fill_color` above.
         //
         // Cost drives the same split. A running animation asks for a window
         // frame per tick, and a window frame repaints everything in it --
-        // live terminal grids included. Hover changes on every row a pointer
-        // crosses, so animating it would schedule repaints for the length of
-        // a sweep down the sidebar; selection changes once per click. An
-        // unselected row therefore carries no animation state at all, rather
-        // than animating an invisible zero-alpha fill.
+        // live terminal grids included. The trail's frames are bounded to
+        // one short fade after the pointer last crossed a row, and stop the
+        // moment it lapses; an unselected row carries no per-row animation
+        // state at all, rather than animating an invisible zero-alpha fill.
         if !selected && !multi {
             return row.into_any_element();
         }
@@ -4142,11 +4291,10 @@ impl Sidebar {
         colors: SemanticColors,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let slot = div().w(px(Space::INDENT)).flex_none().flex().items_center();
         let id = row.id().clone();
-        slot.id(format!("fold:{}", id.0))
-            .justify_center()
-            .cursor_pointer()
+        div()
+            .id(format!("fold:{}", id.0))
+            .trailing_row_action(colors)
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(move |this, _, _, cx| {
                 cx.stop_propagation();
@@ -4265,7 +4413,7 @@ impl Sidebar {
                         }
                     }))
                     .child(project_disclosure(!expanded, colors))
-                    .child(div().min_w(px(0.0)).flex_1().child("Archived"))
+                    .child(div().min_w(px(0.0)).flex_1().child(t("sidebar.archived")))
                     .child(archive_count(group.archived.len(), colors)),
             );
         let now = Instant::now();
@@ -4277,20 +4425,39 @@ impl Sidebar {
         self.disclosure_animating |= frame.animating;
         let body_height =
             (SIDEBAR_NAV_ROW_HEIGHT + 2.0) * group.archived.len() as f32 * frame.reveal;
+        self.row_window.advance(4.0 + SIDEBAR_NAV_ROW_HEIGHT);
+        let body_top = self.row_window.cursor();
         if frame.reveal > 0.0 {
+            let settled = !frame.animating && frame.reveal >= 1.0 && interactive;
             let mut children = Vec::new();
             for session in &group.archived {
                 let id = session.id.clone();
+                if !self.place_row(Some(&id), 2.0, SIDEBAR_NAV_ROW_HEIGHT, !settled) {
+                    children.push(Slot::Skipped {
+                        height: SIDEBAR_NAV_ROW_HEIGHT,
+                        margin: 2.0,
+                    });
+                    continue;
+                }
                 let rendered = self.archived_row(session, colors, window, cx);
                 let rendered = if expanded && interactive {
                     self.track_row_bounds(id, rendered, None)
                 } else {
                     rendered
                 };
-                children.push((rendered, SIDEBAR_NAV_ROW_HEIGHT, 1.0));
+                children.push(Slot::Built {
+                    row: rendered,
+                    height: SIDEBAR_NAV_ROW_HEIGHT,
+                    margin: 2.0,
+                });
             }
-            bucket = bucket.child(disclosure_body(children, &frame, expanded && interactive));
+            bucket = bucket.child(disclosure_body(
+                windowing::body_rows(children),
+                &frame,
+                expanded && interactive,
+            ));
         }
+        self.row_window.set_cursor(body_top + body_height);
         (
             bucket.into_any_element(),
             SIDEBAR_NAV_ROW_HEIGHT + 4.0 + body_height,
@@ -4321,7 +4488,9 @@ impl Sidebar {
         } else if hovered || focused {
             RowFill::Hover.color(colors)
         } else {
-            RowFill::Clear.color(colors)
+            let mut trail = RowFill::Hover.color(colors);
+            trail.a *= self.session_hover_linger(&id);
+            trail
         };
         let row_session = session.clone();
         let revive_id = id.clone();
@@ -4333,7 +4502,7 @@ impl Sidebar {
             // Same insets as a live row: the archive glyph takes the activity
             // column and the title lands on the title column.
             .pl(px(Space::ROW_H - 1.0))
-            .pr(px(Space::ROW_H))
+            .pr(px(Space::ROW_H - 1.0))
             .h(px(SIDEBAR_NAV_ROW_HEIGHT))
             .flex()
             .items_center()
@@ -4446,16 +4615,8 @@ impl Sidebar {
                         move || format!("session-revive:{}", id.0)
                     })
                     .role(Role::Button)
-                    .aria_label("Revive session")
-                    .size(px(SIDEBAR_TRAILING_SLOT))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(Radius::CHIP))
-                    .cursor_pointer()
-                    .text_color(colors.secondary)
-                    .hover(move |button| button.bg(Fill::subtle(colors)))
+                    .aria_label(t("sidebar.revive_session"))
+                    .trailing_row_action(colors)
                     // The row drags; keep mouse-down off it so a press on
                     // the control is always a revive.
                     .on_mouse_down(MouseButton::Left, |_, _, cx| {
@@ -4624,7 +4785,7 @@ impl Sidebar {
                         div()
                             .flex_none()
                             .text_color(colors.secondary)
-                            .child("What's new ·"),
+                            .child(t("sidebar.whats_new_prefix")),
                     )
                     .child(
                         div()
@@ -4696,7 +4857,7 @@ impl Sidebar {
                 div()
                     .id("account")
                     .debug_selector(|| "account".into())
-                    .px(px(8.0))
+                    .px(px(Space::ROW_H))
                     .h(px(SIDEBAR_NAV_ROW_HEIGHT))
                     .flex()
                     .items_center()
@@ -4716,11 +4877,13 @@ impl Sidebar {
                         };
                         if !this.preview && this.ui.popover == Some(Popover::Account) {
                             cx.emit(SidebarEvent::RefreshUsageLimits);
-                            cx.emit(SidebarEvent::AccountAction(None));
+                            cx.emit(SidebarEvent::AccountAction(AccountRequest::Refresh));
                         }
                         cx.notify();
                     }))
-                    .child(account_avatar(&account_label, 20.0, colors))
+                    // The avatar takes the leading column and the name the
+                    // title column, like every row above it.
+                    .child(account_avatar(&account_label, LEADING_SLOT, colors))
                     .child(
                         div()
                             .min_w(px(0.0))
@@ -4743,14 +4906,20 @@ impl Sidebar {
                             Some(SharedString::from(crate::fonts::mono_family())),
                         ))
                     })
-                    .child(div().text_size(px(9.0)).text_color(colors.tertiary).child(
-                        sf_symbol_weighted(
-                            "chevron.up.chevron.down",
-                            8.5,
-                            SymbolWeight::Semibold,
-                            colors.tertiary,
-                        ),
-                    )),
+                    .child(
+                        div()
+                            .size(px(SIDEBAR_TRAILING_SLOT))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(sf_symbol_weighted(
+                                "chevron.up.chevron.down",
+                                8.5,
+                                SymbolWeight::Semibold,
+                                colors.tertiary,
+                            )),
+                    ),
             )
             .into_any_element()
     }
@@ -4798,13 +4967,13 @@ impl Sidebar {
             .flex()
             .flex_col()
             .role(Role::Menu)
-            .aria_label("Sidebar view options")
+            .aria_label(t("sidebar.layout.options"))
             .rounded(px(Radius::FLOATING_MENU))
             .p(px(4.0))
-            .child(section_label("Grouping"))
+            .child(section_label(t("sidebar.layout.grouping")))
             .child(choice_menu_row(
                 "sidebar-group-project",
-                "Project",
+                t("sidebar.layout.project"),
                 "P",
                 grouping == SidebarGrouping::Project,
                 self.ui.layout_menu_index == 0,
@@ -4816,7 +4985,7 @@ impl Sidebar {
             ))
             .child(choice_menu_row(
                 "sidebar-group-recency",
-                "Recency",
+                t("sidebar.layout.recency"),
                 "R",
                 grouping == SidebarGrouping::Recency,
                 self.ui.layout_menu_index == 1,
@@ -4827,11 +4996,11 @@ impl Sidebar {
                 }),
             ))
             .child(menu_divider(colors))
-            .child(section_label("Ordering"));
+            .child(section_label(t("sidebar.layout.ordering")));
         if grouping == SidebarGrouping::Project {
             content = content.child(choice_menu_row(
                 "sidebar-order-custom",
-                "Custom",
+                t("sidebar.layout.custom"),
                 "C",
                 ordering == SidebarOrdering::Custom,
                 self.ui.layout_menu_index == 2,
@@ -4845,7 +5014,7 @@ impl Sidebar {
         content = content
             .child(choice_menu_row(
                 "sidebar-order-newest",
-                "Newest first",
+                t("sidebar.layout.newest_first"),
                 "N",
                 ordering == SidebarOrdering::NewestFirst,
                 self.ui.layout_menu_index
@@ -4862,7 +5031,7 @@ impl Sidebar {
             ))
             .child(choice_menu_row(
                 "sidebar-order-oldest",
-                "Oldest first",
+                t("sidebar.layout.oldest_first"),
                 "O",
                 ordering == SidebarOrdering::OldestFirst,
                 self.ui.layout_menu_index
@@ -5274,9 +5443,10 @@ impl Sidebar {
         let (target, subtitle) = if preserve_repo {
             match repo_state {
                 Some(crate::store::RepoTarget::Resolved(path)) => (path, None),
-                Some(crate::store::RepoTarget::Pending) => {
-                    (fallback_target, Some("locating repo…".to_owned()))
-                }
+                Some(crate::store::RepoTarget::Pending) => (
+                    fallback_target,
+                    Some(t("sidebar.new_agent.locating_repo").to_owned()),
+                ),
                 Some(crate::store::RepoTarget::NotCloned) => {
                     let place = selected_host.as_ref().map_or_else(
                         || crate::platform::local_machine_label_lowercase().to_owned(),
@@ -5289,9 +5459,16 @@ impl Sidebar {
                         .to_owned();
                     (
                         fallback_target,
-                        Some(format!(
-                            "{} not on {place} — opens in {folder}",
-                            repo_name.as_deref().unwrap_or("repo")
+                        Some(tf(
+                            "sidebar.new_agent.repo_missing",
+                            &[
+                                (
+                                    "repo",
+                                    &repo_name.as_deref().unwrap_or(t("sidebar.new_agent.repo")),
+                                ),
+                                ("place", &place),
+                                ("folder", &folder),
+                            ],
                         )),
                     )
                 }
@@ -5471,7 +5648,7 @@ impl Sidebar {
                     .flex_1()
                     .text_size(px(Typo::ROW.size))
                     .text_color(colors.primary)
-                    .child("Manage Agents…"),
+                    .child(t("sidebar.new_agent.manage_agents")),
             ),
         );
         self.popover_shell_at(
@@ -5553,7 +5730,12 @@ impl Sidebar {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(AgentLogo::new(agent_kind, 20.0, colors).badged(false)),
+                    .child(
+                        AgentLogo::new(agent_kind, MENU_AGENT_LOGO, colors)
+                            .badged(false)
+                            .inset(MENU_AGENT_LOGO_INSET)
+                            .monochrome(true),
+                    ),
             )
             .child(
                 div()
@@ -5599,7 +5781,7 @@ impl Sidebar {
                         .bg(Fill::subtle(colors))
                         .hover(move |button| button.bg(colors.primary.alpha(0.10)))
                         .on_click(move |_, _, cx| cx.open_url(&url))
-                        .child("Setup…"),
+                        .child(t("sidebar.new_agent.setup")),
                 )
             })
             .when(!shortcut.is_empty(), |row| {
@@ -5635,7 +5817,7 @@ impl Sidebar {
             syncing,
         } = panel;
         let mut content = div().flex().flex_col().child(panel_header(
-            "Where",
+            t("sidebar.new_agent.where"),
             colors,
             cx.listener(|this, _, _, cx| {
                 cx.stop_propagation();
@@ -5644,7 +5826,7 @@ impl Sidebar {
             }),
         ));
         if !hosts.is_empty() {
-            content = content.child(section_label("Machine", colors));
+            content = content.child(section_label(t("sidebar.new_agent.machine"), colors));
             // "This Mac" first: it is a real target, not the absence of one,
             // so the choice can always be undone here.
             //
@@ -5759,10 +5941,10 @@ impl Sidebar {
                     .pb(px(4.0))
                     .text_size(px(Typo::META.size))
                     .text_color(colors.tertiary)
-                    .child("Also where ⌘T opens"),
+                    .child(t("sidebar.new_agent.also_cmd_t")),
             );
         }
-        content = content.child(section_label("Folder", colors));
+        content = content.child(section_label(t("sidebar.new_agent.folder"), colors));
         let current_name = target.rsplit('/').next().unwrap_or(&target).to_owned();
         content = content.child(
             choice_row(
@@ -5808,13 +5990,16 @@ impl Sidebar {
             );
         }
         let browse_label = match &selected_host {
-            None => "Choose Folder…".to_owned(),
-            Some(id) => format!(
-                "Browse {}…",
-                hosts
-                    .iter()
-                    .find(|entry| entry.id == *id)
-                    .map_or(id.as_str(), |entry| entry.display_name())
+            None => t("sidebar.new_agent.choose_folder").to_owned(),
+            Some(id) => tf(
+                "sidebar.new_agent.browse_host",
+                &[(
+                    "host",
+                    &hosts
+                        .iter()
+                        .find(|entry| entry.id == *id)
+                        .map_or(id.as_str(), |entry| entry.display_name()),
+                )],
             ),
         };
         let browse_host = selected_host.clone();
@@ -5937,7 +6122,7 @@ impl Sidebar {
                 choice_row(
                     "use-new-agent-directory",
                     "checkmark.circle",
-                    "Use this folder".to_owned(),
+                    t("sidebar.new_agent.use_folder").to_owned(),
                     true,
                     colors,
                     cx.listener(move |this, _, _, cx| {
@@ -5967,7 +6152,7 @@ impl Sidebar {
                     let parent_host = host.clone();
                     rows = rows.child(directory_row(
                         "arrow.up",
-                        "Parent folder".to_owned(),
+                        t("sidebar.new_agent.parent_folder").to_owned(),
                         colors,
                         cx.listener(move |this, _, _, cx| {
                             this.directory_scroll = ScrollHandle::new();
@@ -6011,7 +6196,7 @@ impl Sidebar {
                             .py(px(7.0))
                             .text_size(px(Typo::META.size))
                             .text_color(colors.tertiary)
-                            .child("Showing the first 512 folders"),
+                            .child(t("sidebar.new_agent.first_512")),
                     );
                 }
                 panel = panel.child(rows);
@@ -6039,7 +6224,7 @@ impl Sidebar {
                                 .id("retry-directory-listing")
                                 .cursor_pointer()
                                 .text_color(colors.primary)
-                                .child("Retry")
+                                .child(t("sidebar.retry"))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.store
                                         .write()
@@ -6068,7 +6253,7 @@ impl Sidebar {
                             14.0,
                             colors.tertiary,
                         ))
-                        .child("Loading folders…"),
+                        .child(t("sidebar.new_agent.loading_folders")),
                 );
             }
         }
@@ -6123,9 +6308,9 @@ impl Sidebar {
             );
         if let Some(command) = command {
             let action = match command {
-                UpdateCommand::Download => "Download",
-                UpdateCommand::Install => "Restart",
-                _ => "Check",
+                UpdateCommand::Download => t("sidebar.update.download"),
+                UpdateCommand::Install => t("sidebar.update.restart"),
+                _ => t("sidebar.update.check"),
             };
             row = row
                 .cursor_pointer()
@@ -6200,17 +6385,21 @@ impl Sidebar {
                             .flex_none()
                             .text_size(px(Typo::META.size))
                             .text_color(colors.tertiary)
-                            .child("This Mac"),
+                            .child(t("sidebar.account.this_mac")),
                     ),
             )
             .child(menu_divider(colors))
             .child(self.account_switch_menu(colors, cx))
             .child(menu_divider(colors))
-            .child(account_limits_menu(&limits, colors))
+            .child(account_limits_menu(
+                &limits,
+                !self.preview && !self.accounts_loaded(),
+                colors,
+            ))
             .child(menu_divider(colors))
             .child(account_action_row(
                 "account-settings",
-                "Settings",
+                t("sidebar.account.settings"),
                 crate::commands::command(CommandId::OpenSettings).shortcut_label(),
                 colors,
                 cx.listener(|this, _, window, cx| {
@@ -6233,7 +6422,7 @@ impl Sidebar {
         colors: SemanticColors,
         cx: &mut Context<Self>,
     ) -> PopoverSpec {
-        let (project, host, collapsed, pinned) = {
+        let (project, host, collapsed, pinned, fresh_worktree) = {
             let store = self.store.read().expect("session store lock poisoned");
             let Some(project) = store.projects().get(&id).cloned() else {
                 return PopoverSpec::empty();
@@ -6247,14 +6436,17 @@ impl Sidebar {
                     .and_then(|session| session.host.clone()),
                 store.preferences().sidebar_collapsed_projects.contains(&id),
                 store.preferences().sidebar_pinned_projects.contains(&id),
+                store.preferences().new_agent_start(&id)
+                    == crate::store::NewAgentStart::FreshWorktree,
             )
         };
+        let local = host.is_none() && project.host.is_none();
         let content = div()
             .p(px(4.0))
             .flex()
             .flex_col()
             .child(menu_row(
-                "New Session Here",
+                t("sidebar.project_menu.new_session_here"),
                 colors,
                 cx.listener({
                     let root = project.root.clone();
@@ -6266,9 +6458,9 @@ impl Sidebar {
             ))
             .child(menu_row(
                 if pinned {
-                    "Unpin Project"
+                    t("sidebar.project_menu.unpin")
                 } else {
-                    "Pin Project"
+                    t("sidebar.project_menu.pin")
                 },
                 colors,
                 cx.listener({
@@ -6284,8 +6476,34 @@ impl Sidebar {
                     }
                 }),
             ))
+            .when(local, |menu| {
+                menu.child(menu_row(
+                    if fresh_worktree {
+                        t("sidebar.project_menu.new_agents_checkout")
+                    } else {
+                        t("sidebar.project_menu.new_agents_worktree")
+                    },
+                    colors,
+                    cx.listener({
+                        let id = id.clone();
+                        move |this, _, _, cx| {
+                            let _ = this
+                                .store
+                                .write()
+                                .expect("session store lock poisoned")
+                                .toggle_project_fresh_worktree(id.clone());
+                            this.ui.popover = None;
+                            cx.notify();
+                        }
+                    }),
+                ))
+            })
             .child(menu_row(
-                if collapsed { "Expand" } else { "Collapse" },
+                if collapsed {
+                    t("sidebar.project_menu.expand")
+                } else {
+                    t("sidebar.project_menu.collapse")
+                },
                 colors,
                 cx.listener({
                     let id = id.clone();
@@ -6302,20 +6520,27 @@ impl Sidebar {
             ))
             .child(menu_divider(colors))
             .child(menu_row(
-                "Close All Sessions",
+                t("sidebar.project_menu.close_all"),
                 colors,
                 cx.listener(move |this, _, _, cx| {
                     this.close_project_sessions(&id, cx);
                 }),
             ));
+        // Wide enough for the longest entry ("New Agents: Fresh Worktree" and
+        // its translations); 184 clipped it even in English.
         match position {
-            Some(position) => {
-                self.popover_shell_at(position, Anchor::TopLeft, 184.0, content, colors, cx)
-            }
+            Some(position) => self.popover_shell_at(
+                position,
+                Anchor::TopLeft,
+                PROJECT_MENU_WIDTH,
+                content,
+                colors,
+                cx,
+            ),
             None => self.popover_shell_at(
                 point(px(12.0), px(96.0)),
                 Anchor::TopLeft,
-                184.0,
+                PROJECT_MENU_WIDTH,
                 content,
                 colors,
                 cx,
@@ -6333,7 +6558,7 @@ impl Sidebar {
         colors: SemanticColors,
         cx: &mut Context<Self>,
     ) -> PopoverSpec {
-        let (session, pinned, unread, bulk, hosts, migrating) = {
+        let (session, pinned, unread, bulk, hosts, migrating, resume_all) = {
             let mut store = self.store.write().expect("session store lock poisoned");
             let Some(session) = store.sessions().get(&id).cloned() else {
                 return PopoverSpec::empty();
@@ -6350,7 +6575,16 @@ impl Sidebar {
                 };
             let hosts = store.hosts().to_vec();
             let migrating = store.migrating().contains(&id);
-            (session, pinned, unread, bulk, hosts, migrating)
+            // Beside a restart-ended session's own Resume: the rest of them.
+            let resume_all = match &session.status {
+                diri_proto::SessionStatus::Exited(info)
+                    if info.ended_by_interruption() && session.can_resume() =>
+                {
+                    store.resume_all_offer()
+                }
+                _ => None,
+            };
+            (session, pinned, unread, bulk, hosts, migrating, resume_all)
         };
         let mut content = div().p(px(4.0)).flex().flex_col();
         if bulk.len() > 1 {
@@ -6365,7 +6599,11 @@ impl Sidebar {
             };
             if !active.is_empty() {
                 content = content.child(menu_row(
-                    count_label("Archive", active.len()),
+                    count_label(
+                        active.len(),
+                        "sidebar.bulk.archive_one",
+                        "sidebar.bulk.archive_other",
+                    ),
                     colors,
                     cx.listener(move |this, _, _, cx| {
                         this.archive_sessions(active.clone());
@@ -6376,7 +6614,11 @@ impl Sidebar {
             }
             if !parked.is_empty() {
                 content = content.child(menu_row(
-                    count_label("Revive", parked.len()),
+                    count_label(
+                        parked.len(),
+                        "sidebar.bulk.revive_one",
+                        "sidebar.bulk.revive_other",
+                    ),
                     colors,
                     cx.listener(move |this, _, _, cx| {
                         this.store
@@ -6389,7 +6631,11 @@ impl Sidebar {
                 ));
             }
             content = content.child(menu_row(
-                count_label("Close", bulk.len()),
+                count_label(
+                    bulk.len(),
+                    "sidebar.bulk.close_one",
+                    "sidebar.bulk.close_other",
+                ),
                 colors,
                 cx.listener(move |this, _, _, cx| {
                     this.close_sessions(bulk.clone(), cx);
@@ -6400,7 +6646,7 @@ impl Sidebar {
         } else if session.is_archived() {
             content = content
                 .child(menu_row(
-                    "Revive",
+                    t("sidebar.session_menu.revive"),
                     colors,
                     cx.listener({
                         let id = id.clone();
@@ -6415,7 +6661,7 @@ impl Sidebar {
                     }),
                 ))
                 .child(menu_row(
-                    "Remove from Sidebar",
+                    t("sidebar.session_menu.remove"),
                     colors,
                     cx.listener({
                         let id = id.clone();
@@ -6436,7 +6682,7 @@ impl Sidebar {
                 let url = format!("http://localhost:{port}");
                 content = content
                     .child(menu_row(
-                        format!("Open localhost:{port}"),
+                        tf("sidebar.session_menu.open_localhost", &[("port", &port)]),
                         colors,
                         cx.listener(move |this, _, _, cx| {
                             cx.open_url(&url);
@@ -6451,9 +6697,9 @@ impl Sidebar {
             {
                 content = content.child(menu_row(
                     if session.kind == ProtoAgentKind::CLAUDE_CODE {
-                        "Continue with another account…"
+                        t("sidebar.session_menu.continue_account")
                     } else {
-                        "Switch account for open conversations…"
+                        t("sidebar.session_menu.switch_account")
                     },
                     colors,
                     cx.listener({
@@ -6469,9 +6715,9 @@ impl Sidebar {
             if !running && session.can_resume() {
                 // A local terminal comes back as a fresh shell where it was.
                 let label = if session.kind == ProtoAgentKind::SHELL && session.host.is_none() {
-                    "Restart"
+                    t("sidebar.session_menu.restart")
                 } else {
-                    "Resume"
+                    t("sidebar.session_menu.resume")
                 };
                 content = content.child(menu_row(
                     label,
@@ -6488,6 +6734,20 @@ impl Sidebar {
                         }
                     }),
                 ));
+                if let Some(count) = resume_all {
+                    content = content.child(menu_row(
+                        crate::terminal_pane::resume_all_label(count),
+                        colors,
+                        cx.listener(move |this, _, _, cx| {
+                            this.store
+                                .write()
+                                .expect("session store lock poisoned")
+                                .resume_all();
+                            this.ui.popover = None;
+                            cx.notify();
+                        }),
+                    ));
+                }
             }
             // Session handoff (Claude only): local sessions offer "Move to
             // <host>", remote ones "Move to Local". Hidden while a move is
@@ -6496,7 +6756,7 @@ impl Sidebar {
                 if let Some(current) = &session.host {
                     if hosts.iter().any(|entry| &entry.id == current) {
                         content = content.child(menu_row(
-                            "Move to Local",
+                            t("sidebar.session_menu.move_local"),
                             colors,
                             cx.listener({
                                 let id = id.clone();
@@ -6515,7 +6775,10 @@ impl Sidebar {
                     for entry in &hosts {
                         let target = entry.id.clone();
                         content = content.child(menu_row(
-                            format!("Move to {}", entry.display_name()),
+                            tf(
+                                "sidebar.session_menu.move_to",
+                                &[("host", &entry.display_name())],
+                            ),
                             colors,
                             cx.listener({
                                 let id = id.clone();
@@ -6538,9 +6801,9 @@ impl Sidebar {
                     // Shells/Cursor can't resume a conversation — archiving
                     // still works, but say what reviving will get you.
                     if session.resumability == diri_proto::Resumability::NotResumable {
-                        "Archive (won't be resumable)"
+                        t("sidebar.session_menu.archive_not_resumable")
                     } else {
-                        "Archive Session"
+                        t("sidebar.session_menu.archive")
                     },
                     colors,
                     cx.listener({
@@ -6553,7 +6816,7 @@ impl Sidebar {
                     }),
                 ))
                 .child(menu_row(
-                    "Rename…",
+                    t("sidebar.session_menu.rename"),
                     colors,
                     cx.listener(move |this, _, window, cx| {
                         this.ui.popover = None;
@@ -6565,9 +6828,9 @@ impl Sidebar {
                 ))
                 .child(menu_row(
                     if pinned {
-                        "Unpin Session"
+                        t("sidebar.session_menu.unpin")
                     } else {
-                        "Pin Session"
+                        t("sidebar.session_menu.pin")
                     },
                     colors,
                     cx.listener({
@@ -6586,9 +6849,9 @@ impl Sidebar {
             if let Some(read) = read_toggle(&session, unread) {
                 content = content.child(menu_row(
                     if read {
-                        "Mark as Read"
+                        t("sidebar.session_menu.mark_read")
                     } else {
-                        "Mark as Unread"
+                        t("sidebar.session_menu.mark_unread")
                     },
                     colors,
                     cx.listener({
@@ -6610,7 +6873,7 @@ impl Sidebar {
             }
             content = content
                 .child(menu_row(
-                    "Remove from Sidebar",
+                    t("sidebar.session_menu.remove"),
                     colors,
                     cx.listener({
                         let id = id.clone();
@@ -6721,7 +6984,12 @@ impl Sidebar {
         };
         let mut details = div().flex().flex_col().gap(px(5.0));
         if session.hibernation.is_some() {
-            details = details.child(hover_detail("moon.fill", "Sleeping", false, colors));
+            details = details.child(hover_detail(
+                "moon.fill",
+                t("session.sleeping"),
+                false,
+                colors,
+            ));
         }
         if let Some(project) = &project {
             details = details.child(hover_detail("folder.fill", &project.name, false, colors));
@@ -6825,8 +7093,9 @@ impl Sidebar {
         )
     }
 
-    /// One bounded 8 Hz wake for the whole sidebar, only while working marks
-    /// are shown. A one-shot is rearmed by painting, so an unmounted sidebar
+    /// One bounded 8 Hz wake for the whole sidebar, only while an
+    /// indeterminate progress sweep is shown. Working marks need none: the
+    /// window advances their frames without rendering (`diri_ui::FrameLoop`). A one-shot is rearmed by painting, so an unmounted sidebar
     /// cannot keep a background loop alive.
     ///
     /// Visibility/occlusion is GPUI's job (display-link stops when the
@@ -6868,6 +7137,22 @@ impl Sidebar {
     pub(crate) fn advance_activity_frame_for_test(&mut self, cx: &mut Context<Self>) {
         self.activity_frame = (self.activity_frame + 1) % 8;
         self.notify_activity_frame(cx);
+    }
+
+    /// What one scroll-wheel step over the list does: GPUI moves the offset
+    /// and notifies the view that owns the scroll container.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn scroll_list_for_test(&mut self, y: f32, cx: &mut Context<Self>) {
+        self.list_scroll.set_offset(point(px(0.0), px(-y)));
+        cx.notify();
+    }
+
+    /// Builds every row (`false`) or only the rows near the viewport, for
+    /// tests that compare the two.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn set_row_windowing_for_test(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.windowing = on;
+        cx.notify();
     }
 
     /// One publication from the shared store.
@@ -6976,15 +7261,15 @@ impl Sidebar {
                                         div()
                                             .text_size(px(Typo::ROW_EMPHASIZED.size))
                                             .font_weight(Typo::ROW_EMPHASIZED.weight)
-                                            .child("Create a sibling?"),
+                                            .child(t("sidebar.sibling.title")),
                                     )
                                     .child(
                                         div()
                                             .text_size(px(Typo::META.size))
                                             .text_color(colors.secondary)
-                                            .child(format!(
-                                                "Same agent and project as {}",
-                                                proposal.source_title
+                                            .child(tf(
+                                                "sidebar.sibling.detail",
+                                                &[("title", &proposal.source_title)],
                                             )),
                                     ),
                             )
@@ -7052,7 +7337,7 @@ impl Sidebar {
                                 cx.emit(SidebarEvent::FocusTerminal);
                                 cx.notify();
                             }))
-                            .child("Create sibling"),
+                            .child(t("sidebar.sibling.create")),
                     ),
             ))
             .into_any_element()
@@ -7176,8 +7461,7 @@ impl Sidebar {
                 preview.hidden = true;
                 cx.notify();
             });
-            self.ui.delegation_notice =
-                Some("Choose Custom ordering to rearrange projects.".to_owned());
+            self.ui.delegation_notice = Some(t("sidebar.notice.custom_for_projects").to_owned());
             self.ui.drag = None;
             self.drag_preview = None;
             cx.notify();
@@ -7308,14 +7592,14 @@ impl Sidebar {
                 store.sessions().get(source_id).map_or_else(
                     || {
                         Err(crate::delegation::DelegationRefusal(
-                            "The dragged session no longer exists.".to_owned(),
+                            t("sidebar.notice.dragged_gone").to_owned(),
                         ))
                     },
                     |source| {
                         store.projects().get(&source.project_id).map_or_else(
                             || {
                                 Err(crate::delegation::DelegationRefusal(
-                                    "The session's project no longer exists.".to_owned(),
+                                    t("sidebar.notice.project_gone").to_owned(),
                                 ))
                             },
                             |project| sibling_proposal(source, project),
@@ -7407,14 +7691,13 @@ impl Sidebar {
                 .cloned()
         };
         let Some(target) = selected else {
-            self.ui.delegation_notice = Some("Select a session first.".to_owned());
+            self.ui.delegation_notice = Some(t("sidebar.notice.select_first").to_owned());
             cx.notify();
             return false;
         };
         let Some(source) = self.ui.delegation_mark.clone() else {
             self.ui.delegation_mark = Some(target);
-            self.ui.delegation_notice =
-                Some("Source marked. Focus another session and press ⌃⌘D again.".to_owned());
+            self.ui.delegation_notice = Some(t("sidebar.notice.source_marked").to_owned());
             cx.notify();
             return true;
         };
@@ -7557,9 +7840,22 @@ impl Sidebar {
         if !selection_changed {
             return;
         }
-        // A saved layout still references the closing session. Leave it before
-        // activating the survivor, so layout synchronization cannot reselect
-        // the closing row while its removal or the next layout is in flight.
+        // A saved layout moves on by itself: RootView sees the session on
+        // screen close and shows the next one in place, in the same frame.
+        if self.workspace_nav.active.is_some() {
+            cx.notify();
+            return;
+        }
+        cx.emit(SidebarEvent::SessionActivated);
+        cx.notify();
+    }
+
+    /// The session on screen ended and no other session has a place in any
+    /// layout: leave the layout for the session this window falls back to,
+    /// which opens in its project layout once the Engine has placed it.
+    pub(crate) fn leave_layout_for_survivor(&mut self, cx: &mut Context<Self>) {
+        // Writing reconciles this window's selection off the ended session.
+        drop(self.store.write().expect("session store lock poisoned"));
         if self.workspace_nav.active.is_some() {
             self.activate_workspace(None, cx);
         }
@@ -7686,8 +7982,7 @@ impl Sidebar {
             .sidebar_ordering
             != SidebarOrdering::Custom
         {
-            self.ui.delegation_notice =
-                Some("Choose Custom ordering before moving sessions.".to_owned());
+            self.ui.delegation_notice = Some(t("sidebar.notice.custom_for_sessions").to_owned());
             cx.notify();
             return true;
         }
@@ -7900,13 +8195,13 @@ impl RecencyBucket {
         Self::Earlier,
     ];
 
-    const fn label(self) -> &'static str {
-        match self {
-            Self::Today => "Today",
-            Self::Yesterday => "Yesterday",
-            Self::PreviousSevenDays => "Previous 7 days",
-            Self::Earlier => "Earlier",
-        }
+    fn label(self) -> &'static str {
+        t(match self {
+            Self::Today => "sidebar.recency.today",
+            Self::Yesterday => "sidebar.recency.yesterday",
+            Self::PreviousSevenDays => "sidebar.recency.previous_7_days",
+            Self::Earlier => "sidebar.recency.earlier",
+        })
     }
 
     const fn for_day(session_day: i64, today: i64) -> Self {
@@ -8065,17 +8360,36 @@ fn offset_to_reveal(
     }
 }
 
+/// Scrolls the list so the row `id` is fully visible. A row that painted
+/// last frame reveals from its bounds; one the list only walked past (built
+/// rows are only those near the viewport) reveals from its walked slot.
 fn reveal_tracked_row(
     scroll: &ScrollHandle,
     row_bounds: &RefCell<HashMap<SessionId, Bounds<Pixels>>>,
+    row_slots: &RefCell<HashMap<SessionId, row_window::Span>>,
     id: &SessionId,
     window: &mut Window,
 ) -> bool {
-    let Some(row) = row_bounds.borrow().get(id).copied() else {
-        return false;
-    };
     let viewport = scroll.bounds();
     let offset = scroll.offset();
+    let Some(row) = row_bounds.borrow().get(id).copied() else {
+        let Some(slot) = row_slots.borrow().get(id).copied() else {
+            return false;
+        };
+        if viewport.size.height <= px(0.0) {
+            return false;
+        }
+        let next_y = row_window::offset_revealing(
+            f32::from(offset.y),
+            f32::from(viewport.size.height),
+            slot,
+        );
+        if (next_y - f32::from(offset.y)).abs() > f32::EPSILON {
+            scroll.set_offset(point(offset.x, px(next_y)));
+            window.refresh();
+        }
+        return true;
+    };
     let next_y = offset_to_reveal(
         f32::from(offset.y),
         f32::from(viewport.top()),
@@ -8174,12 +8488,14 @@ pub(crate) mod render_probe {
 
 impl Render for Sidebar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::perf_overlay::rendered("sidebar");
+        self.discard_rename_preedit(window, cx);
         #[cfg(test)]
         let render_started = std::time::Instant::now();
         let root = self.render_sidebar(window, cx);
         #[cfg(test)]
         render_probe::render_finished(render_started.elapsed());
-        root
+        root.children(crate::perf_overlay::badge("sidebar"))
     }
 }
 
@@ -8316,6 +8632,7 @@ impl Sidebar {
         {
             self.dismiss_hover_card(cx);
         }
+        self.observe_session_hover(&visible_set, selected.as_ref(), cx.reduce_motion());
         self.shortcut_ranks.clear();
         let session_count = visible.len();
         for (index, id) in visible.iter().enumerate() {
@@ -8364,14 +8681,18 @@ impl Sidebar {
                 .min_h(px(0.0))
                 .overflow_y_scroll()
                 .px(px(Space::INSET))
-                .pt(px(8.0))
-                .pb(px(SIDEBAR_NAV_ROW_HEIGHT + 17.0))
+                .pt(px(LIST_TOP_PADDING))
+                .pb(px(windowing::LIST_BOTTOM_PADDING))
                 .flex()
                 .flex_col()
-                .gap(px(8.0));
+                .gap(px(SECTION_GAP));
+            self.begin_row_window();
             match grouping {
                 SidebarGrouping::Project => {
-                    for group in &projection.projects {
+                    for (index, group) in projection.projects.iter().enumerate() {
+                        if index > 0 {
+                            self.row_window.advance(SECTION_GAP);
+                        }
                         list = list.child(self.project_section(group, colors, window, cx));
                     }
                 }
@@ -8386,6 +8707,7 @@ impl Sidebar {
                     ));
                 }
             }
+            self.finish_row_window();
             list = list.child(self.empty_space_drop_target(colors, cx));
             list
         });
@@ -8394,15 +8716,22 @@ impl Sidebar {
         self.rows_mounted = list.is_some();
         self.rows_stale = false;
         self.notify_keeps_rows = false;
-        // Rows mounted this pass (leaving ghosts included) keep their views.
+        // Rows mounted this pass (leaving ghosts included) keep their views,
+        // and so do rows the list walked past without building, so scrolling
+        // back to them does not create them again.
         let mounted = std::mem::take(&mut self.mounted_row_ids);
-        self.session_row_views.retain(|id, _| mounted.contains(id));
+        let walked = self.rows_mounted.then(|| self.row_slots.borrow());
+        self.session_row_views.retain(|id, _| {
+            mounted.contains(id) || walked.as_ref().is_some_and(|slots| slots.contains_key(id))
+        });
+        drop(walked);
 
         // Row, disclosure and title motion ask the display link for frames.
         self.disclosure_tick = self.disclosure_animating;
+        self.settle_row_window(window);
         self.schedule_activity_tick(cx);
         self.schedule_title_tick();
-        if self.disclosure_tick || self.title_tick {
+        if self.disclosure_tick || self.title_tick || self.hover_trails.is_fading() {
             self.request_motion_frame(window, cx);
         }
 
@@ -8479,7 +8808,7 @@ impl Sidebar {
                         .pt(px(18.0))
                         .text_size(px(Typo::META.size))
                         .text_color(colors.tertiary)
-                        .child("No sessions match this filter"),
+                        .child(t("sidebar.filter_empty")),
                 );
             } else if projection.projects.is_empty() {
                 body = body.child(self.empty_state(colors, cx));
@@ -8488,6 +8817,8 @@ impl Sidebar {
                 // instead of being sliced off by the container edge.
                 let viewport = Rc::clone(&self.fade_viewport);
                 let weak = self.weak_self.clone();
+                let built_band = Rc::clone(&self.built_band);
+                let scroll = self.list_scroll.clone();
                 body = body.child(
                     div()
                         .relative()
@@ -8500,6 +8831,8 @@ impl Sidebar {
                                 && viewport.get() != Some(list)
                             {
                                 viewport.set(Some(list));
+                                Self::refresh_on_next_frame(&weak, window);
+                            } else if !windowing::band_covers_scroll(built_band.get(), &scroll) {
                                 Self::refresh_on_next_frame(&weak, window);
                             }
                         })
@@ -8536,7 +8869,14 @@ impl Sidebar {
             self.request_motion_frame(window, cx);
         }
         // Paint the edge without reducing the shared sidebar content width.
-        root = root.when(!self.surface_in_parent, |root| {
+        let islands = self
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .preferences()
+            .pane_density
+            .islands();
+        root = root.when(!self.surface_in_parent && !islands, |root| {
             root.child(
                 div()
                     .absolute()
@@ -8646,10 +8986,6 @@ fn icon_button(
         .into_any_element()
 }
 
-/// Title `display_title` gives a placeholder-named session that has exited.
-/// The "Ended" chip stands down when the title already says it.
-const ENDED_TITLE: &str = "Ended";
-
 /// One leading column per ancestor level. A column is drawn full height while
 /// that ancestor still has siblings below, and stops halfway on the last child
 /// so a subtree visibly closes instead of trailing a rail into the next row.
@@ -8746,6 +9082,37 @@ fn indent_rails(row: &crate::store::SidebarRow, colors: SemanticColors) -> Vec<A
         .collect()
 }
 
+/// One look for every hover control on a sidebar row: the same square,
+/// corner, ink, and hover fill, so ⋯, +, and ✕ never differ in size.
+trait RowAction: Sized {
+    fn row_action(self, colors: SemanticColors) -> Self;
+
+    /// A row control standing on the 16px trailing column: its 24px hover
+    /// square overhangs the slot evenly, keeping the glyph on the column
+    /// shared with the agent marks.
+    fn trailing_row_action(self, colors: SemanticColors) -> Self;
+}
+
+impl RowAction for gpui::Stateful<Div> {
+    fn row_action(self, colors: SemanticColors) -> Self {
+        self.flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(Radius::BADGE))
+            .cursor_pointer()
+            .text_color(colors.secondary)
+            .hover(move |button| button.bg(Fill::subtle(colors)))
+            .active(|button| button.opacity(0.72))
+    }
+
+    fn trailing_row_action(self, colors: SemanticColors) -> Self {
+        self.size(px(SIDEBAR_ACTION_SLOT))
+            .mx(px(-SIDEBAR_ACTION_OUTSET))
+            .row_action(colors)
+    }
+}
+
 /// Quiet pin for rows held at the top of their band. It takes the same 16px
 /// slot as the agent glyph beside it, so the two read as one column rather
 /// than a glyph and a straggler.
@@ -8758,6 +9125,36 @@ fn pin_mark(colors: SemanticColors) -> AnyElement {
         .items_center()
         .justify_center()
         .child(sf_symbol("pin.fill", 9.0, colors.tertiary))
+        .into_any_element()
+}
+
+/// Quiet trailing glyph for a session a schedule opened: a grey clock, or an
+/// indigo one when diri woke the Mac for it (a moon already means Sleeping). Hover names the schedule and what happened,
+/// so the tab explains why it appeared while nobody was at the keyboard.
+fn scheduled_mark(
+    id: &SessionId,
+    run: &diri_proto::schedules::ScheduledRunInfo,
+    colors: SemanticColors,
+) -> AnyElement {
+    let (symbol, color) = if run.woke_mac {
+        ("clock.fill", crate::schedules_page::NIGHT)
+    } else {
+        ("clock.fill", colors.tertiary)
+    };
+    use crate::tooltip_warmth::WarmTooltip;
+    let tooltip = crate::schedules_page::scheduled_run_summary(run);
+    div()
+        .id(format!("scheduled-mark:{}", id.0))
+        .debug_selector(|| "scheduled-mark".to_owned())
+        .aria_label(tooltip.clone())
+        .flex_none()
+        .flex()
+        .items_center()
+        .child(sf_symbol(symbol, 9.0, color))
+        .warm_tooltip(move |_, cx| {
+            cx.new(|_| crate::palette_chrome::PaletteTooltip(tooltip.clone(), colors))
+                .into()
+        })
         .into_any_element()
 }
 
@@ -8783,6 +9180,34 @@ fn archive_count(count: usize, colors: SemanticColors) -> AnyElement {
 /// rather than the host's name: the name repeated down a whole project reads
 /// as a wall of chips, while one small server mark says "not this machine"
 /// without competing with the titles.
+const PANE_COUNT_WIDTH: f32 = 24.0;
+
+/// A split tab's pane count: a quiet two-column glyph and the number.
+fn pane_count_mark(id: &SessionId, panes: usize, colors: SemanticColors) -> AnyElement {
+    div()
+        .debug_selector({
+            let id = id.clone();
+            move || format!("session-panes:{}", id.0)
+        })
+        .id(format!("session-panes:{}", id.0))
+        .role(Role::Image)
+        .aria_label(tf("session.pane_count", &[("count", &panes)]))
+        .flex_none()
+        .w(px(PANE_COUNT_WIDTH))
+        .flex()
+        .items_center()
+        .justify_end()
+        .gap(px(2.0))
+        .child(sf_symbol("rectangle.split.2x1", 9.0, colors.tertiary))
+        .child(
+            div()
+                .text_size(px(Typo::META.size))
+                .text_color(colors.tertiary)
+                .child(panes.to_string()),
+        )
+        .into_any_element()
+}
+
 fn remote_mark(colors: SemanticColors) -> AnyElement {
     div()
         .debug_selector(|| "remote-mark".to_owned())
@@ -8876,7 +9301,11 @@ fn choice_menu_row(
         .debug_selector(move || id.into())
         .role(Role::MenuItem)
         .aria_label(label)
-        .aria_description(if selected { "Selected" } else { "Not selected" })
+        .aria_description(if selected {
+            t("sidebar.a11y.selected")
+        } else {
+            t("sidebar.a11y.not_selected")
+        })
         .aria_keyshortcuts(shortcut)
         .px(px(8.0))
         .h(px(30.0))
@@ -9002,7 +9431,7 @@ fn copy_session_id_row(
     cx: &mut Context<Sidebar>,
 ) -> AnyElement {
     menu_row(
-        "Copy Session ID",
+        t("sidebar.session_menu.copy_id"),
         colors,
         cx.listener(move |this, _, _, cx| {
             cx.write_to_clipboard(gpui::ClipboardItem::new_string(id.0.clone()));
@@ -9012,11 +9441,13 @@ fn copy_session_id_row(
     )
 }
 
-fn count_label(verb: &str, count: usize) -> String {
+/// A bulk action's label: `one` for a single session, `other` (with a
+/// `{count}` placeholder) for several.
+fn count_label(count: usize, one: &'static str, other: &'static str) -> String {
     if count == 1 {
-        format!("{verb} 1 Session")
+        t(one).to_owned()
     } else {
-        format!("{verb} {count} Sessions")
+        tf(other, &[("count", &count)])
     }
 }
 
@@ -9030,7 +9461,7 @@ fn local_account_label(preview: bool) -> String {
         .ok()
         .map(|label| label.trim().to_owned())
         .filter(|label| !label.is_empty())
-        .unwrap_or_else(|| "Local agents".to_owned())
+        .unwrap_or_else(|| t("sidebar.account.local_agents").to_owned())
 }
 
 fn account_avatar(label: &str, size: f32, colors: SemanticColors) -> AnyElement {
@@ -9056,6 +9487,7 @@ fn account_avatar(label: &str, size: f32, colors: SemanticColors) -> AnyElement 
 }
 
 /// Height of the plain action rows at the bottom of the account menu.
+const PROJECT_MENU_WIDTH: f32 = 252.0;
 const ACCOUNT_MENU_ACTION_ROW_HEIGHT: f32 = 28.0;
 
 /// Height of the single-line stat rows in the account menu.
@@ -9065,6 +9497,7 @@ const ACCOUNT_MENU_STAT_ROW_HEIGHT: f32 = 22.0;
 /// when the menu opens, so there is no control here.
 fn account_limits_menu(
     limits: &[crate::usage::limits::AccountLimits],
+    loading: bool,
     colors: SemanticColors,
 ) -> AnyElement {
     let now = crate::usage::Clock::read(&crate::usage::SystemClock).unix_seconds;
@@ -9075,15 +9508,17 @@ fn account_limits_menu(
         .flex()
         .flex_col()
         .py(px(3.0));
-    if limits.is_empty() {
-        section = section.child(menu_note("Checking provider limits…", colors));
+    // Every window of the logins in use; each account row above shows its tightest.
+    let live: Vec<_> = limits.iter().filter(|account| account.live).collect();
+    if live.is_empty() && loading {
+        section = section.child(menu_note(t("sidebar.account.checking_limits"), colors));
     }
-    for account in limits {
+    for account in live {
         for (index, limit) in account.windows.iter().enumerate() {
             let expired = limit.resets_at.is_some_and(|reset| reset <= now);
             let stale = expired || account.error.is_some() || now - account.checked_at > 360;
             let trailing = if stale {
-                "stale".to_owned()
+                t("sidebar.account.stale").to_owned()
             } else {
                 match limit.resets_at {
                     Some(reset) if reset > now => compact_reset(reset - now),
@@ -9331,7 +9766,7 @@ fn agent_picker_options(
         .collect();
     // Terminal is last on purpose: it is the escape hatch, not an agent.
     options.push(AgentPickerOption {
-        title: "Terminal".to_owned(),
+        title: t("sidebar.new_agent.terminal").to_owned(),
         kind: ProtoAgentKind::SHELL,
         shortcut: crate::commands::command(CommandId::NewTerminal)
             .shortcut_label()
@@ -9344,7 +9779,7 @@ fn agent_picker_options(
     // A note sits beside agents and terminals in the sidebar, so it starts
     // from the same menu.
     options.push(AgentPickerOption {
-        title: "Note".to_owned(),
+        title: t("sidebar.new_agent.note").to_owned(),
         kind: ProtoAgentKind::NOTE,
         shortcut: crate::commands::command(CommandId::NewNote)
             .shortcut_label()
@@ -9403,8 +9838,8 @@ struct WherePanel<'a> {
 // Agents, the location, Manage Agents, machines and folders) and for every
 // other diri menu: see `crate::floating::MENU_ROW_HEIGHT`.
 use crate::floating::{
-    MENU_ROW_GAP, MENU_ROW_HEIGHT, MENU_ROW_ICON_SLOT, MENU_ROW_INSET,
-    MENU_ROW_RADIUS as SIDEBAR_MENU_ROW_RADIUS, menu_separator,
+    MENU_AGENT_LOGO, MENU_AGENT_LOGO_INSET, MENU_ROW_GAP, MENU_ROW_HEIGHT, MENU_ROW_ICON_SLOT,
+    MENU_ROW_INSET, MENU_ROW_RADIUS as SIDEBAR_MENU_ROW_RADIUS, menu_separator,
 };
 
 /// A secondary row of the menu: glyph in the icon slot, then whatever the
@@ -9456,7 +9891,7 @@ fn panel_header(
                 .id("new-agent-back")
                 .debug_selector(|| "new-agent-back".into())
                 .role(Role::Button)
-                .aria_label("Back to agents")
+                .aria_label(t("sidebar.new_agent.back"))
                 .size(px(22.0))
                 .flex_none()
                 .flex()
@@ -9689,6 +10124,7 @@ fn compact_duration(seconds: i64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use gpui::InputHandler as _;
     #[cfg(target_os = "macos")]
     use std::path::PathBuf;
 
@@ -9830,6 +10266,8 @@ mod tests {
             reason: diri_proto::ExitReason::Exited,
             code: Some(0),
             signal: None,
+            system_restart: false,
+            interrupted: false,
         });
         assert_eq!(display_title(&session), "Ended");
     }
@@ -10023,31 +10461,52 @@ mod tests {
         assert_eq!(status_state(session, true), StatusState::Working);
     }
 
+    /// Advances the window's animated sprites one 125 ms step and returns
+    /// the tiles they now show.
+    fn step_working_marks(cx: &mut VisualTestContext) -> (bool, Vec<gpui::AtlasTile>) {
+        cx.executor().advance_clock(Duration::from_millis(125));
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            (
+                window.advance_sprite_animations(cx),
+                window.animated_sprite_tiles(),
+            )
+        })
+    }
+
     #[gpui::test]
-    fn working_sidebar_repaints_without_pointer_input(cx: &mut TestAppContext) {
+    fn working_marks_advance_without_rendering_anything(cx: &mut TestAppContext) {
         let (sidebar, _, cx) = drag_harness(cx);
         cx.update(|window, _| window.activate_window());
         cx.run_until_parked();
-        let (working, listed) = sidebar.read_with(cx, |sidebar, _| {
-            (sidebar.animated_rows.len(), sidebar.session_row_views.len())
-        });
-        assert!(working > 0, "the fixture must show a working row");
-        assert!(working < listed, "the fixture must show an idle row");
+        assert!(
+            sidebar.read_with(cx, |sidebar, _| sidebar.activity_tick.is_none()),
+            "working marks need no sidebar tick"
+        );
+        let mut tiles = cx.update(|window, _| window.animated_sprite_tiles());
+        assert!(!tiles.is_empty(), "the fixture must show a working row");
         render_probe::take();
-        // No mouse movement or store events: the working mark must advance
-        // itself, re-rendering the working rows and reusing every other row.
+        // No mouse movement or store events: the window swaps the marks'
+        // frames in the drawn scene, and no view renders for it.
         for _ in 0..3 {
-            let frame = sidebar.read_with(cx, |sidebar, _| sidebar.activity_frame);
-            cx.executor().advance_clock(Duration::from_millis(125));
-            cx.run_until_parked();
-            assert_eq!(
-                sidebar.read_with(cx, |sidebar, _| sidebar.activity_frame),
-                (frame + 1) % 8,
-            );
+            let (advanced, next) = step_working_marks(cx);
+            assert!(advanced, "working animation froze without pointer input");
+            assert_eq!(next.len(), tiles.len());
+            assert_ne!(next, tiles, "every working mark shows its next frame");
+            tiles = next;
             let (rows, renders, _) = render_probe::take();
-            assert_eq!(renders, 1, "working animation froze without pointer input");
-            assert_eq!(rows, working, "a tick re-renders exactly the working rows");
+            assert_eq!((rows, renders), (0, 0), "a frame step renders nothing");
         }
+        // Within a step there is nothing new to present.
+        assert!(!cx.update(|window, cx| window.advance_sprite_animations(cx)));
+        // A redraw that reuses the cached rows keeps their marks animating.
+        sidebar.update(cx, |sidebar, cx| sidebar.store_changed(cx));
+        cx.run_until_parked();
+        assert_eq!(render_probe::take().0, 0, "the redraw reuses every row");
+        assert_eq!(cx.update(|window, _| window.animated_sprite_tiles()), tiles);
+        let (advanced, next) = step_working_marks(cx);
+        assert!(advanced);
+        assert_ne!(next, tiles);
     }
 
     /// Held-⌘ hints fade in and out on cached session rows: the fade reaches
@@ -10156,19 +10615,15 @@ mod tests {
 
     #[gpui::test]
     fn working_sidebar_keeps_animating_when_the_window_is_unfocused(cx: &mut TestAppContext) {
-        let (sidebar, _, cx) = drag_harness(cx);
+        let (_sidebar, _, cx) = drag_harness(cx);
         cx.update(|window, _| window.activate_window());
         cx.run_until_parked();
         cx.deactivate_window();
         cx.run_until_parked();
         for _ in 0..3 {
-            let frame = sidebar.read_with(cx, |sidebar, _| sidebar.activity_frame);
-            cx.executor().advance_clock(Duration::from_millis(125));
-            cx.run_until_parked();
-            assert_eq!(
-                sidebar.read_with(cx, |sidebar, _| sidebar.activity_frame),
-                (frame + 1) % 8,
-            );
+            let (advanced, tiles) = step_working_marks(cx);
+            assert!(advanced);
+            assert!(!tiles.is_empty());
         }
     }
 
@@ -10183,7 +10638,14 @@ mod tests {
             cx.debug_bounds("session-agent-logo:preview-codex")
                 .is_none()
         );
-        assert_eq!(cx.debug_bounds("session-close:preview-codex"), Some(logo));
+        // The ✕ stands on the logo's column, with the same hover square as
+        // every other row control.
+        let close = cx.debug_bounds("session-close:preview-codex").unwrap();
+        assert_eq!(close.center(), logo.center());
+        assert_eq!(
+            close.size,
+            gpui::size(px(SIDEBAR_ACTION_SLOT), px(SIDEBAR_ACTION_SLOT))
+        );
         cx.simulate_mouse_move(point(px(500.0), px(320.0)), None, Modifiers::default());
         assert_eq!(
             cx.debug_bounds("session-agent-logo:preview-codex"),
@@ -10193,29 +10655,20 @@ mod tests {
     }
 
     #[gpui::test]
-    fn sidebar_activity_stops_when_hidden_or_motion_is_reduced(cx: &mut TestAppContext) {
+    fn reduced_motion_paints_still_working_marks(cx: &mut TestAppContext) {
         let (sidebar, _, cx) = drag_harness(cx);
         cx.update(|window, _| window.activate_window());
         cx.run_until_parked();
-        assert!(sidebar.read_with(cx, |sidebar, _| sidebar.activity_tick.is_some()));
-        sidebar.update(cx, |sidebar, cx| sidebar.conceal(cx));
-        cx.run_until_parked();
-        let frame = sidebar.read_with(cx, |sidebar, _| sidebar.activity_frame);
-        cx.executor().advance_clock(Duration::from_secs(1));
-        cx.run_until_parked();
-        sidebar.read_with(cx, |sidebar, _| {
-            assert!(sidebar.activity_tick.is_none());
-            assert_eq!(sidebar.activity_frame, frame);
-        });
-        sidebar.update(cx, |sidebar, cx| sidebar.reveal(cx));
-        cx.run_until_parked();
-        assert!(sidebar.read_with(cx, |sidebar, _| sidebar.activity_tick.is_some()));
+        let live = |cx: &mut VisualTestContext| {
+            !cx.update(|window, _| window.animated_sprite_tiles())
+                .is_empty()
+        };
+        assert!(live(cx));
         cx.update(|_, cx| cx.set_reduce_motion(true));
         cx.run_until_parked();
-        sidebar.read_with(cx, |sidebar, _| {
-            assert!(sidebar.activity_tick.is_none());
-            assert_eq!(sidebar.activity_frame, 0);
-        });
+        assert!(!live(cx), "reduced motion paints a still mark");
+        assert!(!step_working_marks(cx).0);
+        assert!(sidebar.read_with(cx, |sidebar, _| sidebar.activity_tick.is_none()));
     }
 
     #[gpui::test]
@@ -10664,6 +11117,8 @@ mod tests {
         &mut VisualTestContext,
     ) {
         let handoffs: Rc<RefCell<Vec<HandoffProposal>>> = Rc::default();
+        // Real icons, so working marks reach the scene as sprites.
+        cx.update(|cx| cx.set_asset_source_for_test(diri_ui::IconAssets));
         let (view, cx) = cx.add_window_view({
             let handoffs = Rc::clone(&handoffs);
             move |_, cx| {
@@ -11441,6 +11896,109 @@ mod tests {
         });
     }
 
+    fn rename_harness(
+        cx: &mut TestAppContext,
+    ) -> (Entity<Sidebar>, SessionId, &mut VisualTestContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let sidebar = cx.new(|cx| Sidebar::new(None, true, PreviewScenario::Typical, cx));
+            SidebarPopoverHarness { sidebar }
+        });
+        let sidebar = view.read_with(cx, |harness, _| harness.sidebar.clone());
+        let id = sidebar.read_with(cx, |sidebar, _| {
+            sidebar
+                .ui
+                .focus_cursor
+                .clone()
+                .expect("render seeds the cursor")
+        });
+        sidebar.update_in(cx, |sidebar, window, cx| {
+            sidebar.ui.begin_rename(id.clone(), "Before");
+            sidebar.focus_handle.focus(window, cx);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        (sidebar, id, cx)
+    }
+
+    #[gpui::test]
+    fn rename_accepts_composed_cjk_text_once(cx: &mut TestAppContext) {
+        let (sidebar, id, cx) = rename_harness(cx);
+        let mut handler = sidebar.update(cx, |sidebar, cx| sidebar.rename_input_handler(cx));
+        cx.update(|window, cx| {
+            // Composition replaces the selected title, and the candidate
+            // window anchors inside the field.
+            handler.replace_and_mark_text_in_range(None, "ni", Some(2..2), window, cx);
+            assert_eq!(handler.marked_text_range(window, cx), Some(0..2));
+            let caret = handler
+                .bounds_for_range(2..2, window, cx)
+                .expect("caret bounds");
+            assert!(caret.left() >= px(40.0) && caret.right() <= px(200.0));
+            handler.replace_and_mark_text_in_range(None, "你好", Some(2..2), window, cx);
+            handler.replace_text_in_range(None, "你好", window, cx);
+            assert_eq!(handler.marked_text_range(window, cx), None);
+        });
+        sidebar.read_with(cx, |sidebar, _| {
+            assert_eq!(sidebar.ui.rename_draft.text(), "你好");
+            assert!(!sidebar.ui.rename_composition.is_composing());
+        });
+
+        cx.simulate_keystrokes("enter");
+
+        sidebar.read_with(cx, |sidebar, _| {
+            assert!(sidebar.ui.renaming.is_none());
+            let store = sidebar.store.read().expect("store");
+            assert_eq!(store.sessions()[&id].title, "你好");
+        });
+    }
+
+    #[gpui::test]
+    fn rename_escape_cancels_composition_before_the_edit(cx: &mut TestAppContext) {
+        let (sidebar, _, cx) = rename_harness(cx);
+        let mut handler = sidebar.update(cx, |sidebar, cx| sidebar.rename_input_handler(cx));
+        cx.update(|window, cx| {
+            handler.replace_and_mark_text_in_range(None, "かん", Some(2..2), window, cx);
+        });
+        sidebar.read_with(cx, |sidebar, _| {
+            assert_eq!(sidebar.ui.rename_draft.text(), "かん");
+            assert!(sidebar.ui.rename_composition.is_composing());
+        });
+
+        cx.simulate_keystrokes("escape");
+
+        sidebar.read_with(cx, |sidebar, _| {
+            assert!(sidebar.ui.renaming.is_some(), "Escape only cancels preedit");
+            assert_eq!(sidebar.ui.rename_draft.text(), "Before");
+            assert!(!sidebar.ui.rename_composition.is_composing());
+        });
+        // The cancelled composition's handler is stale: a late commit from the
+        // input method changes nothing.
+        cx.update(|window, cx| handler.replace_text_in_range(None, "感", window, cx));
+        sidebar.read_with(cx, |sidebar, _| {
+            assert_eq!(sidebar.ui.rename_draft.text(), "Before");
+        });
+
+        cx.simulate_keystrokes("escape");
+
+        sidebar.read_with(cx, |sidebar, _| assert!(sidebar.ui.renaming.is_none()));
+    }
+
+    #[gpui::test]
+    fn rename_editing_keys_fix_preedit_as_typed_text(cx: &mut TestAppContext) {
+        let (sidebar, _, cx) = rename_harness(cx);
+        let mut handler = sidebar.update(cx, |sidebar, cx| sidebar.rename_input_handler(cx));
+        cx.update(|window, cx| {
+            handler.replace_and_mark_text_in_range(None, "한", Some(3..3), window, cx);
+        });
+
+        cx.simulate_keystrokes("backspace");
+
+        sidebar.read_with(cx, |sidebar, _| {
+            assert_eq!(sidebar.ui.rename_draft.text(), "");
+            assert!(!sidebar.ui.rename_composition.is_composing());
+            assert!(sidebar.ui.renaming.is_some());
+        });
+    }
+
     #[gpui::test]
     fn keyboard_cursor_moves_without_activating_until_enter(cx: &mut TestAppContext) {
         let (view, cx) = cx.add_window_view(|_, cx| {
@@ -11499,7 +12057,7 @@ mod tests {
                 sidebar
             });
             cx.subscribe(&sidebar, move |_, _, event: &SidebarEvent, _| {
-                if let SidebarEvent::AccountAction(Some(id)) = event {
+                if let SidebarEvent::AccountAction(AccountRequest::Switch(id)) = event {
                     observed.borrow_mut().push(id.clone());
                 }
             })
@@ -11519,6 +12077,64 @@ mod tests {
         assert!(
             cx.debug_bounds("account-menu").is_some(),
             "switch stays in menu"
+        );
+    }
+
+    #[gpui::test]
+    fn account_menu_stays_one_line_per_account(cx: &mut TestAppContext) {
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        let observed = requests.clone();
+        let (_view, cx) = cx.add_window_view(|_, cx| {
+            let sidebar = cx.new(|cx| {
+                let mut sidebar = Sidebar::new(None, true, PreviewScenario::Typical, cx);
+                sidebar.ui.popover = Some(Popover::Account);
+                // Side project was never signed in; Codex also runs on a
+                // login no profile holds yet.
+                let overview = sidebar.accounts.overview_mut();
+                overview.logins[3].signed_in = false;
+                overview.live[1].profile_id = None;
+                sidebar
+            });
+            cx.subscribe(&sidebar, move |_, _, event: &SidebarEvent, _| {
+                if let SidebarEvent::AccountAction(request) = event {
+                    observed.borrow_mut().push(request.clone());
+                }
+            })
+            .detach();
+            SidebarPopoverHarness { sidebar }
+        });
+        let click = |cx: &mut gpui::VisualTestContext, selector: &'static str| {
+            let target = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} is shown"));
+            cx.simulate_click(target.center(), Modifiers::default());
+        };
+
+        click(cx, "switch-account-preview-0");
+        assert!(
+            requests.borrow().is_empty(),
+            "the account in use is already live"
+        );
+        click(cx, "switch-account-preview-1");
+        click(cx, "switch-account-preview-3");
+        assert_eq!(
+            *requests.borrow(),
+            vec![
+                AccountRequest::Switch("preview-1".into()),
+                AccountRequest::SignIn("preview-3".into()),
+            ]
+        );
+        // Saving and adding accounts live in Settings, not here.
+        for selector in ["add-account", "save-account-codex", "unsaved-account-codex"] {
+            assert!(
+                cx.debug_bounds(selector).is_none(),
+                "{selector} is not in the menu"
+            );
+        }
+        assert!(cx.debug_bounds("manage-accounts").is_some());
+        assert!(
+            cx.debug_bounds("account-menu").is_some(),
+            "the menu stays open"
         );
     }
 
@@ -11829,8 +12445,9 @@ mod tests {
     /// review without touching a running Diri instance. Set
     /// `DIRI_VISUAL_GROUPING=recency`, `DIRI_VISUAL_LIGHT=1`,
     /// `DIRI_VISUAL_THEME=<theme id>`, or
-    /// `DIRI_VISUAL_POPOVER=none|project|session` to select the state to
-    /// capture (the default opens the grouping menu), and
+    /// `DIRI_VISUAL_POPOVER=none|project|session|server|new-agent` to select
+    /// the state to capture (the default opens the grouping menu),
+    /// `DIRI_VISUAL_LANGUAGE=zh-Hans` to render in another catalog, and
     /// `DIRI_VISUAL_READ=seen|unseen` to finish that session's turn.
     /// `DIRI_VISUAL_BACKDROP=62616e` supplies a fixed RGB backdrop under glass;
     /// headless rendering cannot capture the native desktop blur.
@@ -11863,8 +12480,20 @@ mod tests {
                 id: SessionId::new("preview-shell"),
                 position: point(px(48.0), px(210.0)),
             }),
+            "new-agent" => Some(Popover::NewAgent {
+                directory: None,
+                host: None,
+            }),
             _ => Some(Popover::SidebarLayout),
         };
+        // DIRI_VISUAL_LANGUAGE=zh-Hans renders the sidebar in that catalog.
+        // Ignored fixture only: the language is process-wide.
+        if let Some(language) = std::env::var("DIRI_VISUAL_LANGUAGE")
+            .ok()
+            .and_then(|tag| crate::i18n::Language::from_tag(&tag))
+        {
+            diri_i18n::set_language(language);
+        }
         // First row of a right-click menu, for `DIRI_VISUAL_MENU_HOVER`.
         let menu_hover = match &popover {
             Some(Popover::ProjectActions { .. }) => Some(point(px(140.0), px(168.0))),
@@ -11891,7 +12520,7 @@ mod tests {
         cx.update(|cx| crate::fonts::init(cx));
 
         let window = cx
-            .open_window(size(px(width), px(height)), |_, cx| {
+            .open_window(size(px(width), px(height)), |window, cx| {
                 let sidebar = cx.new(|cx| {
                     let mut sidebar = Sidebar::new(None, true, scenario, cx);
                     sidebar.ui.width = width;
@@ -11905,6 +12534,17 @@ mod tests {
                     }
                     if std::env::var_os("DIRI_VISUAL_HOVER").is_some() {
                         sidebar.ui.hovered_session = Some(SessionId::new("preview-codex"));
+                    }
+                    // `DIRI_VISUAL_RENAME=<title>` opens the inline rename,
+                    // with `<title>` composing as input-method preedit.
+                    if let Ok(title) = std::env::var("DIRI_VISUAL_RENAME") {
+                        sidebar.ui.begin_rename(SessionId::new("preview-codex"), "");
+                        let units = title.encode_utf16().count();
+                        sidebar.ui.rename_composition.compose(
+                            &mut sidebar.ui.rename_draft,
+                            &title,
+                            units..units,
+                        );
                     }
                     let now = wall_clock_millis();
                     let mut store = sidebar.store.write().expect("preview session store");
@@ -11943,6 +12583,22 @@ mod tests {
                                 } else {
                                     now - 1.0
                                 }));
+                        }
+                        // `DIRI_VISUAL_SCHEDULED=1` marks two sessions as
+                        // scheduled runs: one diri woke the Mac for (indigo
+                        // clock) and one it did not (grey clock).
+                        if std::env::var_os("DIRI_VISUAL_SCHEDULED").is_some() {
+                            let woke = session.id == SessionId::new("preview-spawned-review");
+                            if woke || session.id == SessionId::new("preview-cursor") {
+                                session.scheduled_run =
+                                    Some(diri_proto::schedules::ScheduledRunInfo {
+                                        schedule_id: "sched_preview".into(),
+                                        title: session.title.clone(),
+                                        due_at: diri_proto::DateMillis(now - 600_000.0),
+                                        wake_mac: woke,
+                                        woke_mac: woke,
+                                    });
+                            }
                         }
                         store.upsert_session(session);
                     }
@@ -12015,6 +12671,37 @@ mod tests {
                         asking.listening_ports = None;
                         asking.updated_at = diri_proto::DateMillis(now);
                         store.upsert_session(asking);
+                    }
+                    // `DIRI_VISUAL_REMOTE_WORKTREES=1` replaces the fixture
+                    // with remote worktree Sessions an older Engine filed as
+                    // one project each, loaded through this build's Engine.
+                    if std::env::var_os("DIRI_VISUAL_REMOTE_WORKTREES").is_some() {
+                        let dir = tempfile::tempdir().expect("state dir");
+                        let state = dir.path().join("state.json");
+                        std::fs::write(
+                            &state,
+                            serde_json::to_vec(&crate::sidebar::fixture::remote_worktree_state())
+                                .expect("encode state"),
+                        )
+                        .expect("write state");
+                        let engine = Arc::new(diri_engine::ManifestEngine::new(Vec::new()));
+                        let mut registry = diri_engine::registry::Registry::new(engine, &state);
+                        registry.load().expect("load state");
+                        let mut sessions = registry.records();
+                        for session in &mut sessions {
+                            session.updated_at = diri_proto::DateMillis(now);
+                        }
+                        store.hydrate(diri_proto::SessionListResult {
+                            projects: registry
+                                .projects_raw()
+                                .iter()
+                                .map(|project| {
+                                    serde_json::from_value(project.clone()).expect("project")
+                                })
+                                .collect(),
+                            sessions,
+                        });
+                        store.select(SessionId::new("preview-slop-0"));
                     }
                     store
                         .update_preferences(|prefs| {
@@ -12135,6 +12822,9 @@ mod tests {
                     }
                     sidebar
                 });
+                if std::env::var_os("DIRI_VISUAL_RENAME").is_some() {
+                    sidebar.update(cx, |sidebar, cx| sidebar.focus_handle.focus(window, cx));
+                }
                 cx.new(|_| SidebarPopoverHarness { sidebar })
             })
             .expect("open headless sidebar window");
@@ -12427,7 +13117,9 @@ mod tests {
                         configured_path: None,
                         path_source: Some(diri_proto::AgentPathSource::SystemPath),
                         show_in_quick_create: true,
+                        launch_args: Vec::new(),
                         error: None,
+                        signed_in: None,
                         descriptor: Some(diri_proto::AgentDescriptor {
                             display_name: label.to_owned(),
                             ..Default::default()
@@ -12676,7 +13368,16 @@ mod tests {
             Some(chevron)
         );
         assert!(close.left() > chevron.right());
-        assert_eq!(close.right(), project.right() - px(Space::ROW_H));
+        assert_eq!(
+            close.right(),
+            project.right() - px(Space::ROW_H - SIDEBAR_ACTION_OUTSET)
+        );
+        // ⋯, +, and ✕ share one square and one pitch.
+        let menu = cx.debug_bounds("PROJECT_MENU_preview-dirijor").unwrap();
+        let add = cx.debug_bounds("PROJECT_ADD_preview-dirijor").unwrap();
+        assert_eq!(menu.size, close.size);
+        assert_eq!(add.size, close.size);
+        assert_eq!(add.left() - menu.left(), close.left() - add.left());
 
         cx.simulate_click(close.center(), Modifiers::default());
 
@@ -12738,7 +13439,7 @@ mod tests {
             popover.top() > menu.bottom(),
             "project actions must open below their trigger"
         );
-        assert_eq!(popover.size.width, px(184.0));
+        assert_eq!(popover.size.width, px(PROJECT_MENU_WIDTH));
     }
 
     #[gpui::test]

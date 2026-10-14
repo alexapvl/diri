@@ -75,6 +75,18 @@ fn main() {
         let _ = diri_engine::holder::guard::run_group_guard(std::io::stdin().lock());
         return;
     }
+    #[cfg(target_os = "macos")]
+    if arguments.get(1).map(String::as_str) == Some(diri_engine::holder::launcher::RELAY_FLAG) {
+        // A one-shot launchd job that submits the manager's job from outside
+        // diri.app's coalition, then exits (see `RELAY_FLAG`).
+        let executable =
+            std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from(&arguments[0]));
+        if let Err(error) = diri_engine::holder::launcher::run_relay(&executable, &arguments[2..]) {
+            eprintln!("diri-holder: relay: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     // The daemon detaches us with setsid at spawn. Direct/manual launches
     // detach here as well; parent death never terminates a POSIX child, and
     // ignoring SIGHUP severs the last terminal coupling.
@@ -109,6 +121,21 @@ fn main() {
             .map_or(Duration::from_secs(30), Duration::from_secs_f64);
         HolderManagerServer::new(std::path::Path::new(&directory), idle)
             .with_group_guard()
+            .with_engine(
+                value_after(&arguments, diri_engine::holder::manager::ENGINE_PID_FLAG)
+                    .and_then(|pid| pid.parse().ok()),
+                std::env::var("DIRI_HOLDER_ABANDON_SECONDS")
+                    .ok()
+                    .and_then(|raw| raw.parse::<f64>().ok())
+                    .map_or(
+                        diri_engine::holder::manager::ABANDON_GRACE,
+                        Duration::from_secs_f64,
+                    ),
+            )
+            .with_agent_launcher(
+                value_after(&arguments, diri_engine::holder::AGENT_LAUNCHER_FLAG)
+                    .map(std::path::PathBuf::from),
+            )
             .run()
     } else if let Some(spec_path) = value_after(&arguments, "--spec") {
         match std::fs::read(&spec_path) {

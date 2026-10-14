@@ -64,6 +64,8 @@ struct ControlState {
     /// lease can tell whether another view left the PTY at a different size.
     requested_size: Option<(u16, u16)>,
     resize_wake: Arc<Notify>,
+    /// Cuts a reattach wait short; see [`AttachmentControl::retry`].
+    retry: Arc<Notify>,
     /// Flip-flopping PTY sizes (A→B→A…), the signature of a layout loop.
     resize_storm: crate::telemetry::ResizeStorm,
     /// Last `pane.input_rejected` event, to keep one per burst.
@@ -73,8 +75,50 @@ struct ControlState {
     echo_due: Option<Instant>,
     /// The session's keystroke probe, shared with its transport task.
     echo: Arc<crate::telemetry::EchoProbe>,
+    /// Typed input this attachment accepted that a disconnect could have
+    /// lost; see [`InputAtRisk`].
+    input_at_risk: InputAtRisk,
     #[cfg(test)]
     resize_sends: u64,
+}
+
+/// How long typed input stays at risk even after a frame arrived: a frame
+/// that left the Engine before the keystroke landed proves nothing about it.
+const INPUT_AT_RISK_WINDOW: Duration = Duration::from_secs(2);
+
+/// Typed input whose delivery a dropped connection leaves in doubt. There is
+/// no PTY delivery acknowledgement, so the evidence is a frame received after
+/// the keystroke and a short window around it. A reconnect with nothing at
+/// risk (an idle or backgrounded pane) is silent.
+#[derive(Clone, Copy, Debug, Default)]
+struct InputAtRisk {
+    /// When this attachment last accepted typed input.
+    last: Option<Instant>,
+    /// Whether no frame has arrived since that input.
+    unanswered: bool,
+}
+
+impl InputAtRisk {
+    fn sent(&mut self, at: Instant) {
+        self.last = Some(at);
+        self.unanswered = true;
+    }
+
+    fn frame_received(&mut self) {
+        self.unanswered = false;
+    }
+
+    /// Whether a connection that ended at `closed` may have lost input.
+    fn at(self, closed: Instant) -> bool {
+        self.last.is_some_and(|sent| {
+            self.unanswered || closed.saturating_duration_since(sent) <= INPUT_AT_RISK_WINDOW
+        })
+    }
+}
+
+/// What the pane says after a reconnect that may have lost typing.
+fn input_at_risk_notice() -> &'static str {
+    t("terminal.input.at_risk")
 }
 
 /// Accepted means queued locally. There is no PTY delivery acknowledgement.
@@ -95,11 +139,11 @@ impl InputRejection {
     }
 
     fn message(self) -> &'static str {
-        match self {
-            Self::PassiveView => "This terminal is active in another view. Focus it to type here.",
-            Self::Disconnected => "Terminal input was not accepted while reconnecting.",
-            Self::Overloaded => "Terminal input queue is full. The latest input was not accepted.",
-        }
+        t(match self {
+            Self::PassiveView => "terminal.input.passive_view",
+            Self::Disconnected => "terminal.input.disconnected",
+            Self::Overloaded => "terminal.input.overloaded",
+        })
     }
 }
 
@@ -147,6 +191,12 @@ impl AttachmentControl {
             state.pending_resize = None;
             state.resize_wake.notify_one();
         }
+    }
+
+    /// The session's record changed: reattach now rather than after the
+    /// current backoff, or at all after a definitive refusal.
+    pub(super) fn retry(&self) {
+        self.state.lock().unwrap().retry.notify_one();
     }
 
     pub(super) fn ownership_revision(&self) -> u64 {
@@ -236,7 +286,9 @@ impl AttachmentControl {
             } => writer.scroll(direction, lines, col, row),
         };
         if typed && result.is_ok() {
-            state.echo_due = Some(Instant::now());
+            let now = Instant::now();
+            state.echo_due = Some(now);
+            state.input_at_risk.sent(now);
         }
         result.map_err(|error| match error {
             AttachmentClosed::Backpressure => InputRejection::Overloaded,
@@ -325,6 +377,17 @@ impl AttachmentControl {
         }
     }
 
+    /// Keys a message jump sends to move an Agent's transcript (PageUp,
+    /// PageDown). Like a wheel report they travel as raw terminal bytes, so
+    /// neither the Engine's status nor its prompt tracking reads them as the
+    /// user typing.
+    pub(super) fn navigate(&self, bytes: Vec<u8>) {
+        if !bytes.is_empty() {
+            self.claim_if_vacant();
+            self.report("navigate", self.submit(AttachmentCommand::Mouse(bytes)));
+        }
+    }
+
     pub(super) fn scroll(&self, direction: u8, lines: u16, col: u16, row: u16) {
         self.claim_if_vacant();
         self.report(
@@ -397,10 +460,12 @@ impl ControllerLease {
                 pending_resize: None,
                 requested_size: None,
                 resize_wake: Arc::new(Notify::new()),
+                retry: Arc::new(Notify::new()),
                 resize_storm: crate::telemetry::ResizeStorm::default(),
                 rejection_recorded: None,
                 echo_due: None,
                 echo: echo.clone(),
+                input_at_risk: InputAtRisk::default(),
                 #[cfg(test)]
                 resize_sends: 0,
             }));
@@ -678,7 +743,11 @@ fn spawn_transport(
             if cancelled { return; }
         }
         let mut trace = crate::telemetry::TransportTrace::new(&id);
-        let echo = control.lock().unwrap().echo.clone();
+        let (echo, retry) = {
+            let state = control.lock().unwrap();
+            (state.echo.clone(), state.retry.clone())
+        };
+        let mut backoff = REATTACH_DELAY;
         loop {
             trace.connecting();
             let connect = SessionAttachment::connect(&socket, id.clone());
@@ -691,7 +760,13 @@ fn spawn_transport(
                 Ok(Err(_)) => trace.connect_failed("error"),
                 Err(_) => trace.connect_failed("timeout"),
             }
+            // Unreachable Engines and attaches that end before their first
+            // grid back off exponentially; a session that painted resets it.
+            let mut ceiling = REATTACH_MAX_UNREACHABLE;
             if let Ok(Ok(mut attachment)) = connected {
+                ceiling = REATTACH_MAX_EMPTY;
+                let mut rejected = None;
+                let mut painted = false;
                 let writer = attachment.handle();
                 let resize_wake = {
                     let mut state = control.lock().unwrap();
@@ -700,6 +775,8 @@ fn spawn_transport(
                         state.last_resize = Some(size);
                     }
                     state.writer = Some(writer.clone());
+                    // Only this attachment's typing can be lost with it.
+                    state.input_at_risk = InputAtRisk::default();
                     state.resize_wake.clone()
                 };
                 trace.live();
@@ -736,11 +813,15 @@ fn spawn_transport(
                         }
                         _ = &mut shutdown => break true,
                         chunk = attachment.chunks.recv() => match chunk {
+                            // The channel ends right after; remember why.
+                            Some(TerminalChunk::Rejected(reason)) => rejected = Some(reason),
                             Some(chunk) => {
                                 trace.chunk(&chunk);
                                 let grid = matches!(chunk, TerminalChunk::Grid(_));
                                 if grid {
+                                    painted = true;
                                     echo.frame_received();
+                                    control.lock().unwrap().input_at_risk.frame_received();
                                 }
                                 let _ = events.send(PaneEvent::Chunk(id.clone(), 0, chunk));
                                 if grid {
@@ -756,22 +837,50 @@ fn spawn_transport(
                 drop(resize_wait);
                 // Linearize closed admission before draining. The existing
                 // single queue keeps all commands accepted before this point.
-                control.lock().unwrap().writer = None;
-                if !matches!(tokio::time::timeout(Duration::from_secs(2), attachment.close_checked()).await, Ok(Ok(()))) {
+                let input_at_risk = {
+                    let mut state = control.lock().unwrap();
+                    state.writer = None;
+                    state.input_at_risk.at(Instant::now())
+                };
+                if !matches!(tokio::time::timeout(Duration::from_secs(2), attachment.close_checked()).await, Ok(Ok(()))) && rejected.is_none() {
                     // Payload-free diagnostic also covers EOF/write failure
                     // during last-view close, when no view remains to notify.
+                    // A refused attach never accepted input, so it has none to lose.
                     eprintln!("diri: terminal attachment drain interrupted; queued input may not have reached the session");
                     trace.drain_interrupted();
                 }
                 if stopping { return; }
-                trace.detached();
-                let _ = events.send(PaneEvent::InputFeedback(id.clone(),
-                    "Terminal connection interrupted. Recent input may not have reached the session; it will not be replayed.".into()));
+                if let Some(reason) = rejected {
+                    // The same request would be refused again: wait for the
+                    // pane to report that the session changed (resumed,
+                    // relaunched) instead of asking every half second.
+                    trace.rejected(reason);
+                    let _ = events.send(PaneEvent::AttachmentState(id.clone(), 0, AttachmentState::Unavailable));
+                    tokio::select! {
+                        _ = &mut shutdown => return,
+                        _ = retry.notified() => {}
+                    }
+                    backoff = REATTACH_DELAY;
+                    continue;
+                }
+                trace.detached(input_at_risk);
+                // The pane shows Reconnecting either way; a notice is only
+                // for typing the dropped connection may have swallowed. An
+                // idle or backgrounded pane (App Nap) reconnects silently.
+                if input_at_risk {
+                    let _ = events.send(PaneEvent::InputFeedback(id.clone(), input_at_risk_notice().into()));
+                }
+                if painted {
+                    backoff = REATTACH_DELAY;
+                }
             }
             let _ = events.send(PaneEvent::AttachmentState(id.clone(), 0, AttachmentState::Reconnecting));
+            let delay = backoff.min(ceiling);
+            backoff = (delay * 2).min(REATTACH_MAX_EMPTY);
             tokio::select! {
                 _ = &mut shutdown => return,
-                _ = tokio::time::sleep(REATTACH_DELAY) => {}
+                _ = retry.notified() => backoff = REATTACH_DELAY,
+                _ = tokio::time::sleep(delay) => {}
             }
         }
     });
@@ -929,10 +1038,12 @@ mod tests {
                 pending_resize: None,
                 requested_size: None,
                 resize_wake: Arc::new(Notify::new()),
+                retry: Arc::new(Notify::new()),
                 resize_storm: crate::telemetry::ResizeStorm::default(),
                 rejection_recorded: None,
                 echo_due: None,
                 echo: Arc::default(),
+                input_at_risk: InputAtRisk::default(),
                 #[cfg(test)]
                 resize_sends: 0,
             }))
@@ -982,6 +1093,270 @@ mod tests {
         last_stop.send(()).unwrap();
     }
 
+    /// An Engine that accepts every attach and closes it at once, after a
+    /// refusal frame when given one: the reconnect-storm shape.
+    fn closing_engine(
+        runtime: &tokio::runtime::Runtime,
+        refusal: Option<diri_proto::frames::AttachRejection>,
+    ) -> (PathBuf, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let path = std::env::temp_dir().join(format!(
+            "diri-refuse-{}-{}.sock",
+            std::process::id(),
+            NEXT_VIEW.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _enter = runtime.enter();
+        let listener = UnixListener::bind(&path).unwrap();
+        let connects = Arc::new(AtomicUsize::new(0));
+        let count = connects.clone();
+        let task = runtime.spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                count.fetch_add(1, Ordering::SeqCst);
+                let mut stream = BufReader::new(stream);
+                let mut hello = String::new();
+                let _ = stream.read_line(&mut hello).await;
+                if let Some(reason) = refusal {
+                    let frame = Frame::attach_rejected(reason);
+                    let _ = stream
+                        .get_mut()
+                        .write_all(&FrameCodec::encode(&frame).unwrap())
+                        .await;
+                }
+            }
+        });
+        (path, connects, task)
+    }
+
+    /// The transport's control state, every attachment state it reported,
+    /// and its shutdown.
+    type Transport = (
+        Arc<Mutex<ControlState>>,
+        Arc<Mutex<Vec<AttachmentState>>>,
+        oneshot::Sender<()>,
+    );
+
+    fn transport_against(runtime: &tokio::runtime::Runtime, path: PathBuf) -> Transport {
+        transport_with_notices(runtime, path).0
+    }
+
+    /// [`transport_against`], plus every notice the transport raised.
+    fn transport_with_notices(
+        runtime: &tokio::runtime::Runtime,
+        path: PathBuf,
+    ) -> (Transport, Arc<Mutex<Vec<String>>>) {
+        let (events, mut rx) = pane_event_channel();
+        let state = Arc::new(Mutex::new(ControlState {
+            owner: 1,
+            ownership_revision: 0,
+            writer: None,
+            last_resize: None,
+            pending_resize: None,
+            requested_size: None,
+            resize_wake: Arc::new(Notify::new()),
+            retry: Arc::new(Notify::new()),
+            resize_storm: crate::telemetry::ResizeStorm::default(),
+            rejection_recorded: None,
+            echo_due: None,
+            echo: Arc::default(),
+            input_at_risk: InputAtRisk::default(),
+            resize_sends: 0,
+        }));
+        let (stop, shutdown) = oneshot::channel();
+        let (done, _) = watch::channel(false);
+        spawn_transport(
+            runtime.handle(),
+            path,
+            SessionId("a-note".into()),
+            state.clone(),
+            events,
+            shutdown,
+            (None, DrainFinished(done)),
+        );
+        let states = Arc::new(Mutex::new(Vec::new()));
+        let notices = Arc::new(Mutex::new(Vec::new()));
+        let (seen, noticed) = (states.clone(), notices.clone());
+        runtime.spawn(async move {
+            let mut batch = Vec::new();
+            while rx.recv_batch(&mut batch).await {
+                for event in batch.drain(..) {
+                    match event {
+                        PaneEvent::AttachmentState(_, _, state) => seen.lock().unwrap().push(state),
+                        PaneEvent::InputFeedback(_, message) => {
+                            noticed.lock().unwrap().push(message)
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        });
+        ((state, states, stop), notices)
+    }
+
+    /// An Engine that seeds each attach with one grid and drops the
+    /// connection when told to, as one does after `attach.sink_dropped`.
+    fn dropping_engine(
+        runtime: &tokio::runtime::Runtime,
+    ) -> (PathBuf, Arc<Notify>, tokio::task::JoinHandle<()>) {
+        let path = std::env::temp_dir().join(format!(
+            "diri-drop-{}-{}.sock",
+            std::process::id(),
+            NEXT_VIEW.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _enter = runtime.enter();
+        let listener = UnixListener::bind(&path).unwrap();
+        let drop_now = Arc::new(Notify::new());
+        let notified = drop_now.clone();
+        let task = runtime.spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let mut stream = BufReader::new(stream);
+                let mut hello = String::new();
+                let _ = stream.read_line(&mut hello).await;
+                let seed = Frame::grid(&frame(1, 'a')).unwrap();
+                let _ = stream
+                    .get_mut()
+                    .write_all(&FrameCodec::encode(&seed).unwrap())
+                    .await;
+                notified.notified().await;
+                drop(stream);
+            }
+        });
+        (path, drop_now, task)
+    }
+
+    fn input_control(state: &Arc<Mutex<ControlState>>) -> AttachmentControl {
+        AttachmentControl {
+            state: state.clone(),
+            view: 1,
+            events: pane_event_channel().0,
+            id: SessionId("a-note".into()),
+            echo: Arc::default(),
+            input_observer: None,
+        }
+    }
+
+    /// Drops one live attachment (after `typing`, if any) and returns the
+    /// notices raised by the time the transport is reconnecting.
+    fn notices_after_drop(typing: Option<&[u8]>) -> Vec<String> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (path, drop_now, engine) = dropping_engine(&runtime);
+        let ((state, states, stop), notices) = transport_with_notices(&runtime, path.clone());
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !states.lock().unwrap().contains(&AttachmentState::Live) {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                // Let the seed land so only input after it is unanswered.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            })
+            .await
+            .unwrap();
+        });
+        if let Some(typing) = typing {
+            input_control(&state).input(typing.to_vec());
+        }
+        drop_now.notify_one();
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while !states
+                    .lock()
+                    .unwrap()
+                    .contains(&AttachmentState::Reconnecting)
+                {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            })
+            .await
+            .unwrap();
+        });
+        let _ = stop.send(());
+        engine.abort();
+        let _ = std::fs::remove_file(path);
+        notices.lock().unwrap().clone()
+    }
+
+    #[test]
+    fn a_dropped_connection_with_no_typing_reconnects_silently() {
+        assert_eq!(notices_after_drop(None), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_dropped_connection_right_after_typing_says_keystrokes_may_be_lost() {
+        assert_eq!(notices_after_drop(Some(b"x")), [input_at_risk_notice()]);
+    }
+
+    #[test]
+    fn input_is_at_risk_until_answered_and_out_of_the_window() {
+        let now = Instant::now();
+        let closed = now + Duration::from_secs(10);
+        assert!(!InputAtRisk::default().at(closed), "nothing typed");
+        let mut risk = InputAtRisk::default();
+        risk.sent(now);
+        assert!(risk.at(closed), "no frame since the keystroke");
+        risk.frame_received();
+        assert!(
+            risk.at(now + Duration::from_secs(1)),
+            "a frame right after proves nothing"
+        );
+        assert!(!risk.at(closed), "answered long before the close");
+    }
+
+    #[test]
+    fn a_refused_attach_waits_for_the_session_to_change_instead_of_retrying() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (path, connects, engine) = closing_engine(
+            &runtime,
+            Some(diri_proto::frames::AttachRejection::NotTerminal),
+        );
+        let (state, states, stop) = transport_against(&runtime, path.clone());
+        // Long enough for three retries at the old fixed 500 ms.
+        runtime.block_on(async { tokio::time::sleep(Duration::from_millis(1700)).await });
+        assert_eq!(connects.load(Ordering::SeqCst), 1, "a refusal is final");
+        assert_eq!(
+            states.lock().unwrap().last(),
+            Some(&AttachmentState::Unavailable)
+        );
+
+        // The pane saw the session's record change: one more try.
+        state.lock().unwrap().retry.notify_one();
+        runtime.block_on(async { tokio::time::sleep(Duration::from_millis(300)).await });
+        assert_eq!(connects.load(Ordering::SeqCst), 2);
+        let _ = stop.send(());
+        engine.abort();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn attaches_that_close_at_once_back_off_exponentially() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // An older Engine closes without saying why.
+        let (path, connects, engine) = closing_engine(&runtime, None);
+        let (_state, states, stop) = transport_against(&runtime, path.clone());
+        // Fixed 500 ms retries attach 5 times in 2.2 s; 0.5 → 1 → 2 s waits
+        // attach at 0, 0.5 and 1.5 s.
+        runtime.block_on(async { tokio::time::sleep(Duration::from_millis(2200)).await });
+        let attempts = connects.load(Ordering::SeqCst);
+        assert!((2..=3).contains(&attempts), "{attempts} attaches");
+        assert!(
+            !states
+                .lock()
+                .unwrap()
+                .contains(&AttachmentState::Unavailable),
+            "an unexplained close is not a refusal"
+        );
+        let _ = stop.send(());
+        engine.abort();
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn measure_control_gate_cost_without_terminal_locking() {
         let (events, _rx) = pane_event_channel();
@@ -994,10 +1369,12 @@ mod tests {
                 pending_resize: None,
                 requested_size: None,
                 resize_wake: Arc::new(Notify::new()),
+                retry: Arc::new(Notify::new()),
                 resize_storm: crate::telemetry::ResizeStorm::default(),
                 rejection_recorded: None,
                 echo_due: None,
                 echo: Arc::default(),
+                input_at_risk: InputAtRisk::default(),
                 #[cfg(test)]
                 resize_sends: 0,
             })),

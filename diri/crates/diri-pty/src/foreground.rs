@@ -22,6 +22,72 @@ pub fn program_name(pid: u32) -> io::Result<String> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "unnamed foreground program"))
 }
 
+/// The npm package `pid`'s program is installed from: `codebuff` for
+/// `node ~/.npm-global/bin/cb`, `@scope/cli` for a native binary an npm
+/// package ships. `None` for a program outside any `node_modules` tree.
+///
+/// Read from the script an interpreter runs, else the executable itself,
+/// with symlinks resolved, since npm's `bin` entries are links into the
+/// package. Only the package's name leaves this module.
+pub fn npm_package(pid: u32) -> io::Result<Option<String>> {
+    let (first, second) = leading_arguments(pid)?;
+    let script = second.filter(|script| {
+        script.starts_with('/') && interpreted(base_name(&first).trim_start_matches('-'))
+    });
+    let path = match script {
+        Some(script) => std::path::PathBuf::from(script),
+        None => executable_path(pid)?,
+    };
+    let path = std::fs::canonicalize(path)?;
+    Ok(path.to_str().and_then(package_from_path))
+}
+
+/// The package a path inside a `node_modules` tree belongs to: the innermost
+/// one, so a CLI's bundled dependency names the dependency.
+fn package_from_path(path: &str) -> Option<String> {
+    const MODULES: &str = "/node_modules/";
+    let rest = &path[path.rfind(MODULES)? + MODULES.len()..];
+    let mut parts = rest.split('/').filter(|part| !part.is_empty());
+    let first = parts.next()?;
+    let name = if first.starts_with('@') {
+        format!("{first}/{}", parts.next()?)
+    } else {
+        first.to_owned()
+    };
+    // A path segment may hold anything; a package name holds none of this.
+    (name.len() <= 214 && !name.chars().any(|c| c.is_control() || c.is_whitespace()))
+        .then_some(name)
+}
+
+#[cfg(target_os = "macos")]
+fn executable_path(pid: u32) -> io::Result<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    let mut buffer = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // SAFETY: buffer is writable for the length passed.
+    let length = unsafe {
+        libc::proc_pidpath(
+            pid as libc::c_int,
+            buffer.as_mut_ptr().cast(),
+            buffer.len() as u32,
+        )
+    };
+    if length <= 0 {
+        return Err(io::Error::last_os_error());
+    }
+    buffer.truncate(length as usize);
+    Ok(std::ffi::OsString::from_vec(buffer).into())
+}
+
+#[cfg(target_os = "linux")]
+fn executable_path(pid: u32) -> io::Result<std::path::PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/exe"))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn executable_path(_: u32) -> io::Result<std::path::PathBuf> {
+    Err(io::ErrorKind::Unsupported.into())
+}
+
 /// The live working directory of `pid`, as the kernel reports it.
 pub fn working_directory(pid: u32) -> io::Result<String> {
     crate::process_facts::working_directory(pid)
@@ -267,12 +333,16 @@ const INTERPRETERS: &[&str] = &[
 /// Extensions a script's file name carries but its command does not.
 const SCRIPT_EXTENSIONS: &[&str] = &[".js", ".mjs", ".cjs", ".ts", ".py", ".rb", ".pl", ".sh"];
 
-fn name_from_arguments(first: &str, second: Option<&str>) -> Option<String> {
-    let program = base_name(first).trim_start_matches('-');
-    let interpreted = INTERPRETERS.contains(&program)
+fn interpreted(program: &str) -> bool {
+    INTERPRETERS.contains(&program)
         || program
             .strip_prefix("python")
-            .is_some_and(|version| version.chars().all(|c| c.is_ascii_digit() || c == '.'));
+            .is_some_and(|version| version.chars().all(|c| c.is_ascii_digit() || c == '.'))
+}
+
+fn name_from_arguments(first: &str, second: Option<&str>) -> Option<String> {
+    let program = base_name(first).trim_start_matches('-');
+    let interpreted = interpreted(program);
     let name = match second {
         Some(script) if interpreted && !script.starts_with('-') && !script.is_empty() => {
             let script = base_name(script);
@@ -359,9 +429,139 @@ fn leading_arguments(_: u32) -> io::Result<(String, Option<String>)> {
     Err(io::ErrorKind::Unsupported.into())
 }
 
+/// The values of `names` in another process's environment (this user's
+/// processes only; anyone else's fails). `None` for a name it does not set.
+pub fn environment_values(pid: u32, names: &[&str]) -> io::Result<Vec<Option<String>>> {
+    let block = environment_block(pid)?;
+    Ok(names
+        .iter()
+        .map(|name| {
+            block.iter().find_map(|entry| {
+                let value = entry.strip_prefix(name.as_bytes())?.strip_prefix(b"=")?;
+                String::from_utf8(value.to_vec()).ok()
+            })
+        })
+        .collect())
+}
+
+#[cfg(target_os = "macos")]
+fn environment_block(pid: u32) -> io::Result<Vec<Vec<u8>>> {
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
+    let mut size = 0usize;
+    // SAFETY: a null buffer asks for the size.
+    if unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            std::ptr::null_mut(),
+            &raw mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let mut buffer = vec![0u8; size];
+    // SAFETY: mib is a valid three-level name; buffer is writable for size bytes.
+    if unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            buffer.as_mut_ptr().cast(),
+            &raw mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    procargs2_environment(&buffer[..size.min(buffer.len())])
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid argument block"))
+}
+
+/// The environment entries of a `KERN_PROCARGS2` block: past `argc`, the
+/// executable path, its NUL padding and the `argc` arguments.
+#[cfg(any(target_os = "macos", test))]
+fn procargs2_environment(bytes: &[u8]) -> Option<Vec<Vec<u8>>> {
+    let argc = i32::from_ne_bytes(bytes.get(..4)?.try_into().ok()?);
+    let rest = &bytes[4..];
+    let path_end = rest.iter().position(|byte| *byte == 0)?;
+    let start = path_end + rest[path_end..].iter().position(|byte| *byte != 0)?;
+    let mut entries = rest[start..].split(|byte| *byte == 0);
+    for _ in 0..argc.max(0) {
+        entries.next()?;
+    }
+    Some(
+        entries
+            .take_while(|entry| !entry.is_empty())
+            .map(<[u8]>::to_vec)
+            .collect(),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn environment_block(pid: u32) -> io::Result<Vec<Vec<u8>>> {
+    let bytes = std::fs::read(format!("/proc/{pid}/environ"))?;
+    Ok(bytes
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn environment_block(_: u32) -> io::Result<Vec<Vec<u8>>> {
+    Err(io::ErrorKind::Unsupported.into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The child [`the_environment_follows_the_arguments`] reads.
+    #[test]
+    #[ignore = "a helper process, not a test"]
+    fn sleeper() {
+        std::thread::sleep(std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn the_environment_follows_the_arguments() {
+        let mut block = 2i32.to_ne_bytes().to_vec();
+        block.extend_from_slice(b"/bin/x\0\0\0x\0-a\0K=v\0DIRIJOR_SOCKET=/s\0\0junk");
+        let entries = procargs2_environment(&block).unwrap();
+        assert_eq!(
+            entries,
+            vec![b"K=v".to_vec(), b"DIRIJOR_SOCKET=/s".to_vec()]
+        );
+        // A real child's environment reads back, unset names as None. Not
+        // `/bin/sleep`: macOS withholds Apple platform binaries' environment.
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", "foreground::tests::sleeper"])
+            .env_clear()
+            .env("DIRIJOR_SOCKET", "/tmp/probe.sock")
+            .spawn()
+            .unwrap();
+        // Until the child has exec'd, it is still a copy of this process.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let values = loop {
+            let values = environment_values(child.id(), &["DIRIJOR_SOCKET", "DIRIJOR_SESSION_ID"]);
+            if values.as_ref().is_ok_and(|values| values[0].is_some())
+                || std::time::Instant::now() > deadline
+            {
+                break values;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(
+            values.unwrap(),
+            vec![Some("/tmp/probe.sock".to_owned()), None]
+        );
+    }
 
     #[test]
     fn programs_are_named_without_their_arguments() {
@@ -375,6 +575,82 @@ mod tests {
             name_from_arguments("claude", Some("--resume")).unwrap(),
             "claude"
         );
+    }
+
+    #[test]
+    fn a_path_names_the_innermost_npm_package() {
+        assert_eq!(
+            package_from_path("/opt/homebrew/lib/node_modules/codebuff/index.js").as_deref(),
+            Some("codebuff")
+        );
+        assert_eq!(
+            package_from_path(
+                "/Users/a/.npm/lib/node_modules/@tencent-ai/codebuddy-code/bin/codebuddy"
+            )
+            .as_deref(),
+            Some("@tencent-ai/codebuddy-code")
+        );
+        assert_eq!(
+            package_from_path("/x/node_modules/@sourcegraph/amp/node_modules/@ampcode/cli/bin/amp")
+                .as_deref(),
+            Some("@ampcode/cli")
+        );
+        assert_eq!(package_from_path("/usr/local/bin/cb"), None);
+        assert_eq!(package_from_path("/x/node_modules/"), None);
+        assert_eq!(package_from_path("/x/node_modules/@scope"), None);
+    }
+
+    /// The child's package once it has exec'd (until then it is still a copy
+    /// of this process), then the child is stopped.
+    fn package_once_execd(mut child: std::process::Child) -> io::Result<Option<String>> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let package = loop {
+            let package = npm_package(child.id());
+            if package.as_ref().is_ok_and(Option::is_some) || std::time::Instant::now() > deadline {
+                break package;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let _ = child.kill();
+        let _ = child.wait();
+        package
+    }
+
+    /// A program launched through an npm-style `bin` link is traced back to
+    /// the package the link points into.
+    #[test]
+    fn a_linked_executable_reads_back_its_package() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let package = root.join("lib/node_modules/codebuff");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        // A copy, so the executable really lives inside the package and only
+        // the link sits on PATH, as npm lays a `bin` entry out.
+        let real = package.join("cb");
+        std::fs::copy(std::env::current_exe().unwrap(), &real).unwrap();
+        let link = root.join("bin/cb");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let child = std::process::Command::new(&link)
+            .args(["--ignored", "--exact", "foreground::tests::sleeper"])
+            .spawn()
+            .unwrap();
+        let package = package_once_execd(child);
+        assert_eq!(package.unwrap().as_deref(), Some("codebuff"));
+
+        // An interpreted entry point is traced through the script it runs,
+        // as `#!/usr/bin/env node` leaves `node <bin link>` in argv.
+        let script = root.join("lib/node_modules/command-code/dist/index.sh");
+        std::fs::create_dir_all(script.parent().unwrap()).unwrap();
+        std::fs::write(&script, "sleep 5\n").unwrap();
+        let link = root.join("bin/cmd");
+        std::os::unix::fs::symlink(&script, &link).unwrap();
+        let child = std::process::Command::new("/bin/sh")
+            .arg(&link)
+            .spawn()
+            .unwrap();
+        let package = package_once_execd(child);
+        assert_eq!(package.unwrap().as_deref(), Some("command-code"));
     }
 
     #[test]
@@ -425,9 +701,8 @@ mod tests {
             "{ports:?}"
         );
         drop(listener);
-        // Parallel process-fact fixtures fork from this test process. A child
-        // can briefly retain the listener between fork and exec/exit even
-        // though this test has closed its own descriptor.
+        // A sibling test's fork holds a copy of the descriptor until its exec,
+        // so the port can outlive the drop briefly; it must then go away.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             let ports = listening_ports(group).unwrap();
@@ -435,7 +710,7 @@ mod tests {
                 break;
             }
             assert!(std::time::Instant::now() < deadline, "{ports:?}");
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
 

@@ -1,6 +1,6 @@
 use super::*;
 use crate::store::TabOrientation;
-use crate::tab_navigation::{TAB_STRIP_HEIGHT, selected_project_tabs};
+use crate::tab_navigation::selected_project_tabs;
 use diri_ui::title_fade;
 
 pub(super) const TAB_WIDTH: f32 = 164.0;
@@ -176,6 +176,11 @@ impl StripMenu {
     }
 }
 
+/// Window x of the strip's first control when it shares the traffic
+/// lights' row: the lights end 74 pt in, and the control's glyph sits at
+/// its leading edge, so this leaves a clear 10 pt.
+const STRIP_FIRST_CONTROL_X: f32 = 84.0;
+
 impl Sidebar {
     /// Open a session or project context menu from the horizontal strip.
     pub(super) fn open_strip_menu(
@@ -300,6 +305,45 @@ impl Sidebar {
             .tab_orientation
     }
 
+    /// The horizontal strip's height in the current density.
+    pub fn tab_strip_height(&self) -> f32 {
+        let store = self.store.read().expect("store");
+        crate::tab_navigation::tab_strip_height(store.preferences().pane_density)
+    }
+
+    /// Comfortable density: panes are islands on the chrome.
+    pub fn islands(&self) -> bool {
+        let store = self.store.read().expect("store");
+        store.preferences().pane_density.islands()
+    }
+
+    /// Room before the strip's first control. With the panel hidden the
+    /// strip shares the traffic lights' row, and its first control sits just
+    /// past the lights, at the same window x in either density.
+    pub(super) fn strip_leading_inset(&self) -> f32 {
+        if crate::window_chrome::traffic_lights_visible() && !self.ui.visible {
+            let gap = self
+                .store
+                .read()
+                .expect("store")
+                .preferences()
+                .pane_density
+                .island_gap();
+            STRIP_FIRST_CONTROL_X - gap
+        } else {
+            10.0
+        }
+    }
+
+    /// The strip's height when it is on screen, else zero.
+    pub fn horizontal_tabs_height(&self) -> f32 {
+        if self.horizontal_tabs_visible() {
+            self.tab_strip_height()
+        } else {
+            0.0
+        }
+    }
+
     pub fn horizontal_tabs_visible(&self) -> bool {
         let store = self.store.read().expect("store");
         store.preferences().tab_orientation == TabOrientation::Horizontal
@@ -380,6 +424,7 @@ impl Sidebar {
             (tabs, selected, custom, marks)
         };
         let reduce_motion = cx.reduce_motion();
+        self.observe_tab_hover(&tabs.sessions, selected.as_ref(), reduce_motion);
         if self.tab_shift.settled.get() {
             self.tab_shift.deltas.clear();
         }
@@ -525,6 +570,7 @@ impl Sidebar {
             custom_ordering,
             held_hint,
             pill_drawn,
+            hover_linger,
             ..
         } = *props;
         let id = id.clone();
@@ -549,7 +595,7 @@ impl Sidebar {
                     id.0
                 )))
                 .role(Role::Image)
-                .aria_label("Progress")
+                .aria_label(t("sidebar.tabs.progress"))
                 .children(progress_mark)
                 .into_any_element(),
             StatusState::IdleSeen | StatusState::None => div()
@@ -571,7 +617,7 @@ impl Sidebar {
                 })
                 .role(Role::Image)
                 .aria_label(state.label())
-                .child(activity_mark(state, props.activity_frame, colors))
+                .child(activity_mark(state, colors))
                 .into_any_element(),
         };
         let mark = crate::held_hints::in_leading_slot(
@@ -615,6 +661,11 @@ impl Sidebar {
             // The shared pill layer draws the selection; a tab fills itself
             // only while that layer stands down.
             .glass_pill(colors, active && !pill_drawn)
+            // The tab the pointer just left keeps a fading fill; the
+            // declarative hover below still lights the new tab at once.
+            .when(!active && hover_linger > 0.0, |row| {
+                row.bg(colors.primary.alpha(0.06 * hover_linger))
+            })
             .hover(move |row| {
                 if active {
                     row
@@ -622,6 +673,23 @@ impl Sidebar {
                     row.bg(colors.primary.alpha(0.06))
                 }
             })
+            .on_hover(cx.listener({
+                let id = id.clone();
+                move |this, hovering: &bool, _, cx| {
+                    this.hover_trails.tabs.hover_event(
+                        &id,
+                        *hovering,
+                        Instant::now(),
+                        cx.reduce_motion(),
+                    );
+                    // Only a leave has something new to paint: the fade's
+                    // first frame. The fading tab's `hover_linger` prop
+                    // changes, so only it re-renders.
+                    if !*hovering && this.hover_trails.tabs.is_fading() {
+                        this.notify_without_staling_rows(cx);
+                    }
+                }
+            }))
             .when(custom_ordering, |row| {
                 let drag_id = id.clone();
                 let drag_entity = entity.clone();
@@ -669,7 +737,7 @@ impl Sidebar {
                         close_id.0
                     )))
                     .role(Role::Button)
-                    .aria_label("Close session")
+                    .aria_label(t("session.close_session"))
                     .size(px(18.0))
                     .flex_none()
                     .flex()
@@ -867,7 +935,7 @@ impl Sidebar {
         // only painted surface, so the per-frame work `Sidebar::render`
         // does has to happen here: settle workspace navigation (a pending
         // project-agent open, a created or removed workspace) and keep the
-        // working marks' 8 Hz tick alive only while one is on screen.
+        // progress sweeps' 8 Hz tick alive only while one is on screen.
         self.reconcile_workspace_navigation(cx);
         self.working_row_rendered = false;
         // The strip stands in for the panel; its marks advance through a
@@ -880,7 +948,7 @@ impl Sidebar {
         let strip = self.horizontal_strip(available_width, trailing, cx);
         self.schedule_activity_tick(cx);
         self.schedule_title_tick();
-        if self.title_tick {
+        if self.title_tick || self.hover_trails.is_fading() {
             // Notifies the sidebar, not the caller: `RootView` read it to
             // paint the strip, so the strip repaints on the display link.
             self.request_motion_frame(window, cx);
@@ -903,7 +971,7 @@ impl Sidebar {
             // selection made while they were away.
             self.tab_pill.forget();
             self.workspace_nav.available_width = available_width;
-            return self.workspace_strip(colors, cx);
+            return self.workspace_strip(colors, trailing, cx);
         }
         let rows = self.render_project_tab_rows(available_width, cx);
         let held_hint = self.strip_held_hint;
@@ -918,32 +986,35 @@ impl Sidebar {
                 },
             ))
             .role(Role::TabList)
-            .aria_label("Project sessions")
+            .aria_label(t("sidebar.tabs.project_sessions"))
             .titlebar_drag_area()
             .flex_none()
-            .h(px(TAB_STRIP_HEIGHT))
+            .h(px(self.tab_strip_height()))
             .w_full()
             .flex()
             .items_center()
             .relative()
-            .py(px(6.0))
+            .pt(px(
+                6.0 + self.tab_strip_height() - crate::tab_navigation::TAB_STRIP_HEIGHT
+            ))
+            .pb(px(6.0))
             .gap(px(0.0))
-            .pl(px(if crate::window_chrome::traffic_lights_visible() && !self.ui.visible {
-                92.0
-            } else {
-                10.0
-            }))
+            .pl(px(self.strip_leading_inset()))
             .pr(px(10.0 + self.strip_caption_inset))
-            .child(
-                div()
-                    .absolute()
-                    .left(px(0.0))
-                    .right(px(0.0))
-                    .bottom(px(0.0))
-                    .h(px(1.0))
-                    .bg(colors.primary.alpha(0.07)),
-            )
-            .bg(colors.sidebar_surface())
+            // Comfortable: the island below is the edge, so no hairline.
+            .when(!self.islands(), |strip| {
+                strip.child(
+                    div()
+                        .absolute()
+                        .left(px(0.0))
+                        .right(px(0.0))
+                        .bottom(px(0.0))
+                        .h(px(1.0))
+                        .bg(colors.primary.alpha(0.07)),
+                )
+            })
+            // Islands already paint this chrome; a second tint would darken it.
+            .when(!self.islands(), |strip| strip.bg(colors.sidebar_surface()))
             .text_color(colors.primary)
             .child(
                 div()
@@ -954,14 +1025,20 @@ impl Sidebar {
                     .items_center()
                     // Content only: the strip's own fill keeps its color.
                     .opacity(self.title_opacity)
-                    .child(self.project_control(colors, cx))
+            .child(
+                // A breath between the project control and the first tab.
+                div()
+                    .flex_none()
+                    .mr(px(diri_ui::Metrics::TOOLBAR_COMPACT_GAP + 2.0))
+                    .child(self.project_control(colors, cx)),
+            )
             .child(rows)
             .child(crate::held_hints::below(
                 div()
                     .id("horizontal-peek-tabs")
                     .debug_selector(|| "horizontal-peek-tabs".into())
                     .role(Role::Button)
-                    .aria_label("Peek tabs")
+                    .aria_label(t("sidebar.tabs.peek"))
                     .size(px(28.0))
                     .flex_none()
                     .flex()
@@ -986,7 +1063,7 @@ impl Sidebar {
                     .id("horizontal-new-tab")
                     .debug_selector(|| "horizontal-new-tab".into())
                     .role(Role::Button)
-                    .aria_label("New session")
+                    .aria_label(t("sidebar.tabs.new_session"))
                     .size(px(28.0))
                     .flex_none()
                     .flex()
@@ -1073,7 +1150,11 @@ mod tests {
         cx: &mut TestAppContext,
         reduce_motion: bool,
     ) -> (Entity<Sidebar>, &mut VisualTestContext) {
-        cx.update(|cx| cx.set_reduce_motion(reduce_motion));
+        cx.update(|cx| {
+            cx.set_reduce_motion(reduce_motion);
+            // Real icons, so working marks reach the scene as sprites.
+            cx.set_asset_source_for_test(diri_ui::IconAssets);
+        });
         let (view, cx) = cx.add_window_view(move |_, cx| {
             let sidebar = cx.new(|cx| {
                 let mut sidebar = Sidebar::new(None, true, PreviewScenario::Typical, cx);
@@ -1205,11 +1286,12 @@ mod tests {
         assert!(!working.is_empty(), "the preview strip has a working tab");
         assert_eq!(tab_renders(&sidebar, cx).len(), order.len());
 
-        // A working mark's tick re-renders the working tabs alone.
+        // A working mark's frame step re-renders no tab.
         let before = tab_renders(&sidebar, cx);
         cx.executor().advance_clock(Duration::from_millis(125));
         cx.run_until_parked();
-        assert_eq!(rerendered(&before, &tab_renders(&sidebar, cx)), working);
+        assert!(cx.update(|window, cx| window.advance_sprite_animations(cx)));
+        assert_eq!(rerendered(&before, &tab_renders(&sidebar, cx)), []);
 
         // A store publication that changes nothing re-renders no tab.
         let before = tab_renders(&sidebar, cx);
@@ -1468,6 +1550,13 @@ mod tests {
         );
     }
 
+    /// Advances the window's animated sprites one 125 ms step.
+    fn step_marks(cx: &mut VisualTestContext) -> bool {
+        cx.executor().advance_clock(Duration::from_millis(125));
+        cx.run_until_parked();
+        cx.update(|window, cx| window.advance_sprite_animations(cx))
+    }
+
     #[gpui::test]
     fn horizontal_strip_keeps_the_working_mark_ticking_while_the_panel_is_hidden(
         cx: &mut TestAppContext,
@@ -1477,19 +1566,16 @@ mod tests {
         cx.run_until_parked();
         sidebar.read_with(cx, |sidebar, _| {
             assert!(!sidebar.is_visible(), "the panel is hidden");
-            assert!(sidebar.working_row_rendered);
-            assert!(sidebar.activity_tick.is_some());
+            assert!(sidebar.activity_tick.is_none(), "marks need no tick");
         });
+        assert!(
+            !cx.update(|window, _| window.animated_sprite_tiles())
+                .is_empty()
+        );
         for _ in 0..3 {
-            let frame = sidebar.read_with(cx, |sidebar, _| sidebar.activity_frame);
-            cx.executor().advance_clock(Duration::from_millis(125));
-            cx.run_until_parked();
-            assert_eq!(
-                sidebar.read_with(cx, |sidebar, _| sidebar.activity_frame),
-                (frame + 1) % 8,
-            );
+            assert!(step_marks(cx));
         }
-        // Once nothing works, the strip lets the wake lapse.
+        // Once nothing works, nothing is left to advance.
         sidebar.update(cx, |sidebar, cx| {
             let mut store = sidebar.store.write().unwrap();
             let sessions: Vec<_> = store.sessions().values().cloned().collect();
@@ -1502,8 +1588,11 @@ mod tests {
             cx.notify();
         });
         cx.run_until_parked();
-        cx.executor().advance_clock(Duration::from_millis(125));
-        cx.run_until_parked();
+        assert!(
+            cx.update(|window, _| window.animated_sprite_tiles())
+                .is_empty()
+        );
+        assert!(!step_marks(cx));
         sidebar.read_with(cx, |sidebar, _| {
             assert!(!sidebar.working_row_rendered);
             assert!(sidebar.activity_tick.is_none());
@@ -1512,8 +1601,7 @@ mod tests {
 
     /// A floating menu is its own window and reads the sidebar while it
     /// draws, so GPUI comes to regard that window as the sidebar's. Closing
-    /// it leaves the sidebar with no window until the main one draws again,
-    /// and a tick landing in that gap must not strand the working marks.
+    /// it must not strand the working marks in the main window.
     #[gpui::test]
     fn working_mark_keeps_ticking_after_a_floating_window_closes(cx: &mut TestAppContext) {
         struct Panel {
@@ -1539,13 +1627,7 @@ mod tests {
             .unwrap();
         cx.run_until_parked();
         for _ in 0..3 {
-            let frame = sidebar.read_with(cx, |sidebar, _| sidebar.activity_frame);
-            cx.executor().advance_clock(Duration::from_millis(125));
-            cx.run_until_parked();
-            assert_eq!(
-                sidebar.read_with(cx, |sidebar, _| sidebar.activity_frame),
-                (frame + 1) % 8,
-            );
+            assert!(step_marks(cx));
         }
     }
 

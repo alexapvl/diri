@@ -61,6 +61,8 @@ use uuid::Uuid;
 
 pub(crate) mod a11y;
 mod prompts;
+// DIRI PATCH (sprite animation)
+mod sprite_animation;
 
 pub use a11y::A11ySubtreeBuilder;
 
@@ -1147,6 +1149,8 @@ pub struct Window {
     active: Rc<Cell<bool>>,
     hovered: Rc<Cell<bool>>,
     pub(crate) needs_present: Rc<Cell<bool>>,
+    /// DIRI PATCH (sprite animation): see `window/sprite_animation.rs`.
+    sprite_animations: sprite_animation::SpriteAnimations,
     #[cfg(any(test, feature = "test-support"))]
     immediate_frame_requests: Cell<usize>,
     /// Tracks recent input event timestamps to determine if input is arriving at a high rate.
@@ -1658,6 +1662,9 @@ impl Window {
                                     // Bypass cached view reuse so we don't replay stale
                                     // atlas tile references after a GPU device recovery.
                                     window.refresh();
+                                    // DIRI PATCH (sprite animation): those tiles
+                                    // are gone too; the redraw registers fresh ones.
+                                    window.sprite_animations.clear();
                                 }
                                 let arena_clear_needed = window.draw(cx);
                                 window.present();
@@ -1665,9 +1672,17 @@ impl Window {
                             })
                             .log_err();
                     })
-                } else if needs_present {
+                } else {
+                    // DIRI PATCH (sprite animation): with nothing dirty, an
+                    // animated mark that reached its next frame swaps tiles in
+                    // the rendered scene and presents it again. No render,
+                    // layout or paint runs.
                     handle
-                        .update(&mut cx, |_, window, _| window.present())
+                        .update(&mut cx, |_, window, cx| {
+                            if window.advance_sprite_animations(cx) || needs_present {
+                                window.present();
+                            }
+                        })
                         .log_err();
                 }
 
@@ -1867,6 +1882,7 @@ impl Window {
             active,
             hovered,
             needs_present,
+            sprite_animations: sprite_animation::SpriteAnimations::new(),
             #[cfg(any(test, feature = "test-support"))]
             immediate_frame_requests: Cell::new(0),
             input_rate_tracker,
@@ -2463,6 +2479,56 @@ impl Window {
             .render_to_image(&self.rendered_frame.scene)
     }
 
+    /// DIRI PATCH (scene region capture): a bitmap of `bounds` as the last
+    /// drawn frame shows it, with `levels` mip levels (largest first), each
+    /// ready to paint with [`Window::paint_image`]. Renders the last frame's
+    /// scene offscreen and reads the region back, so it costs one extra GPU
+    /// frame and a blocking read-back; it never presents or disturbs the next
+    /// frame. The caller owns the images: pass each to [`Window::drop_image`]
+    /// once it is no longer painted, or it stays in the sprite atlas.
+    pub fn capture_region(
+        &self,
+        bounds: Bounds<Pixels>,
+        levels: usize,
+    ) -> anyhow::Result<Vec<Arc<RenderImage>>> {
+        let scale = self.scale_factor();
+        let viewport = self.viewport_size();
+        let device = |value: Pixels, limit: Pixels| {
+            (f32::from(value) * scale)
+                .round()
+                .clamp(0.0, (f32::from(limit) * scale).round()) as i32
+        };
+        let left = device(bounds.origin.x, viewport.width);
+        let top = device(bounds.origin.y, viewport.height);
+        let right = device(bounds.origin.x + bounds.size.width, viewport.width);
+        let bottom = device(bounds.origin.y + bounds.size.height, viewport.height);
+        if right <= left || bottom <= top {
+            anyhow::bail!("capture bounds {bounds:?} are outside the window");
+        }
+        let region = Bounds {
+            origin: point(DevicePixels(left), DevicePixels(top)),
+            size: size(DevicePixels(right - left), DevicePixels(bottom - top)),
+        };
+        let captures =
+            self.platform_window
+                .capture_scene_region(&self.rendered_frame.scene, region, levels)?;
+        captures
+            .into_iter()
+            .map(|capture| {
+                let buffer = image::RgbaImage::from_raw(
+                    capture.size.width.0 as u32,
+                    capture.size.height.0 as u32,
+                    capture.bgra,
+                )
+                .ok_or_else(|| anyhow::anyhow!("captured level has the wrong length"))?;
+                Ok(Arc::new(RenderImage::new(SmallVec::from_elem(
+                    image::Frame::new(buffer),
+                    1,
+                ))))
+            })
+            .collect()
+    }
+
     /// Set the content size of the window.
     pub fn resize(&mut self, size: Size<Pixels>) {
         self.platform_window.resize(size);
@@ -2894,6 +2960,11 @@ impl Window {
         let previous_window_active = self.rendered_frame.window_active;
         mem::swap(&mut self.rendered_frame, &mut self.next_frame);
         self.next_frame.clear();
+        // DIRI PATCH (sprite animation)
+        self.sprite_animations.collect(
+            &mut self.rendered_frame.scene,
+            cx.background_executor().now(),
+        );
         let current_focus_path = self.rendered_frame.focus_path();
         let current_window_active = self.rendered_frame.window_active;
         let mut focus_before_listeners = self.focus;
@@ -3005,6 +3076,32 @@ impl Window {
     }
 
     #[profiling::function]
+    /// DIRI PATCH (sprite animation): brings every animated sprite in the
+    /// rendered scene to the current frame. Returns whether the scene changed
+    /// and needs presenting; nothing is rendered, laid out or painted.
+    pub fn advance_sprite_animations(&mut self, cx: &App) -> bool {
+        self.sprite_animations.is_live()
+            && self.sprite_animations.apply(
+                &mut self.rendered_frame.scene,
+                cx.background_executor().now(),
+            )
+    }
+
+    /// DIRI PATCH (sprite animation): forgets which step each animation last
+    /// showed, so the next advance rewrites every animated sprite.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn refresh_sprite_animations_for_test(&mut self) {
+        self.sprite_animations.forget_shown_steps();
+    }
+
+    /// DIRI PATCH (sprite animation): the tiles the rendered scene's animated
+    /// sprites show, in scene order.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn animated_sprite_tiles(&self) -> Vec<crate::AtlasTile> {
+        self.sprite_animations
+            .live_tiles(&self.rendered_frame.scene)
+    }
+
     fn present(&mut self) {
         self.platform_window.draw(&self.rendered_frame.scene);
         #[cfg(feature = "input-latency-histogram")]
@@ -4492,6 +4589,101 @@ impl Window {
             color: color.opacity(element_opacity),
             tile,
             transformation,
+        });
+
+        Ok(())
+    }
+
+    /// DIRI PATCH (sprite animation): paints a looping SVG animation made of
+    /// `frames`, one every `interval`, that advances without rendering,
+    /// laying out or painting anything again. See `window/sprite_animation.rs`.
+    ///
+    /// Every frame is rasterized at `bounds`' size the first time, under its
+    /// own atlas key, so a static use of the same SVG never animates.
+    pub fn paint_animated_svg(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        frames: &[SharedString],
+        interval: Duration,
+        color: Hsla,
+        cx: &App,
+    ) -> Result<()> {
+        self.invalidator.debug_assert_paint();
+        if frames.is_empty() {
+            return Ok(());
+        }
+
+        let element_opacity = self.element_opacity();
+        let bounds = self.snap_bounds(bounds);
+        let size = bounds
+            .size
+            .map(|pixels| DevicePixels::from((pixels.0 * SMOOTH_SVG_SCALE_FACTOR).ceil() as i32));
+
+        let animation = match self.sprite_animations.lookup(frames, size, interval) {
+            Some(animation) => animation,
+            None => {
+                let mut tiles = SmallVec::<[crate::AtlasTile; 8]>::new();
+                for path in frames {
+                    let params = RenderSvgParams {
+                        path: SharedString::from(format!("{path}#diri-animated")),
+                        size,
+                    };
+                    let tile = self.sprite_atlas.get_or_insert_with(
+                        &params.clone().into(),
+                        &mut || {
+                            let Some(bytes) = cx.svg_renderer.load_asset(path)? else {
+                                return Ok(None);
+                            };
+                            let Some((size, bytes)) =
+                                cx.svg_renderer.render_alpha_mask(&params, Some(&bytes))?
+                            else {
+                                return Ok(None);
+                            };
+                            Ok(Some((size, Cow::Owned(bytes))))
+                        },
+                    )?;
+                    let Some(tile) = tile else {
+                        return Ok(());
+                    };
+                    tiles.push(tile);
+                }
+                self.sprite_animations.register(
+                    frames,
+                    size,
+                    interval,
+                    tiles,
+                    cx.background_executor().now(),
+                )
+            }
+        };
+        let tile = self
+            .sprite_animations
+            .current_tile(animation, cx.background_executor().now());
+
+        let content_mask = self.snapped_content_mask();
+        let svg_bounds = Bounds {
+            origin: bounds.center()
+                - Point::new(
+                    ScaledPixels(tile.bounds.size.width.0 as f32 / SMOOTH_SVG_SCALE_FACTOR / 2.),
+                    ScaledPixels(tile.bounds.size.height.0 as f32 / SMOOTH_SVG_SCALE_FACTOR / 2.),
+                ),
+            size: tile
+                .bounds
+                .size
+                .map(|value| ScaledPixels(value.0 as f32 / SMOOTH_SVG_SCALE_FACTOR)),
+        };
+        let final_bounds = svg_bounds
+            .map_origin(|value| ScaledPixels(round_half_toward_zero(value.0)))
+            .map_size(|size| size.ceil());
+
+        self.next_frame.scene.insert_primitive(MonochromeSprite {
+            order: 0,
+            pad: 0,
+            bounds: final_bounds,
+            content_mask,
+            color: color.opacity(element_opacity),
+            tile,
+            transformation: TransformationMatrix::unit(),
         });
 
         Ok(())

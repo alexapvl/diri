@@ -116,7 +116,7 @@ fn a_missing_file_shows_an_explanation_not_a_crash(cx: &mut gpui::TestAppContext
 /// Sessions and a note a fixture editor can mention, one session per status
 /// a chip draws.
 pub(crate) fn fixture_mentions() -> Vec<editor_view::MentionEntry> {
-    use diri_notes::mention::{Candidate, MentionTarget, note_label, session_label};
+    use diri_notes::mention::{Candidate, MentionTarget, note_label};
     use diri_ui::{AgentKind, StatusState};
     let mut entries: Vec<editor_view::MentionEntry> = [
         (
@@ -157,7 +157,7 @@ pub(crate) fn fixture_mentions() -> Vec<editor_view::MentionEntry> {
         |(id, agent, name, title, status, detail)| editor_view::MentionEntry {
             candidate: Candidate {
                 target: MentionTarget::Session(id.into()),
-                label: session_label(name, title),
+                label: super::mention_label(name, title),
                 keywords: name.to_lowercase(),
             },
             agent: Some(agent),
@@ -217,7 +217,7 @@ fn at_mentions_insert_session_and_note_links(cx: &mut gpui::TestAppContext) {
         assert_eq!(
             view.mention_matches().len(),
             2,
-            "codex resize + gemini release"
+            "gemini release + codex resize"
         );
         view.vertical(true, false, cx);
         view.indent(&editor_view::Indent, window, cx);
@@ -231,7 +231,7 @@ fn at_mentions_insert_session_and_note_links(cx: &mut gpui::TestAppContext) {
     let text = std::fs::read_to_string(store.path_for(&id).unwrap()).unwrap();
     assert!(
         text.contains(
-            "wait for [@Gemini: release notes draft](diri://session/s_gemini) then [@Groceries](diri://note/n-groceries) mail me@x"
+            "wait for [@fix resize flicker](diri://session/s_codex) then [@Groceries](diri://note/n-groceries) mail me@x"
         ),
         "{text}"
     );
@@ -239,7 +239,7 @@ fn at_mentions_insert_session_and_note_links(cx: &mut gpui::TestAppContext) {
     assert_eq!(
         doc.mentions(),
         vec![
-            diri_notes::mention::MentionTarget::Session("s_gemini".into()),
+            diri_notes::mention::MentionTarget::Session("s_codex".into()),
             diri_notes::mention::MentionTarget::Note("n-groceries".into()),
         ]
     );
@@ -557,7 +557,7 @@ fn the_session_chip_api_reads_live_status_and_inserts_links(cx: &mut gpui::TestA
     pane.update(cx, |pane, cx| pane.save(cx));
     let text = std::fs::read_to_string(store.path_for(&id).unwrap()).unwrap();
     assert!(
-        text.contains("[@Codex: fix resize flicker](diri://session/s_codex)"),
+        text.contains("[@fix resize flicker](diri://session/s_codex)"),
         "{text}"
     );
 }
@@ -1211,5 +1211,46 @@ fn edits_and_direct_file_changes_land_while_the_person_types(cx: &mut gpui::Test
         versions
             .iter()
             .any(|v| v.author == diri_notes::history::Author::Session("s_agent".into()))
+    );
+}
+
+/// The backlinks start below the note's last row, however much its text
+/// wraps. Regression: the page took its height from text measured wider than
+/// it is drawn, so on a long note of wrapped list items the backlinks painted
+/// over the last paragraphs and the note would not scroll to its end.
+#[gpui::test]
+fn backlinks_sit_below_the_last_row_of_wrapped_text(cx: &mut gpui::TestAppContext) {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = Arc::new(NoteStore::open(dir.path().join("notes")).expect("store"));
+    let sentence = "Never overwrite the real app, test only in the temporary folder, \
+        and stop for any password prompt rather than guessing. ";
+    let mut md = String::from("# Handoff\n\n");
+    for i in 0..12 {
+        md.push_str(&format!("- Step {i}. {}\n", sentence.repeat(3)));
+    }
+    md.push_str(&format!("\nLast paragraph. {}\n", sentence.repeat(4)));
+    let (_, doc) = markdown::parse(&md);
+    let (id, _) = store.create(doc, None).expect("create");
+    let (pane, cx) = pane(cx, store);
+    cx.simulate_resize(gpui::size(px(900.0), px(600.0)));
+    pane.update_in(cx, |pane, window, cx| {
+        pane.show(&SessionId::new("s_note"), &id, window, cx)
+    });
+    let editor = editor(&pane, cx);
+    for _ in 0..40 {
+        editor.update(cx, |view, cx| view.scroll_by_for_test(px(-400.0), cx));
+        cx.run_until_parked();
+    }
+    let last = editor.read_with(cx, |view, _| view.editor.blocks().last().unwrap().id);
+    let selector: &'static str = format!("note-row-{last}").leak();
+    let row = cx
+        .debug_bounds(selector)
+        .expect("the last row is on screen");
+    let footer = cx.debug_bounds("note-footer").expect("backlinks shown");
+    assert!(
+        footer.top() >= row.bottom(),
+        "backlinks at {:?} overlap the last row ending at {:?}",
+        footer.top(),
+        row.bottom()
     );
 }

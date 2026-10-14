@@ -1,6 +1,10 @@
 pub mod brand_raster;
 pub mod browser;
 pub(crate) mod floating_panel;
+pub(crate) mod global_shortcut;
+// Tests never touch the real login items; see `schedules_page::login`.
+#[cfg(not(test))]
+pub(crate) mod login_item;
 pub mod menu_bar;
 pub mod notifier;
 pub(crate) mod terminal_keys;

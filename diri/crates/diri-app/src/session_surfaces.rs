@@ -16,15 +16,20 @@ use diri_ui::{
     StatusState,
 };
 use gpui::{
-    Animation, AnimationExt, AnyElement, BoxShadow, ClickEvent, Context, Entity, FocusHandle,
-    FontWeight, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent, MouseButton, Render, ScrollHandle,
-    SharedString, Task, Window, div, ease_out_quint, point, prelude::*, px, rgba,
+    AnyElement, BoxShadow, ClickEvent, Context, Entity, FocusHandle, FontWeight, KeyDownEvent,
+    KeyUpEvent, ModifiersChangedEvent, MouseButton, Render, ScrollHandle, SharedString, Task,
+    Window, div, point, prelude::*, px, rgba,
 };
 
+#[path = "overview_calm.rs"]
+mod overview_calm;
+#[path = "overview_zoom_surface.rs"]
+mod overview_zoom_surface;
 #[path = "tab_peek_surface.rs"]
 mod tab_peek_surface;
 #[path = "workspace_peek_surface.rs"]
 mod workspace_peek_surface;
+pub(crate) use overview_calm::OverviewVariant;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum PeekItem {
@@ -66,10 +71,16 @@ pub struct SessionSurfaces {
     client: Arc<diri_client::DaemonClient>,
     tokio: Option<tokio::runtime::Handle>,
     screens: HashMap<SessionId, ScreenPreview>,
+    /// Colored screens of sessions that are not mounted, read once per open
+    /// so every calm-overview card is a real miniature, not a blank box.
+    screen_grids: HashMap<SessionId, TerminalElement>,
     screen_requests: HashMap<SessionId, ScreenRequest>,
     overview_was_visible: bool,
-    overview_generation: usize,
     overview_list_scroll: ScrollHandle,
+    /// Safari-style zoom between the page and its overview card.
+    zoom: overview_zoom_surface::ZoomPresentation,
+    /// Phase-1 design exploration: which overview layout renders.
+    pub(crate) overview_variant: OverviewVariant,
     /// This view is `.cached()` in RootView, so ambient window redraws no
     /// longer reach it: store changes must notify it directly.
     _store_changes: Task<()>,
@@ -180,10 +191,16 @@ impl SessionSurfaces {
             client: Arc::clone(runtime.client()),
             tokio,
             screens: HashMap::new(),
+            screen_grids: HashMap::new(),
             screen_requests: HashMap::new(),
             overview_was_visible: false,
-            overview_generation: 0,
             overview_list_scroll: ScrollHandle::new(),
+            zoom: Default::default(),
+            // Prototype switch while the design is chosen: DIRI_OVERVIEW_VARIANT
+            // = a (Safari) | b (gallery) | c (mini windows, default) | current.
+            overview_variant: OverviewVariant::from_env(
+                &std::env::var("DIRI_OVERVIEW_VARIANT").unwrap_or_else(|_| "c".into()),
+            ),
             _store_changes: store_changes,
         }
     }
@@ -244,6 +261,8 @@ impl SessionSurfaces {
         store.cancel_switcher();
         store.dismiss_overview();
         drop(store);
+        self.reset_overview_zoom(cx);
+        self.overview_was_visible = false;
         cx.notify();
     }
 }
@@ -277,13 +296,25 @@ impl Render for SessionSurfaces {
                 store.switcher_state().is_visible(),
             )
         };
-        if !overview_visible && self.overview_was_visible {
+        if switcher_visible || self.peek.paint_visible() {
+            // Another surface took over; never fly the overview underneath it.
+            self.reset_overview_zoom(cx);
+        } else if overview_visible != self.overview_was_visible {
+            self.follow_overview_visibility(overview_visible, window, cx);
+        }
+        self.advance_zoom(window, cx);
+        self.settle_zoom_images(overview_visible, window);
+        if !overview_visible && !self.zoom.zoom.is_active() {
+            // Previews refresh on every open; drop them once nothing shows them.
             self.screen_requests.clear();
             self.screens.clear();
+            self.screen_grids.clear();
+            self.zoom.forget_cards();
         }
         if overview_visible && !self.overview_was_visible {
-            self.overview_generation = self.overview_generation.wrapping_add(1);
-            self.overview_grid_scroll.scroll_to_item(0);
+            if self.overview_variant == OverviewVariant::Current {
+                self.overview_grid_scroll.scroll_to_item(0);
+            }
             self.overview_list_scroll.scroll_to_item(0);
         }
         self.overview_was_visible = overview_visible;
@@ -309,6 +340,8 @@ impl Render for SessionSurfaces {
             .on_modifiers_changed(cx.listener(Self::handle_modifiers_changed));
         if self.peek.paint_visible() {
             root.inset_0().child(self.render_tab_peek(window, cx))
+        } else if self.zoom_painting() {
+            root.inset_0().child(self.render_overview_zoom(window, cx))
         } else if overview_visible {
             root.inset_0().child(self.render_overview(window, cx))
         } else if switcher_visible {
@@ -361,7 +394,10 @@ impl SessionSurfaces {
             return;
         }
 
-        store.set_overview_columns(overview_columns(f32::from(window.viewport_size().width)));
+        if self.overview_variant == OverviewVariant::Current {
+            // The calm overview sets its own column count as it lays out.
+            store.set_overview_columns(overview_columns(f32::from(window.viewport_size().width)));
+        }
         let handled = match event.keystroke.key.as_str() {
             "escape" => store.overview_escape(),
             "backspace" | "delete" => store.overview_backspace(),
@@ -398,6 +434,19 @@ impl SessionSurfaces {
     }
 
     fn reveal_overview_focus(&self, window: &Window) {
+        if self.overview_variant != OverviewVariant::Current {
+            let focused = self
+                .store
+                .read()
+                .expect("session store lock poisoned")
+                .overview_state()
+                .focused()
+                .cloned();
+            if let Some(id) = focused {
+                self.reveal_calm_card(&id, window, false);
+            }
+            return;
+        }
         let mut store = self.store.write().expect("session store lock poisoned");
         let sessions = store.ordered_sessions();
         let state = store.overview_state();
@@ -646,6 +695,9 @@ impl SessionSurfaces {
     }
 
     fn render_overview(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        if self.overview_variant != OverviewVariant::Current {
+            return self.render_calm_overview(self.overview_variant, window, cx);
+        }
         let (sessions, state) = {
             let mut store = self.store.write().expect("session store lock poisoned");
             (store.ordered_sessions(), store.overview_state().clone())
@@ -863,7 +915,7 @@ impl SessionSurfaces {
             .size_full()
             .flex()
             .flex_col()
-            .pt(px(42.0))
+            .pt(px(diri_ui::Metrics::TITLE_BAR))
             .bg(colors.background)
             .overflow_hidden()
             .occlude()
@@ -895,18 +947,9 @@ impl SessionSurfaces {
                 content.child(self.bulk_close_bar(state.selection().len(), visible_count, cx))
             });
 
-        let content = if cx.reduce_motion() {
-            content.into_any_element()
-        } else {
-            content
-                .with_animation(
-                    ("overview-entry", self.overview_generation),
-                    Animation::new(std::time::Duration::from_millis(120))
-                        .with_easing(ease_out_quint()),
-                    |view, value| view.opacity(value),
-                )
-                .into_any_element()
-        };
+        // The entrance is the zoom from the page (overview_zoom_surface), so
+        // the grid itself no longer fades in on its own.
+        let content = content.into_any_element();
 
         div()
             .id("overview-scrim")
@@ -1593,8 +1636,14 @@ impl SessionSurfaces {
             .into_any_element()
     }
 
+    /// Screens are fetched while the grid is up, and from the first touch of
+    /// a pinch so the page's card is ready before it is visible.
+    fn overview_wants_screens(&self) -> bool {
+        self.store.read().unwrap().overview_state().is_visible() || self.zoom.zoom.is_active()
+    }
+
     fn request_screen(&mut self, id: SessionId, cx: &mut Context<Self>) {
-        if !self.store.read().unwrap().overview_state().is_visible()
+        if !self.overview_wants_screens()
             || self.screens.contains_key(&id)
             || self.screen_requests.contains_key(&id)
             || self.screen_requests.len() >= 4
@@ -1607,17 +1656,57 @@ impl SessionSurfaces {
         let client = Arc::clone(&self.client);
         let request_id = id.clone();
         let request = tokio.spawn(async move {
-            tokio::time::timeout(
-                std::time::Duration::from_secs(3),
-                client.read_screen(&request_id),
-            )
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                let screen = client.read_screen(&request_id).await;
+                // The visible grid with its colors: one probe for where the
+                // live grid starts, then the rows themselves.
+                let grid = async {
+                    let probe = client.read_scrollback_cells(&request_id, 0, 1).await.ok()?;
+                    let rows = (probe.total_rows - probe.live_start_row).clamp(1, 200);
+                    client
+                        .read_scrollback_cells(&request_id, probe.live_start_row, rows)
+                        .await
+                        .ok()
+                }
+                .await;
+                (screen, grid)
+            })
             .await
+            .map(|(screen, grid)| screen.map(|screen| (screen, grid)))
         });
         let abort = request.abort_handle();
         let task_id = id.clone();
         let task = cx.spawn(async move |this, cx| {
+            let mut grid = None;
             let preview = match request.await {
-                Ok(Ok(Ok(screen))) => {
+                Ok(Ok(Ok((screen, cells)))) => {
+                    grid = cells.and_then(|cells| {
+                        let cols = u16::try_from(cells.cols).ok()?.max(1);
+                        let count = usize::try_from(cells.row_count).ok()?;
+                        let rows =
+                            diri_proto::grid::GridRowCodec::decode_rows(&cells.payload, count)
+                                .ok()?;
+                        let height = u16::try_from(rows.len()).ok()?.max(1);
+                        let element = TerminalElement::with_buffer(
+                            diri_term::buffer::GridBuffer::new(cols, height),
+                        );
+                        element.apply_damage(diri_proto::grid::GridUpdate {
+                            cols,
+                            rows: height,
+                            cursor_col: 0,
+                            cursor_row: 0,
+                            cursor_visible: false,
+                            is_full_snapshot: true,
+                            changed_rows: rows
+                                .into_iter()
+                                .enumerate()
+                                .map(|(row, cells)| {
+                                    diri_proto::grid::ChangedRow::new(row as u16, cells)
+                                })
+                                .collect(),
+                        });
+                        Some(element)
+                    });
                     let lines = screen_excerpt(&screen.text);
                     if lines.is_empty() {
                         ScreenPreview::Empty
@@ -1629,7 +1718,10 @@ impl SessionSurfaces {
             };
             let _ = this.update(cx, |this, cx| {
                 this.screen_requests.remove(&task_id);
-                if this.store.read().unwrap().overview_state().is_visible() {
+                if this.overview_wants_screens() {
+                    if let Some(grid) = grid {
+                        this.screen_grids.insert(task_id.clone(), grid);
+                    }
                     this.screens.insert(task_id, preview);
                 }
                 cx.notify();
@@ -1665,6 +1757,7 @@ impl SessionSurfaces {
             );
         } else {
             let label = match self.screens.get(&id) {
+                _ if session.is_note() => crate::i18n::t("nav.notes.note"),
                 Some(ScreenPreview::Unavailable) => "Preview unavailable",
                 Some(ScreenPreview::Empty) => "No screen output yet",
                 _ => "Loading preview…",
@@ -1689,7 +1782,11 @@ impl SessionSurfaces {
                     ),
             );
         }
-        if self.screens.contains_key(&id) || self.screen_requests.contains_key(&id) {
+        // A note has no terminal to preview.
+        if session.is_note()
+            || self.screens.contains_key(&id)
+            || self.screen_requests.contains_key(&id)
+        {
             return preview.into_any_element();
         }
         // Prepaint receives the scroll viewport's clip. Offscreen sessions do
@@ -1786,7 +1883,7 @@ fn ui_agent_kind(kind: &ProtoAgentKind) -> AgentKind {
         ProtoAgentKind::CURSOR_ID => AgentKind::Cursor,
         ProtoAgentKind::GEMINI_ID => AgentKind::Gemini,
         ProtoAgentKind::SHELL_ID => AgentKind::Shell,
-        _ => AgentKind::Generic,
+        id => AgentKind::from_agent_id(id),
     }
 }
 
@@ -1893,9 +1990,11 @@ mod tests {
             listening_ports: None,
             foreground_agent: None,
             terminal_cwd: None,
+            agent_workspace: None,
             note_id: None,
             foreground_ports: None,
             terminal_progress: None,
+            scheduled_run: None,
         }
     }
 
@@ -1912,7 +2011,9 @@ mod tests {
         let probe = Arc::clone(&background_scrolls);
         let (view, cx) = cx.add_window_view(move |_, cx| OverviewHarness {
             surfaces: cx.new(|cx| {
-                let surfaces = SessionSurfaces::new(runtime, None, cx);
+                let mut surfaces = SessionSurfaces::new(runtime, None, cx);
+                // This covers the original gallery, not the calm prototypes.
+                surfaces.overview_variant = OverviewVariant::Current;
                 surfaces.store.write().unwrap().toggle_overview();
                 surfaces
             }),
@@ -1920,6 +2021,11 @@ mod tests {
         });
         cx.simulate_resize(size(px(1100.0), px(700.0)));
         let surfaces = view.read_with(cx, |h, _| h.surfaces.clone());
+        // Let the opening cross-fade land; the grid takes input once it rests.
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(1));
+        surfaces.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
         let bounds = cx.debug_bounds("OVERVIEW_GALLERY").unwrap();
         assert_eq!(
             cx.debug_bounds("OVERVIEW_CONTENT").unwrap().size,
@@ -1943,6 +2049,52 @@ mod tests {
             surfaces.read_with(cx, |s, _| s.overview_grid_scroll.max_offset().x),
             px(0.0)
         );
+    }
+
+    /// A note card has no terminal: asking for its screen could only fail
+    /// with `session_has_no_terminal`, every time the overview opened.
+    #[gpui::test]
+    fn overview_never_asks_a_note_for_its_screen(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        // A current-thread runtime nothing drives: requests are queued (which
+        // is what this test checks) but never run, so no worker thread wakes
+        // the GPUI test scheduler from outside and the test stays deterministic.
+        let tokio = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut note = session(1);
+        note.kind = ProtoAgentKind::NOTE;
+        note.note_id = Some("n_plan".into());
+        let (terminal_id, note_id) = (session(0).id, note.id.clone());
+        let runtime = Arc::new(StoreRuntime::inert());
+        runtime.store.write().unwrap().hydrate(SessionListResult {
+            sessions: vec![session(0), note],
+            projects: vec![],
+        });
+        let handle = tokio.handle().clone();
+        let (view, cx) = cx.add_window_view(move |_, cx| OverviewHarness {
+            surfaces: cx.new(|cx| {
+                let mut surfaces = SessionSurfaces::new(runtime, Some(handle), cx);
+                surfaces.overview_variant = OverviewVariant::Current;
+                surfaces.store.write().unwrap().toggle_overview();
+                surfaces
+            }),
+            background_scrolls: Arc::new(AtomicUsize::new(0)),
+        });
+        cx.simulate_resize(size(px(1100.0), px(700.0)));
+        let surfaces = view.read_with(cx, |h, _| h.surfaces.clone());
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(1));
+        surfaces.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        surfaces.read_with(cx, |s, _| {
+            let asked =
+                |id: &SessionId| s.screen_requests.contains_key(id) || s.screens.contains_key(id);
+            assert!(asked(&terminal_id), "the terminal card asks for its screen");
+            assert!(!asked(&note_id), "the note card must not");
+        });
+        drop(tokio);
     }
 
     #[gpui::test]
@@ -2524,6 +2676,573 @@ mod tests {
             });
             cx.new(|_| OverviewHarness { surfaces, background_scrolls: Arc::new(AtomicUsize::new(0)) })
         }).unwrap();
+        cx.run_until_parked();
+        cx.capture_screenshot(window.into())
+            .unwrap()
+            .save(output)
+            .unwrap();
+    }
+
+    fn calm_fleet(count: usize) -> SessionListResult {
+        SessionListResult {
+            sessions: (0..count)
+                .map(|i| {
+                    let mut s = session(i);
+                    s.project_id = ProjectId::new(if i < 5 { "diri" } else { "anara" });
+                    s
+                })
+                .collect(),
+            projects: ["diri", "anara"]
+                .into_iter()
+                .map(|name| diri_proto::Project {
+                    id: ProjectId::new(name),
+                    root: format!("/work/{name}"),
+                    name: name.into(),
+                    pinned_order: None,
+                    host: None,
+                })
+                .collect(),
+        }
+    }
+
+    /// The zoom's first frame flies toward the layout's estimate of a card;
+    /// every later frame toward where the card painted. The two must agree,
+    /// and revealing a card must scroll it on screen.
+    #[gpui::test]
+    fn calm_card_estimates_match_painted_cards_and_reveal_scrolls(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let runtime = Arc::new(StoreRuntime::inert());
+        runtime.store.write().unwrap().hydrate(calm_fleet(14));
+        let (view, cx) = cx.add_window_view(move |_, cx| OverviewHarness {
+            surfaces: cx.new(|cx| {
+                let mut surfaces = SessionSurfaces::new(runtime, None, cx);
+                surfaces.overview_variant = OverviewVariant::Windows;
+                surfaces.store.write().unwrap().toggle_overview();
+                surfaces
+            }),
+            background_scrolls: Arc::new(AtomicUsize::new(0)),
+        });
+        cx.simulate_resize(size(px(1300.0), px(800.0)));
+        let surfaces = view.read_with(cx, |h, _| h.surfaces.clone());
+        let check = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|window, cx| {
+                let surfaces = surfaces.read(cx);
+                let painted = surfaces.zoom.cards.borrow().clone();
+                assert_eq!(painted.len(), 14);
+                for (id, card) in painted {
+                    let estimate = surfaces.calm_card_estimate(&id, window).unwrap();
+                    for (a, b) in [
+                        (card.x, estimate.x),
+                        (card.y, estimate.y),
+                        (card.width, estimate.width),
+                        (card.height, estimate.height),
+                    ] {
+                        assert!(
+                            (a - b).abs() < 0.51,
+                            "{id:?}: painted {card:?}, estimate {estimate:?}"
+                        );
+                    }
+                }
+            });
+        };
+        check(cx);
+        let last = session(13).id;
+        cx.update(|window, cx| surfaces.read(cx).reveal_calm_card(&last, window, true));
+        view.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        check(cx);
+        cx.update(|window, cx| {
+            let card = surfaces.read(cx).zoom.cards.borrow()[&last];
+            let height = f32::from(window.viewport_size().height);
+            assert!(card.y >= 42.0 && card.y + card.height <= height, "{card:?}");
+        });
+    }
+
+    /// The workbench a zoom flies out of: a pane (title bar over the grid,
+    /// padded the way `TerminalPane` pads it) under the overview surfaces.
+    /// Only the macOS pixel test builds it.
+    #[cfg(target_os = "macos")]
+    struct ZoomHarness {
+        surfaces: Entity<SessionSurfaces>,
+        page: TerminalElement,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Render for ZoomHarness {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let colors = self.surfaces.read(cx).colors();
+            let theme = {
+                let surfaces = self.surfaces.read(cx);
+                let store = surfaces.store.read().unwrap();
+                crate::app_theme::terminal_theme_in(&store)
+            };
+            let pane = div()
+                .absolute()
+                .left(px(240.0))
+                .top(px(0.0))
+                .w(px(1200.0))
+                .h(px(900.0))
+                .flex()
+                .flex_col()
+                .bg(theme.background)
+                .child(
+                    div()
+                        .flex_none()
+                        .h(px(diri_ui::Metrics::TITLE_BAR))
+                        .flex()
+                        .items_center()
+                        .px(px(14.0))
+                        .border_b_1()
+                        .border_color(colors.primary.alpha(0.08))
+                        .text_size(px(13.0))
+                        .text_color(colors.secondary)
+                        .child("Overflowing session 01 — feature/session-01"),
+                )
+                .child(
+                    div().flex_1().pt(px(2.0)).pb(px(10.0)).px(px(12.0)).child(
+                        self.page
+                            .clone()
+                            .font(crate::fonts::terminal_font(""))
+                            .font_size(px(13.0))
+                            .theme(theme),
+                    ),
+                );
+            div().size_full().bg(colors.background).child(pane).child(
+                self.surfaces
+                    .clone()
+                    .cached(StyleRefinement::default().absolute().inset_0()),
+            )
+        }
+    }
+
+    /// The zoom flies a picture of the page and lands as the card itself:
+    /// the flight never re-lays the terminal out, and at progress 1 it paints
+    /// the calm overview pixel for pixel, so it ends without a swap. Set
+    /// `DIRI_VISUAL_OUTPUT_DIR` to keep the frame strip.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "headless Metal pixel comparison; run explicitly on macOS"]
+    fn calm_zoom_lands_as_the_card_pixel_for_pixel() {
+        use crate::overview_fixture as fx;
+        use crate::overview_zoom::Landing;
+        use gpui::HeadlessAppContext;
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(diri_ui::IconAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.update(|cx| crate::fonts::init(cx));
+        let screens = [
+            fx::codex_done(),
+            fx::htop(),
+            fx::git_graph(),
+            fx::vim_review(),
+        ];
+        let window = cx
+            .open_window(size(px(1440.0), px(900.0)), |_, cx| {
+                let runtime = Arc::new(StoreRuntime::inert());
+                let mut fleet = calm_fleet(screens.len());
+                for record in &mut fleet.sessions {
+                    record.status = SessionStatus::Idle;
+                    record.last_turn_completed_at = Some(DateMillis(1.0));
+                    record.last_seen_at = Some(DateMillis(2.0));
+                }
+                runtime.store.write().unwrap().hydrate(fleet);
+                let buffers: Vec<_> = screens
+                    .iter()
+                    .map(|screen| Arc::new(RwLock::new(fx::screen(screen))))
+                    .collect();
+                let page = TerminalElement::new(buffers[1].clone()).focused(false);
+                let surfaces = cx.new(|cx| {
+                    let mut view = SessionSurfaces::new(runtime, None, cx);
+                    view.overview_variant = OverviewVariant::Windows;
+                    for (i, buffer) in buffers.iter().enumerate() {
+                        view.set_resident_buffer(session(i).id, buffer.clone());
+                    }
+                    view.set_page_region(
+                        crate::terminal_pane::TerminalViewport {
+                            x: 240.0,
+                            y: 0.0,
+                            width: 1200.0,
+                            height: 900.0,
+                        },
+                        42.0,
+                    );
+                    view.store.write().unwrap().select(session(1).id);
+                    view
+                });
+                cx.new(|_| ZoomHarness { surfaces, page })
+            })
+            .unwrap();
+        let surfaces = cx
+            .update_window(window.into(), |root, _, cx| {
+                root.downcast::<ZoomHarness>()
+                    .unwrap()
+                    .read(cx)
+                    .surfaces
+                    .clone()
+            })
+            .unwrap();
+        let out = std::env::var("DIRI_VISUAL_OUTPUT_DIR")
+            .ok()
+            .map(std::path::PathBuf::from);
+        let save = |image: &image::RgbaImage, name: &str| {
+            if let Some(dir) = &out {
+                image
+                    .save(dir.join(format!("calm-zoom-{name}.png")))
+                    .unwrap();
+            }
+        };
+        // The page, then ⇧⌘O: the first overview frame takes its picture.
+        cx.run_until_parked();
+        let page = cx.capture_screenshot(window.into()).unwrap();
+        save(&page, "0-page");
+        cx.update(|cx| {
+            surfaces.update(cx, |view, cx| {
+                view.store.write().unwrap().toggle_overview();
+                cx.notify();
+            })
+        });
+        cx.run_until_parked();
+        let cost = cx.update(|cx| {
+            let view = surfaces.read(cx);
+            assert!(view.zoom.zoom.is_flying(), "⇧⌘O zooms the page in");
+            let snapshot = view.zoom.snapshot.as_ref().expect("the page was captured");
+            assert_eq!(snapshot.source, Landing::Page);
+            snapshot.cost
+        });
+        // Re-capture a few times for a steadier number than the first call.
+        let repeat = cx
+            .update_window(window.into(), |_, window, _| {
+                let bounds =
+                    gpui::Bounds::new(point(px(240.0), px(0.0)), size(px(1200.0), px(662.0)));
+                let started = std::time::Instant::now();
+                for _ in 0..10 {
+                    window.capture_region(bounds, 4).unwrap();
+                }
+                started.elapsed() / 10
+            })
+            .unwrap();
+        eprintln!("page snapshot: first capture {cost:?}, steady {repeat:?}");
+        // Land, then take the resting grid.
+        cx.update(|cx| {
+            surfaces.update(cx, |view, cx| {
+                view.zoom.zoom.reset(Landing::Overview);
+                cx.notify();
+            })
+        });
+        cx.run_until_parked();
+        cx.capture_screenshot(window.into()).unwrap();
+        let resting = cx.capture_screenshot(window.into()).unwrap();
+        save(&resting, "resting");
+        let card = cx.update(|cx| surfaces.read(cx).zoom.cards.borrow()[&session(1).id]);
+        // The strip along the way: the page picture, scaled about its grid.
+        let hold = |cx: &mut HeadlessAppContext, progress: f32| {
+            cx.update(|cx| {
+                surfaces.update(cx, |view, cx| {
+                    let now = cx.background_executor().now();
+                    view.zoom.session = Some(session(1).id);
+                    view.zoom.crossfade = false;
+                    view.zoom.grip = None;
+                    let page = view.zoom.page_cache.clone();
+                    view.zoom.set_snapshot(page);
+                    view.zoom.zoom.reset(Landing::Page);
+                    view.zoom.zoom.begin(Landing::Page, now);
+                    let scale = 1.0 - progress * (1.0 - card.width / 1200.0);
+                    view.zoom
+                        .zoom
+                        .pinch(scale - 1.0, now + std::time::Duration::from_millis(16));
+                    assert!((view.zoom.zoom.progress() - progress).abs() < 1e-3);
+                    assert!(view.zoom_painting());
+                    cx.notify();
+                })
+            });
+            cx.run_until_parked();
+            cx.capture_screenshot(window.into()).unwrap()
+        };
+        for progress in [0.25_f32, 0.5, 0.75, 0.85, 0.9, 0.95] {
+            let frame = hold(&mut cx, progress);
+            save(&frame, &format!("{:03}", (progress * 100.0).round() as u32));
+        }
+        let landed = hold(&mut cx, 1.0);
+        save(&landed, "100");
+        // Pinching a card open with no current page picture grows the card's
+        // own picture and hands over to the live pane near the end.
+        cx.update(|cx| {
+            surfaces.update(cx, |view, cx| {
+                view.zoom.set_page_cache(None);
+                view.zoom.zoom.reset(Landing::Overview);
+                cx.notify();
+            })
+        });
+        cx.run_until_parked();
+        cx.update_window(window.into(), |root, window, cx| {
+            let harness = root.downcast::<ZoomHarness>().unwrap();
+            harness.read(cx).surfaces.clone().update(cx, |view, _| {
+                assert!(view.take_return_snapshot(&session(1).id, card, window));
+                let snapshot = view.zoom.snapshot.as_ref().unwrap();
+                assert_eq!(snapshot.source, Landing::Overview);
+            });
+        })
+        .unwrap();
+        for progress in [0.5_f32, 0.08] {
+            cx.update(|cx| {
+                surfaces.update(cx, |view, cx| {
+                    let now = cx.background_executor().now();
+                    view.zoom.session = Some(session(1).id);
+                    view.zoom.grip = None;
+                    view.zoom.zoom.reset(Landing::Overview);
+                    view.zoom.zoom.begin(Landing::Overview, now);
+                    let scale = 1.0 - progress * (1.0 - card.width / 1200.0);
+                    let from = card.width / 1200.0;
+                    view.zoom.zoom.pinch(
+                        scale / from - 1.0,
+                        now + std::time::Duration::from_millis(16),
+                    );
+                    cx.notify();
+                })
+            });
+            cx.run_until_parked();
+            let image = cx.capture_screenshot(window.into()).unwrap();
+            save(
+                &image,
+                &format!("out-{:03}", (progress * 100.0).round() as u32),
+            );
+        }
+        assert_eq!(resting.dimensions(), landed.dimensions());
+        let scale = resting.width() as f32 / 1440.0;
+        let inside = |x: u32, y: u32| {
+            let (x, y) = (x as f32 / scale, y as f32 / scale);
+            x >= card.x && x < card.x + card.width && y >= card.y && y < card.y + card.height
+        };
+        let mut card_pixels = 0;
+        for (x, y, a) in resting.enumerate_pixels() {
+            let b = landed.get_pixel(x, y);
+            if inside(x, y) {
+                card_pixels += 1;
+                assert_eq!(a, b, "the landed card differs at ({x}, {y})");
+            } else {
+                // The card's soft shadow overlaps its neighbour's; above the
+                // grid it blends in the other order, a level at most apart.
+                let apart =
+                    a.0.iter()
+                        .zip(b.0.iter())
+                        .map(|(a, b)| a.abs_diff(*b))
+                        .max();
+                assert!(
+                    apart <= Some(1),
+                    "the landed zoom moved pixels at ({x}, {y})"
+                );
+            }
+        }
+        assert!(card_pixels > 10_000, "the card was measured: {card:?}");
+    }
+
+    /// Phase-1 design exploration. `DIRI_VISUAL_VARIANT` = current | a | b | c.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes calm overview design screenshots"]
+    fn render_calm_overview_screenshot() {
+        use crate::overview_fixture as fx;
+        use gpui::HeadlessAppContext;
+        let output = std::env::var("DIRI_VISUAL_OUTPUT").expect("set DIRI_VISUAL_OUTPUT");
+        let light = std::env::var_os("DIRI_VISUAL_LIGHT").is_some();
+        fx::LIGHT.store(light, std::sync::atomic::Ordering::Relaxed);
+        let variant =
+            OverviewVariant::from_env(&std::env::var("DIRI_VISUAL_VARIANT").unwrap_or_default());
+        let dim = |key: &str, default: f32| {
+            std::env::var(key)
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(default)
+        };
+        let (width, height) = (
+            dim("DIRI_VISUAL_WIDTH", 1440.0),
+            dim("DIRI_VISUAL_HEIGHT", 900.0),
+        );
+        let platform = gpui_platform::current_platform(true);
+        let mut cx = HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(diri_ui::IconAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.update(|cx| {
+            crate::fonts::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let fleet: Vec<(&str, &str, ProtoAgentKind, &str, String)> = vec![
+            (
+                "diri",
+                "Make the session overview calm",
+                ProtoAgentKind::CLAUDE_CODE,
+                "working",
+                fx::claude_working(),
+            ),
+            (
+                "anara",
+                "Fix the login redirect loop",
+                ProtoAgentKind::CLAUDE_CODE,
+                "input",
+                fx::claude_permission(),
+            ),
+            (
+                "diri",
+                "Fix the flaky reconnect test",
+                ProtoAgentKind::CODEX,
+                "done",
+                fx::codex_done(),
+            ),
+            (
+                "anara",
+                "Web dev server",
+                ProtoAgentKind::SHELL,
+                "working",
+                fx::vite_server(),
+            ),
+            (
+                "diri",
+                "Release 0.8.9",
+                ProtoAgentKind::SHELL,
+                "working",
+                fx::cargo_release(),
+            ),
+            (
+                "diri",
+                "System monitor",
+                ProtoAgentKind::SHELL,
+                "idle",
+                fx::htop(),
+            ),
+            (
+                "anara",
+                "Onboarding copy pass",
+                ProtoAgentKind::GEMINI,
+                "asleep",
+                fx::gemini_asleep(),
+            ),
+            (
+                "diri",
+                "Tidy branch history",
+                ProtoAgentKind::CODEX,
+                "idle",
+                fx::git_graph(),
+            ),
+            (
+                "diri",
+                "overview_layout.rs",
+                ProtoAgentKind::SHELL,
+                "idle",
+                fx::vim_review(),
+            ),
+        ];
+        let window = cx
+            .open_window(size(px(width), px(height)), |_, cx| {
+                let runtime = Arc::new(StoreRuntime::inert());
+                let sessions: Vec<_> = fleet
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (project, title, kind, status, _))| {
+                        let mut s = session(i);
+                        s.title = (*title).into();
+                        s.kind = kind.clone();
+                        s.project_id = ProjectId::new(*project);
+                        s.cwd = format!("/work/{project}");
+                        s.status = match *status {
+                            "working" => SessionStatus::Working,
+                            "input" => {
+                                SessionStatus::NeedsInput(diri_proto::NeedsInputKind::Permission)
+                            }
+                            _ => SessionStatus::Idle,
+                        };
+                        if *status == "done" {
+                            s.last_turn_completed_at = Some(DateMillis(10.0));
+                        }
+                        if *status == "idle" {
+                            s.last_turn_completed_at = Some(DateMillis(1.0));
+                            s.last_seen_at = Some(DateMillis(2.0));
+                        }
+                        if *status == "asleep" {
+                            s.hibernation = Some(diri_proto::HibernationInfo {
+                                since: DateMillis(0.0),
+                                reason: diri_proto::HibernationReason::Idle,
+                                tree_pids: vec![],
+                                tree_start_times: None,
+                            });
+                        }
+                        s
+                    })
+                    .collect();
+                {
+                    let mut store = runtime.store.write().unwrap();
+                    let projects = ["diri", "anara"]
+                        .into_iter()
+                        .map(|name| diri_proto::Project {
+                            id: ProjectId::new(name),
+                            root: format!("/work/{name}"),
+                            name: name.into(),
+                            pinned_order: None,
+                            host: None,
+                        })
+                        .collect();
+                    store.hydrate(SessionListResult { sessions, projects });
+                    store
+                        .update_preferences(|p| {
+                            p.terminal_theme = if light {
+                                "dirijor-light"
+                            } else {
+                                "dirijor-dark"
+                            }
+                            .into();
+                            p.window_material = crate::store::WindowMaterial::Opaque;
+                        })
+                        .unwrap();
+                }
+                let surfaces = cx.new(|cx| {
+                    let mut view = SessionSurfaces::new(runtime, None, cx);
+                    view.overview_variant = variant;
+                    {
+                        let mut store = view.store.write().unwrap();
+                        store.select(session(2).id);
+                        store.toggle_overview();
+                        if let Ok(query) = std::env::var("DIRI_VISUAL_QUERY") {
+                            store.append_overview_query(&query);
+                        }
+                    }
+                    for (i, (_, _, kind, _, screen)) in fleet.iter().enumerate() {
+                        let buffer = if *kind == ProtoAgentKind::SHELL {
+                            fx::screen(screen)
+                        } else {
+                            fx::screen_bottom(screen)
+                        };
+                        let text: String = buffer
+                            .cells
+                            .chunks(usize::from(buffer.cols))
+                            .map(|row| {
+                                row.iter()
+                                    .map(|cell| {
+                                        char::from_u32(cell.scalar)
+                                            .filter(|c| *c != '\0')
+                                            .unwrap_or(' ')
+                                    })
+                                    .collect::<String>()
+                                    .trim_end()
+                                    .to_owned()
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        view.screens
+                            .insert(session(i).id, ScreenPreview::Ready(screen_excerpt(&text)));
+                        view.set_resident_buffer(session(i).id, Arc::new(RwLock::new(buffer)));
+                    }
+                    view
+                });
+                cx.new(|_| OverviewHarness {
+                    surfaces,
+                    background_scrolls: Arc::new(AtomicUsize::new(0)),
+                })
+            })
+            .unwrap();
         cx.run_until_parked();
         cx.capture_screenshot(window.into())
             .unwrap()

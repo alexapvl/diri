@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
-use diri_proto::grid::{GridCell, GridUpdate};
+use diri_proto::grid::{CommandEnd, GridCell, GridUpdate};
 use diri_proto::terminal::MouseModes;
 use gpui::{
     App, Bounds, ContentMask, Element, ElementId, FocusHandle, Font, FontFallbacks, FontId,
@@ -19,6 +19,7 @@ use crate::find::{
     FindSnapshot, FindSpan, NavigationTarget, SearchJob, SearchRequest, SearchResult,
     TerminalFindModel,
 };
+use crate::inline_images::{DrawGrid, ImageDraw, InlineImageCache, append_row_draws};
 use crate::metrics::CellMetrics;
 use crate::scrollback::{
     ScrollRouter, ScrollbackApplyError, ScrollbackRequest, ScrollbackViewport, ScrolledState,
@@ -96,6 +97,9 @@ pub struct TerminalElement {
     background_opacity: f32,
     font: Font,
     font_size: Pixels,
+    /// Multiple of the font's natural line height; 1.0 paints rows exactly
+    /// as tall as the font asks for.
+    line_height_scale: f32,
     focus_handle: Option<FocusHandle>,
     text_input: Option<TextInputCallback>,
     ime_state: Arc<Mutex<TerminalImeState>>,
@@ -242,6 +246,10 @@ impl TerminalInputHandler {
         // Committed text is typing like any key: it lands at the live prompt,
         // which a held reading view would keep off screen with no cursor. The
         // target offset is zero, so the visible row count cannot clamp it.
+        // It also ends a message jump in flight, even at the live edge.
+        if !text.is_empty() {
+            note_interaction(&self.view.shared, &self.view.buffer);
+        }
         let returned =
             !text.is_empty() && set_view_offset(&self.view.shared, &self.view.buffer, 0, 0);
         let solid = note_keystroke(&self.cursor);
@@ -363,7 +371,7 @@ struct ElementSharedState {
     modes: Mutex<TerminalModes>,
     scroll_router: Mutex<ScrollRouter>,
     history_lines: Mutex<HistoryLineCache>,
-    metrics: Mutex<Option<(Font, u32, CellMetrics)>>,
+    metrics: Mutex<Option<(Font, u32, u32, CellMetrics)>>,
     /// Behind its own `Arc` so the input handler and the blink wake can hold
     /// it without holding the rest of the view's state.
     cursor: Arc<Mutex<CursorDriver>>,
@@ -376,6 +384,64 @@ struct ElementSharedState {
     /// Called once, from the first paint that puts non-blank content on
     /// screen after it was armed; see [`TerminalElement::on_first_content_paint`].
     content_paint: Mutex<Option<ArmedContentPaint>>,
+    /// The message a jump just brought into view, briefly marked.
+    message_flash: Mutex<Option<MessageFlash>>,
+    /// How the finished shell commands on screen ended, kept until the rows
+    /// or the window over them change.
+    command_marks: Mutex<CommandMarkCache>,
+    /// Advances whenever the user types, scrolls or starts a selection, so a
+    /// jump in flight can tell it no longer owns the view.
+    interactions: AtomicU64,
+    /// Decoded inline images; empty and inert until a host installs a
+    /// requester.
+    inline_images: Arc<InlineImageCache>,
+}
+
+/// Rows an OSC 133 end is looked for below the window, so a prompt near the
+/// bottom still shows how its command ended once the end scrolls out of view.
+const COMMAND_END_LOOKAHEAD: usize = 512;
+
+/// Width left of the grid that command marks may draw in. Hosts pad the grid
+/// by at least this much; without padding the marks are clipped away.
+pub const COMMAND_MARK_GUTTER: f32 = 10.0;
+
+/// Rows a command-output lookup reads either way from the pointer.
+const COMMAND_OUTPUT_SEARCH_ROWS: usize = 20_000;
+
+#[derive(Default)]
+struct CommandMarkCache {
+    /// Buffer generation, window top, painted rows, history cache sequence
+    /// and size, and whether the view reads history.
+    key: Option<(u64, i64, usize, Option<u64>, usize, bool)>,
+    marks: Vec<(i64, CommandEnd)>,
+}
+
+/// A band over a message Diri just brought into view: it holds, then fades.
+#[derive(Clone, Debug)]
+struct MessageFlash {
+    /// Absolute rows, in the coordinates of [`ScrollbackViewport::absolute_row`].
+    rows: std::ops::Range<i64>,
+    started: Instant,
+    /// The first row as it looked once drawn. Output that rewrites it ends
+    /// the band early, rather than leaving it over other text.
+    first: Option<Vec<GridCell>>,
+}
+
+const MESSAGE_FLASH_HOLD: Duration = Duration::from_millis(500);
+const MESSAGE_FLASH: Duration = Duration::from_millis(1700);
+
+impl MessageFlash {
+    /// Full strength while held, then an ease-out to nothing.
+    fn strength(&self, now: Instant) -> f32 {
+        let elapsed = now.saturating_duration_since(self.started);
+        if elapsed <= MESSAGE_FLASH_HOLD {
+            return 1.0;
+        }
+        let fade = (elapsed - MESSAGE_FLASH_HOLD).as_secs_f32()
+            / (MESSAGE_FLASH - MESSAGE_FLASH_HOLD).as_secs_f32();
+        let rest = (1.0 - fade).clamp(0.0, 1.0);
+        rest * rest
+    }
 }
 
 /// When a view first painted content after the host armed the callback.
@@ -646,6 +712,8 @@ pub struct TerminalPrepaintState {
     decoration_quads: Vec<PaintQuad>,
     sprite_shapes: Vec<AntialiasedShape>,
     overlay_quads: Vec<PaintQuad>,
+    /// Shell command marks, drawn in the padding left of the grid.
+    gutter_quads: Vec<PaintQuad>,
     selection: SelectionPaint,
     /// Reading path: window row and the absolute row whose shape paint reads
     /// from the history cache, as the live path reads the row cache.
@@ -658,6 +726,8 @@ pub struct TerminalPrepaintState {
     /// composed copies, so an unchanged frame clones nothing.
     paint_from_cache: bool,
     scroll: Option<ScrollPaint>,
+    /// Inline images over the rows that carry them, already scrolled.
+    images: Vec<ImageDraw>,
 }
 
 /// A reading view resting between rows. Everything row-positioned is built
@@ -736,11 +806,16 @@ impl TerminalElement {
                 scroll_glide: Mutex::new(GlideState::default()),
                 paints: AtomicU64::new(0),
                 content_paint: Mutex::new(None),
+                message_flash: Mutex::new(None),
+                command_marks: Mutex::default(),
+                interactions: AtomicU64::new(0),
+                inline_images: Arc::default(),
             }),
             theme: TermTheme::default(),
             background_opacity: 1.0,
             font: terminal_font,
             font_size: px(13.0),
+            line_height_scale: 1.0,
             focus_handle: None,
             text_input: None,
             ime_state: Arc::new(Mutex::new(TerminalImeState::default())),
@@ -750,6 +825,13 @@ impl TerminalElement {
             reduce_motion: false,
             cursor_hidden: false,
         }
+    }
+
+    /// This terminal's inline-image cache, for the host to install a
+    /// requester and deliver decoded images. Clones share it.
+    #[must_use]
+    pub fn inline_images(&self) -> Arc<InlineImageCache> {
+        Arc::clone(&self.shared.inline_images)
     }
 
     #[must_use]
@@ -766,6 +848,14 @@ impl TerminalElement {
     #[must_use]
     pub fn has_content(&self) -> bool {
         !read_lock(&self.buffer).is_blank()
+    }
+
+    /// Grid updates that changed the mirrored screen since it was created:
+    /// a blank screen after many tells an agent that draws without glyphs
+    /// from one that printed nothing.
+    #[must_use]
+    pub fn grid_changes(&self) -> u64 {
+        read_lock(&self.buffer).generation()
     }
 
     /// Rows in the mirrored screen. The daemon owns this number, so it trails
@@ -812,6 +902,12 @@ impl TerminalElement {
 
     pub fn font_size(mut self, font_size: Pixels) -> Self {
         self.font_size = font_size;
+        self
+    }
+
+    #[must_use]
+    pub fn line_height_scale(mut self, scale: f32) -> Self {
+        self.line_height_scale = scale;
         self
     }
 
@@ -871,7 +967,195 @@ impl TerminalElement {
     /// cursor is dimmed on screen and the host should repaint it solid.
     #[must_use]
     pub fn note_user_input(&self) -> bool {
+        self.note_interaction();
         note_keystroke(&self.shared.cursor)
+    }
+
+    /// A press the terminal application receives: like typing, it ends a
+    /// message jump in flight and its band.
+    pub fn note_pointer_input(&self) {
+        self.note_interaction();
+    }
+
+    /// The user took the view: typing, a wheel or a selection. Ends a message
+    /// band, tells a jump in flight to stop, and shows the screen as it is.
+    fn note_interaction(&self) {
+        note_interaction(&self.shared, &self.buffer);
+    }
+
+    /// Keeps painting the screen as it is now while a message jump moves the
+    /// Agent's view underneath, then shows the result at once on release.
+    /// The live grid keeps receiving every update meanwhile.
+    pub fn hold_frame(&self, held: bool) {
+        mutex_lock(&self.shared.viewport).hold_frame(held, &read_lock(&self.buffer));
+    }
+
+    pub fn frame_held(&self) -> bool {
+        mutex_lock(&self.shared.viewport).frame_held()
+    }
+
+    /// Advances on every keystroke, wheel and selection gesture.
+    pub fn interaction_generation(&self) -> u64 {
+        self.shared.interactions.load(Ordering::Relaxed)
+    }
+
+    /// Marks the message on these window rows for a moment.
+    pub fn flash_message(&self, rows: std::ops::Range<usize>) {
+        let viewport = mutex_lock(&self.shared.viewport);
+        let start = viewport.absolute_row(rows.start);
+        let end = viewport.absolute_row(rows.end);
+        drop(viewport);
+        self.flash_message_rows(start..end);
+    }
+
+    /// Marks the message on these absolute rows for a moment, including rows
+    /// a reading view has yet to fetch.
+    pub fn flash_message_rows(&self, rows: std::ops::Range<i64>) {
+        *mutex_lock(&self.shared.message_flash) = Some(MessageFlash {
+            rows,
+            started: Instant::now(),
+            first: None,
+        });
+    }
+
+    /// The absolute rows a message band covers while it shows.
+    pub fn message_flash_rows(&self) -> Option<std::ops::Range<i64>> {
+        mutex_lock(&self.shared.message_flash)
+            .as_ref()
+            .filter(|flash| flash.started.elapsed() < MESSAGE_FLASH)
+            .map(|flash| flash.rows.clone())
+    }
+
+    pub fn clear_message_flash(&self) {
+        *mutex_lock(&self.shared.message_flash) = None;
+    }
+
+    /// Draws the message band under the text: a tint across the message's
+    /// rows and a bar in its left margin. Returns whether it still animates.
+    fn paint_message_flash(
+        &self,
+        viewport: &ScrollbackViewport,
+        painted_rows: usize,
+        visible_cols: usize,
+        origin: Point<Pixels>,
+        metrics: CellMetrics,
+        quads: &mut Vec<PaintQuad>,
+    ) -> bool {
+        let mut slot = mutex_lock(&self.shared.message_flash);
+        let Some(flash) = slot.as_mut() else {
+            return false;
+        };
+        let strength = flash.strength(Instant::now());
+        let top = viewport.absolute_row(0);
+        let first = usize::try_from(flash.rows.start - top)
+            .ok()
+            .filter(|row| *row < painted_rows);
+        if let Some(row) = first {
+            let cells = viewport.window_row(&read_lock(&self.buffer), row);
+            let blank = cells.iter().all(|cell| matches!(cell.scalar, 0 | 32));
+            match &flash.first {
+                Some(drawn) if *drawn != cells => {
+                    *slot = None;
+                    return false;
+                }
+                None if !blank => flash.first = Some(cells),
+                _ => {}
+            }
+        }
+        if strength <= 0.0 {
+            *slot = None;
+            return false;
+        }
+        let band = self.theme.find_match;
+        let bar = self.theme.find_match_current;
+        for absolute in flash.rows.clone() {
+            let Some(row) = usize::try_from(absolute - top)
+                .ok()
+                .filter(|row| *row < painted_rows)
+            else {
+                continue;
+            };
+            append_overlay_quad(
+                row,
+                0,
+                visible_cols,
+                origin,
+                metrics,
+                gpui::Rgba {
+                    a: band.a * 0.7 * strength,
+                    ..band
+                },
+                quads,
+            );
+            quads.push(fill(
+                Bounds::new(
+                    point(origin.x, origin.y + metrics.y_for_row(row as u16)),
+                    size(px(3.0), metrics.line_height),
+                ),
+                gpui::Rgba {
+                    a: (bar.a * 2.0).min(1.0) * strength,
+                    ..bar
+                },
+            ));
+        }
+        true
+    }
+
+    /// Draws a short bar in the padding left of each finished shell command's
+    /// prompt row: green when it exited 0, red otherwise. Commands whose
+    /// shell reported no status stay unmarked.
+    fn paint_command_marks(
+        &self,
+        viewport: &ScrollbackViewport,
+        painted_rows: usize,
+        origin: Point<Pixels>,
+        metrics: CellMetrics,
+        quads: &mut Vec<PaintQuad>,
+    ) {
+        // The alternate screen never holds marks, so it draws none.
+        let buffer = read_lock(&self.buffer);
+        let top = viewport.absolute_row(0);
+        let key = (
+            buffer.generation(),
+            top,
+            painted_rows,
+            viewport.cache_seq(),
+            viewport.cached_row_count(),
+            viewport.is_reading(),
+        );
+        let mut cache = mutex_lock(&self.shared.command_marks);
+        if cache.key != Some(key) {
+            cache.marks = crate::command_marks::finished_prompts(
+                top,
+                painted_rows,
+                COMMAND_END_LOOKAHEAD,
+                |row| viewport.stored_row(&buffer, row),
+            );
+            cache.key = Some(key);
+        }
+        drop(buffer);
+        let inset = metrics.line_height * 0.2;
+        for &(absolute, end) in &cache.marks {
+            let color = match end {
+                CommandEnd::Succeeded => self.theme.ansi[2],
+                CommandEnd::Failed => self.theme.ansi[1],
+                CommandEnd::Unknown => continue,
+            };
+            let row = (absolute - top) as u16;
+            quads.push(fill(
+                Bounds::new(
+                    point(
+                        origin.x - px(COMMAND_MARK_GUTTER) + px(4.0),
+                        origin.y + metrics.y_for_row(row) + inset,
+                    ),
+                    size(px(2.0), metrics.line_height - inset * 2.0),
+                ),
+                gpui::Rgba {
+                    a: color.a * 0.8,
+                    ..color
+                },
+            ));
+        }
     }
 
     /// Drives cursor motion from a caller-owned clock instead of the wall
@@ -967,6 +1251,13 @@ impl TerminalElement {
     }
 
     #[must_use]
+    /// The absolute row at the top of a reading view whose history geometry
+    /// is known; `None` while following live output.
+    pub fn reading_top_row(&self) -> Option<i64> {
+        let viewport = mutex_lock(&self.shared.viewport);
+        (viewport.geometry_known() && viewport.view_offset() > 0).then(|| viewport.absolute_row(0))
+    }
+
     pub fn viewport(&self) -> ScrollbackViewport {
         mutex_lock(&self.shared.viewport).clone()
     }
@@ -1068,6 +1359,7 @@ impl TerminalElement {
     /// Resolves a wheel event and applies local scrollback movement. Daemon
     /// routes are returned for the app to pass to `SessionAttachment::scroll`.
     pub fn route_wheel(&self, event: WheelEvent) -> Option<WheelRoute> {
+        self.note_interaction();
         self.cancel_scroll_glide();
         let modes = *mutex_lock(&self.shared.modes);
         if let WheelDelta::PrecisePoints(points) = event.delta
@@ -1163,6 +1455,7 @@ impl TerminalElement {
     }
 
     pub fn begin_selection(&self, col: usize, window_row: usize) {
+        self.note_interaction();
         let absolute_row = mutex_lock(&self.shared.viewport).absolute_row(window_row);
         mutex_lock(&self.shared.selection).begin(SelectionPoint {
             row: absolute_row,
@@ -1177,17 +1470,20 @@ impl TerminalElement {
     }
 
     pub fn begin_rectangle_selection(&self, col: usize, row: usize) {
+        self.note_interaction();
         let row = mutex_lock(&self.shared.viewport).absolute_row(row);
         mutex_lock(&self.shared.selection).begin_rectangle(SelectionPoint { row, col });
     }
 
     pub fn select_word(&self, col: usize, window_row: usize) {
+        self.note_interaction();
         let viewport = mutex_lock(&self.shared.viewport);
         let buffer = read_lock(&self.buffer);
         mutex_lock(&self.shared.selection).select_word(&viewport, &buffer, window_row, col);
     }
 
     pub fn select_line(&self, window_row: usize) {
+        self.note_interaction();
         let viewport = mutex_lock(&self.shared.viewport);
         let buffer = read_lock(&self.buffer);
         mutex_lock(&self.shared.selection).select_line(&viewport, &buffer, window_row);
@@ -1217,6 +1513,34 @@ impl TerminalElement {
 
     pub fn clear_selection(&self) {
         mutex_lock(&self.shared.selection).clear();
+    }
+
+    /// The output of the finished shell command under a window cell, found
+    /// from OSC 133 marks in the rows this view holds.
+    #[must_use]
+    pub fn command_output_at(
+        &self,
+        col: usize,
+        window_row: usize,
+    ) -> Option<crate::command_marks::CommandOutput> {
+        let viewport = mutex_lock(&self.shared.viewport);
+        let buffer = read_lock(&self.buffer);
+        let at = SelectionPoint {
+            row: viewport.absolute_row(window_row),
+            col,
+        };
+        crate::command_marks::command_output_at(at, COMMAND_OUTPUT_SEARCH_ROWS, |row| {
+            viewport.stored_row(&buffer, row)
+        })
+    }
+
+    /// Selects a range of absolute cells, as a programmatic selection: no
+    /// sheen, and the caller copies it if it wants to.
+    pub fn select_range(&self, start: SelectionPoint, end: SelectionPoint) {
+        self.note_interaction();
+        let mut selection = mutex_lock(&self.shared.selection);
+        selection.begin(start);
+        selection.drag_to(end);
     }
 
     /// The web URL whose text spans the given window cell, if any.
@@ -1250,6 +1574,11 @@ impl TerminalElement {
             .iter()
             .find(|link| usize::from(link.start) <= col && col < usize::from(link.end))
         {
+            // An inline image's cells are not a link, and their blanks hold
+            // nothing to resolve either.
+            if diri_proto::inline_image::is_anchor(&link.uri) {
+                return None;
+            }
             return reference_from_run(&link.uri).map(|reference| ReferenceHit {
                 reference,
                 spans: vec![(absolute_row, usize::from(link.start), usize::from(link.end))],
@@ -1498,13 +1827,18 @@ impl TerminalElement {
         metrics: CellMetrics,
         window: &mut Window,
     ) -> ShapedLine {
-        let (text, runs) = self.row_text_and_runs(row, graphemes, tints);
-        window.text_system().shape_line(
+        let mut cell_starts = Vec::new();
+        let (text, runs) = self.row_text(row, graphemes, tints, Some(&mut cell_starts));
+        let mut line = window.text_system().shape_line(
             SharedString::from(text),
             self.font_size,
             &runs,
             Some(metrics.cell_width),
-        )
+        );
+        if !reorders(row, graphemes) {
+            anchor_glyphs_to_cells(&mut line, &cell_starts, metrics.cell_width);
+        }
+        line
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1553,11 +1887,7 @@ impl TerminalElement {
     /// A row with right-to-left text is positioned from the whole line and is
     /// shaped whole.
     fn shaped_cells(&self, row: &[GridCell], graphemes: &[(u16, String)]) -> usize {
-        let reorders = row.iter().any(|cell| is_bidi_sensitive(cell.scalar))
-            || graphemes
-                .iter()
-                .any(|(_, text)| text.chars().any(|ch| is_bidi_sensitive(u32::from(ch))));
-        if reorders {
+        if reorders(row, graphemes) {
             return row.len();
         }
         let last_glyph = row.iter().enumerate().rposition(|(column, cell)| {
@@ -1570,11 +1900,24 @@ impl TerminalElement {
         last_glyph.map_or(1, |last| last + 2).min(row.len())
     }
 
+    #[cfg(test)]
     fn row_text_and_runs(
         &self,
         row: &[GridCell],
         graphemes: &[(u16, String)],
         tints: &[Tint],
+    ) -> (String, Vec<TextRun>) {
+        self.row_text(row, graphemes, tints, None)
+    }
+
+    /// The shaped text of `row` and its runs; `cell_starts` receives the byte
+    /// offset where each shaped cell begins.
+    fn row_text(
+        &self,
+        row: &[GridCell],
+        graphemes: &[(u16, String)],
+        tints: &[Tint],
+        mut cell_starts: Option<&mut Vec<usize>>,
     ) -> (String, Vec<TextRun>) {
         let row = &row[..self.shaped_cells(row, graphemes)];
         let mut text = String::with_capacity(row.len());
@@ -1585,6 +1928,9 @@ impl TerminalElement {
             let resolved = self.theme.resolve_cell_under(*cell, tint_at(tints, column));
             let ch = render_char(*cell, resolved.visible);
             let mut byte_len = ch.len_utf8();
+            if let Some(starts) = cell_starts.as_deref_mut() {
+                starts.push(text.len());
+            }
             text.push(ch);
             while graphemes
                 .peek()
@@ -1868,6 +2214,12 @@ fn paint_cursor_glyph(
     }
 }
 
+fn note_interaction(shared: &ElementSharedState, buffer: &SharedGridBuffer) {
+    shared.interactions.fetch_add(1, Ordering::Relaxed);
+    *mutex_lock(&shared.message_flash) = None;
+    mutex_lock(&shared.viewport).hold_frame(false, &read_lock(buffer));
+}
+
 fn note_keystroke(cursor: &Mutex<CursorDriver>) -> bool {
     mutex_lock(cursor).note_keystroke()
 }
@@ -2000,6 +2352,7 @@ impl Element for TerminalElement {
                 decoration_quads: Vec::new(),
                 sprite_shapes: Vec::new(),
                 overlay_quads: Vec::new(),
+                gutter_quads: Vec::new(),
                 selection: SelectionPaint::default(),
                 lines: Vec::new(),
                 metrics: None,
@@ -2008,6 +2361,7 @@ impl Element for TerminalElement {
                 cache_misses: 0,
                 paint_from_cache: false,
                 scroll: None,
+                images: Vec::new(),
             };
         }
 
@@ -2027,6 +2381,7 @@ impl Element for TerminalElement {
                 decoration_quads: Vec::new(),
                 sprite_shapes: Vec::new(),
                 overlay_quads: Vec::new(),
+                gutter_quads: Vec::new(),
                 selection: SelectionPaint::default(),
                 lines: Vec::new(),
                 metrics: None,
@@ -2035,23 +2390,27 @@ impl Element for TerminalElement {
                 cache_misses: 0,
                 paint_from_cache: false,
                 scroll: None,
+                images: Vec::new(),
             };
         }
 
         let started_at = Instant::now();
         let font_size_bits = f32::from(self.font_size).to_bits();
+        let scale_bits = self.line_height_scale.to_bits();
         let metrics = {
             let mut cached = mutex_lock(&self.shared.metrics);
-            if let Some((cached_font, cached_size, metrics)) = cached.as_ref()
+            if let Some((cached_font, cached_size, cached_scale, metrics)) = cached.as_ref()
                 && cached_font == &self.font
                 && *cached_size == font_size_bits
+                && *cached_scale == scale_bits
             {
                 *metrics
             } else {
                 let font_id = window.text_system().resolve_font(&self.font);
                 let metrics =
-                    CellMetrics::measure_font(window.text_system(), font_id, self.font_size);
-                *cached = Some((self.font.clone(), font_size_bits, metrics));
+                    CellMetrics::measure_font(window.text_system(), font_id, self.font_size)
+                        .with_line_height_scale(self.line_height_scale);
+                *cached = Some((self.font.clone(), font_size_bits, scale_bits, metrics));
                 metrics
             }
         };
@@ -2080,6 +2439,7 @@ impl Element for TerminalElement {
         let mut decoration_quads = Vec::new();
         let mut sprite_shapes = Vec::new();
         let mut overlay_quads = Vec::new();
+        let mut gutter_quads = Vec::new();
         let mut lines = Vec::with_capacity(visible_rows);
         let grid = SpriteGrid::new(bounds.origin, metrics, window.scale_factor());
         let cursor;
@@ -2369,6 +2729,23 @@ impl Element for TerminalElement {
         }
 
         drop(highlights);
+        self.paint_command_marks(
+            &viewport,
+            painted_rows,
+            bounds.origin,
+            metrics,
+            &mut gutter_quads,
+        );
+        if self.paint_message_flash(
+            &viewport,
+            painted_rows,
+            visible_cols,
+            bounds.origin,
+            metrics,
+            &mut overlay_quads,
+        ) {
+            window.request_animation_frame();
+        }
 
         *mutex_lock(&self.shared.input_cell) = (!viewport.is_reading()
             && usize::from(cursor.row) < visible_rows
@@ -2444,11 +2821,37 @@ impl Element for TerminalElement {
         };
         let cursor = self.animate_cursor(cursor, focused, metrics, visible_cols, window);
 
+        // Rows carry their images' anchors; most carry no links at all.
+        let mut images = Vec::new();
+        {
+            let buffer = read_lock(&self.buffer);
+            let grid = DrawGrid {
+                origin: point(bounds.left(), bounds.top() - scroll_shift),
+                cell_width: metrics.cell_width,
+                line_height: metrics.line_height,
+                visible_cols,
+                scale_factor: window.scale_factor(),
+            };
+            for window_row in 0..painted_rows {
+                let links = viewport.row_links(&buffer, viewport.absolute_row(window_row));
+                if !links.is_empty() {
+                    append_row_draws(
+                        &self.shared.inline_images,
+                        links,
+                        window_row,
+                        grid,
+                        &mut images,
+                    );
+                }
+            }
+        }
+
         let scroll = (scroll_shift > px(0.0)).then(|| {
             let backdrop = background_quads.remove(0);
             for quad in background_quads
                 .iter_mut()
                 .chain(&mut overlay_quads)
+                .chain(&mut gutter_quads)
                 .chain(&mut decoration_quads)
             {
                 quad.bounds.origin.y -= scroll_shift;
@@ -2476,6 +2879,7 @@ impl Element for TerminalElement {
             decoration_quads,
             sprite_shapes,
             overlay_quads,
+            gutter_quads,
             selection,
             lines,
             metrics: Some(metrics),
@@ -2484,6 +2888,7 @@ impl Element for TerminalElement {
             cache_misses,
             paint_from_cache,
             scroll,
+            images,
         }
     }
 
@@ -2551,6 +2956,17 @@ impl Element for TerminalElement {
         if let Some(scroll) = &prepaint.scroll {
             window.with_content_mask(Some(ContentMask { bounds }), |window| {
                 window.paint_quad(scroll.backdrop.clone());
+            });
+        }
+        if !prepaint.gutter_quads.is_empty() {
+            let gutter = Bounds::new(
+                point(bounds.left() - px(COMMAND_MARK_GUTTER), content.top()),
+                size(px(COMMAND_MARK_GUTTER), content.size.height),
+            );
+            window.with_content_mask(Some(ContentMask { bounds: gutter }), |window| {
+                for quad in prepaint.gutter_quads.drain(..) {
+                    window.paint_quad(quad);
+                }
             });
         }
         window.with_content_mask(Some(ContentMask { bounds: content }), |window| {
@@ -2696,6 +3112,16 @@ impl Element for TerminalElement {
                     shape.paint(window);
                 }
             });
+
+            for image in self.shared.inline_images.take_retired() {
+                let _ = window.drop_image(image);
+            }
+            for draw in prepaint.images.drain(..) {
+                window.with_content_mask(Some(ContentMask { bounds: draw.clip }), |window| {
+                    let _ =
+                        window.paint_image(draw.bounds, Default::default(), draw.image, 0, false);
+                });
+            }
 
             let cursor_schedule = prepaint
                 .cursor
@@ -3127,6 +3553,78 @@ fn paint_line_around_cursor(
             );
         });
     }
+}
+
+/// Whether glyph order and position in `row` are a property of the whole line.
+fn reorders(row: &[GridCell], graphemes: &[(u16, String)]) -> bool {
+    row.iter().any(|cell| is_bidi_sensitive(cell.scalar))
+        || graphemes
+            .iter()
+            .any(|(_, text)| text.chars().any(|ch| is_bidi_sensitive(u32::from(ch))))
+}
+
+/// Pins each cell's glyphs to that cell's column.
+///
+/// The shaper's own grid snap counts glyphs and treats any glyph drawn less
+/// than half a cell after the previous one as a combining mark. A cell whose
+/// glyph has no advance (U+00AD SOFT HYPHEN, U+2028) or a narrow fallback
+/// advance is one column on the grid but not to that count, so every glyph
+/// after it is drawn a column early: under the next cell's cursor and
+/// background, with the cursor showing the glyph to its left. Glyph byte
+/// indexes name their cell exactly, so the layout is copied only for a row
+/// that is actually off the grid.
+fn anchor_glyphs_to_cells(line: &mut ShapedLine, cell_starts: &[usize], cell_width: Pixels) {
+    if glyph_shifts(line, cell_starts, cell_width).all(|shift| shift == px(0.0)) {
+        return;
+    }
+    let shifts: Vec<Pixels> = glyph_shifts(line, cell_starts, cell_width).collect();
+    let mut runs = line.runs.clone();
+    for (glyph, shift) in runs
+        .iter_mut()
+        .flat_map(|run| run.glyphs.iter_mut())
+        .zip(shifts)
+    {
+        glyph.position.x += shift;
+    }
+    let layout: &mut Arc<gpui::LineLayout> = line;
+    *layout = Arc::new(gpui::LineLayout {
+        font_size: layout.font_size,
+        width: layout.width,
+        ascent: layout.ascent,
+        descent: layout.descent,
+        runs,
+        len: layout.len,
+    });
+}
+
+/// How far each glyph of `line` must move to sit on its cell. A cell's first
+/// glyph sets the shift and the rest of the cell (its combining marks) follow;
+/// a glyph within a pixel of its column keeps the shaper's position.
+fn glyph_shifts<'a>(
+    line: &'a ShapedLine,
+    cell_starts: &'a [usize],
+    cell_width: Pixels,
+) -> impl Iterator<Item = Pixels> + 'a {
+    let mut cell = usize::MAX;
+    let mut shift = px(0.0);
+    line.runs
+        .iter()
+        .flat_map(|run| run.glyphs.iter())
+        .map(move |glyph| {
+            let column = cell_starts
+                .partition_point(|&start| start <= glyph.index)
+                .saturating_sub(1);
+            if column != cell {
+                cell = column;
+                let target = cell_width * column as f32;
+                shift = if (glyph.position.x - target).abs() > px(1.0) {
+                    target - glyph.position.x
+                } else {
+                    px(0.0)
+                };
+            }
+            shift
+        })
 }
 
 fn styled_font(base: &Font, style: ResolvedCellStyle) -> Font {
@@ -4486,6 +4984,94 @@ mod selection_repaint_tests {
         let element = TerminalElement::with_buffer(GridBuffer::new(COLS, ROWS));
         element.apply_damage(update(true, &[(0, "zero"), (1, "one"), (2, "two")]));
         element
+    }
+
+    #[test]
+    fn message_band_marks_rows_until_the_user_takes_the_view() {
+        let element = populated_element();
+        let top = element.viewport().absolute_row(0);
+        element.flash_message(1..3);
+        assert_eq!(element.message_flash_rows(), Some(top + 1..top + 3));
+        // A jump in flight compares this to tell the user took the view.
+        let before = element.interaction_generation();
+        let _ = element.note_user_input();
+        assert!(element.interaction_generation() > before);
+        assert_eq!(element.message_flash_rows(), None, "typing ends the band");
+        element.flash_message_rows(40..42);
+        assert!(element.route_wheel(wheel(1.0)).is_some());
+        assert_eq!(
+            element.message_flash_rows(),
+            None,
+            "the wheel ends the band"
+        );
+        element.flash_message_rows(40..42);
+        element.begin_selection(0, 0);
+        assert_eq!(
+            element.message_flash_rows(),
+            None,
+            "selecting ends the band"
+        );
+    }
+
+    #[test]
+    fn a_held_frame_hides_the_live_grid_until_released() {
+        let element = populated_element();
+        element.hold_frame(true);
+        assert!(element.frame_held());
+        // The Agent's view travels underneath.
+        element.apply_damage(update(true, &[(0, "new"), (1, "output"), (2, "below")]));
+        let painted = |element: &TerminalElement| {
+            element
+                .viewport()
+                .window_row(&super::read_lock(&element.buffer), 1)
+        };
+        assert_eq!(painted(&element), row("one"));
+        assert_eq!(element.view_offset(), 0, "holding is not scrolling");
+        element.hold_frame(false);
+        assert_eq!(painted(&element), row("output"));
+        // Typing shows the screen as it is at once.
+        element.hold_frame(true);
+        let _ = element.note_user_input();
+        assert!(!element.frame_held());
+    }
+
+    #[test]
+    fn committed_text_ends_a_jump_in_flight() {
+        // Ordinary letters arrive as committed text, not encoded keys, and
+        // must stop a jump just the same, even with the view already live.
+        let element = populated_element();
+        use gpui::{Bounds, point, px, size};
+        let handler = super::TerminalInputHandler {
+            text_input: std::sync::Arc::new(|_| {}),
+            ime_state: std::sync::Arc::default(),
+            view: element.damage_observer(),
+            cursor_bounds: Bounds::new(point(px(0.0), px(0.0)), size(px(8.0), px(16.0))),
+            cell_width: px(8.0),
+            cursor: std::sync::Arc::default(),
+        };
+        element.hold_frame(true);
+        element.flash_message(1..2);
+        let before = element.interaction_generation();
+        handler.commit_text("y");
+        assert!(element.interaction_generation() > before);
+        assert!(!element.frame_held());
+        assert_eq!(element.message_flash_rows(), None);
+        assert_eq!(element.view_offset(), 0);
+    }
+
+    #[test]
+    fn message_band_holds_then_fades_out() {
+        let started = std::time::Instant::now();
+        let flash = super::MessageFlash {
+            rows: 0..1,
+            started,
+            first: None,
+        };
+        assert_eq!(flash.strength(started), 1.0);
+        assert_eq!(flash.strength(started + super::MESSAGE_FLASH_HOLD), 1.0);
+        let midway = started + (super::MESSAGE_FLASH_HOLD + super::MESSAGE_FLASH) / 2;
+        assert!((0.0..1.0).contains(&flash.strength(midway)));
+        assert_eq!(flash.strength(started + super::MESSAGE_FLASH), 0.0);
     }
 
     #[test]

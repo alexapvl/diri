@@ -193,6 +193,28 @@ pub(crate) fn find_profile_codex_transcript(
     agent_id: &str,
     cwd: &str,
 ) -> Option<TrustedTranscript> {
+    find_codex_transcript_in(profile, home, agent_id, Some(cwd))
+}
+
+/// The rollout Codex wrote for `agent_id`, wherever it says it ran. Only for
+/// a tab that has no conversation yet: the thread id came from this tab's own
+/// notify callback, and Codex records the cwd as `getcwd()` resolved it, which
+/// need not spell the tab's directory the same way. Dropping the id there
+/// left the tab unresumable for good.
+pub(crate) fn find_profile_codex_transcript_any_cwd(
+    profile: Option<&diri_proto::AgentAccountProfile>,
+    home: &Path,
+    agent_id: &str,
+) -> Option<TrustedTranscript> {
+    find_codex_transcript_in(profile, home, agent_id, None)
+}
+
+fn find_codex_transcript_in(
+    profile: Option<&diri_proto::AgentAccountProfile>,
+    home: &Path,
+    agent_id: &str,
+    cwd: Option<&str>,
+) -> Option<TrustedTranscript> {
     if !safe_agent_id(agent_id) {
         return None;
     }
@@ -217,14 +239,9 @@ pub(crate) fn find_profile_codex_transcript(
                 continue;
             }
             let path = entry.path();
-            if let Some(transcript) = validate_profile_transcript_path(
-                profile,
-                home,
-                &AgentKind::CODEX,
-                agent_id,
-                cwd,
-                &path,
-            ) {
+            if let Some(transcript) =
+                validate_transcript_in(profile, home, &AgentKind::CODEX, agent_id, cwd, &path)
+            {
                 let modified = transcript
                     .file
                     .metadata()
@@ -295,7 +312,7 @@ pub(crate) fn find_codex_thread_for_launch(
                 continue;
             };
             if meta.is_subagent()
-                || meta.cwd != cwd
+                || !same_cwd(&meta.cwd, cwd)
                 || !safe_agent_id(&meta.id)
                 || exclude.contains(&meta.id)
                 || !name.ends_with(&format!("-{}.jsonl", meta.id))
@@ -337,6 +354,19 @@ pub(crate) fn validate_profile_transcript_path(
     cwd: &str,
     path: &Path,
 ) -> Option<TrustedTranscript> {
+    validate_transcript_in(profile, home, kind, agent_id, Some(cwd), path)
+}
+
+/// `cwd: None` skips only the Codex launch-directory check; the root, file
+/// ownership and conversation identity checks always apply.
+fn validate_transcript_in(
+    profile: Option<&diri_proto::AgentAccountProfile>,
+    home: &Path,
+    kind: &AgentKind,
+    agent_id: &str,
+    cwd: Option<&str>,
+    path: &Path,
+) -> Option<TrustedTranscript> {
     if !safe_agent_id(agent_id) {
         return None;
     }
@@ -367,12 +397,31 @@ pub(crate) fn validate_profile_transcript_path(
         }
         AgentKind::CODEX_ID => {
             let (found_id, found_cwd) = codex_identity_from(&mut file)?;
-            (found_id == agent_id && found_cwd == cwd).then(|| TrustedTranscript {
-                path: path.to_path_buf(),
-                file,
+            (found_id == agent_id && cwd.is_none_or(|cwd| same_cwd(&found_cwd, cwd))).then(|| {
+                TrustedTranscript {
+                    path: path.to_path_buf(),
+                    file,
+                }
             })
         }
         _ => None,
+    }
+}
+
+/// Whether Codex's recorded cwd names the tab's directory. Codex stores
+/// `getcwd()`, which resolves symlinks (`/tmp` → `/private/tmp`, a symlinked
+/// projects folder) and drops a trailing slash; the tab keeps the path the
+/// user opened. Compare spellings first, then the resolved directories.
+pub(crate) fn same_cwd(recorded: &str, expected: &str) -> bool {
+    if recorded == expected || Path::new(recorded) == Path::new(expected) {
+        return true;
+    }
+    match (
+        Path::new(recorded).canonicalize(),
+        Path::new(expected).canonicalize(),
+    ) {
+        (Ok(recorded), Ok(expected)) => recorded == expected,
+        _ => false,
     }
 }
 
@@ -688,9 +737,11 @@ pub(crate) enum CursorTranscriptTurn {
 /// Cursor writes `tool_use` while a turn is in flight and a text-only
 /// assistant line (or `turn_ended`) when it is done. The tail can still belong
 /// to the preceding turn while a new response streams; it must not override
-/// a live working spinner.
-pub(crate) fn cursor_transcript_turn(path: &Path) -> Option<CursorTranscriptTurn> {
-    classify_cursor_transcript_object(&last_jsonl_object(path)?)
+/// a live working spinner, so the file's size comes back with it: an
+/// unchanged size is the same tail.
+pub(crate) fn cursor_transcript_turn(path: &Path) -> Option<(CursorTranscriptTurn, u64)> {
+    let (object, bytes) = last_jsonl_object(path)?;
+    Some((classify_cursor_transcript_object(&object)?, bytes))
 }
 
 fn classify_cursor_transcript_object(object: &Value) -> Option<CursorTranscriptTurn> {
@@ -720,7 +771,7 @@ fn assistant_uses_tool(object: &Value) -> bool {
         })
 }
 
-fn last_jsonl_object(path: &Path) -> Option<Value> {
+fn last_jsonl_object(path: &Path) -> Option<(Value, u64)> {
     let mut handle = open_regular_readonly(path)?;
     let end = handle.seek(SeekFrom::End(0)).ok()?;
     if end == 0 {
@@ -744,7 +795,7 @@ fn last_jsonl_object(path: &Path) -> Option<Value> {
             newest = Some(value);
         }
     }
-    newest
+    Some((newest?, end))
 }
 
 /// Cursor's workspace-paths.js replaces every run of non-ASCII-alphanumeric
@@ -2277,7 +2328,7 @@ mod tests {
 "#,
         );
         assert_eq!(
-            cursor_transcript_turn(&path),
+            cursor_transcript_turn(&path).map(|(turn, _)| turn),
             Some(CursorTranscriptTurn::Working)
         );
 
@@ -2288,7 +2339,7 @@ mod tests {
 "#,
         );
         assert_eq!(
-            cursor_transcript_turn(&path),
+            cursor_transcript_turn(&path).map(|(turn, _)| turn),
             Some(CursorTranscriptTurn::Working)
         );
 
@@ -2299,7 +2350,7 @@ mod tests {
 "#,
         );
         assert_eq!(
-            cursor_transcript_turn(&path),
+            cursor_transcript_turn(&path).map(|(turn, _)| turn),
             Some(CursorTranscriptTurn::Idle)
         );
 
@@ -2310,7 +2361,7 @@ mod tests {
 "#,
         );
         assert_eq!(
-            cursor_transcript_turn(&path),
+            cursor_transcript_turn(&path).map(|(turn, _)| turn),
             Some(CursorTranscriptTurn::Idle)
         );
     }

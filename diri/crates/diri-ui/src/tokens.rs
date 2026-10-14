@@ -144,6 +144,10 @@ pub struct SemanticColors {
     /// density, 0 paints every glass surface solid, and values above 1 thin
     /// the tints toward clear. Ignored by opaque windows.
     transparency: f32,
+    /// Modern's clear glass: every glass tint carries [`Self::CLEAR_GLASS`]
+    /// of its authored coverage, so the desktop reads through the whole
+    /// window, terminal included. Ignored by opaque windows.
+    clear: bool,
     /// How far the palette is from dark (0) to light (1). Every real theme
     /// sits at an end. A fade between a dark and a light theme passes through
     /// the middle, and the values that differ by appearance travel with it
@@ -164,6 +168,7 @@ impl SemanticColors {
             floating_surface: rgba_f32(0.949, 0.953, 0.941, 1.0),
             material: Material::Opaque,
             transparency: 1.0,
+            clear: false,
             lightness: 1.0,
         }
     }
@@ -180,6 +185,7 @@ impl SemanticColors {
             floating_surface: rgba_f32(0.141, 0.161, 0.196, 1.0),
             material: Material::Opaque,
             transparency: 1.0,
+            clear: false,
             lightness: 0.0,
         }
     }
@@ -234,6 +240,7 @@ impl SemanticColors {
             floating_surface,
             material: Material::Opaque,
             transparency: 1.0,
+            clear: false,
             lightness: match appearance {
                 Appearance::Dark => 0.0,
                 Appearance::Light => 1.0,
@@ -293,17 +300,37 @@ impl SemanticColors {
         self.transparency
     }
 
+    /// Thins every glass tint to Modern's clear glass. See [`Self::clear`].
+    pub const fn with_clear_glass(mut self, clear: bool) -> Self {
+        self.clear = clear;
+        self
+    }
+
+    pub const fn clear_glass(self) -> bool {
+        self.clear
+    }
+
+    /// Share of each authored glass coverage that clear glass keeps. The
+    /// terminal lands near 50% over the blurred desktop: text stays legible
+    /// on the blur while the wallpaper's hue carries through every surface.
+    pub const CLEAR_GLASS: f32 = 0.55;
+
     /// Past this the sidebar tint is nearly gone and labels sit on raw
     /// wallpaper.
     pub const MAX_TRANSPARENCY: f32 = 1.5;
 
     fn glass_alpha(self, dark: f32, light: f32) -> f32 {
-        let shipped = self
+        let authored = self
             .between(
                 rgba_f32(0.0, 0.0, 0.0, dark),
                 rgba_f32(0.0, 0.0, 0.0, light),
             )
             .a;
+        let shipped = if self.clear {
+            authored * Self::CLEAR_GLASS
+        } else {
+            authored
+        };
         // Return the authored constant untouched at the default so the
         // shipped look is bit-for-bit what it was before the slider.
         if self.transparency == 1.0 {
@@ -443,7 +470,9 @@ impl Ink {
     pub fn working(kind: crate::AgentKind, semantic: SemanticColors) -> Rgba {
         match kind {
             crate::AgentKind::ClaudeCode | crate::AgentKind::Note => Palette::CLAY,
-            crate::AgentKind::Codex | crate::AgentKind::Cursor => semantic.primary.alpha(0.96),
+            crate::AgentKind::Codex | crate::AgentKind::Cursor | crate::AgentKind::Agent(_) => {
+                semantic.primary.alpha(0.96)
+            }
             crate::AgentKind::Gemini => Palette::GEMINI_BLUE,
             crate::AgentKind::Shell | crate::AgentKind::Generic => Self::GENERIC_WORKING,
         }
@@ -474,7 +503,9 @@ impl Ink {
             crate::AgentKind::Codex => rgba_f32(0.180, 0.800, 0.741, 1.0),
             crate::AgentKind::Cursor => rgba_f32(0.62, 0.45, 0.95, 1.0),
             crate::AgentKind::Gemini => rgba_f32(0.85, 0.40, 0.55, 1.0),
-            crate::AgentKind::Shell | crate::AgentKind::Generic => rgba_f32(0.62, 0.64, 0.68, 1.0),
+            crate::AgentKind::Shell | crate::AgentKind::Generic | crate::AgentKind::Agent(_) => {
+                rgba_f32(0.62, 0.64, 0.68, 1.0)
+            }
         }
     }
 }
@@ -580,7 +611,7 @@ impl Space {
 pub struct Metrics;
 
 impl Metrics {
-    pub const TITLE_BAR: f32 = 42.0;
+    pub const TITLE_BAR: f32 = 48.0;
     pub const TOOLBAR_EDGE_INSET: f32 = 12.0;
     pub const TOOLBAR_TRAFFIC_LIGHT_LANE: f32 = 66.0;
     pub const TOOLBAR_ITEM_GAP: f32 = 8.0;
@@ -619,6 +650,11 @@ impl Motion {
     pub const OVERLAY_FADE: f32 = 0.12;
     /// The way out of an overlay fade: shorter, because the hand has moved on.
     pub const OVERLAY_FADE_OUT: f32 = 0.08;
+    /// Hover-out on list rows and tabs. Hover-in is instant; only the row the
+    /// pointer just left keeps a fading fill this long, so a sweep reads as a
+    /// soft trail rather than rows blinking. Short enough that the trail never
+    /// looks like a second, lagging cursor.
+    pub const HOVER_LINGER: f32 = 0.11;
     /// Sidebar and inspector open/close. Longer than the fades above because
     /// the seam moves a whole panel width and pushes the workbench with it.
     pub const SEAM_SLIDE_MS: u64 = 260;

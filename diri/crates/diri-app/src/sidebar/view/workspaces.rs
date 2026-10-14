@@ -1,9 +1,7 @@
 mod groups;
 mod project_agents;
 use super::*;
-use diri_proto::workspace::{
-    DockEdge, PaneId, TabId, WorkspaceId, WorkspaceMutation, WorkspaceRecord,
-};
+use diri_proto::workspace::{PaneId, TabId, WorkspaceId, WorkspaceMutation, WorkspaceRecord};
 use groups::{WorkspaceRowKey, project_groups};
 use project_agents::{ProjectAgentOpen, first_agent, focused_agent};
 
@@ -47,11 +45,6 @@ pub(super) enum WorkspaceEditor {
 #[derive(Clone)]
 pub(super) enum SessionDestination {
     Tab(WorkspaceId),
-    Split {
-        tab: TabId,
-        pane: PaneId,
-        edge: DockEdge,
-    },
 }
 pub(super) struct WorkspaceNavigation {
     pub active: Option<WorkspaceId>,
@@ -127,7 +120,7 @@ fn tab_title(tab: &diri_proto::workspace::WorkspaceTab, store: &SessionStore) ->
         .sessions()
         .get(focused_agent(tab).unwrap_or_else(|| first_agent(&tab.layout)))
         .map(|session| display_title(session))
-        .unwrap_or_else(|| "Unavailable session".into())
+        .unwrap_or_else(|| t("sidebar.workspace.unavailable_session").into())
 }
 
 fn workspace_menu_targets(
@@ -314,23 +307,12 @@ impl Sidebar {
         cx.emit(SidebarEvent::WorkspaceActivated(id));
         cx.notify();
     }
-    pub(crate) fn choose_split_session(
-        &mut self,
-        tab: TabId,
-        pane: PaneId,
-        edge: DockEdge,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.workspace_nav.editor = None;
-        self.workspace_nav.destination = Some(SessionDestination::Split { tab, pane, edge });
-        self.workspace_nav.highlighted_session = None;
-        self.workspace_nav.menu = true;
-        self.workspace_nav.query.clear();
-        self.workspace_nav.focus.focus(window, cx);
-        self.peek(window, cx);
-        cx.notify();
+    /// Settles workspace navigation outside a render, for a store change
+    /// the sidebar would otherwise only see when it next paints.
+    pub(crate) fn settle_workspace_navigation(&mut self, cx: &mut Context<Self>) {
+        self.reconcile_workspace_navigation(cx);
     }
+
     pub(super) fn reconcile_workspace_navigation(&mut self, cx: &mut Context<Self>) {
         self.reconcile_project_agent(cx);
         self.reconcile_workspace_activation(cx);
@@ -533,12 +515,6 @@ impl Sidebar {
                 session_id: id,
                 title: None,
             },
-            SessionDestination::Split { tab, pane, edge } => WorkspaceMutation::SplitPane {
-                tab_id: tab,
-                target: pane,
-                session_id: id,
-                edge,
-            },
         };
         if self.store.write().expect("store").edit_workspace(mutation) {
             self.workspace_nav.menu = false;
@@ -576,7 +552,7 @@ impl Sidebar {
                 return div()
                     .p(px(14.0))
                     .text_color(colors.secondary)
-                    .child("Loading workspaces…")
+                    .child(t("sidebar.workspace.loading"))
                     .into_any_element();
             };
             project_groups(
@@ -592,7 +568,7 @@ impl Sidebar {
         let mut rows = div()
             .id("workspace-tabs")
             .role(Role::TabList)
-            .aria_label("Workspace tabs")
+            .aria_label(t("sidebar.workspace.tabs"))
             .flex()
             .gap(px(3.0));
         if horizontal {
@@ -783,7 +759,7 @@ impl Sidebar {
                         remove.0
                     )))
                     .role(Role::Button)
-                    .aria_label("Remove tab from workspace")
+                    .aria_label(t("sidebar.workspace.remove_tab"))
                     .size(px(14.0))
                     .flex_none()
                     .flex()
@@ -965,7 +941,7 @@ impl Sidebar {
                     div()
                         .text_size(px(12.0))
                         .text_color(colors.secondary)
-                        .child("Loading workspaces…"),
+                        .child(t("sidebar.workspace.loading")),
                 );
             }
             crate::store::WorkspaceCatalogStatus::Unavailable(detail) => {
@@ -980,11 +956,11 @@ impl Sidebar {
                         div()
                             .id("retry-workspaces")
                             .role(Role::Button)
-                            .aria_label("Retry loading workspaces")
+                            .aria_label(t("sidebar.workspace.retry_aria"))
                             .cursor_pointer()
                             .p(px(6.0))
                             .text_size(px(12.0))
-                            .child("Retry")
+                            .child(t("sidebar.retry"))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.store.write().expect("store").refresh_workspaces();
                                 cx.notify();
@@ -1006,13 +982,13 @@ impl Sidebar {
             self.workspace_nav.editor,
             Some(WorkspaceEditor::RenameTab(_))
         ) {
-            "Tab name"
+            t("sidebar.workspace.tab_name")
         } else if self.workspace_nav.editor.is_some() {
-            "Workspace name"
+            t("sidebar.workspace.name")
         } else if self.workspace_nav.destination.is_some() {
-            "Find a session"
+            t("sidebar.workspace.find_session")
         } else {
-            "Workspaces"
+            t("sidebar.workspace.title")
         };
         panel = panel.child(
             div()
@@ -1049,7 +1025,7 @@ impl Sidebar {
                     .py(px(6.0))
                     .text_size(px(11.0))
                     .text_color(colors.tertiary)
-                    .child("Return to save · Escape to cancel"),
+                    .child(t("sidebar.workspace.edit_keys")),
             );
             return Some(panel);
         }
@@ -1060,7 +1036,7 @@ impl Sidebar {
                     .px(px(5.0))
                     .text_size(px(10.0))
                     .text_color(colors.tertiary)
-                    .child("↑ ↓ to choose · Return to add"),
+                    .child(t("sidebar.workspace.choose_keys")),
             );
         }
         let mut choices = div()
@@ -1072,37 +1048,6 @@ impl Sidebar {
             .max_h(px(330.0))
             .overflow_y_scroll();
         if let Some(destination) = &self.workspace_nav.destination {
-            if let SessionDestination::Split { tab, pane, edge } = destination {
-                let right = *edge == DockEdge::Right;
-                let tab = tab.clone();
-                let pane = pane.clone();
-                panel = panel.child(
-                    div()
-                        .id("workspace-split-direction")
-                        .role(Role::Button)
-                        .aria_label("Change split direction")
-                        .p(px(6.0))
-                        .cursor_pointer()
-                        .text_size(px(12.0))
-                        .child(if right {
-                            "Side by side  ↔"
-                        } else {
-                            "Top and bottom  ↕"
-                        })
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.workspace_nav.destination = Some(SessionDestination::Split {
-                                tab: tab.clone(),
-                                pane: pane.clone(),
-                                edge: if right {
-                                    DockEdge::Bottom
-                                } else {
-                                    DockEdge::Right
-                                },
-                            });
-                            cx.notify();
-                        })),
-                );
-            }
             let sessions = session_choices(&store, &query);
             if self
                 .workspace_nav
@@ -1119,7 +1064,7 @@ impl Sidebar {
                         .p(px(7.0))
                         .text_size(px(12.0))
                         .text_color(colors.secondary)
-                        .child("No matching sessions"),
+                        .child(t("sidebar.workspace.no_matches")),
                 );
             }
             for session in sessions {
@@ -1129,14 +1074,17 @@ impl Sidebar {
                 let title = display_title(&session);
                 let detail = format!(
                     "{} · {}",
-                    session.host.as_deref().unwrap_or("Local"),
+                    session
+                        .host
+                        .as_deref()
+                        .unwrap_or(t("sidebar.workspace.local")),
                     session.cwd
                 );
                 choices = choices.child(
                     div()
                         .id(SharedString::from(format!("workspace-session-{}", id.0)))
                         .role(Role::Button)
-                        .aria_label(format!("Add {title}"))
+                        .aria_label(tf("sidebar.workspace.add_session", &[("title", &title)]))
                         .aria_selected(selected)
                         .when(selected, |row| row.bg(colors.primary.alpha(0.08)))
                         .px(px(7.0))
@@ -1179,7 +1127,7 @@ impl Sidebar {
                     div()
                         .id("workspace-all-sessions")
                         .role(Role::Button)
-                        .aria_label("Browse all sessions")
+                        .aria_label(t("sidebar.workspace.browse_all"))
                         .bg(if self.workspace_nav.highlighted_workspace == Some(None) {
                             colors.primary.alpha(0.10)
                         } else {
@@ -1193,7 +1141,7 @@ impl Sidebar {
                         .rounded(px(6.0))
                         .cursor_pointer()
                         .hover(move |row| row.bg(colors.primary.alpha(0.06)))
-                        .child("Projects")
+                        .child(t("sidebar.workspace.projects"))
                         .on_click(cx.listener(|this, _, _, cx| this.activate_workspace(None, cx))),
                 );
             }
@@ -1247,7 +1195,7 @@ impl Sidebar {
                                 div()
                                     .id(SharedString::from(format!("rename-workspace-{}", id.0)))
                                     .role(Role::Button)
-                                    .aria_label("Rename workspace")
+                                    .aria_label(t("sidebar.workspace.rename"))
                                     .size(px(20.0))
                                     .flex()
                                     .items_center()
@@ -1289,7 +1237,7 @@ impl Sidebar {
                 let mut actions = div().flex().items_center().gap(px(4.0)).pt(px(5.0));
                 for (label, icon, mutation, enabled) in [
                     (
-                        "Move workspace up",
+                        "sidebar.workspace.move_up",
                         "arrow.up",
                         WorkspaceMutation::MoveWorkspace {
                             workspace_id: workspace.id.clone(),
@@ -1298,7 +1246,7 @@ impl Sidebar {
                         index > 0,
                     ),
                     (
-                        "Move workspace down",
+                        "sidebar.workspace.move_down",
                         "arrow.down",
                         WorkspaceMutation::MoveWorkspace {
                             workspace_id: workspace.id.clone(),
@@ -1307,7 +1255,7 @@ impl Sidebar {
                         index + 1 < snapshot.workspaces.len(),
                     ),
                     (
-                        "Remove workspace",
+                        "sidebar.workspace.remove",
                         "trash",
                         WorkspaceMutation::RemoveWorkspace {
                             workspace_id: workspace.id.clone(),
@@ -1319,7 +1267,7 @@ impl Sidebar {
                         div()
                             .id(SharedString::from(label))
                             .role(Role::Button)
-                            .aria_label(label)
+                            .aria_label(t(label))
                             .h(px(28.0))
                             .px(px(8.0))
                             .flex()
@@ -1333,8 +1281,12 @@ impl Sidebar {
                                     .hover(move |button| button.bg(colors.primary.alpha(0.07)))
                             })
                             .child(sf_symbol(icon, 11.0, colors.secondary))
-                            .when(label == "Remove workspace", |button| {
-                                button.child(div().text_size(px(11.0)).child("Remove"))
+                            .when(label == "sidebar.workspace.remove", |button| {
+                                button.child(
+                                    div()
+                                        .text_size(px(11.0))
+                                        .child(t("sidebar.workspace.remove_short")),
+                                )
                             })
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 if enabled {
@@ -1352,7 +1304,7 @@ impl Sidebar {
                         .px(px(5.0))
                         .text_size(px(10.0))
                         .text_color(colors.tertiary)
-                        .child("Removing a workspace keeps its sessions running."),
+                        .child(t("sidebar.workspace.remove_detail")),
                 );
             }
             if let Some(workspace) = self.workspace_nav.active.clone() {
@@ -1360,14 +1312,14 @@ impl Sidebar {
                     div()
                         .id("workspace-add-existing-agent")
                         .role(Role::Button)
-                        .aria_label("Open existing agent in this layout")
+                        .aria_label(t("sidebar.workspace.open_existing_aria"))
                         .h(px(30.0))
                         .px(px(7.0))
                         .flex()
                         .items_center()
                         .cursor_pointer()
                         .text_size(px(12.0))
-                        .child("Open existing agent…")
+                        .child(t("sidebar.workspace.open_existing"))
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.workspace_nav.destination =
                                 Some(SessionDestination::Tab(workspace.clone()));
@@ -1381,7 +1333,7 @@ impl Sidebar {
                 div()
                     .id("new-workspace")
                     .role(Role::Button)
-                    .aria_label("Create workspace")
+                    .aria_label(t("sidebar.workspace.create"))
                     .h(px(30.0))
                     .px(px(7.0))
                     .flex()
@@ -1391,7 +1343,7 @@ impl Sidebar {
                     .cursor_pointer()
                     .hover(move |row| row.bg(colors.primary.alpha(0.06)))
                     .child(sf_symbol("plus", 11.0, colors.secondary))
-                    .child(div().text_size(px(12.0)).child("New workspace"))
+                    .child(div().text_size(px(12.0)).child(t("sidebar.workspace.new")))
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.begin_workspace_editor(WorkspaceEditor::Create, "", window, cx)
                     })),
@@ -1404,6 +1356,7 @@ impl Sidebar {
     pub(super) fn workspace_strip(
         &mut self,
         colors: SemanticColors,
+        trailing: Option<AnyElement>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         self.end_lift_if_released(cx);
@@ -1418,30 +1371,33 @@ impl Sidebar {
                 },
             ))
             .titlebar_drag_area()
-            .h(px(crate::tab_navigation::TAB_STRIP_HEIGHT))
+            .h(px(self.tab_strip_height()))
             .w_full()
             .flex_none()
             .flex()
             .items_center()
             .relative()
-            .py(px(6.0))
+            .pt(px(
+                6.0 + self.tab_strip_height() - crate::tab_navigation::TAB_STRIP_HEIGHT
+            ))
+            .pb(px(6.0))
             .gap(px(0.0))
-            .pl(px(if crate::window_chrome::traffic_lights_visible() && !self.ui.visible {
-                92.0
-            } else {
-                10.0
-            }))
+            .pl(px(self.strip_leading_inset()))
             .pr(px(10.0 + self.strip_caption_inset))
-            .child(
-                div()
-                    .absolute()
-                    .left(px(0.0))
-                    .right(px(0.0))
-                    .bottom(px(0.0))
-                    .h(px(1.0))
-                    .bg(colors.primary.alpha(0.07)),
-            )
-            .bg(colors.sidebar_surface())
+            // Comfortable: the island below is the edge, so no hairline.
+            .when(!self.islands(), |strip| {
+                strip.child(
+                    div()
+                        .absolute()
+                        .left(px(0.0))
+                        .right(px(0.0))
+                        .bottom(px(0.0))
+                        .h(px(1.0))
+                        .bg(colors.primary.alpha(0.07)),
+                )
+            })
+            // Islands already paint this chrome; a second tint would darken it.
+            .when(!self.islands(), |strip| strip.bg(colors.sidebar_surface()))
             .child(
                 div()
                     .flex_1()
@@ -1451,13 +1407,19 @@ impl Sidebar {
                     .items_center()
                     // Content only: the strip's own fill keeps its color.
                     .opacity(self.title_opacity)
-                    .child(self.project_control(colors, cx))
+            .child(
+                // A breath between the project control and the first tab.
+                div()
+                    .flex_none()
+                    .mr(px(diri_ui::Metrics::TOOLBAR_COMPACT_GAP + 2.0))
+                    .child(self.project_control(colors, cx)),
+            )
             .child(self.workspace_rows(true, colors, cx))
             .child(
                 div()
                     .id("horizontal-workspace-add-tab")
                     .role(Role::Button)
-                    .aria_label("New Agent")
+                    .aria_label(t("sidebar.new_agent"))
                     .size(px(26.0))
                     .flex_none()
                     .flex()
@@ -1471,6 +1433,16 @@ impl Sidebar {
                     })),
             )
             )
+            .when_some(trailing, |strip, trailing| {
+                strip.child(
+                    div()
+                        .flex_none()
+                        .ml(px(6.0))
+                        .flex()
+                        .items_center()
+                        .child(trailing),
+                )
+            })
             .into_any_element()
     }
 }

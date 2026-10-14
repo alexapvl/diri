@@ -16,11 +16,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(any(target_os = "macos", windows, test))]
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use diri_updater::Release;
+use crate::i18n::{t, tf};
 #[cfg(any(target_os = "macos", windows))]
 use diri_updater::UpdaterConfig;
+use diri_updater::{Release, UpdateChannel};
 #[cfg(any(target_os = "macos", windows, test))]
-use diri_updater::{Result as UpdateResult, StagedUpdate, UpdateError, Updater};
+use diri_updater::{Result as UpdateResult, SourceReport, StagedUpdate, UpdateError, Updater};
 use tokio::runtime::Runtime;
 use tokio::sync::{mpsc, watch};
 
@@ -49,6 +50,12 @@ trait UpdateBackend: Send + Sync {
         on_progress: &mut dyn FnMut(f32),
     ) -> UpdateResult<StagedUpdate>;
     fn install(&self, staged: &StagedUpdate, relaunch: bool) -> UpdateResult<()>;
+    /// Which route (GitHub or the mirror) served the last network step.
+    fn take_source(&self) -> Option<SourceReport> {
+        None
+    }
+    /// Points later checks at another channel's feed.
+    fn set_channel(&self, _channel: UpdateChannel) {}
 }
 
 #[cfg(any(target_os = "macos", windows, test))]
@@ -80,6 +87,14 @@ impl UpdateBackend for Updater {
 
     fn install(&self, staged: &StagedUpdate, relaunch: bool) -> UpdateResult<()> {
         Updater::install(self, staged, relaunch)
+    }
+
+    fn take_source(&self) -> Option<SourceReport> {
+        Updater::take_source(self)
+    }
+
+    fn set_channel(&self, channel: UpdateChannel) {
+        Updater::set_channel(self, channel);
     }
 }
 
@@ -165,22 +180,34 @@ impl UpdateState {
     /// One line for the account footer and the Settings row.
     pub fn summary(&self) -> String {
         match &self.phase {
-            UpdatePhase::Unsupported(_) => "Updates off for this build".to_owned(),
+            UpdatePhase::Unsupported(_) => t("settings.updates.off").to_owned(),
             UpdatePhase::Idle => format!("diri {}", self.current_version),
-            UpdatePhase::Checking => "Checking for updates…".to_owned(),
-            UpdatePhase::UpToDate => format!("diri {} is up to date", self.current_version),
-            UpdatePhase::Available(release) if self.is_downgrade(&release.version) => {
-                format!("Switch to {}", release.version)
-            }
-            UpdatePhase::Available(release) => format!("Update to {}", release.version),
-            UpdatePhase::Downloading { progress, .. } => {
-                format!("Downloading… {}%", (progress * 100.0).round() as u32)
-            }
-            UpdatePhase::Ready(release) if self.is_downgrade(&release.version) => {
-                format!("Restart to switch to {}", release.version)
-            }
-            UpdatePhase::Ready(release) => format!("Restart to update to {}", release.version),
-            UpdatePhase::Installing => "Restarting…".to_owned(),
+            UpdatePhase::Checking => t("settings.updates.checking").to_owned(),
+            UpdatePhase::UpToDate => tf(
+                "settings.updates.up_to_date",
+                &[("version", &self.current_version)],
+            ),
+            UpdatePhase::Available(release) if self.is_downgrade(&release.version) => tf(
+                "settings.updates.switch_to",
+                &[("version", &release.version)],
+            ),
+            UpdatePhase::Available(release) => tf(
+                "settings.updates.update_to",
+                &[("version", &release.version)],
+            ),
+            UpdatePhase::Downloading { progress, .. } => tf(
+                "settings.updates.downloading",
+                &[("percent", &((progress * 100.0).round() as u32))],
+            ),
+            UpdatePhase::Ready(release) if self.is_downgrade(&release.version) => tf(
+                "settings.updates.restart_to_switch",
+                &[("version", &release.version)],
+            ),
+            UpdatePhase::Ready(release) => tf(
+                "settings.updates.restart_to_update",
+                &[("version", &release.version)],
+            ),
+            UpdatePhase::Installing => t("settings.updates.restarting").to_owned(),
             UpdatePhase::Failed(reason) => reason.clone(),
         }
     }
@@ -204,6 +231,9 @@ pub enum UpdateCommand {
     /// Unlike a regular update the target may be older than the running build;
     /// the same signature and checksum checks apply.
     InstallVersion(String),
+    /// Follow another channel's feed: drop whatever the old channel offered
+    /// or staged, then check the new one.
+    SetChannel(UpdateChannel),
 }
 
 /// UI-side handle: a state stream plus a command sink.
@@ -263,6 +293,7 @@ impl UpdateHandle {
             },
             Some(ready.staged.release.version.as_str()),
             installed.as_ref().err(),
+            None,
             started,
             false,
         );
@@ -279,26 +310,18 @@ impl UpdateHandle {
 #[cfg(any(target_os = "macos", windows, test))]
 /// One updater step for the flight recorder. A failure carries the error's
 /// class and its scrubbed text (release URLs are public; home paths and user
-/// names are scrubbed).
+/// names are scrubbed). `source` says which route answered — GitHub or the
+/// update mirror — as closed labels only.
 fn record_update(
     kind: &'static str,
     outcome: &'static str,
     version: Option<&str>,
     error: Option<&UpdateError>,
+    source: Option<SourceReport>,
     started: std::time::Instant,
     user_initiated: bool,
 ) {
-    let error_kind = error.map(|error| match error {
-        UpdateError::NotUpdatable(_) => "not_updatable",
-        UpdateError::Network(_) => "network",
-        UpdateError::Feed(_) => "feed",
-        UpdateError::UntrustedUrl(_) => "untrusted_url",
-        UpdateError::Integrity(_) => "integrity",
-        UpdateError::Signature(_) => "signature",
-        UpdateError::NotWritable(_) => "not_writable",
-        UpdateError::Io(_) => "io",
-        UpdateError::Tool { .. } => "tool",
-    });
+    let error_kind = error.map(UpdateError::kind);
     let fields = vec![
         ("outcome", diri_telemetry::Value::from(outcome)),
         ("from", diri_telemetry::Value::from(CURRENT_VERSION)),
@@ -312,6 +335,25 @@ fn record_update(
         ),
         ("ms", diri_telemetry::Value::from(started.elapsed())),
         ("error_kind", diri_telemetry::Value::from(error_kind)),
+        (
+            "http_status",
+            diri_telemetry::Value::from(error.and_then(|error| match error {
+                UpdateError::Network { failure, .. } => failure.http_status(),
+                _ => None,
+            })),
+        ),
+        (
+            "source",
+            diri_telemetry::Value::from(source.map(|source| source.source.label())),
+        ),
+        (
+            "github_error",
+            diri_telemetry::Value::from(source.and_then(|source| source.github_error)),
+        ),
+        (
+            "mirror_error",
+            diri_telemetry::Value::from(source.and_then(|source| source.mirror_error)),
+        ),
     ];
     // An unsupported build (a `cargo run`) failing to update is expected.
     let severity = match error {
@@ -327,11 +369,16 @@ fn record_update(
 ///
 /// Never fails: a build that cannot update itself still gets a handle, parked
 /// in [`UpdatePhase::Unsupported`], so no caller needs an `Option`.
-pub fn spawn(runtime: &Arc<Runtime>, automatic: bool, skipped: Option<String>) -> UpdateHandle {
+pub fn spawn(
+    runtime: &Arc<Runtime>,
+    automatic: bool,
+    skipped: Option<String>,
+    channel: UpdateChannel,
+) -> UpdateHandle {
     #[cfg(not(any(target_os = "macos", windows)))]
     {
-        let _ = (runtime, automatic, skipped);
-        unsupported("Use the installed package or download a newer Linux release from GitHub")
+        let _ = (runtime, automatic, skipped, channel);
+        unsupported(t("settings.updates.linux_unsupported"))
     }
 
     #[cfg(any(target_os = "macos", windows))]
@@ -347,7 +394,11 @@ pub fn spawn(runtime: &Arc<Runtime>, automatic: bool, skipped: Option<String>) -
 
         let updater: Option<Arc<dyn UpdateBackend>> =
             match UpdaterConfig::for_running_app(CURRENT_VERSION) {
-                Ok(config) => Some(Arc::new(Updater::new(config))),
+                Ok(config) => {
+                    let updater = Updater::new(config);
+                    updater.set_channel(channel);
+                    Some(Arc::new(updater))
+                }
                 Err(error) => {
                     state_tx.send_replace(UpdateState {
                         phase: UpdatePhase::Unsupported(error.to_string()),
@@ -514,6 +565,21 @@ impl Service {
             }
             UpdateCommand::ListReleases => self.list_releases().await,
             UpdateCommand::InstallVersion(version) => self.install_version(version).await,
+            UpdateCommand::SetChannel(channel) => {
+                self.updater.set_channel(channel);
+                // Commands run one at a time, so no download is in flight. An
+                // offer or a staged build from the old channel must not
+                // install on quit once the user has left that channel.
+                self.pending = None;
+                self.staged = None;
+                self.ready_install.lock().expect("ready update").take();
+                let previous = self.state.borrow().clone();
+                self.state.send_replace(UpdateState {
+                    releases: Vec::new(),
+                    ..previous
+                });
+                self.check(true).await;
+            }
         }
     }
 
@@ -530,7 +596,7 @@ impl Service {
             }
             Ok(Err(error)) => self.fail(&error, true),
             Err(_) => self.publish(
-                UpdatePhase::Failed("The release list stopped unexpectedly".to_owned()),
+                UpdatePhase::Failed(t("settings.updates.releases_stopped").to_owned()),
                 true,
             ),
         }
@@ -566,7 +632,7 @@ impl Service {
             }
             Err(_) => {
                 self.publish(
-                    UpdatePhase::Failed("The version lookup stopped unexpectedly".to_owned()),
+                    UpdatePhase::Failed(t("settings.updates.lookup_stopped").to_owned()),
                     true,
                 );
                 return;
@@ -619,6 +685,7 @@ impl Service {
                 .and_then(Option::as_ref)
                 .map(|release| release.version.as_str()),
             found.as_ref().ok().and_then(|found| found.as_ref().err()),
+            self.updater.take_source(),
             started,
             user_initiated,
         );
@@ -639,7 +706,7 @@ impl Service {
             }
             Ok(Err(error)) => self.fail(&error, user_initiated),
             Err(_) => self.publish(
-                UpdatePhase::Failed("The update check stopped unexpectedly".to_owned()),
+                UpdatePhase::Failed(t("settings.updates.check_stopped").to_owned()),
                 user_initiated,
             ),
         }
@@ -708,6 +775,7 @@ impl Service {
                 .as_ref()
                 .ok()
                 .and_then(|staged| staged.as_ref().err()),
+            self.updater.take_source(),
             started,
             user_initiated,
         );
@@ -723,7 +791,7 @@ impl Service {
             }
             Ok(Err(error)) => self.fail(&error, user_initiated),
             Err(_) => self.publish(
-                UpdatePhase::Failed("The download stopped unexpectedly".to_owned()),
+                UpdatePhase::Failed(t("settings.updates.download_stopped").to_owned()),
                 user_initiated,
             ),
         }
@@ -745,6 +813,7 @@ impl Service {
             },
             Some(ready.staged.release.version.as_str()),
             installed.as_ref().err(),
+            None,
             started,
             true,
         );
@@ -801,6 +870,7 @@ mod tests {
         offered: Release,
         downloads: AtomicUsize,
         installs: Mutex<Vec<bool>>,
+        channels: Mutex<Vec<UpdateChannel>>,
     }
 
     impl UpdateBackend for FakeUpdater {
@@ -842,6 +912,10 @@ mod tests {
         fn install(&self, _staged: &StagedUpdate, relaunch: bool) -> UpdateResult<()> {
             self.installs.lock().expect("installs").push(relaunch);
             Ok(())
+        }
+
+        fn set_channel(&self, channel: UpdateChannel) {
+            self.channels.lock().expect("channels").push(channel);
         }
     }
 
@@ -937,6 +1011,7 @@ mod tests {
                 offered: release("0.5.0"),
                 downloads: AtomicUsize::new(0),
                 installs: Mutex::new(Vec::new()),
+                channels: Mutex::new(Vec::new()),
             });
             let backend: Arc<dyn UpdateBackend> = updater.clone();
             let (state_tx, mut state_rx) = watch::channel(UpdateState::default());
@@ -991,6 +1066,7 @@ mod tests {
                 offered: release("0.5.0"),
                 downloads: AtomicUsize::new(0),
                 installs: Mutex::new(Vec::new()),
+                channels: Mutex::new(Vec::new()),
             });
             let backend: Arc<dyn UpdateBackend> = updater.clone();
             let (state_tx, mut state_rx) = watch::channel(UpdateState::default());
@@ -1048,6 +1124,7 @@ mod tests {
                 offered: release("0.5.0"),
                 downloads: AtomicUsize::new(0),
                 installs: Mutex::new(Vec::new()),
+                channels: Mutex::new(Vec::new()),
             });
             let backend: Arc<dyn UpdateBackend> = updater.clone();
             let (state_tx, mut state_rx) = watch::channel(UpdateState::default());
@@ -1098,6 +1175,7 @@ mod tests {
                 offered: release("0.5.0"),
                 downloads: AtomicUsize::new(0),
                 installs: Mutex::new(Vec::new()),
+                channels: Mutex::new(Vec::new()),
             });
             let backend: Arc<dyn UpdateBackend> = updater.clone();
             let (state_tx, mut state_rx) = watch::channel(UpdateState::default());
@@ -1163,6 +1241,7 @@ mod tests {
             offered: release("0.8.0"),
             downloads: AtomicUsize::new(0),
             installs: Mutex::new(Vec::new()),
+            channels: Mutex::new(Vec::new()),
         });
         let phase = drain_service(
             updater.clone(),
@@ -1215,7 +1294,10 @@ mod tests {
             ) -> UpdateResult<StagedUpdate> {
                 if self.0.downloads.load(Ordering::SeqCst) == 0 {
                     self.0.downloads.fetch_add(1, Ordering::SeqCst);
-                    return Err(UpdateError::Network("interrupted".to_owned()));
+                    return Err(UpdateError::Network {
+                        failure: diri_updater::NetworkFailure::Other,
+                        detail: "interrupted".to_owned(),
+                    });
                 }
                 self.0.download_and_stage(release, on_progress)
             }
@@ -1227,6 +1309,7 @@ mod tests {
             offered: release("0.8.0"),
             downloads: AtomicUsize::new(0),
             installs: Mutex::new(Vec::new()),
+            channels: Mutex::new(Vec::new()),
         }));
         let phase = drain_service(
             updater.clone(),
@@ -1248,6 +1331,7 @@ mod tests {
             offered: release("0.5.0"),
             downloads: AtomicUsize::new(0),
             installs: Mutex::new(Vec::new()),
+            channels: Mutex::new(Vec::new()),
         });
         let backend: Arc<dyn UpdateBackend> = updater.clone();
         let ready_install = Arc::new(Mutex::new(Some(ReadyInstall {
@@ -1287,6 +1371,7 @@ mod tests {
                 offered: release("0.5.0"),
                 downloads: AtomicUsize::new(0),
                 installs: Mutex::new(Vec::new()),
+                channels: Mutex::new(Vec::new()),
             });
             let backend: Arc<dyn UpdateBackend> = updater.clone();
             let (state_tx, state_rx) = watch::channel(UpdateState::default());
@@ -1327,6 +1412,76 @@ mod tests {
                 *updater.installs.lock().expect("installs"),
                 vec![false],
                 "a normal quit must swap the staged app without reopening it"
+            );
+        });
+    }
+
+    #[test]
+    fn switching_channel_drops_the_staged_build_and_checks_the_new_feed() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("test runtime");
+        runtime.block_on(async {
+            let updater = Arc::new(FakeUpdater {
+                offered: release("0.5.0"),
+                downloads: AtomicUsize::new(0),
+                installs: Mutex::new(Vec::new()),
+                channels: Mutex::new(Vec::new()),
+            });
+            let backend: Arc<dyn UpdateBackend> = updater.clone();
+            let (state_tx, mut state_rx) = watch::channel(UpdateState::default());
+            let (command_tx, command_rx) = mpsc::unbounded_channel();
+            let ready_install = Arc::new(Mutex::new(None));
+            let task = tokio::spawn(service(
+                Some(backend),
+                true,
+                None,
+                state_tx,
+                command_rx,
+                Arc::clone(&ready_install),
+            ));
+
+            command_tx
+                .send(UpdateCommand::Check {
+                    user_initiated: false,
+                })
+                .expect("send check");
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !matches!(state_rx.borrow().phase, UpdatePhase::Ready(_)) {
+                    state_rx.changed().await.expect("service remains alive");
+                }
+            })
+            .await
+            .expect("automatic update reaches ready");
+            assert!(ready_install.lock().unwrap().is_some());
+
+            command_tx
+                .send(UpdateCommand::SetChannel(UpdateChannel::Nightly))
+                .expect("send channel");
+            // The new feed is checked, and its offer downloaded afresh.
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if updater.downloads.load(Ordering::SeqCst) == 2
+                        && matches!(state_rx.borrow().phase, UpdatePhase::Ready(_))
+                    {
+                        return;
+                    }
+                    state_rx.changed().await.expect("service remains alive");
+                }
+            })
+            .await
+            .expect("the new channel is checked");
+            task.abort();
+
+            assert_eq!(
+                *updater.channels.lock().unwrap(),
+                vec![UpdateChannel::Nightly]
+            );
+            assert_eq!(
+                updater.downloads.load(Ordering::SeqCst),
+                2,
+                "the old channel's staged build is not reused"
             );
         });
     }

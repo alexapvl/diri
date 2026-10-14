@@ -67,8 +67,9 @@ Either way you get the same universal build, signed and notarized, so it opens
 without a Gatekeeper prompt.
 
 The cask lives in [cristicretu/homebrew-diri](https://github.com/cristicretu/homebrew-diri)
-rather than `homebrew-cask`, which requires a notability threshold the project
-does not meet yet. It declares `auto_updates true`, so Homebrew installs diri
+for now. A submission to the official `homebrew/cask` repository is prepared in
+[packaging/homebrew](packaging/homebrew/README.md). The cask declares
+`auto_updates true`, so Homebrew installs diri
 once and then leaves it alone — diri updates itself after that, and
 `brew upgrade` will not clobber a build the app moved itself to. See
 [UPDATING.md](UPDATING.md) for how that works.
@@ -165,6 +166,16 @@ after adding or removing skills. Cached plugin versions are labeled separately;
 the catalogue does not activate skills or change provider configuration.
 
 ## Agent preferences
+
+On macOS, **Settings → Shortcuts → Application → Show or hide Diri globally**
+can record a system-wide shortcut that brings Diri to the front from another app.
+Press the same shortcut while Diri is in the foreground to hide it.
+It also restores a minimized main window or reopens it if it was closed. The shortcut is unassigned
+by default, persists across launches, and can be cleared or restored using the
+existing shortcut controls. Include Command, Control, or Option; Fn combinations
+are unsupported. Registration conflicts are shown without replacing the previous
+assignment. No Accessibility permission is required. Diri must still be running;
+the shortcut does not launch the app after quitting.
 
 The default agent is stored in
 `~/Library/Application Support/diri/prefs.json` as the agent manifest's stable

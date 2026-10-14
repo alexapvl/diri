@@ -8,8 +8,8 @@
 //! when:
 //!
 //! - its props changed (selection, activity mark or its frame, title, kind,
-//!   theme, held-⌘ hint, ordering mode, whether the shared selection pill
-//!   stands in for its fill);
+//!   theme, held-⌘ hint, ordering mode, hover-out fade, whether the shared
+//!   selection pill stands in for its fill);
 //! - it is lifted or sliding in a drag reorder, or its title is settling;
 //! - it was notified itself (its own hover, an animation frame it requested);
 //! - the sidebar was notified for anything other than a store publication or
@@ -39,8 +39,6 @@ pub(in crate::sidebar) struct StripTabProps {
     /// ⌘1–⌘8, then ⌘9 for the last tab.
     pub(super) rank: Option<usize>,
     pub(super) state: StatusState,
-    /// The activity mark's frame, or zero for a mark that does not animate.
-    pub(super) activity_frame: usize,
     /// Terminal progress, when the session reports any.
     pub(super) progress: Option<crate::progress_mark::ProgressFace>,
     pub(super) colors: SemanticColors,
@@ -58,6 +56,9 @@ pub(in crate::sidebar) struct StripTabProps {
     pub(super) settling: bool,
     /// A terminal's directory, shown when the pointer rests on its tab.
     pub(super) location: Option<String>,
+    /// The fraction of the hover fill a tab the pointer just left still
+    /// wears; it changes each frame of the fade (see `hover_linger`).
+    pub(super) hover_linger: f32,
 }
 
 impl StripTabProps {
@@ -133,11 +134,6 @@ impl Sidebar {
             active,
             rank,
             state,
-            activity_frame: if state == StatusState::Working {
-                self.activity_frame
-            } else {
-                0
-            },
             progress: crate::progress_mark::face(session, self.activity_frame, reduce_motion),
             colors,
             custom_ordering,
@@ -153,6 +149,11 @@ impl Sidebar {
             shift,
             settling: self.settling_title(id, 0.0).is_some(),
             location: crate::switcher::terminal_location(session),
+            hover_linger: if active {
+                0.0
+            } else {
+                self.tab_hover_linger(id)
+            },
         }
     }
 
@@ -162,9 +163,9 @@ impl Sidebar {
         props: StripTabProps,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        // An indeterminate progress sweep rides the working marks' tick.
-        self.working_row_rendered |= props.state == StatusState::Working
-            || props.progress.is_some_and(|face| face.animates());
+        // An indeterminate progress sweep rides the sidebar's tick. A working
+        // mark needs no tick: the window advances its frames by itself.
+        self.working_row_rendered |= props.progress.is_some_and(|face| face.animates());
         if props.shift.is_none() {
             self.tab_shift.applied.borrow_mut().remove(&props.id);
         }

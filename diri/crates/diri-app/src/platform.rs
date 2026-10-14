@@ -1,39 +1,43 @@
 //! User-facing desktop vocabulary that genuinely varies by operating system.
 
-pub const fn local_machine_label() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "This Mac"
+pub fn local_machine_label() -> &'static str {
+    crate::i18n::t(if cfg!(target_os = "macos") {
+        "platform.this_mac"
     } else if cfg!(windows) {
-        "This PC"
+        "platform.this_pc"
     } else {
-        "This computer"
-    }
+        "platform.this_computer"
+    })
 }
 
-pub const fn local_machine_label_lowercase() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "this Mac"
+pub fn local_machine_label_lowercase() -> &'static str {
+    crate::i18n::t(if cfg!(target_os = "macos") {
+        "platform.this_mac_lowercase"
     } else if cfg!(windows) {
-        "this PC"
+        "platform.this_pc_lowercase"
     } else {
-        "this computer"
-    }
+        "platform.this_computer_lowercase"
+    })
 }
 
 /// The button that opens a folder in the system file manager.
-pub const fn reveal_in_file_manager_label() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "Show in Finder"
+pub fn reveal_in_file_manager_label() -> &'static str {
+    crate::i18n::t(if cfg!(target_os = "macos") {
+        "settings.privacy.show_in_finder"
     } else if cfg!(windows) {
-        "Show in File Explorer"
+        "platform.show_in_file_explorer"
     } else {
-        "Show in Folder"
-    }
+        "platform.show_in_folder"
+    })
 }
 
 /// Leaving the app: macOS quits, Windows exits.
-pub const fn quit_label() -> &'static str {
-    if cfg!(windows) { "Exit Diri" } else { "Quit Diri" }
+pub fn quit_label() -> &'static str {
+    crate::i18n::t(if cfg!(windows) {
+        "command.exit.title"
+    } else {
+        "command.quit.title"
+    })
 }
 
 /// Whether the modifier diri's shortcuts, multi-select and link clicks use is

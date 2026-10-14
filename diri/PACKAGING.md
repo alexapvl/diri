@@ -19,8 +19,11 @@ The script builds every release binary, installs the locked browser-sidecar
 dependencies, validates the repository's license policy, and passes a declared
 resource manifest to cargo-packager. It emits an AppImage, a Debian package,
 `SHA256SUMS`, `linux-release.json`, and the third-party license inventory under
-`dist/linux`. `linux-release.json` records the version, source commit,
-platform, architecture, format, size, and SHA-256 digest of each artifact.
+`dist/linux`, named for the host architecture (`diri_<v>_x86_64.AppImage` and
+`diri_<v>_amd64.deb`, or `diri_<v>_aarch64.AppImage` and `diri_<v>_arm64.deb`).
+The script refuses to cross-build. `linux-release.json` records the version,
+source commit, platform, architecture, format, size, and SHA-256 digest of each
+artifact.
 
 The AppImage and Debian package have the same internal layout: executables in
 `usr/bin`, manifests and the browser sidecar in `usr/lib/diri`, desktop
@@ -29,8 +32,14 @@ tree. The Debian package declares the glibc 2.35, fontconfig, GLib, Vulkan,
 Wayland, X11/XCB, and xkbcommon runtime dependencies.
 
 Linux packages are always built on Ubuntu 22.04 to establish the oldest
-supported glibc floor, then installed and smoke-tested on clean Ubuntu 22.04
-and 24.04 CI jobs. The smoke covers X11 launch, package upgrade and uninstall,
+supported glibc floor (2.35), natively on both `ubuntu-22.04` (x86_64) and
+`ubuntu-22.04-arm` (aarch64), then installed and smoke-tested on clean Ubuntu
+22.04 and 24.04 CI jobs of the same architecture. A release-set job merges the
+two builds with `write-linux-release-manifest.py --merge`: one `SHA256SUMS`
+over all four packages, and one `linux-release.json` whose top-level
+`architecture`/`artifacts` stay the x86_64 build (the shape every release
+before aarch64 published) while the additive `builds` array lists every
+architecture with its Debian architecture name. The smoke covers X11 launch, package upgrade and uninstall,
 a live shell session, Engine restart/holder adoption, CLI hooks, and MCP. The
 workspace job additionally launches the GUI against headless Wayland. Manual
 native-GPU QA remains a release gate; virtual displays cannot validate real
@@ -43,6 +52,69 @@ release script fetches them from a Nightly run on that commit (dispatching one
 if needed), or takes `DIRI_LINUX_DIST` pointing at a downloaded artifact
 directory; the release is then created once with both platforms' immutable
 assets.
+
+### Linux signatures
+
+The Nightly `linux-package-release` job signs every AppImage and Debian
+package the merged `linux-release.json` declares, plus `SHA256SUMS` and
+`linux-release.json`, with Sigstore keyless signing
+(`scripts/linux-signatures.sh sign`), then verifies them before uploading.
+cosign exchanges the job's GitHub OIDC token for a short-lived certificate
+whose identity is
+`https://github.com/cristicretu/diri/.github/workflows/nightly.yml@refs/heads/main`,
+and records the signature in the public Rekor transparency log. Each file gets
+a `<file>.sigstore.json` bundle. Only `main` runs sign; pull-request runs do
+not. The Ubuntu 24.04 smoke jobs (x86_64 and aarch64) verify the bundles again
+on machines that did not sign them, and `release.sh` verifies them with the pinned identity
+before publishing, so an unsigned or wrongly signed Linux artifact cannot ship.
+The release carries CI's signed Linux checksum list as `SHA256SUMS-linux`
+beside the release-wide `SHA256SUMS`, which `release.sh` writes on the Mac and
+therefore cannot carry a CI signature. User commands are in
+[`LINUX.md`](LINUX.md#install).
+
+Why Sigstore rather than a long-lived GPG or minisign key:
+
+- **No key to keep.** The packages are built in CI, so the strongest statement
+  available is "this workflow on `main` built these bytes", and keyless
+  signing states exactly that. A GPG or minisign key would have to live in a
+  GitHub secret, where anyone able to exfiltrate it could sign anything until
+  it is revoked, and losing it strands every user who pinned its fingerprint.
+- **Tamper evidence.** Every signature is in a public, append-only log, so a
+  signature made outside this workflow would be visible.
+- **Cost to users.** Verification needs `cosign`, which Ubuntu does not
+  preinstall, whereas it does ship `gpg`. That is the main tradeoff, and the
+  reason plain `SHA256SUMS` stays the first instruction.
+- **Debian.** `dpkg-sig` is unmaintained and dpkg does not check embedded
+  `.deb` signatures by default (`debsig-verify` is opt-in policy), so signing
+  inside the package would protect almost nobody. The Debian-native trust path
+  is a signed APT repository `InRelease` file whose key is installed with
+  `signed-by`; that needs repository hosting and a long-lived GPG key, and is a
+  separate decision (see "Not yet" below).
+- **AppImage.** appimagetool can embed a GPG signature, but cargo-packager
+  does not produce one, it again needs a long-lived key, and few tools check
+  it. A detached bundle covers the same bytes.
+
+Rehearse the path locally with a throwaway key, never a release key:
+
+```sh
+export COSIGN_PASSWORD=
+cosign generate-key-pair --output-key-prefix "$TMPDIR/rehearsal"
+DIRI_COSIGN_KEY="$TMPDIR/rehearsal.key" scripts/linux-signatures.sh sign <dist>
+DIRI_COSIGN_PUBLIC_KEY="$TMPDIR/rehearsal.pub" scripts/linux-signatures.sh verify <dist>
+```
+
+Key mode stays offline and never uploads to the transparency log. `release.sh`
+clears both variables before its own verification, and needs `cosign` on the
+release Mac (`brew install cosign`).
+
+Not yet: an APT repository with a signed `InRelease` (so `apt upgrade`
+verifies updates), and GitHub build-provenance attestations.
+The in-app updater does not download Linux artifacts (it tells Linux users to
+update through APT or a newer download), so it has nothing to verify. If a
+Linux self-updater is ever added, it must verify these bundles against the same
+pinned identity, and pick its files from the `builds` entry whose
+`architecture` matches the running binary, never from the top-level x86_64
+fields.
 
 ## macOS
 
@@ -104,7 +176,7 @@ The keychain-profile variable also accepts the legacy `NOTARY_PROFILE` name and 
 - `APPLE_NOTARIZATION_PASSWORD` (an app-specific password)
 - `APPLE_NOTARIZATION_TEAM_ID`
 
-The cargo-packager-compatible aliases `APPLE_ID`, `APPLE_PASSWORD`, and `APPLE_TEAM_ID` are also accepted. The script signs with the hardened runtime, then notarizes in two passes: the `.app` first (submitted as a zip, then stapled), and the DMG second, built from that already-stapled bundle. Both artifacts therefore carry a ticket that validates offline — which the in-app updater requires, since it assesses the bundle it extracts rather than the DMG. It never reads or submits credentials unless one of these notarization configurations is explicitly present.
+The cargo-packager-compatible aliases `APPLE_ID`, `APPLE_PASSWORD`, and `APPLE_TEAM_ID` are also accepted. The script signs with the hardened runtime, then notarizes once: with a DMG it submits only the DMG, whose ticket covers the app inside it, and staples both the DMG and the `.app`. The update zip is made from the stapled `.app`, so the bundle the in-app updater extracts validates offline. The DMG's own copy of the app is not stapled; Gatekeeper checks it online on first launch, while the DMG carries its stapled ticket. Without a DMG, the `.app` is submitted alone (as a zip) and stapled. It never reads or submits credentials unless one of these notarization configurations is explicitly present.
 
 Notarizing also produces `dist/diri-<version>-universal.zip`, the artifact diri's updater downloads. `DIRI_CREATE_ZIP=1` builds it without notarization too. The version in both artifact names comes from `crates/diri-app/Cargo.toml` unless `DIRI_VERSION` overrides it, because the updater compares against `CARGO_PKG_VERSION`.
 

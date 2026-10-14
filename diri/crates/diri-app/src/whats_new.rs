@@ -4,7 +4,9 @@
 //! puts one quiet line in the sidebar footer, where the update pill sits; the
 //! sheet with the clips opens only when that line is clicked. Opening it, or
 //! dismissing the line, marks the release seen. A new install starts with
-//! everything seen, so a first launch shows none of this.
+//! everything seen, so a first launch shows none of this. Help › What's New,
+//! the What's New command, and the thumbnails in Settings › What's New replay
+//! the sheet any time.
 //!
 //! Each highlight carries a short clip recorded from the real window by the
 //! `render_whats_new_clips` fixture and encoded by `scripts/whats-new-clips.sh`,
@@ -31,7 +33,7 @@ pub(crate) struct Clip {
 }
 
 impl Clip {
-    fn for_appearance(&self, appearance: Appearance) -> &'static [u8] {
+    pub(crate) fn for_appearance(&self, appearance: Appearance) -> &'static [u8] {
         match appearance {
             Appearance::Light => self.light,
             Appearance::Dark => self.dark,
@@ -230,7 +232,7 @@ fn decode(bytes: &'static [u8], still: bool, tx: &std::sync::mpsc::SyncSender<De
                 return;
             };
             // GPUI paints BGRA.
-            for pixel in frame.buffer_mut().chunks_exact_mut(4) {
+            for pixel in frame.buffer_mut().as_chunks_mut::<4>().0 {
                 pixel.swap(0, 2);
             }
             let delay = Duration::from(frame.delay()).max(Duration::from_millis(16));
@@ -450,9 +452,16 @@ impl Render for WhatsNewSheet {
         };
         let last = index + 1 == count;
         let eyebrow = if count > 1 {
-            format!("New in diri {} · {} of {count}", self.version, index + 1)
+            crate::i18n::tf(
+                "settings.whats_new.new_in_page",
+                &[
+                    ("version", &self.version),
+                    ("page", &(index + 1)),
+                    ("count", &count),
+                ],
+            )
         } else {
-            format!("New in diri {}", self.version)
+            crate::i18n::tf("settings.whats_new.new_in", &[("version", &self.version)])
         };
 
         let dots = div()
@@ -481,7 +490,12 @@ impl Render for WhatsNewSheet {
         });
         let advance = sheet_button(
             "whats-new-next",
-            if last { "Done" } else { "Next" }.into(),
+            crate::i18n::t(if last {
+                "settings.whats_new.done"
+            } else {
+                "settings.whats_new.next"
+            })
+            .into(),
             None,
             true,
             colors,
@@ -551,7 +565,7 @@ impl Render for WhatsNewSheet {
                             .text_color(colors.tertiary)
                             .cursor_pointer()
                             .hover(move |style| style.text_color(colors.secondary))
-                            .child("Release notes")
+                            .child(crate::i18n::t("settings.whats_new.release_notes"))
                             .on_click(
                                 cx.listener(|_, _, _, cx| cx.emit(WhatsNewEvent::ReleaseNotes)),
                             ),

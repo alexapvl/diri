@@ -78,7 +78,7 @@ impl Peer {
         }
     }
 
-    fn bridge(&self) -> Bridge {
+    pub(super) fn bridge(&self) -> Bridge {
         Bridge::new(self.path.clone(), Some("parent".into()))
     }
 }
@@ -190,6 +190,8 @@ fn exited_agent_does_not_wait_forever_for_idle() {
                 reason: diri_proto::ExitReason::Exited,
                 code: Some(1),
                 signal: None,
+                system_restart: false,
+                interrupted: false,
             }),
         )])
     });

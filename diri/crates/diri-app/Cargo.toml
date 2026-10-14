@@ -1,6 +1,6 @@
 [package]
 name = "diri-app"
-version = "0.9.0"
+version = "0.9.7"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -45,6 +45,7 @@ base64.workspace = true
 diri-web = { path = "../diri-web" }
 qrcode = { version = "0.14", default-features = false }
 raw-window-handle.workspace = true
+regex.workspace = true
 diri-client.workspace = true
 diri-proto.workspace = true
 diri-notes.workspace = true
@@ -62,6 +63,7 @@ notify.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+diri-i18n.workspace = true
 sha2.workspace = true
 smallvec.workspace = true
 tempfile.workspace = true
@@ -71,6 +73,7 @@ url.workspace = true
 
 [dev-dependencies]
 diri-engine.workspace = true
+diri-terminal-state.workspace = true
 gpui = { workspace = true, features = ["test-support", "bench"] }
 gpui_platform = { workspace = true, features = ["test-support"] }
 # Pauses the clock so the notification settle window is exercised without
@@ -78,6 +81,9 @@ gpui_platform = { workspace = true, features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+# The Agent helper diri.app's executable runs as (`--exec-agent`): each Agent
+# a launchd job of its own. diri-pty is libc + diri-proto only.
+diri-pty.workspace = true
 # Existing pinned platform crate: read callback-scoped physical keypad identity.
 gpui_macos.workspace = true
 
@@ -100,6 +106,7 @@ objc2-app-kit = { version = "=0.3.2", default-features = false, features = [
     "NSEvent",
     "NSFont",
     "NSFontDescriptor",
+    "NSFontManager",
     "NSGradient",
     "NSGraphics",
     "NSGraphicsContext",
@@ -139,11 +146,13 @@ objc2-foundation = { version = "=0.3.2", default-features = false, features = [
     "NSArray",
     "NSAttributedString",
     "NSBundle",
+    "NSCalendar",
     "NSDictionary",
     "NSDate",
     "NSRunLoop",
     "NSError",
     "NSGeometry",
+    "NSLocale",
     "NSKeyValueObserving",
     "NSNotification",
     "NSObject",
@@ -154,6 +163,7 @@ objc2-foundation = { version = "=0.3.2", default-features = false, features = [
     "NSTimer",
     "NSURL",
     "NSUserDefaults",
+    "NSValue",
     "block2",
 ] }
 objc2-user-notifications = { version = "=0.3.2", default-features = false, features = [
