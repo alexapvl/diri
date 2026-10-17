@@ -105,7 +105,12 @@ impl Bridge {
         kinds.sort();
         kinds.dedup();
         kinds.push("shell".into());
-        Ok(tool_definitions_for(&kinds))
+        let mut tools = tool_definitions_for(&kinds);
+        // Always listed: Agents read the tool list once, when they start, and
+        // "Talk with your agent" may be turned on later. Its description says
+        // to call it only when Diri's prompt context asks for a summary.
+        tools.push(crate::tools::speak_tool());
+        Ok(tools)
     }
 
     pub fn call(&self, tool: &str, arguments: &Value) -> Result<Value, String> {
@@ -161,6 +166,7 @@ impl Bridge {
             "create_note" => self.create_note(arguments),
             "start_from_note" => self.start_from_note(arguments),
             "note_history" => self.note_history(arguments),
+            diri_proto::voice::SPEAK_TOOL => self.speak(arguments),
             other => Err(format!("unknown tool: {other}")),
         }
     }
@@ -1034,6 +1040,14 @@ impl Bridge {
             "receipt": receipt,
             "recorded_on_task": task,
         }))
+    }
+
+    fn speak(&self, arguments: &Value) -> Result<Value, String> {
+        self.request(
+            Method::VOICE_SPEAK,
+            json!({"sessionID": self.require_caller()?, "text": required_string(arguments, "text")?}),
+            DEFAULT_TIMEOUT,
+        )
     }
 
     fn require_caller(&self) -> Result<&str, String> {
