@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 export const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 export const site = 'https://diri.sh';
 export const repo = 'https://github.com/cristicretu/diri';
-export const today = '2026-10-01';
+export const today = '2026-10-18';
 
 export const esc = text => text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 export const slugify = text => text.toLowerCase().replace(/<[^>]+>/g, '').replace(/[`*]/g, '').replace(/&[a-z]+;/g, '').replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
