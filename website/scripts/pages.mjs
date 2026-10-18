@@ -201,7 +201,9 @@ async function buildCompare(outputs, cards, entries) {
 }
 
 // ── Releases ────────────────────────────────────────────────────────────────
-const clip = item => `<figure class="release-clip"><img src="${item.clip}" width="${item.width}" height="${item.height}" alt="${esc(item.alt)}" loading="lazy" decoding="async"></figure>`;
+const clip = item => item.clip
+  ? `<figure class="release-clip"><img src="${item.clip}" width="${item.width}" height="${item.height}" alt="${esc(item.alt)}" loading="lazy" decoding="async"></figure>`
+  : '';
 const releaseItems = release => release.items.map(item => `<article class="release-item">${clip(item)}<h3>${esc(item.title)}</h3><p>${esc(item.text)}</p></article>`).join('');
 
 async function buildReleases(outputs, cards, entries) {
