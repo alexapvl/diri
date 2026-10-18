@@ -3,7 +3,7 @@
 // and one page per release (whats-new-src/releases.json).
 import { readFile, readdir } from 'node:fs/promises';
 import { resolve } from 'node:path';
-import { root, site, repo, today, esc, render, frontmatter, article, ogPath } from './render.mjs';
+import { root, site, repo, today, esc, render, frontmatter, article, ogPath, footer } from './render.mjs';
 
 const manifests = resolve(root, '../diri/crates/diri-engine/manifests');
 const LOGOS = { 'claude-code': 'claude', codex: 'codex', copilot: 'copilot', cursor: 'cursor', gemini: 'gemini', kimi: 'kimi', opencode: 'opencode', pi: 'pi' };
@@ -201,9 +201,12 @@ async function buildCompare(outputs, cards, entries) {
 }
 
 // ── Releases ────────────────────────────────────────────────────────────────
-const clip = item => item.clip
-  ? `<figure class="release-clip"><img src="${item.clip}" width="${item.width}" height="${item.height}" alt="${esc(item.alt)}" loading="lazy" decoding="async"></figure>`
-  : '';
+const clip = item => {
+  if (!item.clip) return '';
+  const missing = ['width', 'height', 'alt'].filter(key => !item[key]);
+  if (missing.length) throw new Error(`whats-new-src/releases.json: clip ${item.clip} needs ${missing.join(', ')}`);
+  return `<figure class="release-clip"><img src="${item.clip}" width="${item.width}" height="${item.height}" alt="${esc(item.alt)}" loading="lazy" decoding="async"></figure>`;
+};
 const releaseItems = release => release.items.map(item => `<article class="release-item">${clip(item)}<h3>${esc(item.title)}</h3><p>${esc(item.text)}</p></article>`).join('');
 
 async function buildReleases(outputs, cards, entries) {
@@ -259,5 +262,15 @@ export async function buildPages() {
     ...await buildReleases(outputs, cards, entries),
   ];
   await retagGuides(outputs, cards);
+  await syncFooters(outputs);
   return { outputs, cards, entries, urls };
+}
+
+// Hand-written pages share the generated footer, so a license or link change lands everywhere.
+async function syncFooters(outputs) {
+  outputs.set('index.html', await readFile(resolve(root, 'index.html'), 'utf8'));
+  for (const [page, html] of outputs) {
+    if (!page.endsWith('.html') || !html.includes('<footer class="site-footer">')) continue;
+    outputs.set(page, html.replace(/<footer class="site-footer">[\s\S]*?<\/footer>/, () => footer));
+  }
 }

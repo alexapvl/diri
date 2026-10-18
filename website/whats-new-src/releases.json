@@ -7,7 +7,7 @@
     "items": [
       {
         "title": "Talk with your agent",
-        "text": "When an agent finishes, Diri reads a short summary aloud. Answer by voice and end with \"send to agent\"."
+        "text": "When an agent finishes, diri reads a short summary aloud. Answer by voice and end with \"send to agent\"."
       },
       {
         "title": "Agents can use your Mac's apps",
@@ -19,7 +19,7 @@
       },
       {
         "title": "AGPL-3.0",
-        "text": "Diri stays free, including for commercial use. A modified or hosted copy has to publish its source under the same license."
+        "text": "diri stays free, including for commercial use. If you distribute a modified copy, or let people use one over a network, you must offer them its source under the same license."
       }
     ]
   },
