@@ -120,7 +120,7 @@ impl UtilitySurfaces {
         cx: &mut Context<Self>,
     ) -> bool {
         if self.surface != Surface::Settings
-            || self.settings_tab != SettingsTab::General
+            || self.settings_tab != SettingsTab::Privacy
             || !self.privacy.name_active
         {
             return false;
@@ -170,7 +170,7 @@ impl UtilitySurfaces {
             .clone()
             .unwrap_or_else(|| t("settings.privacy.unavailable").to_owned());
         setting_section(
-            t("settings.privacy.title"),
+            t("settings.privacy.diagnostics"),
             div()
                 .flex()
                 .flex_col()
@@ -274,6 +274,19 @@ impl UtilitySurfaces {
                                 cx.reveal_path(folder);
                             }
                         },
+                    ),
+                    colors,
+                ))
+                .child(setting_divider(colors))
+                .child(setting_row(
+                    t("settings.general.copy_diagnostics"),
+                    t("settings.general.copy_diagnostics_detail"),
+                    surface_button(
+                        t("settings.general.preview"),
+                        "preview-diagnostics",
+                        colors,
+                        cx,
+                        |this, cx| this.open_diagnostics(cx),
                     ),
                     colors,
                 )),
