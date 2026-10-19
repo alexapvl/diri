@@ -1803,7 +1803,9 @@ dependencies = [
 name = "diri-web"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.1",
  "diri-client",
+ "diri-engine",
  "diri-platform",
  "diri-proto",
  "getrandom 0.4.3",
