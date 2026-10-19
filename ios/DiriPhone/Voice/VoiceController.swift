@@ -45,7 +45,7 @@ final class VoiceController {
     private var currentUtterance: ObjectIdentifier?
     /// Held so its identifier cannot be reused while callbacks are in flight.
     private var retainedUtterance: AVSpeechUtterance?
-    private let testMode = Dictation.testAudioURL != nil
+    private let testMode = Dictation.testAudioURL != nil || Dictation.testTranscript != nil
 
     init(sessionID: String, client: DiriClient) {
         self.sessionID = sessionID
@@ -205,6 +205,12 @@ final class VoiceController {
                 guard let self, self.phase == .listening, text != self.heard else { return }
                 self.heard = text
                 self.lastHeardChange = .now
+            } onError: { [weak self] message in
+                guard let self, self.phase == .listening, self.heard.isEmpty else { return }
+                self.silenceTask?.cancel()
+                self.dictation.cancel()
+                self.error = "Couldn’t hear that: \(message)"
+                self.phase = .idle
             }
         } catch {
             self.error = error.localizedDescription
@@ -219,7 +225,9 @@ final class VoiceController {
                 guard let self, self.phase == .listening else { return }
                 let quiet = ContinuousClock.now - self.lastHeardChange
                 if !self.heard.isEmpty, quiet >= Self.silenceToSend {
-                    await self.finishListening()
+                    // Outside this task: finishing cancels the silence task,
+                    // and the send must not inherit that cancellation.
+                    Task { await self.finishListening() }
                     return
                 }
                 if self.heard.isEmpty, ContinuousClock.now - began >= Self.nothingHeard {

@@ -15,6 +15,9 @@ import XCTest
 /// - `DIRI_E2E_PROMPT` (optional): what to send from the composer.
 /// - `DIRI_E2E_AUDIO` (optional): audio file the app dictates instead of the
 ///   microphone (`say -o reply.aiff "thanks"`), proving the listen → send leg.
+///   Needs a real device: no speech recogniser starts in the simulator.
+/// - `DIRI_E2E_TRANSCRIPT` (optional): text the app "hears" instead, for the
+///   simulator; proves everything after recognition (silence → send → reply).
 ///
 /// Cleanup: the session it starts is left running for inspection; kill it from
 /// Diri. The pairing is saved in the simulator's keychain.
@@ -41,6 +44,8 @@ final class EndToEndTests: XCTestCase {
         app = XCUIApplication()
         app.launchEnvironment["DIRI_E2E_CWD"] = cwd
         if let audio { app.launchEnvironment["DIRI_VOICE_TEST_AUDIO"] = audio }
+        let transcript = env["DIRI_E2E_TRANSCRIPT"].flatMap { $0.isEmpty ? nil : $0 }
+        if let transcript { app.launchEnvironment["DIRI_VOICE_TEST_TRANSCRIPT"] = transcript }
         app.launch()
 
         // Pair through the paste-link path, whether or not the simulator is
@@ -51,7 +56,7 @@ final class EndToEndTests: XCTestCase {
         } else if app.buttons["Already set up? Scan a code"].waitForExistence(timeout: 5) {
             app.buttons["Already set up? Scan a code"].tap()
         }
-        let paste = app.descendants(matching: .any)["pairing-paste"]
+        let paste = app.descendants(matching: .any).matching(identifier: "pairing-paste").firstMatch
         XCTAssertTrue(paste.waitForExistence(timeout: 10))
         paste.tap()
         let field = app.textFields["pairing-link-field"].exists
@@ -93,10 +98,18 @@ final class EndToEndTests: XCTestCase {
         XCTAssertNotEqual(agentText.label, "Waiting for the agent…")
         XCTAssertEqual(spoken.label, agentText.label)
 
-        if audio != nil {
+        if audio != nil || transcript != nil {
             // The test audio is dictated after speech ends and sent on silence.
             let sent = app.staticTexts["voice-last-sent"]
-            XCTAssertTrue(waitUntil(timeout: 120) { sent.exists }, "dictated reply was never sent")
+            let failure = app.staticTexts["voice-error"]
+            XCTAssertTrue(waitUntil(timeout: 120) { sent.exists || failure.exists },
+                          "dictated reply was never sent; phase: \(app.descendants(matching: .any)["voice-phase"].label)")
+            XCTAssertFalse(failure.exists, "dictation failed: \(failure.label)")
+
+            // The agent answers what was said, and that answer is read too.
+            let firstReply = spoken.label
+            XCTAssertTrue(waitUntil(timeout: 240) { !spoken.label.isEmpty && spoken.label != firstReply },
+                          "the reply to the dictated message was never read aloud")
         }
     }
 

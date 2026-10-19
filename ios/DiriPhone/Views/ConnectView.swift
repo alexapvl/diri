@@ -142,7 +142,7 @@ struct ConnectView: View {
         )
         .font(.footnote).foregroundStyle(.secondary)
       }
-      DisclosureGroup("Or paste a pairing link") {
+      DisclosureGroup {
         TextField("Pairing link from your Mac", text: $link, axis: .vertical)
           .textInputAutocapitalization(.never).autocorrectionDisabled().keyboardType(.URL)
           .textContentType(.none).privacySensitive()
@@ -150,8 +150,11 @@ struct ConnectView: View {
           .padding(.vertical, 8)
         Button("Connect") { connect() }.disabled(link.isEmpty || connecting)
           .accessibilityIdentifier("pairing-connect")
+      } label: {
+        // On the label only: a container's identifier is inherited by its
+        // children and would hide the field's own.
+        Text("Or paste a pairing link").accessibilityIdentifier("pairing-paste")
       }
-      .accessibilityIdentifier("pairing-paste")
       if connecting {
         ProgressView("Connecting to your Mac…")
         Button("Cancel connection") { connectionTask?.cancel() }
@@ -166,7 +169,7 @@ struct ConnectView: View {
       }
       DisclosureGroup("Can’t connect?") {
         Text(
-          "Check Tailscale says Connected on both devices and uses the same account. On the Mac, keep Diri open with phone access on. If access was turned off or Diri restarted, scan the new code. A work-managed Tailscale network may need your administrator to allow this connection."
+          "Check Tailscale says Connected on both devices and uses the same account. On the Mac, keep Diri open with phone access on. If you chose New pairing code on the Mac, scan the new code. A work-managed Tailscale network may need your administrator to allow this connection."
         )
         .font(.footnote).foregroundStyle(.secondary).padding(.top, 8)
       }

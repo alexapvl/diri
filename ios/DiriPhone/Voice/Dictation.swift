@@ -38,6 +38,18 @@ final class Dictation {
         return nil
     }()
 
+    /// DEBUG launch hook for the simulator, where no speech recogniser can
+    /// start: "hear" this text instead, so a UI test still drives the
+    /// silence → send leg. Recognition itself needs a real device.
+    static let testTranscript: String? = {
+        #if DEBUG
+        if let text = ProcessInfo.processInfo.environment["DIRI_VOICE_TEST_TRANSCRIPT"], !text.isEmpty {
+            return text
+        }
+        #endif
+        return nil
+    }()
+
     private let engine = AVAudioEngine()
     private let relay = TapRelay()
     private var engineRunning = false
@@ -78,19 +90,36 @@ final class Dictation {
     // MARK: Recognition
 
     /// Starts recognising. `onText` receives the whole utterance so far each
-    /// time it changes.
-    func begin(onText: @escaping @MainActor (String) -> Void) async throws {
+    /// time it changes; `onError` reports a recogniser that gave up, which
+    /// would otherwise look like silence.
+    func begin(onText: @escaping @MainActor (String) -> Void,
+               onError: @escaping @MainActor (String) -> Void) async throws {
         cancel()
+        if let text = Self.testTranscript {
+            session = ScriptedRecognition(text: text, onText: onText)
+            return
+        }
         if let url = Self.testAudioURL {
-            session = try FileRecognition(url: url, onText: onText)
+            if #available(iOS 26, *) {
+                do {
+                    guard let analyzer = try await FileAnalyzerRecognition.make(
+                        url: url, onText: onText, onError: onError
+                    ) else { throw Failure.unavailable }
+                    session = analyzer
+                } catch {
+                    onError(error.localizedDescription)
+                }
+            } else {
+                session = try FileRecognition(url: url, onText: onText, onError: onError)
+            }
             return
         }
         if #available(iOS 26, *), let analyzer = try? await AnalyzerRecognition.make(
-            inputFormat: engine.inputNode.outputFormat(forBus: 0), onText: onText
+            inputFormat: engine.inputNode.outputFormat(forBus: 0), onText: onText, onError: onError
         ) {
             session = analyzer
         } else {
-            session = try LegacyRecognition(onText: onText)
+            session = try LegacyRecognition(onText: onText, onError: onError)
         }
         let target = session
         relay.set { buffer in target?.append(buffer) }
@@ -148,7 +177,7 @@ private final class LegacyRecognition: RecognitionSession, @unchecked Sendable {
     private var task: SFSpeechRecognitionTask?
     private let box = TextBox()
 
-    init(onText: @escaping @MainActor (String) -> Void) throws {
+    init(onText: @escaping @MainActor (String) -> Void, onError: @escaping @MainActor (String) -> Void) throws {
         guard let recognizer = SFSpeechRecognizer(locale: .current) ?? SFSpeechRecognizer(),
               recognizer.isAvailable, recognizer.supportsOnDeviceRecognition
         else { throw Dictation.Failure.unavailable }
@@ -156,7 +185,12 @@ private final class LegacyRecognition: RecognitionSession, @unchecked Sendable {
         request.shouldReportPartialResults = true
         request.taskHint = .dictation
         let box = box
-        task = recognizer.recognitionTask(with: request) { result, _ in
+        task = recognizer.recognitionTask(with: request) { result, error in
+            if let error, result == nil {
+                let message = error.localizedDescription
+                Task { @MainActor in onError(message) }
+                return
+            }
             guard let result else { return }
             let text = result.bestTranscription.formattedString
             box.text = text
@@ -184,14 +218,19 @@ private final class FileRecognition: RecognitionSession, @unchecked Sendable {
     private var task: SFSpeechRecognitionTask?
     private let box = TextBox()
 
-    init(url: URL, onText: @escaping @MainActor (String) -> Void) throws {
+    init(url: URL, onText: @escaping @MainActor (String) -> Void, onError: @escaping @MainActor (String) -> Void) throws {
         guard let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US")) ?? SFSpeechRecognizer()
         else { throw Dictation.Failure.unavailable }
         let request = SFSpeechURLRecognitionRequest(url: url)
-        request.requiresOnDeviceRecognition = recognizer.supportsOnDeviceRecognition
+        request.requiresOnDeviceRecognition = false
         request.shouldReportPartialResults = true
         let box = box
-        task = recognizer.recognitionTask(with: request) { result, _ in
+        task = recognizer.recognitionTask(with: request) { result, error in
+            if let error, result == nil {
+                let message = error.localizedDescription
+                Task { @MainActor in onError(message) }
+                return
+            }
             guard let result else { return }
             let text = result.bestTranscription.formattedString
             box.text = text
@@ -228,7 +267,8 @@ private final class AnalyzerRecognition: RecognitionSession, @unchecked Sendable
 
     @MainActor
     static func make(inputFormat: AVAudioFormat,
-                     onText: @escaping @MainActor (String) -> Void) async throws -> AnalyzerRecognition? {
+                     onText: @escaping @MainActor (String) -> Void,
+                     onError: @escaping @MainActor (String) -> Void) async throws -> AnalyzerRecognition? {
         guard SpeechTranscriber.isAvailable,
               let locale = await SpeechTranscriber.supportedLocale(equivalentTo: .current)
         else { return nil }
@@ -263,7 +303,11 @@ private final class AnalyzerRecognition: RecognitionSession, @unchecked Sendable
                     let snapshot = box.text
                     await MainActor.run { onText(snapshot) }
                 }
-            } catch {}
+            } catch is CancellationError {
+            } catch {
+                let message = error.localizedDescription
+                await MainActor.run { onError(message) }
+            }
         }
         try await analyzer.start(inputSequence: stream)
         return session
@@ -306,4 +350,80 @@ private final class AnalyzerRecognition: RecognitionSession, @unchecked Sendable
         let analyzer = analyzer
         Task { await analyzer.cancelAndFinishNow() }
     }
+}
+
+/// The DEBUG file hook on the same SpeechAnalyzer path real devices use. The
+/// simulator's legacy recogniser fails to initialise, so this is what a UI
+/// test actually exercises.
+@available(iOS 26, *)
+private final class FileAnalyzerRecognition: RecognitionSession, @unchecked Sendable {
+    private let box = TextBox()
+    private var results: Task<Void, Never>?
+    private var analyzer: SpeechAnalyzer?
+
+    @MainActor
+    static func make(url: URL,
+                     onText: @escaping @MainActor (String) -> Void,
+                     onError: @escaping @MainActor (String) -> Void) async throws -> FileAnalyzerRecognition? {
+        guard SpeechTranscriber.isAvailable,
+              let locale = await SpeechTranscriber.supportedLocale(equivalentTo: Locale(identifier: "en-US"))
+        else { return nil }
+        let transcriber = SpeechTranscriber(
+            locale: locale, transcriptionOptions: [], reportingOptions: [], attributeOptions: []
+        )
+        if let install = try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) {
+            try await install.downloadAndInstall()
+        }
+        let file = try AVAudioFile(forReading: url)
+        let analyzer = SpeechAnalyzer(modules: [transcriber])
+        let session = FileAnalyzerRecognition()
+        session.analyzer = analyzer
+        let box = session.box
+        session.results = Task {
+            do {
+                for try await result in transcriber.results where result.isFinal {
+                    box.text = (box.text + String(result.text.characters)).trimmingCharacters(in: .whitespaces)
+                    let snapshot = box.text
+                    await MainActor.run { onText(snapshot) }
+                }
+            } catch is CancellationError {
+            } catch {
+                let message = error.localizedDescription
+                await MainActor.run { onError(message) }
+            }
+        }
+        try await analyzer.start(inputAudioFile: file, finishAfterFile: true)
+        return session
+    }
+
+    func append(_ buffer: AVAudioPCMBuffer) {}
+
+    @MainActor func finish() async -> String {
+        await results?.value
+        return box.text
+    }
+
+    func cancel() {
+        results?.cancel()
+        let analyzer = analyzer
+        Task { await analyzer?.cancelAndFinishNow() }
+    }
+}
+
+/// The DEBUG transcript hook: reports `text` as one utterance, then silence.
+private final class ScriptedRecognition: RecognitionSession, @unchecked Sendable {
+    private let text: String
+    private let delivery: Task<Void, Never>
+
+    init(text: String, onText: @escaping @MainActor (String) -> Void) {
+        self.text = text
+        delivery = Task {
+            try? await Task.sleep(for: .milliseconds(500))
+            await MainActor.run { onText(text) }
+        }
+    }
+
+    func append(_ buffer: AVAudioPCMBuffer) {}
+    @MainActor func finish() async -> String { text }
+    func cancel() { delivery.cancel() }
 }
