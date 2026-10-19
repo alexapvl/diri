@@ -3533,6 +3533,46 @@ impl UtilitySurfaces {
                                                 }
                                             },
                                         ))
+                                        .child(surface_button(
+                                            t("settings.phone.new_code"),
+                                            "phone-new-code",
+                                            colors,
+                                            cx,
+                                            |this, cx| {
+                                                // Stop serving the old code
+                                                // before it is replaced.
+                                                this.phone_access = None;
+                                                this.phone_loading = true;
+                                                this.phone_error = None;
+                                                let client =
+                                                    Arc::clone(this.store_runtime.client());
+                                                let task = this.runtime.spawn(async move {
+                                                    crate::phone_access::PhoneAccess::reset_pairing()?;
+                                                    crate::phone_access::PhoneAccess::start(client)
+                                                        .await
+                                                });
+                                                cx.spawn(async move |this, cx| {
+                                                    let result = task
+                                                        .await
+                                                        .map_err(|error| error.to_string())
+                                                        .and_then(|result| result);
+                                                    let _ = this.update(cx, |this, cx| {
+                                                        this.phone_loading = false;
+                                                        match result {
+                                                            Ok(access) => {
+                                                                this.phone_access = Some(access)
+                                                            }
+                                                            Err(error) => {
+                                                                this.phone_error = Some(error)
+                                                            }
+                                                        }
+                                                        cx.notify();
+                                                    });
+                                                })
+                                                .detach();
+                                                cx.notify();
+                                            },
+                                        ))
                                         .child(settings_danger_button(
                                             t("settings.phone.turn_off"),
                                             "phone-disable",

@@ -62,4 +62,21 @@ impl AttentionState {
             .iter()
             .filter(|event| event.kind == AttentionKind::Request && !event.resolved)
     }
+
+    /// The turn that finished between `before` and `self`, if any. A
+    /// restarted history (new epoch) or a still-working Agent is not a
+    /// completion, so a reconnect never reports every session's last reply.
+    #[must_use]
+    pub fn completed_turn_since(&self, before: &AttentionState) -> Option<u64> {
+        if before.epoch != self.epoch || self.working {
+            return None;
+        }
+        self.events
+            .iter()
+            .filter(|event| {
+                event.kind == AttentionKind::Completion && event.sequence > before.sequence
+            })
+            .map(|event| event.turn)
+            .max()
+    }
 }
