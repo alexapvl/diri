@@ -28,15 +28,17 @@ use crate::notes::editor_view::NoteEditorView;
 /// The window every clip is recorded in, 16:10 like the sheet's clip frame.
 const WINDOW: (f32, f32) = (1040.0, 650.0);
 
-struct Recorder<'a> {
-    cx: &'a mut HeadlessAppContext,
-    window: AnyWindowHandle,
+pub(super) struct Recorder<'a> {
+    pub(super) cx: &'a mut HeadlessAppContext,
+    pub(super) window: AnyWindowHandle,
     dir: PathBuf,
     frames: Vec<(String, u32)>,
+    step: Option<u32>,
+    marks: Vec<(String, u32)>,
 }
 
 impl<'a> Recorder<'a> {
-    fn new(cx: &'a mut HeadlessAppContext, window: AnyWindowHandle, dir: PathBuf) -> Self {
+    pub(super) fn new(cx: &'a mut HeadlessAppContext, window: AnyWindowHandle, dir: PathBuf) -> Self {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         Self {
@@ -44,10 +46,20 @@ impl<'a> Recorder<'a> {
             window,
             dir,
             frames: Vec::new(),
+            step: None,
+            marks: Vec::new(),
         }
     }
 
-    fn settle(&mut self) {
+    /// Splits every hold into frames `step_ms` apart and moves the app's
+    /// clock between them, so looping marks (the working spinner) turn
+    /// instead of freezing for the length of the hold.
+    pub(super) fn animated(mut self, step_ms: u32) -> Self {
+        self.step = Some(step_ms);
+        self
+    }
+
+    pub(super) fn settle(&mut self) {
         for _ in 0..3 {
             self.cx
                 .update_window(self.window, |view, window, cx| {
@@ -65,8 +77,30 @@ impl<'a> Recorder<'a> {
         }
     }
 
+    /// Notes when `name` happens, in ms from the clip's start, for whatever
+    /// the encoder draws over the frames to keep time with (`marks.txt`).
+    pub(super) fn mark(&mut self, name: &str) {
+        let at = self.frames.iter().map(|(_, hold)| hold).sum();
+        self.marks.push((name.to_owned(), at));
+    }
+
     /// Captures the window as it stands and holds it for `hold_ms`.
-    fn shot(&mut self, hold_ms: u32) {
+    pub(super) fn shot(&mut self, hold_ms: u32) {
+        let Some(step) = self.step else {
+            self.capture(hold_ms);
+            return;
+        };
+        let mut left = hold_ms;
+        while left > 0 {
+            // The last frame takes the remainder rather than a sliver.
+            let hold = if left >= 2 * step { step } else { left };
+            self.capture(hold);
+            self.cx.advance_clock(Duration::from_millis(u64::from(hold)));
+            left -= hold;
+        }
+    }
+
+    fn capture(&mut self, hold_ms: u32) {
         self.settle();
         let name = format!("frame_{:04}.png", self.frames.len());
         self.cx
@@ -77,13 +111,21 @@ impl<'a> Recorder<'a> {
         self.frames.push((name, hold_ms));
     }
 
-    fn finish(self) {
+    pub(super) fn finish(self) {
         let list: String = self
             .frames
             .iter()
             .map(|(name, ms)| format!("{name} {ms}\n"))
             .collect();
         std::fs::write(self.dir.join("frames.txt"), list).unwrap();
+        if !self.marks.is_empty() {
+            let marks: String = self
+                .marks
+                .iter()
+                .map(|(name, at)| format!("{name} {at}\n"))
+                .collect();
+            std::fs::write(self.dir.join("marks.txt"), marks).unwrap();
+        }
         self.cx
             .update_window(self.window, |_, window, _| window.remove_window())
             .unwrap();
