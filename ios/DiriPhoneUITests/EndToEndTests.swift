@@ -18,6 +18,9 @@ import XCTest
 ///   Needs a real device: no speech recogniser starts in the simulator.
 /// - `DIRI_E2E_TRANSCRIPT` (optional): text the app "hears" instead, for the
 ///   simulator; proves everything after recognition (silence → send → reply).
+/// - `DIRI_E2E_SCROLL_SESSION` (optional): id of a session on the same gateway
+///   with over a thousand lines of scrollback; the test switches to it through
+///   the drawer, flings back through its history and switches back.
 ///
 /// Cleanup: the session it starts is left running for inspection; kill it from
 /// Diri. The pairing is saved in the simulator's keychain.
@@ -77,16 +80,59 @@ final class EndToEndTests: XCTestCase {
         XCTAssertTrue(waitUntil(timeout: 30) { start.isEnabled }, "Start never enabled — is Claude installed?")
         start.tap()
 
-        // Send from the composer.
+        // The session opens on its terminal, drawn as a TUI: Claude's welcome
+        // box and status line carry colour.
+        let terminal = app.descendants(matching: .any)["terminal-text"]
         XCTAssertTrue(waitUntil(timeout: 120) {
-            app.staticTexts["terminal-text"].exists && app.buttons["voice-mode-open"].isEnabled
+            terminal.exists && app.buttons["voice-mode-open"].isEnabled
         }, "the new session never opened")
-        let input = app.textViews["composer-field"].exists ? app.textViews["composer-field"] : app.textFields["composer-field"]
+        XCTAssertTrue(waitUntil(timeout: 60) { Self.coloured(terminal) > 0 },
+                      "no coloured cells: \(terminal.value as? String ?? "")")
         // Give the agent a moment to draw its prompt before typing into it.
         sleep(5)
+
+        // Raw keys straight to the PTY: typed text echoes in Claude's input
+        // box, and sticky ctrl + u clears it again.
+        app.buttons["terminal-keyboard"].tap()
+        Self.dismissKeyboardTips(app)
+        XCTAssertTrue(app.buttons["key-ctrl"].waitForExistence(timeout: 5), "no key accessory row")
+        app.typeText("raw keys")
+        XCTAssertTrue(waitUntil(timeout: 15) { terminal.label.contains("raw keys") },
+                      "typed keys never reached the PTY")
+        app.buttons["key-ctrl"].tap()
+        app.typeText("u")
+        XCTAssertTrue(waitUntil(timeout: 15) { !terminal.label.contains("raw keys") }, "ctrl-u did not clear the line")
+        app.buttons["key-hide"].tap()
+
+        // Scrollback: switch to a session with long history through the
+        // drawer, fling back through it, and come back.
+        if let scrollID = env["DIRI_E2E_SCROLL_SESSION"], !scrollID.isEmpty {
+            let claudeID = Self.sessionRow(app, excluding: scrollID)
+            app.buttons["show-sessions"].tap()
+            let row = app.descendants(matching: .any)["session-row-\(scrollID)"].firstMatch
+            XCTAssertTrue(row.waitForExistence(timeout: 10), "the drawer does not list the scroll session")
+            row.tap()
+            XCTAssertTrue(waitUntil(timeout: 20) { Self.total(terminal) > 1000 }, "no history: \(terminal.value as? String ?? "")")
+            let bottom = Self.top(terminal)
+            for _ in 0 ..< 4 { terminal.swipeDown(velocity: .fast) }
+            XCTAssertTrue(waitUntil(timeout: 10) { Self.top(terminal) < bottom - 200 },
+                          "history did not scroll: \(terminal.value as? String ?? "")")
+            app.buttons["show-sessions"].tap()
+            if let claudeID {
+                app.descendants(matching: .any)[claudeID].firstMatch.tap()
+            }
+            XCTAssertTrue(app.buttons["voice-mode-open"].waitForExistence(timeout: 10))
+        }
+
+        // Send from the composer, then open voice mode straight away: it
+        // reads turns that finish while it is open.
+        let input = app.textViews["composer-field"].exists ? app.textViews["composer-field"] : app.textFields["composer-field"]
+        XCTAssertTrue(input.waitForExistence(timeout: 5))
         input.tap()
+        Self.dismissKeyboardTips(app)
         input.typeText(prompt)
         app.buttons["composer-send"].tap()
+        XCTAssertTrue(app.buttons["voice-mode-open"].waitForExistence(timeout: 60), "the draft was not sent")
 
         // Voice mode hears the turn finish and reads it aloud.
         app.buttons["voice-mode-open"].tap()
@@ -111,6 +157,36 @@ final class EndToEndTests: XCTestCase {
             XCTAssertTrue(waitUntil(timeout: 240) { !spoken.label.isEmpty && spoken.label != firstReply },
                           "the reply to the dictated message was never read aloud")
         }
+    }
+
+    /// A fresh simulator introduces its keyboard features (slide to type,
+    /// bilingual typing) over the keyboard the first time it appears.
+    private static func dismissKeyboardTips(_ app: XCUIApplication) {
+        for _ in 0 ..< 3 where app.buttons["Continue"].waitForExistence(timeout: 1.5) {
+            app.buttons["Continue"].tap()
+        }
+    }
+
+    /// Parses "top N of M; coloured K; cols C" from the terminal's value.
+    private static func field(_ element: XCUIElement, _ name: String) -> Int {
+        let value = element.value as? String ?? ""
+        guard let range = value.range(of: name + " ") else { return -1 }
+        return Int(value[range.upperBound...].prefix { $0.isNumber }) ?? -1
+    }
+
+    private static func coloured(_ element: XCUIElement) -> Int { field(element, "coloured") }
+    private static func top(_ element: XCUIElement) -> Int { field(element, "top") }
+    private static func total(_ element: XCUIElement) -> Int { field(element, "of") }
+
+    /// The open session's row identifier, read from the drawer before switching away.
+    private static func sessionRow(_ app: XCUIApplication, excluding id: String) -> String? {
+        app.buttons["show-sessions"].tap()
+        let rows = app.descendants(matching: .any).matching(NSPredicate(format: "identifier BEGINSWITH 'session-row-'"))
+        _ = rows.firstMatch.waitForExistence(timeout: 5)
+        let found = rows.allElementsBoundByIndex.first { $0.isSelected }?.identifier
+        // Choosing the open session again just closes the drawer.
+        if let found { app.descendants(matching: .any)[found].firstMatch.tap() }
+        return found
     }
 
     /// Polls `condition`, answering permission alerts (speech, microphone,
