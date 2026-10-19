@@ -1,9 +1,15 @@
 import Foundation
+import Network
 import Observation
 import SwiftUI
 
-/// Everything the UI reads. One model, because the daemon is the only source of
-/// truth and the phone's job is to mirror it, not to hold opinions of its own.
+/// Everything the UI reads. One model, because the daemons are the only source
+/// of truth and the phone's job is to mirror them, not to hold opinions.
+///
+/// Several gateways can be paired ("Mac", "forge"). They are probed together;
+/// the highest-priority reachable one is *live* — it answers new-session,
+/// agent and folder questions — and sessions are listed from every reachable
+/// one, each tagged with where it runs.
 @MainActor
 @Observable
 final class AppModel {
@@ -19,7 +25,12 @@ final class AppModel {
     private(set) var sessions: [SessionRecord] = []
     private(set) var agents: [DiriClient.AgentReadiness.Item] = []
     private(set) var projects: [String: Project] = [:]
+    /// The live gateway's host label.
     private(set) var host: String = ""
+
+    private(set) var gateways: [Gateway] = []
+    private(set) var outcomes: [String: GatewayProbe.Outcome] = [:]
+    private(set) var liveGatewayID: String?
 
     var selectedSessionID: String?
     /// `-session <id>`, the companion to `-endpoint`: opens straight into one
@@ -34,88 +45,231 @@ final class AppModel {
     var collapsedProjects: Set<String> = []
     var banner: String?
 
-    private var client: DiriClient?
-    private var eventTask: Task<Void, Never>?
+    private let store: SecretStore
+    /// False for a `-endpoint` launch: a seeded gateway is not written back.
+    private var persists = true
+    private var clients: [String: DiriClient] = [:]
+    private var probeClients: [String: DiriClient] = [:]
+    private var payloads: [String: DiriClient.SessionsResponse] = [:]
+    private var sessionOwner: [String: String] = [:]
+    private var eventTasks: [String: Task<Void, Never>] = [:]
     private var pollTask: Task<Void, Never>?
-    private var refreshingClient: DiriClient?
+    private var refreshing: Set<String> = []
+    private var probing = false
+    private var probeQueued = false
+    private var active = true
+    private let pathMonitor = NWPathMonitor()
 
-    /// How often the list is refetched when the event stream is quiet. The
-    /// stream is the fast path; this only exists so a silently dropped
-    /// connection cannot leave the list frozen.
+    /// How often gateways are re-probed and lists refetched when the event
+    /// streams are quiet. The streams are the fast path; this exists so a
+    /// silently dropped connection — or a host coming back — is noticed.
     private let backstopInterval: Duration = .seconds(15)
+    private let probeTimeout: Duration = .seconds(3)
 
-    var endpoint: DiriClient.Endpoint? {
-        didSet {
-            guard endpoint != oldValue else { return }
-            Credentials.save(endpoint)
-            restart()
-        }
-    }
-
-    init() {
-        // `-endpoint <enrolment url>` seeds the connection without going
-        // through the keychain, which is how the simulator gets pointed at a
-        // real host for screenshots and manual testing. It is a launch
-        // argument, so it cannot be set by anything but whoever started the
-        // process.
+    init(store: SecretStore = KeychainSecretStore()) {
+        self.store = store
+        // `-endpoint <enrolment url>` seeds one gateway without going through
+        // the keychain, which is how the simulator gets pointed at a real host.
         if let index = CommandLine.arguments.firstIndex(of: "-endpoint"),
            index + 1 < CommandLine.arguments.count,
            let seeded = DiriClient.Endpoint(enrolmentURL: CommandLine.arguments[index + 1])
         {
-            endpoint = seeded
+            gateways = [Gateway(name: Gateway.provisionalName(for: seeded), endpoint: seeded)]
+            persists = false
         } else {
-            endpoint = Credentials.load()
+            gateways = GatewayStore.load(from: store)
         }
+        pathMonitor.pathUpdateHandler = { [weak self] _ in
+            Task { @MainActor in
+                guard let self, self.active else { return }
+                await self.reprobe()
+            }
+        }
+        pathMonitor.start(queue: DispatchQueue(label: "diri.path"))
         restart()
+    }
+
+    var hasGateways: Bool { !gateways.isEmpty }
+
+    var liveGateway: Gateway? { gateways.first { $0.id == liveGatewayID } }
+
+    // MARK: - Gateways
+
+    private func setGateways(_ list: [Gateway]) {
+        gateways = list
+        if persists { GatewayStore.save(list, to: store) }
+        restart()
+    }
+
+    func removeGateway(_ id: String) {
+        setGateways(gateways.filter { $0.id != id })
+    }
+
+    /// Moves a gateway to the top: it becomes live whenever it is reachable.
+    func preferGateway(_ id: String) {
+        guard let index = gateways.firstIndex(where: { $0.id == id }) else { return }
+        var list = gateways
+        list.insert(list.remove(at: index), at: 0)
+        setGateways(list)
+    }
+
+    func connect(link: String) async throws {
+        guard let candidate = DiriClient.Endpoint(enrolmentURL: link) else {
+            throw DiriClient.Failure.http(400, "Use the pairing code or link in Diri → Settings → Phone access on your Mac.")
+        }
+        // Verify authenticated Engine access before saving credentials.
+        let payload = try await DiriClient(endpoint: candidate, configuration: DiriClient.pairingConfiguration()).sessions()
+        try Task.checkCancellation()
+        let name = payload.host.isEmpty ? Gateway.provisionalName(for: candidate) : payload.host
+        persists = true
+        setGateways(GatewayStore.adding(Gateway(name: name, endpoint: candidate), to: gateways))
     }
 
     // MARK: - Lifecycle
 
     private func restart() {
-        eventTask?.cancel()
+        eventTasks.values.forEach { $0.cancel() }
+        eventTasks = [:]
         pollTask?.cancel()
-        eventTask = nil
         pollTask = nil
+        clients = [:]
+        probeClients = [:]
+        payloads = [:]
+        outcomes = [:]
+        liveGatewayID = nil
 
-        guard let endpoint else {
+        guard !gateways.isEmpty else {
             connection = .unconfigured
-            client = nil
             groups = []
             sessions = []
+            sessionOwner = [:]
             agents = []
             projects = [:]
+            host = ""
             selectedSessionID = nil
             banner = nil
             return
         }
 
-        let client = DiriClient(endpoint: endpoint)
-        self.client = client
-        connection = .connecting
-
-        Task { await refresh() }
-        Task { await loadAgents() }
-
-        eventTask = Task { [weak self] in
-            // The stream ends whenever the network moves; re-subscribing in a
-            // loop is what makes a tunnel change invisible to the user.
-            while !Task.isCancelled {
-                guard let self, let client = self.client else { return }
-                for await _ in await client.events() {
-                    if Task.isCancelled { return }
-                    await self.refresh()
-                }
-                if Task.isCancelled { return }
-                try? await Task.sleep(for: .seconds(2))
-            }
+        for gateway in gateways {
+            clients[gateway.id] = DiriClient(endpoint: gateway.endpoint)
+            probeClients[gateway.id] = DiriClient(
+                endpoint: gateway.endpoint, configuration: DiriClient.probeConfiguration()
+            )
         }
+        connection = .connecting
+        guard active else { return }
 
+        Task { await reprobe() }
         let backstop = backstopInterval
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: backstop)
                 guard let self, !Task.isCancelled else { return }
-                await self.refresh()
+                await self.reprobe()
+            }
+        }
+    }
+
+    func setActive(_ active: Bool) {
+        self.active = active
+        if active {
+            restart()
+        } else {
+            eventTasks.values.forEach { $0.cancel() }
+            eventTasks = [:]
+            pollTask?.cancel()
+        }
+    }
+
+    /// Probes every gateway, picks the live one, and refetches what is reachable.
+    func reprobe() async {
+        guard !gateways.isEmpty else { return }
+        if probing { probeQueued = true; return }
+        probing = true
+        defer { probing = false }
+        repeat {
+            probeQueued = false
+            let list = gateways
+            let probes = probeClients
+            let results = await GatewayProbe.probeAll(list, timeout: probeTimeout) { gateway in
+                guard let client = probes[gateway.id] else { return .unreachable("Not configured") }
+                do {
+                    let health = try await client.health()
+                    return .reachable(host: health.host)
+                } catch DiriClient.Failure.unauthorized {
+                    return .unauthorized
+                } catch {
+                    return .unreachable(error.localizedDescription)
+                }
+            }
+            guard list == gateways else { continue }
+            apply(results)
+            await refreshAll()
+        } while probeQueued
+    }
+
+    private func apply(_ results: [String: GatewayProbe.Outcome]) {
+        outcomes = results
+        // A migrated or pasted gateway is named after its address until it
+        // introduces itself.
+        var renamed = gateways
+        for index in renamed.indices {
+            if case let .reachable(name) = results[renamed[index].id], !name.isEmpty,
+               renamed[index].name == Gateway.provisionalName(for: renamed[index].endpoint),
+               renamed[index].name != name
+            {
+                renamed[index].name = name
+            }
+        }
+        if renamed != gateways {
+            gateways = renamed
+            if persists { GatewayStore.save(renamed, to: store) }
+        }
+
+        let previousLive = liveGatewayID
+        let live = GatewayProbe.live(gateways, outcomes: results)
+        liveGatewayID = live?.id
+        if let live {
+            host = live.name
+            connection = .online(host: live.name)
+            banner = nil
+        } else {
+            host = ""
+            let unauthorized = results.values.contains(.unauthorized)
+            connection = .offline(unauthorized ? "Token rejected" : "No paired computer answered")
+            banner = unauthorized ? "That token was not accepted." : nil
+        }
+        if previousLive != liveGatewayID { Task { await loadAgents() } }
+
+        for gateway in gateways {
+            let reachable = results[gateway.id]?.isReachable == true
+            if reachable, eventTasks[gateway.id] == nil, active {
+                startEvents(for: gateway.id)
+            } else if !reachable {
+                eventTasks.removeValue(forKey: gateway.id)?.cancel()
+                payloads.removeValue(forKey: gateway.id)
+            }
+        }
+        rebuild()
+    }
+
+    private func startEvents(for id: String) {
+        guard let client = clients[id] else { return }
+        eventTasks[id] = Task { [weak self] in
+            // The stream ends whenever the network moves; re-subscribing in a
+            // loop is what makes a tunnel change invisible to the user.
+            while !Task.isCancelled {
+                for await _ in await client.events() {
+                    if Task.isCancelled { return }
+                    await self?.refresh(gateway: id)
+                }
+                if Task.isCancelled { return }
+                // A dropped stream is the first sign a host went away: probe
+                // now rather than at the next backstop tick.
+                try? await Task.sleep(for: .seconds(2))
+                if Task.isCancelled { return }
+                await self?.reprobe()
             }
         }
     }
@@ -123,61 +277,98 @@ final class AppModel {
     // MARK: - Reads
 
     func refresh() async {
-        guard let client else { return }
-        guard refreshingClient !== client else { return }
-        refreshingClient = client
-        defer { if refreshingClient === client { refreshingClient = nil } }
+        await reprobe()
+    }
+
+    private func refreshAll() async {
+        let ids = gateways.map(\.id).filter { outcomes[$0]?.isReachable == true }
+        await withTaskGroup(of: Void.self) { group in
+            for id in ids { group.addTask { await self.refresh(gateway: id) } }
+        }
+    }
+
+    private func refresh(gateway id: String) async {
+        guard let client = clients[id], !refreshing.contains(id) else { return }
+        refreshing.insert(id)
+        defer { refreshing.remove(id) }
         do {
             let payload = try await client.sessions()
-            guard self.client === client, !Task.isCancelled else { return }
-            host = payload.host
-            sessions = payload.sessions
-            projects = Dictionary(
-                (payload.projects ?? []).map { ($0.id, $0) },
-                uniquingKeysWith: { first, _ in first }
-            )
-            reproject()
-            connection = .online(host: payload.host)
-            banner = nil
+            guard clients[id] === client, !Task.isCancelled else { return }
+            payloads[id] = payload
         } catch DiriClient.Failure.unauthorized {
-            guard self.client === client, !Task.isCancelled else { return }
-            connection = .offline("Token rejected")
-            banner = "That token was not accepted."
+            guard clients[id] === client else { return }
+            outcomes[id] = .unauthorized
+            payloads.removeValue(forKey: id)
         } catch {
-            guard self.client === client, !Task.isCancelled else { return }
-            connection = .offline(error.localizedDescription)
+            guard clients[id] === client, !Task.isCancelled else { return }
+            // Keep the last list; the next probe decides whether to fail over.
+            return
         }
+        rebuild()
+    }
+
+    private func rebuild() {
+        let ordered = gateways.compactMap { gateway in payloads[gateway.id].map { (gateway, $0) } }
+        let merged = Self.merge(ordered)
+        sessions = merged.sessions
+        projects = merged.projects
+        sessionOwner = merged.owner
+        reproject()
+    }
+
+    struct Merged {
+        var sessions: [SessionRecord]
+        var projects: [String: Project]
+        var owner: [String: String]
+    }
+
+    /// Joins lists from several gateways, in priority order. Sessions are
+    /// tagged with their gateway only when more than one contributes — one
+    /// gateway needs no label. An id seen twice belongs to the higher-priority
+    /// gateway.
+    static func merge(_ lists: [(Gateway, DiriClient.SessionsResponse)]) -> Merged {
+        let tagged = lists.count > 1
+        var result = Merged(sessions: [], projects: [:], owner: [:])
+        for (gateway, payload) in lists {
+            for var session in payload.sessions where result.owner[session.id] == nil {
+                if tagged { session.gateway = gateway.name }
+                result.owner[session.id] = gateway.id
+                result.sessions.append(session)
+            }
+            for project in payload.projects ?? [] where result.projects[project.id] == nil {
+                result.projects[project.id] = project
+            }
+        }
+        return result
     }
 
     private func loadAgents() async {
-        guard let client else { return }
+        guard let client = liveClient else { agents = []; return }
         let result = (try? await client.agents()) ?? []
-        guard self.client === client, !Task.isCancelled else { return }
+        guard liveClient === client, !Task.isCancelled else { return }
         agents = result
     }
 
-    func connect(link: String) async throws {
-        guard let candidate = DiriClient.Endpoint(enrolmentURL: link) else {
-            throw DiriClient.Failure.http(400, "Use the pairing code or link in Diri → Settings → Phone access on your Mac.")
-        }
-        // Verify authenticated Engine access before replacing saved credentials.
-        _ = try await DiriClient(endpoint: candidate, configuration: DiriClient.pairingConfiguration()).sessions()
-        try Task.checkCancellation()
-        endpoint = candidate
+    private var liveClient: DiriClient? { liveGatewayID.flatMap { clients[$0] } }
+
+    /// The client for a session's own gateway — writes must reach the daemon
+    /// that owns the session, whichever gateway is live.
+    func client(for sessionID: String) -> DiriClient? {
+        sessionOwner[sessionID].flatMap { clients[$0] } ?? liveClient
     }
 
     func hosts() async throws -> [DiriClient.Host] {
-        guard let client else { throw DiriClient.Failure.unauthorized }
+        guard let client = liveClient else { throw DiriClient.Failure.daemonUnreachable("No paired computer answered.") }
         return try await client.hosts()
     }
 
     func agents(host: String?) async throws -> [DiriClient.AgentReadiness.Item] {
-        guard let client else { throw DiriClient.Failure.unauthorized }
+        guard let client = liveClient else { throw DiriClient.Failure.daemonUnreachable("No paired computer answered.") }
         return try await client.agents(host: host)
     }
 
     func directories(host: String?, path: String) async throws -> DiriClient.DirectoryListing {
-        guard let client else { throw DiriClient.Failure.unauthorized }
+        guard let client = liveClient else { throw DiriClient.Failure.daemonUnreachable("No paired computer answered.") }
         return try await client.directories(host: host, path: path)
     }
 
@@ -223,100 +414,63 @@ final class AppModel {
         reproject()
     }
 
+    private func requireClient(_ id: String) throws -> DiriClient {
+        guard let client = client(for: id) else {
+            throw DiriClient.Failure.daemonUnreachable("Connect to your Mac first.")
+        }
+        return client
+    }
+
     func screen(for id: String) async throws -> DiriClient.Screen {
-        guard let client else { throw DiriClient.Failure.daemonUnreachable("Connect to your Mac first.") }
-        return try await client.screen(sessionID: id)
+        try await requireClient(id).screen(sessionID: id)
     }
 
     func diff(for id: String) async throws -> DiriClient.Diff {
-        guard let client else { throw DiriClient.Failure.daemonUnreachable("Connect to your Mac first.") }
-        return try await client.diff(sessionID: id)
-    }
-
-    func setActive(_ active: Bool) {
-        if active { restart() }
-        else { eventTask?.cancel(); pollTask?.cancel() }
+        try await requireClient(id).diff(sessionID: id)
     }
 
     func send(_ text: String, to id: String) async throws {
-        guard let client else { throw DiriClient.Failure.daemonUnreachable("Connect to your Mac first.") }
-        try await client.send(text: text, to: id)
+        try await requireClient(id).send(text: text, to: id)
     }
 
     func send(_ key: TerminalKey, to id: String) async throws {
-        guard let client else { throw DiriClient.Failure.daemonUnreachable("Connect to your Mac first.") }
-        try await client.send(key: key, to: id)
+        try await requireClient(id).send(key: key, to: id)
     }
 
     func markSeen(_ id: String) async {
-        try? await client?.markSeen(sessionID: id)
-        await refresh()
+        guard let client = client(for: id) else { return }
+        try? await client.markSeen(sessionID: id)
+        if let owner = sessionOwner[id] { await refresh(gateway: owner) }
     }
 
     func kill(_ id: String) async throws {
-        guard let client else { return }
+        guard let client = client(for: id) else { return }
         try await client.kill(sessionID: id)
-        await refresh()
+        if let owner = sessionOwner[id] { await refresh(gateway: owner) }
     }
 
     func spawn(kind: String, cwd: String, prompt: String?, host: String? = nil,
                worktree: Bool = false, branch: String? = nil, base: String? = nil) async throws -> SessionRecord {
-        guard let client else { throw DiriClient.Failure.daemonUnreachable("not configured") }
+        guard let client = liveClient, let live = liveGatewayID else {
+            throw DiriClient.Failure.daemonUnreachable("No paired computer answered.")
+        }
         let record = try await client.spawn(kind: kind, cwd: cwd, prompt: prompt,
             host: host, worktree: worktree, branch: branch, base: base)
-        await refresh()
+        sessionOwner[record.id] = live
+        await refresh(gateway: live)
         return record
     }
 
-    /// Directories that already have sessions — almost always where the next
-    /// one belongs, and the only way to avoid typing a path on a phone.
+    /// Directories that already have sessions on the live gateway — almost
+    /// always where the next one belongs.
     var recentDirectories: [String] {
         var seen: Set<String> = []
         var result: [String] = []
-        for session in sessions.sorted(by: { $0.updatedAt > $1.updatedAt }) {
+        let live = sessions.filter { sessionOwner[$0.id] == liveGatewayID }
+        for session in live.sorted(by: { $0.updatedAt > $1.updatedAt }) {
             if seen.insert(session.cwd).inserted { result.append(session.cwd) }
             if result.count == 8 { break }
         }
         return result
-    }
-}
-
-// MARK: - Credentials
-
-/// The endpoint lives in the keychain, not `UserDefaults`: it is a bearer token
-/// that can start and kill processes on a real machine.
-enum Credentials {
-    private static let service = "com.cristicretu.diri.phone"
-    private static let account = "endpoint"
-
-    static func save(_ endpoint: DiriClient.Endpoint?) {
-        guard let endpoint, let data = try? JSONEncoder().encode(endpoint) else {
-            SecItemDelete(baseQuery() as CFDictionary)
-            return
-        }
-        var query = baseQuery()
-        SecItemDelete(query as CFDictionary)
-        query[kSecValueData as String] = data
-        query[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
-        SecItemAdd(query as CFDictionary, nil)
-    }
-
-    static func load() -> DiriClient.Endpoint? {
-        var query = baseQuery()
-        query[kSecReturnData as String] = true
-        query[kSecMatchLimit as String] = kSecMatchLimitOne
-        var item: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
-              let data = item as? Data
-        else { return nil }
-        return try? JSONDecoder().decode(DiriClient.Endpoint.self, from: data)
-    }
-
-    private static func baseQuery() -> [String: Any] {
-        [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-        ]
     }
 }

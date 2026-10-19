@@ -168,9 +168,27 @@ struct SidebarView: View {
     private var toolbar: some ToolbarContent {
         ToolbarItem(placement: .topBarLeading) {
             Menu {
-                Button("Retry connection") { Task { await model.refresh() } }
-                Button("Pair with your Mac…") { pairing = true }
-                Button("Disconnect this phone", role: .destructive) { model.endpoint = nil }
+                Section("Computers, in priority order") {
+                    ForEach(model.gateways) { gateway in
+                        Menu {
+                            if gateway.id != model.gateways.first?.id {
+                                Button("Prefer this computer", systemImage: "arrow.up") {
+                                    model.preferGateway(gateway.id)
+                                }
+                            }
+                            Button("Forget this computer", systemImage: "trash", role: .destructive) {
+                                model.removeGateway(gateway.id)
+                            }
+                        } label: {
+                            Label(gateway.name, systemImage: gatewaySymbol(gateway))
+                            Text(gatewayStatus(gateway))
+                        }
+                        .accessibilityIdentifier("gateway-\(gateway.name)")
+                    }
+                }
+                Button("Retry connection", systemImage: "arrow.clockwise") { Task { await model.refresh() } }
+                Button("Add a computer…", systemImage: "plus") { pairing = true }
+                    .accessibilityIdentifier("add-gateway")
             } label: {
                 HStack(spacing: 5) {
                     ConnectionDot(connection: model.connection, host: model.host)
@@ -178,6 +196,7 @@ struct SidebarView: View {
                 }
             }
             .accessibilityLabel("Mac connection options")
+            .accessibilityIdentifier("connection-menu")
         }
         ToolbarItemGroup(placement: .topBarTrailing) {
             if !model.needingInput.isEmpty {
@@ -193,6 +212,22 @@ struct SidebarView: View {
             }
             Button { spawning = true } label: { Image(systemName: "plus") }
                 .accessibilityLabel("New session")
+                .accessibilityIdentifier("new-session")
+        }
+    }
+
+    private func gatewaySymbol(_ gateway: Gateway) -> String {
+        if gateway.id == model.liveGatewayID { return "checkmark.circle.fill" }
+        return model.outcomes[gateway.id]?.isReachable == true ? "circle.fill" : "circle.dashed"
+    }
+
+    private func gatewayStatus(_ gateway: Gateway) -> String {
+        if gateway.id == model.liveGatewayID { return "Live" }
+        switch model.outcomes[gateway.id] {
+        case .reachable: return "Reachable"
+        case .unauthorized: return "Pairing expired — pair again"
+        case let .unreachable(detail): return "Unreachable · \(detail)"
+        case nil: return "Checking…"
         }
     }
 

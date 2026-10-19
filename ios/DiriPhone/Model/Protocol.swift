@@ -116,11 +116,46 @@ enum RiskHint: String, Codable, Sendable {
     case network
     case fileWrite
     case neutral
+
+    /// A hint a newer daemon invents reads as neutral rather than failing the
+    /// whole session record.
+    init(from decoder: Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        self = Self(rawValue: raw) ?? .neutral
+    }
 }
 
-enum NeedsInputKind: String, Codable, Sendable {
+/// Open set: a newer daemon may add kinds, and one unknown value must not
+/// make every session it appears on fail to decode.
+enum NeedsInputKind: Codable, Hashable, Sendable {
     case permission
     case question
+    case other(String)
+
+    init(rawValue: String) {
+        switch rawValue {
+        case "permission": self = .permission
+        case "question": self = .question
+        default: self = .other(rawValue)
+        }
+    }
+
+    var rawValue: String {
+        switch self {
+        case .permission: "permission"
+        case .question: "question"
+        case let .other(value): value
+        }
+    }
+
+    init(from decoder: Decoder) throws {
+        self.init(rawValue: try decoder.singleValueContainer().decode(String.self))
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
 }
 
 struct NeedsInputDetail: Codable, Hashable, Sendable {
@@ -220,6 +255,9 @@ struct SessionRecord: Codable, Identifiable, Hashable, Sendable {
     var archivedAt: Double?
     var host: String?
     var hibernation: Hibernation?
+    /// Which paired gateway this record came from. Set by the phone, never on
+    /// the wire; shown only when more than one gateway is reachable.
+    var gateway: String?
 
     struct Hibernation: Codable, Hashable, Sendable {
         var reason: String?

@@ -69,7 +69,7 @@ struct ConnectView: View {
           }
         }
       }
-      .onAppear { if model.endpoint != nil { step = .pair } }
+      .onAppear { if model.hasGateways { step = .pair } }
       .onDisappear { connectionTask?.cancel() }
       .sheet(isPresented: $scanning) {
         NavigationStack {
@@ -146,9 +146,12 @@ struct ConnectView: View {
         TextField("Pairing link from your Mac", text: $link, axis: .vertical)
           .textInputAutocapitalization(.never).autocorrectionDisabled().keyboardType(.URL)
           .textContentType(.none).privacySensitive()
+          .accessibilityIdentifier("pairing-link-field")
           .padding(.vertical, 8)
         Button("Connect") { connect() }.disabled(link.isEmpty || connecting)
+          .accessibilityIdentifier("pairing-connect")
       }
+      .accessibilityIdentifier("pairing-paste")
       if connecting {
         ProgressView("Connecting to your Mac…")
         Button("Cancel connection") { connectionTask?.cancel() }
