@@ -52,6 +52,11 @@ final class Dictation {
 
     private let engine = AVAudioEngine()
     private let relay = TapRelay()
+    /// Loudness of each microphone buffer, 0…1, on the audio thread.
+    var onLevel: (@Sendable (Float) -> Void)? {
+        get { relay.onLevel }
+        set { relay.onLevel = newValue }
+    }
     private var engineRunning = false
     private var session: (any RecognitionSession)?
 
@@ -150,9 +155,28 @@ private final class TapRelay: @unchecked Sendable {
         lock.lock(); self.handler = handler; lock.unlock()
     }
 
+    private var levelHandler: (@Sendable (Float) -> Void)?
+    var onLevel: (@Sendable (Float) -> Void)? {
+        get { lock.lock(); defer { lock.unlock() }; return levelHandler }
+        set { lock.lock(); levelHandler = newValue; lock.unlock() }
+    }
+
     func deliver(_ buffer: AVAudioPCMBuffer) {
-        lock.lock(); let handler = handler; lock.unlock()
+        lock.lock(); let handler = handler; let onLevel = levelHandler; lock.unlock()
         handler?(buffer)
+        if let onLevel { onLevel(Self.level(of: buffer)) }
+    }
+
+    /// RMS of the first channel mapped from roughly −50…−10 dBFS onto 0…1:
+    /// speech at arm's length lands mid-range, room noise near zero.
+    static func level(of buffer: AVAudioPCMBuffer) -> Float {
+        guard let samples = buffer.floatChannelData?[0], buffer.frameLength > 0 else { return 0 }
+        let count = Int(buffer.frameLength)
+        var sum: Float = 0
+        for index in 0..<count { sum += samples[index] * samples[index] }
+        let rms = (sum / Float(count)).squareRoot()
+        let decibels = 20 * log10(max(rms, 1e-7))
+        return min(1, max(0, (decibels + 50) / 40))
     }
 }
 

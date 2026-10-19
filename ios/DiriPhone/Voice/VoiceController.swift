@@ -21,6 +21,12 @@ final class VoiceController {
     private(set) var heard: String = ""
     private(set) var lastSent: String = ""
     private(set) var error: String?
+    /// Microphone loudness while listening, 0…1, smoothed for display.
+    private(set) var level: Double = 0
+    /// The word being read aloud, as a range of `agentText`.
+    private(set) var spokenRange: NSRange?
+    /// When the synthesizer last started a word: what the orb pulses on.
+    private(set) var lastWordAt: Date = .distantPast
     var muted = false {
         didSet { if muted, phase == .speaking { synthesizer.stopSpeaking(at: .immediate); phase = .idle } }
     }
@@ -52,6 +58,20 @@ final class VoiceController {
         self.client = client
         synthesizer.delegate = speechDelegate
         speechDelegate.onFinish = { [weak self] id, finished in self?.speechEnded(id, finished: finished) }
+        speechDelegate.onWord = { [weak self] id, range in
+            guard let self, id == self.currentUtterance else { return }
+            self.spokenRange = range
+            self.lastWordAt = .now
+        }
+        dictation.onLevel = { [weak self] value in
+            Task { @MainActor in
+                guard let self, self.phase == .listening else { return }
+                // Fast attack, slow release, so the orb breathes rather than
+                // flickers with every buffer.
+                let next = Double(value)
+                self.level = next > self.level ? next : self.level * 0.8 + next * 0.2
+            }
+        }
     }
 
     // MARK: Lifecycle
@@ -111,6 +131,12 @@ final class VoiceController {
         eventTask = Task { [weak self] in
             while !Task.isCancelled {
                 for await event in await client.events() {
+                    if event.name == "ready" {
+                        // A turn that ended before this stream connected
+                        // sent its event to nobody.
+                        await self?.catchUp()
+                        continue
+                    }
                     guard let finished = DiriClient.TurnFinished(event), finished.sessionID == sessionID else {
                         continue
                     }
@@ -123,6 +149,16 @@ final class VoiceController {
     }
 
     // MARK: Turns
+
+    private func catchUp() async {
+        let spoken = try? await client.spoken(sessionID: sessionID)
+        let transcript = (try? await client.transcript(sessionID: sessionID, limit: 6)) ?? []
+        guard let turn = spoken?.turn ?? transcript.last(where: \.isAgent)?.turn,
+              turn != lastHandledTurn else { return }
+        await turnFinished(DiriClient.TurnFinished(
+            sessionID: sessionID, turn: turn, spoken: spoken?.turn == turn ? spoken?.text : nil
+        ))
+    }
 
     func turnFinished(_ event: DiriClient.TurnFinished) async {
         if let turn = event.turn {
@@ -160,6 +196,7 @@ final class VoiceController {
         if testMode { utterance.volume = 0 }
         autoListenAfterSpeech = thenListen
         lastSpoken = text
+        spokenRange = nil
         currentUtterance = ObjectIdentifier(utterance)
         retainedUtterance = utterance
         phase = .speaking
@@ -168,6 +205,7 @@ final class VoiceController {
 
     private func speechEnded(_ id: ObjectIdentifier, finished: Bool) {
         guard phase == .speaking, id == currentUtterance else { return }
+        spokenRange = nil
         if finished, autoListenAfterSpeech {
             autoListenAfterSpeech = false
             Task { await listen() }
@@ -198,6 +236,7 @@ final class VoiceController {
     private func listen() async {
         error = nil
         heard = ""
+        level = 0
         phase = .listening
         lastHeardChange = .now
         do {
@@ -243,6 +282,7 @@ final class VoiceController {
         guard phase == .listening else { return }
         silenceTask?.cancel()
         phase = .sending
+        level = 0
         let final = await dictation.end()
         let text = (final.isEmpty ? heard : final).trimmingCharacters(in: .whitespacesAndNewlines)
         heard = text
@@ -266,6 +306,14 @@ final class VoiceController {
 
 private final class SpeechDelegate: NSObject, AVSpeechSynthesizerDelegate, @unchecked Sendable {
     var onFinish: (@MainActor (ObjectIdentifier, Bool) -> Void)?
+    var onWord: (@MainActor (ObjectIdentifier, NSRange) -> Void)?
+
+    func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, willSpeakRangeOfSpeechString range: NSRange,
+                           utterance: AVSpeechUtterance) {
+        let onWord = onWord
+        let id = ObjectIdentifier(utterance)
+        Task { @MainActor in onWord?(id, range) }
+    }
 
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
         let onFinish = onFinish
