@@ -8,7 +8,7 @@ struct DiriPhoneApp: App {
     var body: some Scene {
         WindowGroup {
             Group {
-                if model.endpoint == nil {
+                if !model.hasGateways {
                     ConnectView()
                 } else {
                     SidebarView()

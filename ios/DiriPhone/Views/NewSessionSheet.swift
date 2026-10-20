@@ -52,6 +52,7 @@ struct NewSessionSheet: View {
                 .disabled(busy)
                 Section {
                     Toggle("Separate workspace", isOn: $worktree)
+                        .accessibilityIdentifier("new-session-worktree")
                     if worktree {
                         Text("Start a new branch from \(base.isEmpty ? "main" : base), leaving your existing work untouched.")
                             .font(.caption).foregroundStyle(.secondary)
@@ -100,6 +101,7 @@ struct NewSessionSheet: View {
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Start", action: start)
+                        .accessibilityIdentifier("new-session-start")
                         .disabled(busy || loading || cwd.isEmpty || !agents.contains { $0.kind.id == kind })
                 }
             }
@@ -116,6 +118,12 @@ struct NewSessionSheet: View {
                     let available = try await model.agents(host: selectedHost)
                     try Task.checkCancellation()
                     agents = available
+                    #if DEBUG
+                    // UI-test hook: start in a known folder without driving the picker.
+                    if let e2eCwd = ProcessInfo.processInfo.environment["DIRI_E2E_CWD"], !e2eCwd.isEmpty, selectedHost == nil {
+                        cwd = e2eCwd
+                    }
+                    #endif
                     if !agents.contains(where: { $0.kind.id == kind }) { kind = agents.first?.kind.id ?? "" }
                     loading = false
                 } catch {

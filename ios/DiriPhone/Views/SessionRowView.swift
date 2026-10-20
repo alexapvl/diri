@@ -102,6 +102,9 @@ struct SessionRowView: View {
                     .font(.system(size: 9))
                     .foregroundStyle(Tokens.Ink.tertiary)
             }
+            if let gateway = session.gateway, !gateway.isEmpty {
+                RowChip(text: gateway, tint: Tokens.Ink.clay)
+            }
             if let host = session.host, !host.isEmpty {
                 RowChip(text: host, tint: Tokens.Ink.secondary)
             }

@@ -76,6 +76,43 @@ The session menu offers **Review changes** (tracked diff against HEAD) and
 screen warning. Mutations are never automatically retried: after a dropped
 connection, inspect the session before sending or starting again.
 
+## Several computers
+
+Pair more than one gateway (your Mac, `forge`) with **connection menu → Add a
+computer…**. Gateways are kept in Keychain in priority order (older builds'
+single pairing is migrated on first launch). On launch, on returning to the
+foreground, on every network change and every 15 s, all of them are probed
+(`/api/health`, 3 s timeout) at once. The highest-priority reachable one is
+*live* — shown in the toolbar and used for new sessions — and sessions from
+every reachable gateway are listed together, tagged with the gateway's name.
+Writes always go to the gateway that owns the session. **Prefer this
+computer** moves a gateway to the top.
+
+## Voice mode
+
+The waveform button on a session opens a full-screen voice mode for use with
+AirPods and the screen locked. When the agent finishes a turn (`turn_finished`
+on the event stream) it is read aloud — the agent's own `spoken` summary if
+there is one, otherwise the last agent turn from `/transcript`, with code and
+markup stripped and cut at a sentence near 600 characters. Then it listens
+(on-device: `SpeechAnalyzer` on iOS 26+, otherwise `SFSpeechRecognizer` with
+`requiresOnDeviceRecognition`) and sends after 1.5 s of silence. The big
+button interrupts speech, sends early, or starts talking; **Repeat** and
+**Mute** sit below it. Mute stops reading aloud and the automatic listening
+after it. While voice mode is open the Mac's `readAloud` setting is on and is
+restored on close; the screen poll pauses. Sends are never retried — a failed
+one is shown and left to you.
+
+The microphone stays open for as long as voice mode is: an iOS app with the
+`audio` background mode is suspended once its audio session goes idle, and
+voice mode must still hear the next turn with the screen locked.
+
+DEBUG builds read two launch-environment hooks for UI tests:
+`DIRI_VOICE_TEST_AUDIO` (dictate this audio file instead of the microphone;
+speech is then synthesized at zero volume) and `DIRI_E2E_CWD` (prefill the new
+session folder). The opt-in end-to-end test is
+`DiriPhoneUITests/EndToEndTests.swift`; its header documents the variables.
+
 ## Developer CLI / standalone gateway
 
 Start `diri-web` on the host and explicitly print its pairing link:

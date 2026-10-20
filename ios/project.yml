@@ -30,6 +30,12 @@ targets:
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         NSCameraUsageDescription: Scan the private pairing code shown in Diri on your Mac.
         NSLocalNetworkUsageDescription: Connect to Diri on your Mac to control your coding sessions.
+        NSMicrophoneUsageDescription: Voice mode listens for your reply to an agent and transcribes it on this iPhone.
+        NSSpeechRecognitionUsageDescription: Voice mode turns what you say into a message for your agent. Recognition runs on this iPhone.
+        # Voice mode keeps reading turns aloud and listening with the screen
+        # locked; the microphone engine is what keeps the app alive meanwhile.
+        UIBackgroundModes:
+          - audio
         UILaunchScreen:
           UIColorName: LaunchBackground
         UISupportedInterfaceOrientations:
@@ -68,14 +74,30 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.cristicretu.diri.phone.tests
 
+  # Opt-in end-to-end test against a real gateway. Skips unless DIRI_E2E_URL
+  # is set; see DiriPhoneUITests/EndToEndTests.swift.
+  DiriPhoneUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: DiriPhoneUITests
+    dependencies:
+      - target: DiriPhone
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.cristicretu.diri.phone.uitests
+        TEST_TARGET_NAME: DiriPhone
+
 schemes:
   DiriPhone:
     build:
       targets:
         DiriPhone: all
         DiriPhoneTests: [test]
+        DiriPhoneUITests: [test]
     test:
       targets:
         - DiriPhoneTests
+        - DiriPhoneUITests
     archive:
       config: Release
