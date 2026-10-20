@@ -8160,6 +8160,15 @@ mod tests {
         cx.run_until_parked();
         root.update_in(cx, |root, window, cx| {
             assert!(root.active_workspace.is_some(), "the layout is on screen");
+            // Showing the note builds a pane. A live directory watcher runs on
+            // its own thread and aborts the deterministic test scheduler.
+            let runtime = Arc::clone(&root.services.store);
+            let pane = cx.new(|cx| {
+                crate::notes::NotePane::with_store(runtime, None, false, cx)
+            });
+            if let Some(terminal) = &root.terminal {
+                terminal.update(cx, |terminal, _| terminal.set_note_pane_for_test(pane));
+            }
             root.open_todos(window, cx);
             root.show_from_todos(SessionId::new("s_note"), Some(0), window, cx);
         });
