@@ -7,25 +7,54 @@
 use gpui::{KeyDownEvent, PlatformInput};
 use std::cell::RefCell;
 
-thread_local! {
-    static CURRENT: RefCell<Option<(KeyDownEvent, u16)>> = const { RefCell::new(None) };
+struct PhysicalKey {
+    code: u16,
+    modifier_flags: u64,
 }
 
-pub(crate) struct NativeKeyDispatch(Option<(KeyDownEvent, u16)>);
+thread_local! {
+    static CURRENT: RefCell<Option<(KeyDownEvent, u16)>> = const { RefCell::new(None) };
+    static PHYSICAL: RefCell<Option<PhysicalKey>> = const { RefCell::new(None) };
+}
+
+pub(crate) struct NativeKeyDispatch {
+    previous_event: Option<(KeyDownEvent, u16)>,
+    previous_physical: Option<PhysicalKey>,
+}
 
 impl NativeKeyDispatch {
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn enter(event: &PlatformInput, key_code: u16) -> Self {
+        Self::enter_with_flags(event, key_code, 0)
+    }
+
+    /// `modifier_flags` is the raw `NSEvent.modifierFlags` bitfield, including
+    /// the device-dependent left/right bits GPUI's logical modifiers omit.
+    pub(crate) fn enter_with_flags(
+        event: &PlatformInput,
+        key_code: u16,
+        modifier_flags: u64,
+    ) -> Self {
         let current = match event {
             PlatformInput::KeyDown(event) => Some((event.clone(), key_code)),
             _ => None,
         };
-        Self(CURRENT.with(|state| state.replace(current)))
+        Self {
+            previous_event: CURRENT.with(|state| state.replace(current)),
+            previous_physical: PHYSICAL.with(|state| {
+                state.replace(Some(PhysicalKey {
+                    code: key_code,
+                    modifier_flags,
+                }))
+            }),
+        }
     }
 }
 
 impl Drop for NativeKeyDispatch {
     fn drop(&mut self) {
-        CURRENT.with(|state| state.replace(self.0.take()));
+        CURRENT.with(|state| state.replace(self.previous_event.take()));
+        PHYSICAL.with(|state| state.replace(self.previous_physical.take()));
     }
 }
 
@@ -39,6 +68,20 @@ pub fn current_native_key_code(event: &KeyDownEvent) -> Option<u16> {
             .borrow()
             .as_ref()
             .and_then(|(current, code)| (current == event).then_some(*code))
+    })
+}
+
+/// Hardware key code and raw modifier flags for whichever native event is
+/// dispatching on this thread right now.
+///
+/// Valid for key-down and flags-changed. Cleared when that dispatch returns,
+/// so a replayed GPUI event outside the callback sees nothing.
+pub fn current_physical_key() -> Option<(u16, u64)> {
+    PHYSICAL.with(|state| {
+        state
+            .borrow()
+            .as_ref()
+            .map(|key| (key.code, key.modifier_flags))
     })
 }
 
@@ -141,5 +184,21 @@ mod tests {
             assert_eq!(current_native_key_code(&event), Some(76));
         });
         assert_eq!(current_native_key_code(&event), None);
+    }
+
+    #[test]
+    fn flags_changed_keeps_a_physical_key_until_dispatch_ends() {
+        let event = PlatformInput::ModifiersChanged(gpui::ModifiersChangedEvent::default());
+        assert_eq!(current_physical_key(), None);
+        let outer = NativeKeyDispatch::enter_with_flags(&event, 61, 0x40);
+        assert_eq!(current_physical_key(), Some((61, 0x40)));
+        {
+            let inner = NativeKeyDispatch::enter_with_flags(&event, 58, 0x20);
+            assert_eq!(current_physical_key(), Some((58, 0x20)));
+            drop(inner);
+        }
+        assert_eq!(current_physical_key(), Some((61, 0x40)));
+        drop(outer);
+        assert_eq!(current_physical_key(), None);
     }
 }

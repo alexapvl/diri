@@ -1743,6 +1743,11 @@ mod tests {
             key_code: 96,
         };
         assert!(bare.modifiers().is_empty());
+        let right_option = crate::store::DictationShortcut {
+            label: "rightalt".into(),
+            key_code: 61,
+        };
+        assert_eq!(right_option.modifiers(), vec!["alt-right"]);
     }
 
     #[test]

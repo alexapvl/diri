@@ -2489,7 +2489,10 @@ impl RootView {
             ]
             .into_iter()
             .any(|command| commands::matches_keystroke(command, &event.keystroke));
-            if !global_overlay_command {
+            // Recording has to see the shortcut the user actually presses,
+            // including ones that would otherwise open the palette.
+            let recording_shortcut = surfaces.read(cx).is_recording_dictation_shortcut();
+            if recording_shortcut || !global_overlay_command {
                 surfaces.update(cx, |surfaces, cx| {
                     surfaces.key_down(event, window, cx);
                 });

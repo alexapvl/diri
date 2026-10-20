@@ -7421,6 +7421,9 @@ impl Render for UtilitySurfaces {
             .track_focus(&self.focus)
             .key_context(UTILITY_CONTEXT)
             .on_key_down(cx.listener(Self::key_down))
+            .on_modifiers_changed(cx.listener(|this, event, _, cx| {
+                this.dictation_modifiers_changed(event, cx);
+            }))
             .on_action(cx.listener(|this, _: &OpenWorktrees, _, cx| {
                 this.open_worktrees(cx);
             }))
