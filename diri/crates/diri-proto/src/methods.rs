@@ -124,6 +124,12 @@ impl Method {
     pub const VOICE_STATE: &'static str = "voice.state";
     pub const VOICE_SPEAK: &'static str = "voice.speak";
     pub const VOICE_SPOKEN: &'static str = "voice.spoken";
+    /// The latest spoken summary a session gave, without collecting it, for
+    /// readers other than the app (the phone). Older Engines lack it.
+    pub const VOICE_LATEST_SPOKEN: &'static str = "voice.latest_spoken";
+    /// Gets or sets whether a phone voice client wants spoken summaries.
+    /// In memory only; older Engines lack it.
+    pub const VOICE_PHONE_READER: &'static str = "voice.phone_reader";
     pub const TEST_RUN: &'static str = "test.run";
     pub const STATE_SNAPSHOT: &'static str = "state.snapshot";
     pub const DAEMON_PREPARE_SHUTDOWN: &'static str = "daemon.prepare_shutdown";
@@ -859,6 +865,10 @@ pub struct TranscriptTurnRecord {
     /// `user` or `agent`.
     pub role: String,
     pub text: String,
+    /// The attention turn this message ended, when the Engine knows it: set
+    /// on the last agent message of a finished turn. Older Engines omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]

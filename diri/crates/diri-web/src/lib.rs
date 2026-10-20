@@ -19,6 +19,9 @@
 mod api;
 mod auth;
 mod http;
+#[cfg(test)]
+mod testing;
+mod turns;
 mod ui;
 
 use std::net::SocketAddr;
@@ -272,11 +275,34 @@ async fn serve(config: Config, auth: Auth, minted: bool) -> Result<(), String> {
     serve_connections(listener, api).await
 }
 
-/// App-owned gateway with a fresh in-memory credential on each enable.
+/// Where the Mac app keeps its phone pairing token: owner-only, in the app's
+/// support directory, so re-enabling access keeps phones paired.
+#[must_use]
+pub fn phone_token_path() -> PathBuf {
+    let home = diri_platform::home_dir()
+        .map(|p| p.into_os_string())
+        .map_or_else(|| PathBuf::from("."), PathBuf::from);
+    DirijorPaths::app_support(home).join(PHONE_TOKEN_FILE)
+}
+
+const PHONE_TOKEN_FILE: &str = "phone-access.token";
+
+/// Mints a new pairing code at `token_path`. Every phone paired with the old
+/// one must pair again; a running gateway keeps the old code until restarted.
+pub fn reset_phone_pairing(token_path: &std::path::Path) -> Result<(), String> {
+    Auth::rotate(token_path)
+        .map(drop)
+        .map_err(|error| format!("Cannot create a new pairing code: {error}"))
+}
+
+/// App-owned gateway. Its credential persists at `token_path` (created
+/// owner-only on first enable), so turning access off and on again, or
+/// restarting Diri, keeps existing phone pairings.
 pub async fn start_phone_access(
     address: std::net::Ipv4Addr,
     client: Arc<DaemonClient>,
     label: String,
+    token_path: &std::path::Path,
 ) -> Result<(String, tokio::task::JoinHandle<Result<(), String>>), String> {
     let [a, b, _, _] = address.octets();
     if a != 100 || !(64..=127).contains(&b) {
@@ -289,7 +315,8 @@ pub async fn start_phone_access(
     let listener = TcpListener::bind((address, DEFAULT_PORT))
         .await
         .map_err(|error| format!("Cannot enable phone access: {error}"))?;
-    let auth = Auth::temporary().map_err(|error| error.to_string())?;
+    let (auth, _) = Auth::load_or_create(token_path)
+        .map_err(|error| format!("Cannot read the phone pairing code: {error}"))?;
     let url = enrolment_url(&SocketAddr::from((address, DEFAULT_PORT)), auth.token());
     let api = Arc::new(Api {
         client,
@@ -410,6 +437,9 @@ where
         Err(_) => api.client.events(),
     };
     let mut connection = api.client.connection_state();
+    // Subscribed first, then seeded, so no completion falls in between.
+    let mut turns = turns::TurnWatcher::default();
+    api.seed_turns(&mut turns).await;
 
     http::write_event(
         writer,
@@ -428,10 +458,15 @@ where
                         &serde_json::json!({ "seq": event.seq, "params": event.params }),
                     )
                     .await?;
+                    if let Some((session, turn)) = turns.observe(&event.name, &event.params) {
+                        let finished = api.turn_finished(session, turn).await;
+                        http::write_event(writer, turns::TURN_FINISHED, &finished).await?;
+                    }
                 }
                 // Lagged: the phone was backgrounded and missed events. Tell
                 // it to refetch wholesale rather than pretending it is current.
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    api.seed_turns(&mut turns).await;
                     http::write_event(writer, "resync", &serde_json::json!({})).await?;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
@@ -440,7 +475,11 @@ where
                 if changed.is_err() {
                     return Ok(());
                 }
+                let connected = matches!(*connection.borrow(), diri_client::ConnectionState::Connected(_));
                 let state = format!("{:?}", *connection.borrow());
+                if connected {
+                    api.seed_turns(&mut turns).await;
+                }
                 http::write_event(writer, "daemon", &serde_json::json!({ "state": state })).await?;
             }
             () = tokio::time::sleep(HEARTBEAT) => {
@@ -456,6 +495,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[tokio::test]
     async fn phone_entry_point_refuses_lan_and_public_addresses() {
@@ -463,11 +503,19 @@ mod tests {
             let client = Arc::new(DaemonClient::with_socket_path(
                 "/nonexistent/diri-phone-test.sock",
             ));
+            let token = tempfile::tempdir().unwrap();
             assert!(
-                start_phone_access(address.parse().unwrap(), client, "test".into())
-                    .await
-                    .is_err()
+                start_phone_access(
+                    address.parse().unwrap(),
+                    client,
+                    "test".into(),
+                    &token.path().join("phone.token"),
+                )
+                .await
+                .is_err()
             );
+            // Refused before anything is written.
+            assert!(!token.path().join("phone.token").exists());
         }
     }
 
@@ -508,6 +556,83 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(TcpStream::connect(address).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn the_event_stream_announces_a_finished_turn() {
+        use diri_proto::Method;
+        use tokio::io::{AsyncBufReadExt as _, BufReader as TokioBufReader};
+        let engine = crate::testing::fake_engine(|method, _| match method {
+            Method::EVENTS_SUBSCRIBE => json!({"subscribed": true}),
+            Method::VOICE_LATEST_SPOKEN => json!({"turn": 2, "text": "Tests pass."}),
+            _ => json!({}),
+        })
+        .await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let auth = Auth::temporary().unwrap();
+        let token = auth.token().to_owned();
+        let api = Arc::new(Api {
+            client: Arc::clone(&engine.client),
+            auth,
+            host_label: "test".into(),
+        });
+        let server = tokio::spawn(serve_connections(listener, api));
+        let stream = TcpStream::connect(address).await.unwrap();
+        let (read_half, mut write_half) = stream.into_split();
+        write_half
+            .write_all(
+                format!(
+                    "GET /api/events HTTP/1.1\r\nHost: {address}\r\nX-Diri-Token: {token}\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut lines = TokioBufReader::new(read_half).lines();
+        let mut next_data = async |event: &str| loop {
+            let line = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+                .await
+                .expect("event in time")
+                .unwrap()
+                .expect("stream open");
+            if line == format!("event: {event}") {
+                let data = lines.next_line().await.unwrap().unwrap();
+                let data = data.strip_prefix("data: ").expect("data line");
+                break serde_json::from_str::<serde_json::Value>(data).unwrap();
+            }
+        };
+        next_data("ready").await;
+
+        let attention = |sequence: u64, working: bool, completed: bool| {
+            json!({
+                "id": "s_a",
+                "attentionState": {
+                    "version": 1, "epoch": "e", "sequence": sequence, "turn": 2,
+                    "working": working,
+                    "events": if completed { json!([{
+                        "sequence": sequence, "turn": 2, "kind": "completion",
+                        "occurredAt": 0.0, "resolved": false, "blocking": false,
+                        "detail": null,
+                    }]) } else { json!([]) },
+                },
+            })
+        };
+        for (sequence, working, completed) in [(1, true, false), (2, false, true)] {
+            engine
+                .events
+                .send((
+                    diri_proto::EventName::SESSION_UPDATED.into(),
+                    attention(sequence, working, completed),
+                ))
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            next_data("turn_finished").await,
+            json!({"sessionID": "s_a", "turn": 2, "spoken": "Tests pass."})
+        );
+        server.abort();
     }
 
     fn arguments(raw: &[&str]) -> Vec<String> {

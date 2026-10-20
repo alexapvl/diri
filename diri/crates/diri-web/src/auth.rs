@@ -25,6 +25,7 @@ pub struct Auth {
 }
 
 impl Auth {
+    #[cfg(test)]
     pub fn temporary() -> io::Result<Self> {
         Ok(Self {
             token: mint_token()?,
@@ -41,14 +42,28 @@ impl Auth {
                 return Ok((Self { token }, false));
             }
         }
+        Ok((Self::rotate(path)?, true))
+    }
+
+    /// Replaces the token at `path` with a fresh one, revoking every client
+    /// paired with the old one. The file is owner-only from creation and
+    /// swapped in atomically, so a crash never leaves a half-written token.
+    pub fn rotate(path: &Path) -> io::Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
             restrict(parent, 0o700)?;
         }
         let token = mint_token()?;
-        std::fs::write(path, format!("{token}\n"))?;
-        restrict(path, 0o600)?;
-        Ok((Self { token }, true))
+        let mut staging = path.as_os_str().to_owned();
+        staging.push(format!(".{}.tmp", std::process::id()));
+        let staging = PathBuf::from(staging);
+        let written = write_owner_only(&staging, format!("{token}\n").as_bytes())
+            .and_then(|()| std::fs::rename(&staging, path));
+        if written.is_err() {
+            let _ = std::fs::remove_file(&staging);
+        }
+        written?;
+        Ok(Self { token })
     }
 
     #[must_use]
@@ -139,6 +154,27 @@ fn mint_token() -> io::Result<String> {
     getrandom::fill(&mut bytes)
         .map_err(|error| io::Error::other(format!("no system entropy: {error}")))?;
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+#[cfg(unix)]
+fn write_owner_only(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    // `mode` is filtered by the umask and ignored for an existing file.
+    restrict(path, 0o600)?;
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
+#[cfg(not(unix))]
+fn write_owner_only(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    std::fs::write(path, bytes)
 }
 
 #[cfg(unix)]
@@ -247,6 +283,34 @@ mod tests {
         let (second, minted_again) = Auth::load_or_create(&path).expect("reload");
         assert!(!minted_again);
         assert_eq!(first.token(), second.token());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path)
+                .expect("metadata")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
+
+    #[test]
+    fn rotating_revokes_the_old_token_and_stays_owner_only() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("phone.token");
+        let (first, _) = Auth::load_or_create(&path).expect("create");
+        let rotated = Auth::rotate(&path).expect("rotate");
+        assert_ne!(first.token(), rotated.token());
+        let (reloaded, minted) = Auth::load_or_create(&path).expect("reload");
+        assert!(!minted);
+        assert_eq!(reloaded.token(), rotated.token());
+        // Only the token file is left behind: no staging file.
+        let entries: Vec<_> = std::fs::read_dir(directory.path())
+            .expect("list")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("phone.token")]);
 
         #[cfg(unix)]
         {

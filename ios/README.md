@@ -57,8 +57,11 @@ to install or launch. Its bind is Tailscale-only, not your public/LAN address.
 The [Tailscale CLI](https://tailscale.com/docs/reference/tailscale-cli?tab=macos)
 is probed read-only with `TAILSCALE_BE_CLI=1`; Diri does not change VPN settings.
 The pairing code controls all sessions exposed by this Mac: do not share it.
-Turning access off closes existing connections; enabling again produces a new
-code, and the phone must be paired again. Quitting Diri turns access off.
+Turning access off closes existing connections. The code is kept owner-only
+(`0600`) in Diri's application-support directory, so enabling again, or
+relaunching Diri, keeps existing phones paired. **New pairing code** in the
+same settings page replaces it and every phone must be paired again. Quitting
+Diri turns access off.
 
 On the phone, **New session** lets you choose this Mac or a configured SSH
 host, a known project or a browsable folder, and an agent installed on that
