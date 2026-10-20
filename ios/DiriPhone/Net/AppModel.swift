@@ -388,6 +388,35 @@ final class AppModel {
         sessions.first { $0.id == id }
     }
 
+    /// Sessions grouped by the computer they run on — the live gateway's own,
+    /// then each SSH host or other paired gateway — in sidebar order.
+    var computers: [ComputerGroup] {
+        var order: [String] = []
+        var rows: [String: [SidebarRow]] = [:]
+        for row in groups.flatMap(\.rows) {
+            let name = computerName(of: row.session)
+            if rows[name] == nil { order.append(name) }
+            rows[name, default: []].append(row)
+        }
+        return order.map { ComputerGroup(name: $0, rows: rows[$0] ?? []) }
+    }
+
+    func computerName(of session: SessionRecord) -> String {
+        if let host = session.host, !host.isEmpty { return host }
+        if let gateway = session.gateway, !gateway.isEmpty { return gateway }
+        return host.isEmpty ? "This Mac" : host
+    }
+
+    /// Every visible session in drawn order, for ⌘[ and ⌘].
+    var orderedSessionIDs: [String] { computers.flatMap { $0.rows.map(\.session.id) } }
+
+    func neighbour(of id: String?, step: Int) -> String? {
+        let ids = orderedSessionIDs
+        guard !ids.isEmpty else { return nil }
+        guard let id, let index = ids.firstIndex(of: id) else { return ids.first }
+        return ids[(index + step + ids.count) % ids.count]
+    }
+
     /// Sessions asking for a human, in the order the sidebar draws them —
     /// what the "jump to next" affordance walks.
     var needingInput: [SessionRecord] {
@@ -473,4 +502,10 @@ final class AppModel {
         }
         return result
     }
+}
+
+struct ComputerGroup: Identifiable, Hashable {
+    var name: String
+    var rows: [SidebarRow]
+    var id: String { name }
 }

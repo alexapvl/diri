@@ -1,51 +1,40 @@
 import SwiftUI
 
-/// Gym mode: glanced at from a bench between sets, so it has to read at
-/// arm's length. One orb carries the state through motion, one block of large
-/// type carries the words, and the whole screen is the button.
-struct VoiceModeView: View {
+/// Voice mode as a glass panel over the terminal: a small calm indicator,
+/// words at reading size, and capsule controls. The terminal stays visible
+/// above it, so you can watch the agent work while you talk to it.
+struct VoicePanel: View {
     let sessionID: String
+    let onClose: () -> Void
     @Environment(AppModel.self) private var model
-    @Environment(\.dismiss) private var dismiss
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var controller: VoiceController
 
-    init(sessionID: String, client: DiriClient) {
+    init(sessionID: String, client: DiriClient, onClose: @escaping () -> Void) {
         self.sessionID = sessionID
+        self.onClose = onClose
         _controller = State(initialValue: VoiceController(sessionID: sessionID, client: client))
     }
 
     var body: some View {
-        VStack(spacing: 0) {
+        VStack(alignment: .leading, spacing: 14) {
             header
-            // Fixed, not a spacer: the orb must not move as the words below
-            // it grow and shrink.
-            orb
-                .padding(.top, 72)
-            Text(statusLine)
-                .font(.system(size: 15, weight: .medium))
-                .foregroundStyle(Tokens.Ink.tertiary)
-                .padding(.top, 28)
-                .opacity(workingWithoutWords ? 0 : 1)
-                .accessibilityIdentifier("voice-phase")
             words
-                .padding(.top, 14)
-            Spacer(minLength: 16)
             if let error = controller.error {
                 Text(error)
-                    .font(.system(size: 15, weight: .medium))
+                    .font(.subheadline.weight(.medium))
                     .foregroundStyle(Tokens.Ink.danger)
-                    .multilineTextAlignment(.center)
-                    .padding(.horizontal, 32)
-                    .padding(.bottom, 8)
                     .accessibilityIdentifier("voice-error")
             }
             controls
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Tokens.Ink.background.ignoresSafeArea())
-        // Anywhere is the button: a sweaty thumb should not have to aim.
-        .contentShape(Rectangle())
+        .padding(.horizontal, 18)
+        .padding(.top, 16)
+        .padding(.bottom, 14)
+        .frame(maxWidth: 560)
+        .glass(in: RoundedRectangle(cornerRadius: 30, style: .continuous), tint: Color.black.opacity(0.25))
+        // The panel is the button: a tap anywhere talks, sends, or interrupts.
+        .contentShape(RoundedRectangle(cornerRadius: 30, style: .continuous))
         .onTapGesture { controller.primaryAction() }
         .sensoryFeedback(.success, trigger: controller.lastSent)
         .sensoryFeedback(.impact(weight: .light), trigger: controller.phase == .listening)
@@ -64,61 +53,36 @@ struct VoiceModeView: View {
     // MARK: Header
 
     private var header: some View {
-        ZStack {
-            VStack(spacing: 2) {
-                Text(title)
-                    .font(.system(size: 15, weight: .semibold))
-                    .foregroundStyle(Tokens.Ink.secondary)
-                    .lineLimit(1)
-                if let computer {
-                    Text(computer)
-                        .font(.system(size: 13))
-                        .foregroundStyle(Tokens.Ink.tertiary)
-                        .lineLimit(1)
-                }
-            }
-            .padding(.horizontal, 64)
-            HStack {
-                Button { dismiss() } label: {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 17, weight: .semibold))
-                        .foregroundStyle(Tokens.Ink.secondary)
-                        .frame(width: 44, height: 44)
-                        .contentShape(Rectangle())
-                }
-                .accessibilityLabel("Close voice mode")
-                .accessibilityIdentifier("voice-close")
-                Spacer()
-            }
-        }
-        .padding(.horizontal, 12)
-        .padding(.top, 4)
-    }
-
-    // MARK: Orb
-
-    private var orb: some View {
-        Button { controller.primaryAction() } label: {
-            TimelineView(.animation(paused: reduceMotion || !orbMoves)) { timeline in
-                EmberOrb(
-                    mode: orbMode,
+        HStack(spacing: 12) {
+            TimelineView(.animation(paused: reduceMotion || indicatorMode == .idle)) { timeline in
+                VoiceBars(
+                    mode: indicatorMode,
                     level: controller.level,
                     sinceWord: timeline.date.timeIntervalSince(controller.lastWordAt),
                     time: timeline.date.timeIntervalSinceReferenceDate,
                     reduceMotion: reduceMotion
                 )
             }
-            .frame(width: 200, height: 200)
-            .contentShape(Circle())
+            .frame(width: 60, height: 44)
+            .accessibilityHidden(true)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(statusLine)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(statusColor)
+                    .accessibilityIdentifier("voice-phase")
+                Text(title)
+                    .font(.footnote)
+                    .foregroundStyle(Tokens.Ink.tertiary)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 8)
+            GlassIconButton(symbol: "xmark", label: "Close voice mode", size: 34, action: onClose)
+                .accessibilityIdentifier("voice-close")
         }
-        .buttonStyle(.plain)
-        // Not `.disabled`: that greys the orb, and taps while sending are
-        // already ignored by `primaryAction`.
-        .accessibilityLabel(talkLabel)
-        .accessibilityIdentifier("voice-talk")
     }
 
-    private var orbMode: EmberOrb.Mode {
+    private var indicatorMode: VoiceBars.Mode {
         switch controller.phase {
         case .listening: .listening
         case .speaking: .speaking
@@ -127,50 +91,33 @@ struct VoiceModeView: View {
         }
     }
 
-    private var orbMoves: Bool { orbMode != .idle }
-
     // MARK: Words
 
-    @ViewBuilder
     private var words: some View {
-        VStack(spacing: 14) {
+        VStack(alignment: .leading, spacing: 8) {
             if let context = contextLine {
                 Text(context.text)
-                    .font(.system(size: 17))
+                    .font(.subheadline)
                     .foregroundStyle(Tokens.Ink.tertiary)
-                    .multilineTextAlignment(.center)
                     .lineLimit(2)
                     .accessibilityIdentifier(context.id)
             }
-            // Largest type that fits; only a long reply scrolls. Sized to its
-            // content so a short line sits with the orb, not atop a void.
-            ViewThatFits(in: .vertical) {
-                styled(main, size: 30)
-                styled(main, size: 24)
-                ScrollView { styled(main, size: 24) }
-                    .scrollBounceBehavior(.basedOnSize)
-            }
-            .frame(maxHeight: 340, alignment: .top)
+            // Five lines at reading size; the full text is in the label and
+            // in the terminal above.
+            main
+                .lineLimit(5)
+                .fixedSize(horizontal: false, vertical: true)
         }
-        .padding(.horizontal, 28)
+        .font(.title3.weight(.medium))
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    private func styled(_ content: some View, size: CGFloat) -> some View {
-        content
-            .font(.system(size: size, weight: .semibold))
-            .multilineTextAlignment(.center)
-            .frame(maxWidth: .infinity)
-            .fixedSize(horizontal: false, vertical: true)
-    }
-
-    /// The agent is on its first turn and nobody has said anything yet: the
-    /// orb's shimmer is the whole message.
     private var workingWithoutWords: Bool {
         agentWorking && controller.agentText.isEmpty && controller.lastSent.isEmpty
             && (controller.phase == .idle || controller.phase == .waiting)
     }
 
-    /// The one big block: whatever is being said right now, by either side.
+    /// Whatever is being said right now, by either side.
     @ViewBuilder
     private var main: some View {
         switch controller.phase {
@@ -185,7 +132,7 @@ struct VoiceModeView: View {
         case .waiting, .idle, .starting:
             if agentWorking, !controller.lastSent.isEmpty {
                 Text(controller.lastSent)
-                    .foregroundStyle(Tokens.Ink.tertiary)
+                    .foregroundStyle(Tokens.Ink.secondary)
                     .accessibilityIdentifier("voice-last-sent")
             } else if workingWithoutWords {
                 Text("Working on it…")
@@ -199,8 +146,6 @@ struct VoiceModeView: View {
         }
     }
 
-    /// One quiet line above the big block, so the other side of the
-    /// conversation is never lost.
     private var contextLine: (text: String, id: String)? {
         switch controller.phase {
         case .listening, .sending:
@@ -230,7 +175,7 @@ struct VoiceModeView: View {
             result[done].foregroundColor = Tokens.Ink.primary
         }
         if let word = Range(range, in: result) {
-            result[word].foregroundColor = EmberOrb.ember
+            result[word].foregroundColor = VoiceBars.ember
         }
         return result
     }
@@ -238,33 +183,43 @@ struct VoiceModeView: View {
     // MARK: Controls
 
     private var controls: some View {
-        HStack {
-            quiet(symbol: "arrow.counterclockwise", label: "Repeat", id: "voice-repeat") {
-                controller.repeatLast()
-            }
-            .disabled(controller.agentText.isEmpty)
-            Spacer()
-            quiet(symbol: controller.muted ? "speaker.slash.fill" : "speaker.wave.2.fill",
-                  label: controller.muted ? "Unmute" : "Mute", id: "voice-mute") {
-                controller.muted.toggle()
-            }
-        }
-        .padding(.horizontal, 28)
-        .padding(.bottom, 8)
-    }
+        GlassGroup(spacing: 10) {
+            HStack(spacing: 10) {
+                GlassIconButton(symbol: "arrow.counterclockwise", label: "Repeat", size: 44) {
+                    controller.repeatLast()
+                }
+                .disabled(controller.agentText.isEmpty)
+                .opacity(controller.agentText.isEmpty ? 0.45 : 1)
+                .accessibilityIdentifier("voice-repeat")
 
-    private func quiet(symbol: String, label: String, id: String,
-                       action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Image(systemName: symbol)
-                .font(.system(size: 24, weight: .medium))
-                .foregroundStyle(Tokens.Ink.secondary)
-                .frame(width: 64, height: 64)
-                .contentShape(Rectangle())
+                GlassIconButton(
+                    symbol: controller.muted ? "speaker.slash.fill" : "speaker.wave.2.fill",
+                    label: controller.muted ? "Unmute" : "Mute", size: 44
+                ) {
+                    controller.muted.toggle()
+                }
+                .accessibilityIdentifier("voice-mute")
+
+                Spacer(minLength: 0)
+
+                Button { controller.primaryAction() } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: talkSymbol)
+                            .font(.system(size: 15, weight: .semibold))
+                        Text(talkLabel)
+                            .font(.body.weight(.semibold))
+                    }
+                    .foregroundStyle(Tokens.Ink.background)
+                    .padding(.horizontal, 20)
+                    .frame(height: 44)
+                    .background(Capsule().fill(Tokens.Ink.primary))
+                    .contentShape(Capsule())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(talkLabel)
+                .accessibilityIdentifier("voice-talk")
+            }
         }
-        .buttonStyle(.plain)
-        .accessibilityLabel(label)
-        .accessibilityIdentifier(id)
     }
 
     // MARK: Copy
@@ -278,24 +233,39 @@ struct VoiceModeView: View {
 
     private var talkLabel: String {
         switch controller.phase {
-        case .listening: "Send now"
-        case .speaking: "Interrupt and talk"
+        case .listening: "Send"
+        case .speaking: "Interrupt"
         default: "Talk"
+        }
+    }
+
+    private var talkSymbol: String {
+        switch controller.phase {
+        case .listening: "arrow.up"
+        case .speaking: "hand.raised.fill"
+        default: "mic.fill"
+        }
+    }
+
+    private var statusColor: Color {
+        switch controller.phase {
+        case .listening: VoiceBars.ember
+        default: Tokens.Ink.secondary
         }
     }
 
     private var statusLine: String {
         switch controller.phase {
         case .starting: "Starting…"
-        case .speaking: "Tap to interrupt"
-        case .listening: "Pause to send · tap to send now"
+        case .speaking: "Speaking · tap to interrupt"
+        case .listening: "Listening · pause to send"
         case .sending: "Sending…"
         case .waiting, .idle:
             switch model.session(sessionID)?.status {
             case .working?, .starting?: "Working…"
             case .needsInput?: "Needs your input"
             case .exited?: "Session ended"
-            default: controller.muted ? "Muted · tap anywhere to talk" : "Tap anywhere to talk"
+            default: controller.muted ? "Muted · tap to talk" : "Tap to talk"
             }
         }
     }
@@ -303,21 +273,17 @@ struct VoiceModeView: View {
     private var title: String {
         guard let session = model.session(sessionID) else { return "Voice" }
         let trimmed = session.title.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? (session.cwd as NSString).lastPathComponent : trimmed
-    }
-
-    private var computer: String? {
-        model.session(sessionID)?.gateway ?? model.liveGateway?.name
+        let name = trimmed.isEmpty ? (session.cwd as NSString).lastPathComponent : trimmed
+        return "\(name) · \(model.computerName(of: session))"
     }
 }
 
-/// Diri's ember: a warm core with a soft glow, the app icon's light source.
-/// State is carried by motion alone, never by a swapped glyph.
-struct EmberOrb: View {
+/// Five ember bars: still when idle, a slow wave while the agent works,
+/// following the voice while listening, and a beat per word while speaking.
+struct VoiceBars: View {
     enum Mode { case idle, listening, speaking, working }
 
     static let ember = Color(f32: 1.0, 0.584, 0.333)
-    static let core = Color(f32: 1.0, 0.792, 0.584)
 
     let mode: Mode
     let level: Double
@@ -325,72 +291,43 @@ struct EmberOrb: View {
     let time: TimeInterval
     let reduceMotion: Bool
 
+    private let weights: [Double] = [0.55, 0.8, 1.0, 0.8, 0.55]
+
     var body: some View {
-        let scale = reduceMotion ? 1 : self.scale
-        ZStack {
-            // Glow.
-            Circle()
-                .fill(RadialGradient(
-                    colors: [Self.ember.opacity(glow), Self.ember.opacity(0)],
-                    center: .center, startRadius: 30, endRadius: 100
-                ))
-                .scaleEffect(scale * 1.05)
-            // Body.
-            Circle()
-                .fill(RadialGradient(
-                    colors: [Self.core, Self.ember, Self.ember.opacity(0.92)],
-                    center: .center, startRadius: 0, endRadius: 58
-                ))
-                .frame(width: 112, height: 112)
-                .overlay {
-                    if mode == .working, !reduceMotion {
-                        // A slow highlight travelling round the rim.
-                        Circle()
-                            .strokeBorder(
-                                AngularGradient(
-                                    stops: [
-                                        .init(color: Self.core.opacity(0), location: 0),
-                                        .init(color: Self.core.opacity(0), location: 0.7),
-                                        .init(color: Self.core, location: 0.9),
-                                        .init(color: Self.core.opacity(0), location: 1),
-                                    ],
-                                    center: .center,
-                                    angle: .degrees(time.truncatingRemainder(dividingBy: 2.4) / 2.4 * 360)
-                                ),
-                                lineWidth: 6
-                            )
-                            .blur(radius: 3)
-                            .clipShape(Circle())
-                    }
-                }
-                .scaleEffect(scale)
-                .opacity(mode == .idle ? 0.78 : 1)
+        HStack(alignment: .center, spacing: 5) {
+            ForEach(0 ..< 5, id: \.self) { index in
+                Capsule()
+                    .fill(color)
+                    .frame(width: 6, height: height(index))
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var color: Color {
+        switch mode {
+        case .idle: Tokens.Ink.primary.opacity(0.35)
+        case .working: Self.ember.opacity(0.7)
+        case .listening, .speaking: Self.ember
         }
     }
 
-    private var scale: Double {
+    private func height(_ index: Int) -> CGFloat {
+        let minimum = 6.0, maximum = 36.0
+        guard !reduceMotion else { return mode == .idle ? minimum : 16 * weights[index] + minimum }
+        let phase = Double(index) * 0.7
+        let amount: Double
         switch mode {
         case .idle:
-            return 1
-        case .listening:
-            // Breathes on its own so it never looks frozen, and swells with
-            // the voice on top of that.
-            return 1 + 0.03 * sin(time * 2.2) + 0.22 * level
-        case .speaking:
-            // A beat on every word, decaying before the next.
-            let beat = sinceWord < 1 ? 0.09 * exp(-sinceWord * 7) : 0
-            return 1.02 + 0.02 * sin(time * 3) + beat
+            amount = 0
         case .working:
-            return 0.96 + 0.02 * sin(time * 1.4)
+            amount = 0.18 + 0.14 * (0.5 + 0.5 * sin(time * 2.4 - phase))
+        case .listening:
+            amount = 0.12 + min(1, level * 1.6) * (0.75 + 0.25 * sin(time * 9 + phase))
+        case .speaking:
+            let beat = sinceWord < 1 ? exp(-sinceWord * 6) : 0
+            amount = 0.2 + 0.55 * beat * (0.7 + 0.3 * sin(time * 7 + phase))
         }
-    }
-
-    private var glow: Double {
-        switch mode {
-        case .idle: 0.18
-        case .listening: 0.30 + 0.35 * level
-        case .speaking: 0.38
-        case .working: 0.22 + 0.06 * sin(time * 1.4)
-        }
+        return minimum + (maximum - minimum) * amount * weights[index]
     }
 }

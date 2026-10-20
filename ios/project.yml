@@ -26,6 +26,9 @@ targets:
       path: DiriPhone/Info.plist
       properties:
         CFBundleDisplayName: diri
+        # Exempt: only Apple's URLSession/Keychain, no bundled cryptography
+        # (the tunnel is the separately installed Tailscale app).
+        ITSAppUsesNonExemptEncryption: false
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         NSCameraUsageDescription: Scan the private pairing code shown in Diri on your Mac.
@@ -40,6 +43,13 @@ targets:
           UIColorName: LaunchBackground
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        "UISupportedInterfaceOrientations~ipad":
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
         UIUserInterfaceStyle: Dark
         # diri-web speaks plain HTTP over a WireGuard tunnel. The transport is
         # already encrypted and authenticated by Tailscale; TLS on top would
@@ -58,8 +68,10 @@ targets:
           NSAllowsArbitraryLoads: true
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.cristicretu.diri.phone
-        TARGETED_DEVICE_FAMILY: "1"
+        # The App Store Connect record ("Dirijor", team A56RVNJ69X) owns this ID.
+        PRODUCT_BUNDLE_IDENTIFIER: dev.dirijor.ios
+        DEVELOPMENT_TEAM: A56RVNJ69X
+        TARGETED_DEVICE_FAMILY: "1,2"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
 

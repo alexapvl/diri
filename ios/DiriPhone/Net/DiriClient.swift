@@ -56,7 +56,7 @@ actor DiriClient {
     }
 
     private let endpoint: Endpoint
-    private let session: URLSession
+    let session: URLSession
 
     /// Enrollment must fail promptly with actionable setup guidance. Normal
     /// session traffic can wait across network changes; a first-time pairing
@@ -102,7 +102,7 @@ actor DiriClient {
 
     // MARK: - Requests
 
-    private func request(_ path: String, method: String = "GET", body: [String: Any]? = nil) throws -> URLRequest {
+    func request(_ path: String, method: String = "GET", body: [String: Any]? = nil) throws -> URLRequest {
         guard let url = URL(string: path, relativeTo: endpoint.baseURL) else {
             throw Failure.malformed
         }
@@ -117,7 +117,7 @@ actor DiriClient {
         return request
     }
 
-    private func send(_ request: URLRequest) async throws -> Data {
+    func send(_ request: URLRequest) async throws -> Data {
         let (data, response): (Data, URLResponse)
         do {
             (data, response) = try await session.data(for: request)
@@ -136,7 +136,7 @@ actor DiriClient {
         }
     }
 
-    private func decode<T: Decodable>(_ type: T.Type, from data: Data) throws -> T {
+    func decode<T: Decodable>(_ type: T.Type, from data: Data) throws -> T {
         do {
             return try JSONDecoder().decode(type, from: data)
         } catch {
@@ -377,7 +377,7 @@ actor DiriClient {
         }
     }
 
-    private func escape(_ value: String) -> String {
+    func escape(_ value: String) -> String {
         value.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? value
     }
 }
