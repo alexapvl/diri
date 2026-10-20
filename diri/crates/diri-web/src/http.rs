@@ -334,15 +334,21 @@ pub async fn write_event<W>(
 where
     W: AsyncWrite + Unpin,
 {
+    writer
+        .write_all(event_frame(event, data).as_bytes())
+        .await?;
+    writer.flush().await
+}
+
+/// One complete SSE frame, ready to write.
+#[must_use]
+pub fn event_frame(event: &str, data: &serde_json::Value) -> String {
     let payload = serde_json::to_string(data).unwrap_or_else(|_| "{}".into());
     // SSE frames are newline-delimited, so a payload containing a newline
     // would forge a frame boundary. `serde_json` escapes them, but the guard
     // is cheap and this is the one place it would matter.
     let payload = payload.replace('\n', " ");
-    writer
-        .write_all(format!("event: {event}\ndata: {payload}\n\n").as_bytes())
-        .await?;
-    writer.flush().await
+    format!("event: {event}\ndata: {payload}\n\n")
 }
 
 fn reason(status: u16) -> &'static str {

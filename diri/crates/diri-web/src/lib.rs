@@ -18,11 +18,16 @@
 
 mod api;
 mod auth;
+#[cfg(test)]
+mod bench;
 mod http;
+mod terminal;
 #[cfg(test)]
 mod testing;
 mod turns;
 mod ui;
+
+pub use terminal::{TerminalPalette, set_terminal_palette};
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -385,6 +390,16 @@ async fn handle(stream: TcpStream, api: Arc<Api>) -> std::io::Result<()> {
             }
             return stream_events(&mut write_half, &api).await;
         }
+        if request.method == "GET"
+            && let ["api", "session", id, "stream"] = request.segments().as_slice()
+        {
+            if !api.auth.authorizes(&request) {
+                let _ = http::write_response(&mut write_half, None, auth::unauthorized()).await;
+                return Ok(());
+            }
+            let id = diri_proto::SessionId((*id).to_owned());
+            return stream_terminal(&mut reader, &mut write_half, &api, id).await;
+        }
 
         let response = respond(&request, &api).await;
         if !http::write_response(&mut write_half, Some(&request), response).await? || !authenticated
@@ -416,6 +431,75 @@ async fn respond(request: &Request, api: &Api) -> Response {
             Response::text(200, "image/svg+xml; charset=utf-8", ui::ICON_SVG)
         }
         _ => api.route(request).await,
+    }
+}
+
+/// One phone terminal view: a read-only Engine preview republished as
+/// `snapshot`/`diff`/`exit` SSE. The stream task owns the terminal state;
+/// this loop only writes finished frames, so a slow socket never stalls the
+/// preview. Dropping either end closes the preview, which removes its Engine
+/// sink.
+async fn stream_terminal<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    api: &Api,
+    session: diri_proto::SessionId,
+) -> std::io::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncReadExt as _;
+    // Subscribed before the seed so an exit cannot fall in between.
+    let events = match api.client.subscribe_events().await {
+        Ok(receiver) => receiver,
+        Err(_) => api.client.events(),
+    };
+    let (preview, mirror) = match terminal::open(&api.client, &session).await {
+        Ok(opened) => opened,
+        Err(error) => {
+            let _ = http::write_response(writer, None, api::open_error(&error)).await;
+            return Ok(());
+        }
+    };
+    http::begin_event_stream(writer).await?;
+    let (out, mut frames) = tokio::sync::mpsc::channel(terminal::OUT_QUEUE);
+    let task = tokio::spawn(terminal::pump(
+        preview,
+        mirror,
+        Arc::clone(&api.client),
+        session,
+        events,
+        out,
+    ));
+    let _abort = AbortOnDrop(task);
+    let mut scratch = [0_u8; 512];
+    loop {
+        tokio::select! {
+            frame = frames.recv() => {
+                let Some(frame) = frame else { return Ok(()) };
+                writer.write_all(frame.as_bytes()).await?;
+                writer.flush().await?;
+            }
+            // The phone sends nothing on a stream; EOF is its disconnect.
+            read = reader.read(&mut scratch) => {
+                if read.map_or(true, |read| read == 0) {
+                    return Ok(());
+                }
+            }
+            () = tokio::time::sleep(HEARTBEAT) => {
+                writer.write_all(b": ping\n\n").await?;
+                writer.flush().await?;
+            }
+        }
+    }
+}
+
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -632,6 +716,246 @@ mod tests {
             next_data("turn_finished").await,
             json!({"sessionID": "s_a", "turn": 2, "spoken": "Tests pass."})
         );
+        server.abort();
+    }
+
+    fn grid_frame(update: &diri_proto::grid::GridUpdate) -> Vec<u8> {
+        use diri_proto::frames::{Frame, FrameCodec};
+        FrameCodec::encode(&Frame::grid(update).unwrap()).unwrap()
+    }
+
+    fn grid_update(full: bool, rows: &[(u16, &str)]) -> diri_proto::grid::GridUpdate {
+        use diri_proto::grid::{ChangedRow, GridCell, TermColor, TermStyle};
+        diri_proto::grid::GridUpdate {
+            cols: 10,
+            rows: 4,
+            cursor_col: 2,
+            cursor_row: 1,
+            cursor_visible: true,
+            is_full_snapshot: full,
+            changed_rows: rows
+                .iter()
+                .map(|(y, text)| {
+                    let mut cells: Vec<GridCell> = text
+                        .chars()
+                        .map(|ch| {
+                            GridCell::new(
+                                ch as u32,
+                                TermColor::Ansi(1),
+                                TermColor::DefaultInverted,
+                                TermStyle::BOLD,
+                            )
+                        })
+                        .collect();
+                    cells.resize(10, GridCell::BLANK);
+                    ChangedRow::new(*y, cells)
+                })
+                .collect(),
+        }
+    }
+
+    async fn serve_engine(
+        engine: &crate::testing::FakeEngine,
+    ) -> (
+        SocketAddr,
+        String,
+        tokio::task::JoinHandle<Result<(), String>>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let auth = Auth::temporary().unwrap();
+        let token = auth.token().to_owned();
+        let api = Arc::new(Api {
+            client: Arc::clone(&engine.client),
+            auth,
+            host_label: "test".into(),
+        });
+        (
+            address,
+            token,
+            tokio::spawn(serve_connections(listener, api)),
+        )
+    }
+
+    /// The phone's terminal stream end to end: an Engine preview's seed
+    /// becomes `snapshot`, its next update a `diff` of only the changed row,
+    /// the session's exit an `exit`, and hanging up closes the preview.
+    #[tokio::test]
+    async fn the_terminal_stream_turns_a_preview_into_snapshot_diff_and_exit() {
+        use diri_proto::Method;
+        use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, BufReader as TokioBufReader};
+        let mut engine = crate::testing::fake_engine(|method, _| match method {
+            Method::EVENTS_SUBSCRIBE => json!({"subscribed": true}),
+            Method::SESSION_READ_SCROLLBACK_CELLS => json!({
+                "payload": "", "firstRow": 0, "rowCount": 0, "totalRows": 46,
+                "liveStartRow": 42, "cols": 10, "contentSeq": 1,
+            }),
+            _ => json!({}),
+        })
+        .await;
+        let (address, token, server) = serve_engine(&engine).await;
+
+        // No credential, no preview.
+        let mut anonymous = TcpStream::connect(address).await.unwrap();
+        anonymous
+            .write_all(b"GET /api/session/s_a/stream HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        let mut refused = String::new();
+        anonymous.read_to_string(&mut refused).await.unwrap();
+        assert!(refused.starts_with("HTTP/1.1 401"), "{refused}");
+
+        let stream = TcpStream::connect(address).await.unwrap();
+        let (read_half, mut write_half) = stream.into_split();
+        write_half
+            .write_all(
+                format!(
+                    "GET /api/session/s_a/stream HTTP/1.1\r\nHost: {address}\r\nX-Diri-Token: {token}\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let (id, mut preview) =
+            tokio::time::timeout(Duration::from_secs(5), engine.previews.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(id, "s_a");
+        assert!(
+            engine.previews.try_recv().is_err(),
+            "one preview per stream"
+        );
+        preview
+            .write_all(&grid_frame(&grid_update(true, &[(0, "hello")])))
+            .await
+            .unwrap();
+        let modes = diri_proto::frames::Frame::modes_with_bracketed_paste(
+            true,
+            true,
+            diri_proto::terminal::MouseModes::OFF,
+        );
+        preview
+            .write_all(&diri_proto::frames::FrameCodec::encode(&modes).unwrap())
+            .await
+            .unwrap();
+
+        let mut lines = TokioBufReader::new(read_half).lines();
+        let mut next = async |event: &str| loop {
+            let line = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+                .await
+                .expect("event in time")
+                .unwrap()
+                .expect("stream open");
+            if line == format!("event: {event}") {
+                let data = lines.next_line().await.unwrap().unwrap();
+                break serde_json::from_str::<serde_json::Value>(
+                    data.strip_prefix("data: ").unwrap(),
+                )
+                .unwrap();
+            }
+            assert!(!line.starts_with("event:"), "expected {event}, got {line}");
+        };
+        let snapshot = next("snapshot").await;
+        assert_eq!(snapshot["cols"], 10);
+        assert_eq!(snapshot["rows"], 4);
+        assert_eq!(snapshot["historySize"], 42);
+        assert_eq!(
+            snapshot["cursor"],
+            json!({"x": 2, "y": 1, "visible": true, "shape": "block"})
+        );
+        assert_eq!(
+            snapshot["modes"],
+            json!({"altScreen": true, "appCursor": false, "bracketedPaste": true, "mouse": false})
+        );
+        assert_eq!(snapshot["palette"]["ansi"].as_array().unwrap().len(), 16);
+        assert_eq!(
+            snapshot["lines"][0],
+            json!({"runs": [{"t": "hello", "fg": 1, "bg": null, "a": 1}], "wrapped": false})
+        );
+        assert_eq!(snapshot["lines"][3], json!({"runs": [], "wrapped": false}));
+
+        preview
+            .write_all(&grid_frame(&grid_update(false, &[(2, "next")])))
+            .await
+            .unwrap();
+        let diff = next("diff").await;
+        assert_eq!(
+            diff["lines"],
+            json!({"2": {"runs": [{"t": "next", "fg": 1, "bg": null, "a": 1}], "wrapped": false}})
+        );
+        assert!(diff["seq"].as_u64() > snapshot["seq"].as_u64());
+        assert_eq!(diff["historySize"], 42);
+
+        let exited: diri_proto::ExitInfo =
+            serde_json::from_value(json!({"reason": "exited", "code": 3})).unwrap();
+        engine
+            .events
+            .send((
+                diri_proto::EventName::SESSION_UPDATED.into(),
+                json!({
+                    "id": "s_a",
+                    "status": diri_proto::SessionStatus::Exited(exited),
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(next("exit").await, json!({"code": 3}));
+
+        // The stream is over; its preview must not outlive it.
+        drop(write_half);
+        let mut rest = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), preview.read_to_end(&mut rest))
+            .await
+            .expect("preview closed")
+            .unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn closing_the_phone_closes_the_preview() {
+        use diri_proto::Method;
+        use tokio::io::AsyncReadExt as _;
+        let mut engine = crate::testing::fake_engine(|method, _| match method {
+            Method::EVENTS_SUBSCRIBE => json!({"subscribed": true}),
+            _ => json!({}),
+        })
+        .await;
+        let (address, token, server) = serve_engine(&engine).await;
+        let mut phone = TcpStream::connect(address).await.unwrap();
+        phone
+            .write_all(
+                format!(
+                    "GET /api/session/s_b/stream HTTP/1.1\r\nHost: {address}\r\nX-Diri-Token: {token}\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let (_, mut preview) = engine.previews.recv().await.unwrap();
+        preview
+            .write_all(&grid_frame(&grid_update(true, &[])))
+            .await
+            .unwrap();
+        preview
+            .write_all(
+                &diri_proto::frames::FrameCodec::encode(&diri_proto::frames::Frame::modes(
+                    false,
+                    diri_proto::terminal::MouseModes::OFF,
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut head = [0; 64];
+        let read = phone.read(&mut head).await.unwrap();
+        assert!(head[..read].starts_with(b"HTTP/1.1 200"));
+        drop(phone);
+        let mut rest = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), preview.read_to_end(&mut rest))
+            .await
+            .expect("preview closed when the phone hung up")
+            .unwrap();
         server.abort();
     }
 
