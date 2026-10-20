@@ -14,6 +14,7 @@ struct SessionDetailView: View {
     @State private var screenError: String?
     @State private var showingChanges = false
     @State private var followOutput = true
+    @State private var voiceMode = false
     @FocusState private var composerFocused: Bool
 
     /// The screen is polled rather than streamed. `read_screen` is a cheap
@@ -44,6 +45,12 @@ struct SessionDetailView: View {
         .toolbarBackground(Tokens.Ink.background, for: .navigationBar)
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
+                Button { voiceMode = true } label: { Image(systemName: "waveform") }
+                    .disabled(model.client(for: sessionID) == nil)
+                    .accessibilityLabel("Voice mode")
+                    .accessibilityIdentifier("voice-mode-open")
+            }
+            ToolbarItem(placement: .topBarTrailing) {
                 Menu {
                     Button { showingChanges = true } label: { Label("Review changes", systemImage: "doc.text.magnifyingglass") }
                     Toggle("Follow output", isOn: $followOutput)
@@ -62,12 +69,18 @@ struct SessionDetailView: View {
                 }
             }
         }
-        .task(id: "\(sessionID)-\(scenePhase == .active)") {
-            guard scenePhase == .active else { return }
+        // Voice mode runs on the event stream; the screen poll pauses under it.
+        .task(id: "\(sessionID)-\(scenePhase == .active)-\(voiceMode)") {
+            guard scenePhase == .active, !voiceMode else { return }
             await model.markSeen(sessionID)
             await poll()
         }
         .sheet(isPresented: $showingChanges) { SessionChangesView(sessionID: sessionID) }
+        .fullScreenCover(isPresented: $voiceMode) {
+            if let client = model.client(for: sessionID) {
+                VoiceModeView(sessionID: sessionID, client: client)
+            }
+        }
         .alert("Couldn't send", isPresented: .init(
             get: { error != nil }, set: { if !$0 { error = nil } }
         )) {
@@ -91,6 +104,7 @@ struct SessionDetailView: View {
                     .padding(.horizontal, 12)
                     .padding(.vertical, 10)
                     .id(Anchor.bottom)
+                    .accessibilityIdentifier("terminal-text")
             }
             .onChange(of: screen?.text) { _, _ in
                 if followOutput { proxy.scrollTo(Anchor.bottom, anchor: .bottom) }
@@ -133,6 +147,7 @@ struct SessionDetailView: View {
                             )
                     )
                     .focused($composerFocused)
+                    .accessibilityIdentifier("composer-field")
 
                 Button(action: submit) {
                     Image(systemName: "arrow.up")
@@ -144,6 +159,7 @@ struct SessionDetailView: View {
                 .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || busy || screenError != nil || screen == nil)
                 .opacity(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? 0.35 : 1)
                 .accessibilityLabel("Send")
+                .accessibilityIdentifier("composer-send")
             }
             .padding(.horizontal, 10)
         }

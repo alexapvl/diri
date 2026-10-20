@@ -70,6 +70,17 @@ actor DiriClient {
         return configuration
     }
 
+    /// Health probes decide failover, so a silent host must cost seconds, not
+    /// the minutes `waitsForConnectivity` would spend on it.
+    static func probeConfiguration() -> URLSessionConfiguration {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 3
+        configuration.timeoutIntervalForResource = 4
+        configuration.waitsForConnectivity = false
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        return configuration
+    }
+
     /// `configuration` exists so tests can install a stub `URLProtocol`. The
     /// requests this builds are a contract with `diri-web` — a wrong path or a
     /// missing header fails identically to the daemon being down, which is the
@@ -270,14 +281,78 @@ actor DiriClient {
         )
     }
 
+    // MARK: - Voice
+
+    struct Turn: Codable, Equatable, Sendable {
+        var role: String
+        var text: String
+        var turn: Int?
+
+        var isAgent: Bool { role == "agent" }
+    }
+
+    /// Oldest-first conversation turns.
+    func transcript(sessionID: String, limit: Int = 20) async throws -> [Turn] {
+        struct Payload: Decodable { var turns: [Turn] }
+        // Not `queryPath`: URLComponents would percent-encode the already
+        // escaped id a second time.
+        let path = "/api/session/\(escape(sessionID))/transcript?limit=\(limit)"
+        return try decode(Payload.self, from: try await send(try request(path))).turns
+    }
+
+    struct Spoken: Codable, Equatable, Sendable {
+        var turn: Int?
+        var text: String?
+    }
+
+    /// What the agent most recently said aloud (its `speak` summary), if any.
+    func spoken(sessionID: String) async throws -> Spoken {
+        try decode(Spoken.self, from: try await send(try request("/api/session/\(escape(sessionID))/spoken")))
+    }
+
+    private struct VoicePrefs: Codable { var readAloud: Bool }
+
+    func readAloud() async throws -> Bool {
+        try decode(VoicePrefs.self, from: try await send(try request("/api/voice"))).readAloud
+    }
+
+    func setReadAloud(_ on: Bool) async throws {
+        _ = try await send(try request("/api/voice", method: "POST", body: ["readAloud": on]))
+    }
+
     // MARK: - Events
 
-    /// Server-sent events, surfaced as a stream of event names.
+    struct ServerEvent: Equatable, Sendable {
+        var name: String
+        var data: String
+    }
+
+    /// `turn_finished` — an agent ended its turn.
+    struct TurnFinished: Decodable, Equatable, Sendable {
+        var sessionID: String
+        var turn: Int?
+        var spoken: String?
+
+        init(sessionID: String, turn: Int?, spoken: String?) {
+            self.sessionID = sessionID
+            self.turn = turn
+            self.spoken = spoken
+        }
+
+        init?(_ event: ServerEvent) {
+            guard event.name == "turn_finished",
+                  let value = try? JSONDecoder().decode(Self.self, from: Data(event.data.utf8))
+            else { return nil }
+            self = value
+        }
+    }
+
+    /// Server-sent events.
     ///
-    /// The payloads are deliberately ignored: every daemon event means the same
-    /// thing to a phone, which is *refetch*. Applying deltas would risk leaving
-    /// the list subtly wrong after a dropped stream, where a refetch cannot.
-    func events() -> AsyncStream<String> {
+    /// The list treats every event as *refetch*: applying deltas would risk
+    /// leaving it subtly wrong after a dropped stream, where a refetch cannot.
+    /// Voice mode reads the payload of `turn_finished`.
+    func events() -> AsyncStream<ServerEvent> {
         AsyncStream { continuation in
             let task = Task {
                 do {
@@ -287,11 +362,10 @@ actor DiriClient {
                         continuation.finish()
                         return
                     }
+                    var parser = SSEParser()
                     for try await line in bytes.lines {
                         if Task.isCancelled { break }
-                        if let name = line.strippingPrefix("event: ") {
-                            continuation.yield(name)
-                        }
+                        for event in parser.feed(line) { continuation.yield(event) }
                     }
                 } catch {
                     // A dropped stream is normal on a phone. The caller's
@@ -308,9 +382,34 @@ actor DiriClient {
     }
 }
 
+/// Line-at-a-time SSE framing. `AsyncLineSequence` drops empty lines, so a
+/// frame cannot wait for its blank terminator: `diri-web` writes exactly one
+/// `data:` line per event, so the frame is complete when its data arrives.
+struct SSEParser {
+    private var name: String?
+
+    mutating func feed(_ line: String) -> [DiriClient.ServerEvent] {
+        if let value = line.strippingField("event") {
+            name = value
+            return []
+        }
+        if let value = line.strippingField("data"), let name {
+            self.name = nil
+            return [DiriClient.ServerEvent(name: name, data: value)]
+        }
+        if line.isEmpty, let name {
+            self.name = nil
+            return [DiriClient.ServerEvent(name: name, data: "")]
+        }
+        return []
+    }
+}
+
 private extension String {
-    func strippingPrefix(_ prefix: String) -> String? {
-        hasPrefix(prefix) ? String(dropFirst(prefix.count)) : nil
+    func strippingField(_ field: String) -> String? {
+        guard hasPrefix(field + ":") else { return nil }
+        let rest = dropFirst(field.count + 1)
+        return String(rest.hasPrefix(" ") ? rest.dropFirst() : rest)
     }
 }
 
