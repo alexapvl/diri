@@ -163,7 +163,7 @@ can start and kill processes on a real machine, so it does not go in
 For the simulator, two launch arguments skip the setup screen:
 
 ```sh
-xcrun simctl launch booted com.cristicretu.diri.phone \
+xcrun simctl launch booted dev.dirijor.ios \
   -endpoint 'http://forge:7380/?token=…' \
   -session s_1ab7417f0c93          # optional: open straight into one session
 ```
