@@ -8,15 +8,26 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use diri_client::{ClientError, DaemonClient};
-use diri_proto::{AgentKind, SessionDiffBase, SessionId, SessionSpawnParams};
+use diri_proto::voice::{
+    LatestSpokenParams, LatestSpokenResult, PhoneReaderParams, PhoneReaderResult,
+};
+use diri_proto::{
+    AgentKind, ReadTranscriptParams, ReadTranscriptResult, SessionDiffBase, SessionId,
+    SessionSpawnParams,
+};
 use serde_json::{Value, json};
 
 use crate::auth::{self, Auth};
 use crate::http::{Request, Response};
+use crate::turns::TurnWatcher;
 
 /// Long enough for a cold `git diff` on a large repo, short enough that a
 /// wedged daemon shows up as an error on the phone instead of a spinner.
 const CALL_TIMEOUT: Duration = Duration::from_secs(20);
+/// A summary lookup sits in the event stream; it must not stall it.
+const SPOKEN_TIMEOUT: Duration = Duration::from_secs(2);
+const DEFAULT_TRANSCRIPT_TURNS: u32 = 20;
+const MAX_TRANSCRIPT_TURNS: u32 = 100;
 
 pub struct Api {
     pub client: Arc<DaemonClient>,
@@ -64,10 +75,22 @@ impl Api {
                 Err(error) => daemon_error(&error),
             },
             ("POST", ["api", "spawn"]) => self.spawn(request).await,
+            ("GET", ["api", "voice"]) => self.phone_reader(None).await,
+            ("POST", ["api", "voice"]) => {
+                match request.json().get("readAloud").and_then(Value::as_bool) {
+                    Some(read_aloud) => self.phone_reader(Some(read_aloud)).await,
+                    None => Response::error(400, "missing readAloud"),
+                }
+            }
 
             ("GET", ["api", "session", id, "screen"]) => self.screen(id).await,
+            ("GET", ["api", "session", id, "grid"]) => self.grid(id).await,
+            ("GET", ["api", "session", id, "history"]) => self.history(id, request).await,
+            ("POST", ["api", "session", id, "input"]) => self.input(id, request).await,
             ("GET", ["api", "session", id, "scrollback"]) => self.scrollback(id).await,
             ("GET", ["api", "session", id, "diff"]) => self.diff(id).await,
+            ("GET", ["api", "session", id, "transcript"]) => self.transcript(id, request).await,
+            ("GET", ["api", "session", id, "spoken"]) => self.spoken(id).await,
             ("POST", ["api", "session", id, "send"]) => self.send(id, request).await,
             ("POST", ["api", "session", id, "key"]) => self.key(id, request).await,
             ("POST", ["api", "session", id, "resize"]) => self.resize(id, request).await,
@@ -134,6 +157,61 @@ impl Api {
         }
     }
 
+    /// The styled visible grid, read from a momentary read-only preview.
+    async fn grid(&self, id: &str) -> Response {
+        match crate::terminal::open(&self.client, &session_id(id)).await {
+            Ok((mut preview, mut mirror)) => {
+                preview.close().await;
+                Response::json(&mirror.snapshot())
+            }
+            Err(error) => open_error(&error),
+        }
+    }
+
+    async fn history(&self, id: &str, request: &Request) -> Response {
+        let number = |name: &str| match request.query.get(name) {
+            None => Ok(None),
+            Some(raw) => raw.parse::<i64>().map(Some).map_err(|_| name.to_owned()),
+        };
+        let (before, limit) = match (number("before"), number("limit")) {
+            (Ok(before), Ok(limit)) => (before, limit),
+            (Err(name), _) | (_, Err(name)) => {
+                return Response::error(400, &format!("{name} must be a number"));
+            }
+        };
+        let limit = limit
+            .unwrap_or(crate::terminal::DEFAULT_HISTORY_PAGE)
+            .clamp(1, crate::terminal::MAX_HISTORY_PAGE);
+        match crate::terminal::history(&self.client, &session_id(id), before, limit).await {
+            Ok(page) => Response::json(&page),
+            Err(error) => daemon_error(&error),
+        }
+    }
+
+    /// Raw keyboard bytes for the PTY, written unframed. Never logged.
+    async fn input(&self, id: &str, request: &Request) -> Response {
+        use base64::Engine as _;
+        let body = request.json();
+        let Some(encoded) = body.get("data").and_then(Value::as_str) else {
+            return Response::error(400, "missing data");
+        };
+        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(encoded) else {
+            return Response::error(400, "data must be base64");
+        };
+        if bytes.is_empty() {
+            return Response::json(&json!({ "ok": true }));
+        }
+        // The Engine's text path carries a string; every key a phone keyboard
+        // produces (text, controls, escape sequences) is UTF-8.
+        let Ok(text) = String::from_utf8(bytes) else {
+            return Response::error(400, "data must be UTF-8 terminal input");
+        };
+        match self.client.send_text(&session_id(id), text, false).await {
+            Ok(()) => Response::json(&json!({ "ok": true })),
+            Err(error) => daemon_error(&error),
+        }
+    }
+
     async fn scrollback(&self, id: &str) -> Response {
         match self.client.read_scrollback(&session_id(id)).await {
             Ok(result) => Response::json(&serde_json::to_value(&result).unwrap_or(Value::Null)),
@@ -154,6 +232,107 @@ impl Api {
             })),
             Err(error) => daemon_error(&error),
         }
+    }
+
+    /// Text turns oldest-first, for a voice client. Never logged: they are
+    /// the developer's prompts and the Agent's replies.
+    async fn transcript(&self, id: &str, request: &Request) -> Response {
+        let limit = match request.query.get("limit") {
+            None => DEFAULT_TRANSCRIPT_TURNS,
+            Some(raw) => match raw.parse::<u32>() {
+                Ok(limit) => limit.clamp(1, MAX_TRANSCRIPT_TURNS),
+                Err(_) => return Response::error(400, "limit must be a number"),
+            },
+        };
+        let params = ReadTranscriptParams {
+            session_id: session_id(id),
+            turns: Some(limit),
+        };
+        match self
+            .client
+            .request(
+                diri_proto::Method::SESSION_READ_TRANSCRIPT,
+                Some(&params),
+                Some(CALL_TIMEOUT),
+            )
+            .await
+            .and_then(|value| {
+                serde_json::from_value::<ReadTranscriptResult>(value)
+                    .map_err(|error| ClientError::Json(error.to_string()))
+            }) {
+            Ok(result) => Response::json(&json!({
+                "available": result.available,
+                "turns": result.turns.iter().map(|turn| json!({
+                    "role": turn.role,
+                    "text": turn.text,
+                    "turn": turn.turn,
+                })).collect::<Vec<_>>(),
+            })),
+            Err(error) => daemon_error(&error),
+        }
+    }
+
+    /// The session's newest spoken summary, whether or not the Mac read it.
+    async fn spoken(&self, id: &str) -> Response {
+        match self.latest_spoken(id).await {
+            Ok(latest) => Response::json(&json!({ "turn": latest.turn, "text": latest.text })),
+            Err(error) => daemon_error(&error),
+        }
+    }
+
+    async fn latest_spoken(&self, id: &str) -> Result<LatestSpokenResult, ClientError> {
+        let params = LatestSpokenParams {
+            session_id: id.to_string(),
+        };
+        let value = self
+            .client
+            .request(
+                diri_proto::Method::VOICE_LATEST_SPOKEN,
+                Some(&params),
+                Some(SPOKEN_TIMEOUT),
+            )
+            .await?;
+        serde_json::from_value(value).map_err(|error| ClientError::Json(error.to_string()))
+    }
+
+    /// Reads, or sets, whether a phone wants every session's spoken summary.
+    async fn phone_reader(&self, read_aloud: Option<bool>) -> Response {
+        let params = PhoneReaderParams { read_aloud };
+        match self
+            .client
+            .request(
+                diri_proto::Method::VOICE_PHONE_READER,
+                Some(&params),
+                Some(CALL_TIMEOUT),
+            )
+            .await
+            .and_then(|value| {
+                serde_json::from_value::<PhoneReaderResult>(value)
+                    .map_err(|error| ClientError::Json(error.to_string()))
+            }) {
+            Ok(result) => Response::json(&json!({ "readAloud": result.read_aloud })),
+            Err(error) => daemon_error(&error),
+        }
+    }
+
+    /// Baselines finished-turn detection on the sessions as they are now. A
+    /// failure leaves the old baseline; the next update re-establishes it.
+    pub async fn seed_turns(&self, turns: &mut TurnWatcher) {
+        if let Ok(Ok(list)) = tokio::time::timeout(CALL_TIMEOUT, self.client.sessions()).await {
+            turns.seed_records(list.sessions);
+        }
+    }
+
+    /// The `turn_finished` payload, with the summary when the Agent gave one
+    /// for this turn; otherwise the phone fetches the transcript.
+    pub async fn turn_finished(&self, session: String, turn: u64) -> Value {
+        let spoken = self
+            .latest_spoken(&session)
+            .await
+            .ok()
+            .filter(|latest| latest.turn == Some(turn))
+            .and_then(|latest| latest.text);
+        json!({ "sessionID": session, "turn": turn, "spoken": spoken })
     }
 
     async fn send(&self, id: &str, request: &Request) -> Response {
@@ -293,6 +472,15 @@ fn daemon_error(error: &ClientError) -> Response {
         _ => 400,
     };
     Response::error(status, &error.to_string())
+}
+
+pub fn open_error(error: &crate::terminal::OpenError) -> Response {
+    match error {
+        crate::terminal::OpenError::NotFound => {
+            Response::error(404, "no terminal for this session")
+        }
+        crate::terminal::OpenError::Unavailable(reason) => Response::error(502, reason),
+    }
 }
 
 /// The raw bytes behind each button in the frontend's key row.
@@ -453,6 +641,378 @@ mod tests {
         assert!(calls_rx.try_recv().is_err());
         api.client.begin_shutdown();
         engine.abort();
+    }
+
+    async fn call(api: &Api, method: &str, path: &str, body: &str) -> (u16, Value) {
+        use tokio::io::BufReader;
+        let raw = format!(
+            "{method} {path} HTTP/1.1\r\nHost: test\r\nX-Diri-Token: {}\r\nContent-Length: {}\r\n\r\n{body}",
+            api.auth.token(),
+            body.len()
+        );
+        let request = crate::http::read_request(&mut BufReader::new(raw.as_bytes()))
+            .await
+            .unwrap()
+            .unwrap();
+        let response = api.route(&request).await;
+        let body = serde_json::from_slice(&response.body).unwrap_or(Value::Null);
+        (response.status, body)
+    }
+
+    #[tokio::test]
+    async fn voice_routes_keep_the_phone_contract() {
+        use diri_proto::Method;
+        let mut engine = crate::testing::fake_engine(|method, params| match method {
+            Method::SESSION_READ_TRANSCRIPT => json!({
+                "available": true,
+                "turns": [
+                    {"role": "user", "text": "run the tests"},
+                    {"role": "agent", "text": "All green.", "turn": 3},
+                ],
+            }),
+            Method::VOICE_LATEST_SPOKEN => json!({"turn": 3, "text": "All green."}),
+            Method::VOICE_PHONE_READER => json!({
+                "readAloud": params
+                    .and_then(|params| params.get("readAloud"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            }),
+            _ => json!({}),
+        })
+        .await;
+        let api = Api {
+            client: Arc::clone(&engine.client),
+            auth: Auth::temporary().unwrap(),
+            host_label: "Mac".into(),
+        };
+
+        let (status, body) = call(&api, "GET", "/api/session/s_a/transcript", "").await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            body["turns"],
+            json!([
+                {"role": "user", "text": "run the tests", "turn": null},
+                {"role": "agent", "text": "All green.", "turn": 3},
+            ])
+        );
+        let (method, params) = engine.calls.recv().await.unwrap();
+        assert_eq!(method, Method::SESSION_READ_TRANSCRIPT);
+        assert_eq!(params.unwrap(), json!({"sessionID": "s_a", "turns": 20}));
+
+        for (limit, sent) in [("500", 100), ("0", 1), ("7", 7)] {
+            let path = format!("/api/session/s_a/transcript?limit={limit}");
+            assert_eq!(call(&api, "GET", &path, "").await.0, 200);
+            let (_, params) = engine.calls.recv().await.unwrap();
+            assert_eq!(params.unwrap()["turns"], sent);
+        }
+        assert_eq!(
+            call(&api, "GET", "/api/session/s_a/transcript?limit=all", "")
+                .await
+                .0,
+            400
+        );
+
+        let (status, body) = call(&api, "GET", "/api/session/s_a/spoken", "").await;
+        assert_eq!(status, 200);
+        assert_eq!(body, json!({"turn": 3, "text": "All green."}));
+        let (method, params) = engine.calls.recv().await.unwrap();
+        assert_eq!(method, Method::VOICE_LATEST_SPOKEN);
+        assert_eq!(params.unwrap(), json!({"sessionID": "s_a"}));
+
+        assert_eq!(
+            call(&api, "GET", "/api/voice", "").await,
+            (200, json!({"readAloud": false}))
+        );
+        let (_, params) = engine.calls.recv().await.unwrap();
+        assert_eq!(params.unwrap(), json!({}), "a read changes nothing");
+        assert_eq!(
+            call(&api, "POST", "/api/voice", r#"{"readAloud":true}"#).await,
+            (200, json!({"readAloud": true}))
+        );
+        let (method, params) = engine.calls.recv().await.unwrap();
+        assert_eq!(method, Method::VOICE_PHONE_READER);
+        assert_eq!(params.unwrap(), json!({"readAloud": true}));
+        assert_eq!(call(&api, "POST", "/api/voice", "{}").await.0, 400);
+
+        // The summary rides along only for the turn it was given in.
+        assert_eq!(
+            api.turn_finished("s_a".into(), 3).await,
+            json!({"sessionID": "s_a", "turn": 3, "spoken": "All green."})
+        );
+        assert_eq!(
+            api.turn_finished("s_a".into(), 4).await,
+            json!({"sessionID": "s_a", "turn": 4, "spoken": null})
+        );
+    }
+
+    /// A fake scrollback of `history` rows above a 4-row screen, where row
+    /// `n` reads "row n". Answers exactly the window it was asked for.
+    fn scrollback(params: Option<&Value>, history: i64) -> Value {
+        use diri_proto::grid::{GridCell, GridRowCodec, TermColor, TermStyle};
+        let params = params.unwrap();
+        let total = history + 4;
+        let first = params["firstRow"].as_i64().unwrap().clamp(0, total);
+        let end = (first + params["maxRows"].as_i64().unwrap()).min(total);
+        let rows: Vec<Vec<GridCell>> = (first..end)
+            .map(|n| {
+                format!("row {n}")
+                    .chars()
+                    .map(|ch| {
+                        GridCell::new(
+                            ch as u32,
+                            TermColor::Default,
+                            TermColor::DefaultInverted,
+                            TermStyle::empty(),
+                        )
+                    })
+                    .collect()
+            })
+            .collect();
+        let payload = GridRowCodec::encode_rows(&rows).unwrap();
+        let mut result = serde_json::to_value(diri_proto::ReadScrollbackCellsResult {
+            metadata: Vec::new(),
+            payload,
+            first_row: first,
+            row_count: end - first,
+            total_rows: total,
+            live_start_row: history,
+            cols: 10,
+            content_seq: 1,
+        })
+        .unwrap();
+        result["cols"] = json!(10);
+        result
+    }
+
+    #[tokio::test]
+    async fn history_pages_are_bounded_oldest_first_and_never_visible_rows() {
+        use diri_proto::Method;
+        let mut engine = crate::testing::fake_engine(|method, params| match method {
+            Method::SESSION_READ_SCROLLBACK_CELLS => scrollback(params, 2500),
+            _ => json!({}),
+        })
+        .await;
+        let api = Api {
+            client: Arc::clone(&engine.client),
+            auth: Auth::temporary().unwrap(),
+            host_label: "Mac".into(),
+        };
+        let text = |line: &Value| line["runs"][0]["t"].as_str().unwrap().to_owned();
+
+        // No `before`: the newest 200 history rows, ending at the screen.
+        let (status, page) = call(&api, "GET", "/api/session/s_a/history", "").await;
+        assert_eq!(status, 200);
+        assert_eq!(page["historySize"], 2500);
+        assert_eq!(page["start"], 2300);
+        let lines = page["lines"].as_array().unwrap();
+        assert_eq!(lines.len(), 200);
+        assert_eq!(text(&lines[0]), "row 2300");
+        assert_eq!(text(&lines[199]), "row 2499");
+        while engine.calls.try_recv().is_ok() {}
+
+        // `before` is exclusive; the page runs up to it.
+        let (_, page) = call(
+            &api,
+            "GET",
+            "/api/session/s_a/history?before=50&limit=10",
+            "",
+        )
+        .await;
+        assert_eq!(page["start"], 40);
+        let lines = page["lines"].as_array().unwrap();
+        assert_eq!((text(&lines[0]), lines.len()), ("row 40".into(), 10));
+        let (_, params) = engine.calls.recv().await.unwrap();
+        assert_eq!(params.unwrap()["maxRows"], 10, "one read, exactly the page");
+
+        // The page size is capped, and the start of history clamps it.
+        let (_, page) = call(
+            &api,
+            "GET",
+            "/api/session/s_a/history?before=2400&limit=5000",
+            "",
+        )
+        .await;
+        assert_eq!(page["lines"].as_array().unwrap().len(), 1000);
+        assert_eq!(page["start"], 1400);
+        let (_, page) = call(
+            &api,
+            "GET",
+            "/api/session/s_a/history?before=3&limit=10",
+            "",
+        )
+        .await;
+        assert_eq!(
+            (
+                page["start"].clone(),
+                page["lines"].as_array().unwrap().len()
+            ),
+            (json!(0), 3)
+        );
+        let (_, page) = call(&api, "GET", "/api/session/s_a/history?before=0", "").await;
+        assert_eq!(page["lines"], json!([]));
+
+        // Past the end of history: visible rows are never served as history.
+        let (_, page) = call(
+            &api,
+            "GET",
+            "/api/session/s_a/history?before=2503&limit=10",
+            "",
+        )
+        .await;
+        let lines = page["lines"].as_array().unwrap();
+        assert_eq!(page["start"], 2493);
+        assert_eq!(lines.len(), 7);
+        assert_eq!(text(&lines[6]), "row 2499");
+
+        for bad in ["before=x", "limit=-"] {
+            let path = format!("/api/session/s_a/history?{bad}");
+            assert_eq!(call(&api, "GET", &path, "").await.0, 400, "{bad}");
+        }
+    }
+
+    #[tokio::test]
+    async fn input_writes_the_decoded_bytes_unframed() {
+        use diri_proto::Method;
+        let mut engine = crate::testing::fake_engine(|_, _| json!({})).await;
+        let api = Api {
+            client: Arc::clone(&engine.client),
+            auth: Auth::temporary().unwrap(),
+            host_label: "Mac".into(),
+        };
+        // Ctrl-C, Up, Escape and a paste: exactly these bytes, no Enter, no
+        // bracketing.
+        let bytes = b"\x03\x1b[A\x1bpasted text \xe2\x9c\x93";
+        let body = json!({ "data": base64_encode(bytes) }).to_string();
+        let (status, _) = call(&api, "POST", "/api/session/s_a/input", &body).await;
+        assert_eq!(status, 200);
+        let (method, params) = engine.calls.recv().await.unwrap();
+        assert_eq!(method, Method::SESSION_SEND_TEXT);
+        let params = params.unwrap();
+        assert_eq!(params["submit"], false);
+        assert_eq!(params["text"].as_str().unwrap().as_bytes(), bytes);
+
+        for body in [r#"{}"#, r#"{"data":"%%%"}"#, r#"{"data":"/w=="}"#] {
+            assert_eq!(
+                call(&api, "POST", "/api/session/s_a/input", body).await.0,
+                400,
+                "{body}"
+            );
+        }
+        assert!(
+            engine.calls.try_recv().is_err(),
+            "nothing invalid was written"
+        );
+    }
+
+    fn base64_encode(bytes: &[u8]) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    #[tokio::test]
+    async fn every_terminal_route_requires_the_credential() {
+        use tokio::io::BufReader;
+        let mut engine = crate::testing::fake_engine(|_, _| json!({})).await;
+        let api = Api {
+            client: Arc::clone(&engine.client),
+            auth: Auth::temporary().unwrap(),
+            host_label: "Mac".into(),
+        };
+        for (method, path, body) in [
+            ("GET", "/api/session/s_a/grid", ""),
+            ("GET", "/api/session/s_a/history?before=10", ""),
+            ("POST", "/api/session/s_a/input", r#"{"data":"aGk="}"#),
+        ] {
+            let raw = format!(
+                "{method} {path} HTTP/1.1\r\nHost: test\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let request = crate::http::read_request(&mut BufReader::new(raw.as_bytes()))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(api.route(&request).await.status, 401, "{path}");
+        }
+        assert!(engine.calls.try_recv().is_err());
+        assert!(engine.previews.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn the_grid_is_one_styled_snapshot_from_a_preview() {
+        use diri_proto::Method;
+        use tokio::io::AsyncWriteExt as _;
+        let mut engine = crate::testing::fake_engine(|method, params| match method {
+            Method::SESSION_READ_SCROLLBACK_CELLS => scrollback(params, 7),
+            _ => json!({}),
+        })
+        .await;
+        let api = Arc::new(Api {
+            client: Arc::clone(&engine.client),
+            auth: Auth::temporary().unwrap(),
+            host_label: "Mac".into(),
+        });
+        let request = tokio::spawn({
+            let api = Arc::clone(&api);
+            async move { call(&api, "GET", "/api/session/s_a/grid", "").await }
+        });
+        let (_, mut preview) = engine.previews.recv().await.unwrap();
+        let update = diri_proto::grid::GridUpdate {
+            cols: 3,
+            rows: 2,
+            cursor_col: 0,
+            cursor_row: 1,
+            cursor_visible: false,
+            is_full_snapshot: true,
+            changed_rows: vec![diri_proto::grid::ChangedRow::new(
+                0,
+                vec![
+                    diri_proto::grid::GridCell::new(
+                        'x' as u32,
+                        diri_proto::grid::TermColor::Rgb(255, 0, 16),
+                        diri_proto::grid::TermColor::Ansi(200),
+                        diri_proto::grid::TermStyle::UNDERLINE,
+                    );
+                    3
+                ],
+            )],
+        };
+        use diri_proto::frames::{Frame, FrameCodec};
+        preview
+            .write_all(&FrameCodec::encode(&Frame::grid(&update).unwrap()).unwrap())
+            .await
+            .unwrap();
+        preview
+            .write_all(
+                &FrameCodec::encode(&Frame::modes(
+                    false,
+                    diri_proto::terminal::MouseModes {
+                        tracking: diri_proto::terminal::MouseTrackingMode::ButtonEvents,
+                        encoding: diri_proto::terminal::MouseEncoding::Sgr,
+                    },
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, grid) = request.await.unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(
+            (grid["cols"].clone(), grid["rows"].clone()),
+            (json!(3), json!(2))
+        );
+        assert_eq!(grid["historySize"], 7);
+        assert_eq!(grid["cursor"]["visible"], false);
+        assert_eq!(grid["modes"]["mouse"], true);
+        assert_eq!(
+            grid["lines"],
+            json!([
+                {"runs": [{"t": "xxx", "fg": "#ff0010", "bg": 200, "a": 8}], "wrapped": false},
+                {"runs": [], "wrapped": false},
+            ])
+        );
+        let palette = &grid["palette"];
+        assert!(palette["fg"].as_str().unwrap().starts_with('#'));
+        assert_eq!(palette["ansi"][1], "#cd3131");
     }
 
     #[test]

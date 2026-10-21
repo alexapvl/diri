@@ -1,4 +1,6 @@
-//! App-lifetime phone gateway; no service install, public bind, or credentials on disk.
+//! App-lifetime phone gateway; no service install or public bind. Its pairing
+//! token persists owner-only in the app's support directory so phones stay
+//! paired across restarts; [`PhoneAccess::reset_pairing`] rotates it.
 use std::{
     net::Ipv4Addr,
     process::{Child, Command, Stdio},
@@ -16,8 +18,13 @@ pub struct PhoneAccess {
 impl PhoneAccess {
     pub async fn start(client: Arc<diri_client::DaemonClient>) -> Result<Self, String> {
         let address = tailscale_address().await?;
-        let (url, server) =
-            diri_web::start_phone_access(address, client, "Your Mac".into()).await?;
+        let (url, server) = diri_web::start_phone_access(
+            address,
+            client,
+            "Your Mac".into(),
+            &diri_web::phone_token_path(),
+        )
+        .await?;
         let qr = match qrcode::QrCode::new(url.as_bytes()) {
             Ok(qr) => qr,
             Err(error) => {
@@ -53,6 +60,12 @@ impl PhoneAccess {
             server,
             awake,
         })
+    }
+
+    /// Replaces the pairing code: every paired phone must scan the new one.
+    /// Call with access off; [`Self::start`] then serves the new code.
+    pub fn reset_pairing() -> Result<(), String> {
+        diri_web::reset_phone_pairing(&diri_web::phone_token_path())
     }
 
     pub fn is_running(&self) -> bool {

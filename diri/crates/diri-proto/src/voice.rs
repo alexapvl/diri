@@ -43,6 +43,34 @@ pub struct SpokenResult {
     pub text: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct LatestSpokenParams {
+    #[serde(rename = "sessionID")]
+    pub session_id: String,
+}
+
+/// The newest summary a session gave and its turn, whether or not the app
+/// has collected it. Both are `None` when it never gave one.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct LatestSpokenResult {
+    pub turn: Option<u64>,
+    pub text: Option<String>,
+}
+
+/// `readAloud` set changes the phone reader flag; absent only reads it.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PhoneReaderParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_aloud: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PhoneReaderResult {
+    pub read_aloud: bool,
+}
+
 /// Starts the paragraph the app reads aloud.
 pub const SPOKEN_MARKER: &str = "Spoken:";
 

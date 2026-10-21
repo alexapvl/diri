@@ -26,14 +26,30 @@ targets:
       path: DiriPhone/Info.plist
       properties:
         CFBundleDisplayName: diri
+        # Exempt: only Apple's URLSession/Keychain, no bundled cryptography
+        # (the tunnel is the separately installed Tailscale app).
+        ITSAppUsesNonExemptEncryption: false
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         NSCameraUsageDescription: Scan the private pairing code shown in Diri on your Mac.
         NSLocalNetworkUsageDescription: Connect to Diri on your Mac to control your coding sessions.
+        NSMicrophoneUsageDescription: Voice mode listens for your reply to an agent and transcribes it on this iPhone.
+        NSSpeechRecognitionUsageDescription: Voice mode turns what you say into a message for your agent. Recognition runs on this iPhone.
+        # Voice mode keeps reading turns aloud and listening with the screen
+        # locked; the microphone engine is what keeps the app alive meanwhile.
+        UIBackgroundModes:
+          - audio
         UILaunchScreen:
           UIColorName: LaunchBackground
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        "UISupportedInterfaceOrientations~ipad":
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
         UIUserInterfaceStyle: Dark
         # diri-web speaks plain HTTP over a WireGuard tunnel. The transport is
         # already encrypted and authenticated by Tailscale; TLS on top would
@@ -52,8 +68,10 @@ targets:
           NSAllowsArbitraryLoads: true
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.cristicretu.diri.phone
-        TARGETED_DEVICE_FAMILY: "1"
+        # The App Store Connect record ("Dirijor", team A56RVNJ69X) owns this ID.
+        PRODUCT_BUNDLE_IDENTIFIER: dev.dirijor.ios
+        DEVELOPMENT_TEAM: A56RVNJ69X
+        TARGETED_DEVICE_FAMILY: "1,2"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
 
@@ -68,14 +86,30 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.cristicretu.diri.phone.tests
 
+  # Opt-in end-to-end test against a real gateway. Skips unless DIRI_E2E_URL
+  # is set; see DiriPhoneUITests/EndToEndTests.swift.
+  DiriPhoneUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: DiriPhoneUITests
+    dependencies:
+      - target: DiriPhone
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.cristicretu.diri.phone.uitests
+        TEST_TARGET_NAME: DiriPhone
+
 schemes:
   DiriPhone:
     build:
       targets:
         DiriPhone: all
         DiriPhoneTests: [test]
+        DiriPhoneUITests: [test]
     test:
       targets:
         - DiriPhoneTests
+        - DiriPhoneUITests
     archive:
       config: Release

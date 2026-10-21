@@ -28,7 +28,27 @@ pub(crate) fn spawn_appearance(id: &str) -> diri_proto::TerminalAppearance {
 /// The main window calls this as it renders. It follows the store's theme and
 /// keeps every window repainting for exactly as long as a fade is running.
 pub(crate) fn follow(store: &SessionStore, window: &mut gpui::Window, cx: &mut gpui::App) {
-    live::follow(catalog_theme(store.theme_id()), window, cx);
+    let theme = catalog_theme(store.theme_id());
+    live::follow(theme, window, cx);
+    // The phone's terminal view paints with the same colours. The settled
+    // theme, not a fade frame, so a fade does not churn it; the call is a
+    // compare when nothing changed.
+    diri_web::set_terminal_palette(phone_palette(&styled_terminal(
+        theme,
+        store.interface_style(),
+    )));
+}
+
+fn phone_palette(theme: &TermTheme) -> diri_web::TerminalPalette {
+    fn rgb(color: Rgba) -> [u8; 3] {
+        let channel = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+        [channel(color.r), channel(color.g), channel(color.b)]
+    }
+    diri_web::TerminalPalette {
+        foreground: rgb(theme.foreground),
+        background: rgb(theme.background),
+        ansi: theme.ansi.map(rgb),
+    }
 }
 
 /// The terminal theme a store is showing: the previewed one, if any.

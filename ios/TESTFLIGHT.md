@@ -8,19 +8,24 @@ External testers install Diri through TestFlight, not Xcode.
 
 - An active paid Apple Developer membership and an App Store Connect user with
   permission to upload builds. Add the account in Xcode → Settings → Accounts.
-- Confirm the team and reserve the explicit App ID `com.cristicretu.diri.phone`.
-  If that ID is unavailable, change `PRODUCT_BUNDLE_IDENTIFIER` in `project.yml`
-  before the first distribution. Do not change it between beta builds.
-- Create the iOS app record in App Store Connect with that same bundle ID.
+- The team is `A56RVNJ69X` and the App ID is `dev.dirijor.ios`, owned by the
+  existing App Store Connect record "Dirijor" (app id 6788779680). Do not
+  change it between beta builds.
 - Choose a feedback email, beta contact details, and a hosted privacy-policy
   URL. These are owner-supplied values; this repository does not invent them.
 - Review Apple's export-compliance questionnaire. The app uses Apple's
   URLSession/Keychain and a separately installed Tailscale app; it does not
-  bundle WireGuard or its own cryptography. `ITSAppUsesNonExemptEncryption` is
-  deliberately not asserted until the owner has confirmed the answers.
+  bundle WireGuard or its own cryptography, so `project.yml` declares
+  `ITSAppUsesNonExemptEncryption: false` (first beta, October 2026).
 
 Do not commit certificates, provisioning profiles, `.p8` keys, or passwords.
-Use Xcode-managed signing for the first beta; no CI signing secrets are needed.
+Use Xcode-managed signing, or upload without an Xcode account using an App Store
+Connect API key (App Manager) kept outside the repo in
+`~/.appstoreconnect/private_keys/`; pass it to `xcodebuild -exportArchive` with
+`-authenticationKeyPath/-authenticationKeyID/-authenticationKeyIssuerID`. An
+App Manager key cannot use cloud signing, so the Apple Distribution certificate
+must be in the login keychain and the App Store profile installed for a manual
+export.
 
 ## Build and validate
 

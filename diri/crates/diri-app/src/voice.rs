@@ -14,7 +14,6 @@
 // Only macOS speaks; elsewhere the store still detects turns for the tests.
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 
-use diri_proto::attention::AttentionKind;
 use diri_proto::{SessionId, SessionRecord};
 
 /// A system voice the reader can use, as `diri-voice voices` lists it.
@@ -163,16 +162,10 @@ pub(crate) fn completed_turn(
     current: &SessionRecord,
 ) -> Option<u64> {
     let before = previous?.attention_state.as_ref()?;
-    let after = current.attention_state.as_ref()?;
-    if before.epoch != after.epoch || after.working {
-        return None;
-    }
-    after
-        .events
-        .iter()
-        .filter(|event| event.kind == AttentionKind::Completion && event.sequence > before.sequence)
-        .map(|event| event.turn)
-        .max()
+    current
+        .attention_state
+        .as_ref()?
+        .completed_turn_since(before)
 }
 
 /// Most of what the on-device model can take in one request (4096 tokens,
@@ -1453,7 +1446,7 @@ mod macos {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use diri_proto::attention::{AttentionEvent, AttentionState};
+    use diri_proto::attention::{AttentionEvent, AttentionKind, AttentionState};
 
     fn state(
         sequence: u64,

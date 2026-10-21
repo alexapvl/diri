@@ -109,13 +109,83 @@ fn transcript_turns(record: &SessionRecord) -> Result<Vec<TranscriptTurnRecord>,
         crate::transcript::load(&home, Path::new(path), kind, agent_id, &record.cwd, None)
             .map_err(|error| format!("transcript unavailable: {error}"))?
             .ok_or("transcript unavailable")?;
-    Ok(snapshot
+    let mut turns: Vec<TranscriptTurnRecord> = snapshot
         .document
         .turns
         .into_iter()
         .map(|turn| TranscriptTurnRecord {
             role: if turn.role == "You" { "user" } else { "agent" }.into(),
             text: turn.text,
+            turn: None,
         })
-        .collect())
+        .collect();
+    mark_finished_turn(&mut turns, record.attention_state.as_ref());
+    Ok(turns)
+}
+
+/// Tags the closing agent message with the attention turn it finished, so a
+/// reader can match it to that turn's completion. Only while the Agent is
+/// idle: a working Agent's last message is not the end of anything yet.
+fn mark_finished_turn(
+    turns: &mut [TranscriptTurnRecord],
+    attention: Option<&diri_proto::attention::AttentionState>,
+) {
+    let Some(state) = attention.filter(|state| !state.working) else {
+        return;
+    };
+    if let Some(last) = turns.last_mut()
+        && last.role == "agent"
+    {
+        last.turn = Some(state.turn);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use diri_proto::attention::AttentionState;
+
+    fn turn(role: &str) -> TranscriptTurnRecord {
+        TranscriptTurnRecord {
+            role: role.into(),
+            text: "text".into(),
+            turn: None,
+        }
+    }
+
+    fn attention(turn: u64, working: bool) -> AttentionState {
+        AttentionState {
+            version: diri_proto::attention::ATTENTION_VERSION,
+            epoch: "e".into(),
+            sequence: 1,
+            turn,
+            working,
+            observed_at: None,
+            last_native_completion: None,
+            active_tools: Default::default(),
+            events: Vec::new(),
+            native_requests: Default::default(),
+            native_completions: Default::default(),
+        }
+    }
+
+    #[test]
+    fn only_an_idle_agents_closing_message_carries_its_turn() {
+        let mut turns = vec![turn("user"), turn("agent")];
+        mark_finished_turn(&mut turns, Some(&attention(4, false)));
+        assert_eq!(turns[0].turn, None);
+        assert_eq!(turns[1].turn, Some(4));
+
+        let mut working = vec![turn("user"), turn("agent")];
+        mark_finished_turn(&mut working, Some(&attention(4, true)));
+        assert!(working.iter().all(|turn| turn.turn.is_none()));
+
+        let mut asked = vec![turn("agent"), turn("user")];
+        mark_finished_turn(&mut asked, Some(&attention(4, false)));
+        assert!(asked.iter().all(|turn| turn.turn.is_none()));
+
+        let mut unknown = vec![turn("agent")];
+        mark_finished_turn(&mut unknown, None);
+        assert_eq!(unknown[0].turn, None);
+    }
 }
