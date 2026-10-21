@@ -3027,13 +3027,13 @@ impl RootView {
             let runtime = Arc::clone(&self.services.store);
             let model = crate::notes::todos::TodosModel::global(&runtime, cx);
             let page = cx.new(|cx| crate::notes::todos::TodosPage::new(runtime, model, cx));
-            cx.subscribe_in(&page, window, |this, _, event, window, cx| {
+            cx.subscribe(&page, |this, _, event, cx| {
                 use crate::notes::todos::TodosEvent;
                 let (session, block) = match event {
                     TodosEvent::OpenNote { session, block } => (session.clone(), Some(*block)),
                     TodosEvent::OpenSession(session) => (session.clone(), None),
                 };
-                this.show_from_todos(session, block, window, cx);
+                this.show_from_todos(session, block, cx);
             })
             .detach();
             self.todos_page = Some(page);
@@ -3064,32 +3064,30 @@ impl RootView {
         cx.notify();
     }
 
-    /// A note or session chosen on the To-dos page. The page covers whatever
-    /// was on screen; closing it alone would reveal that session again. A
-    /// saved layout also paints over the main pane and, on the next frame,
-    /// selects its own focused agent. Leave the layout first, then select.
-    fn show_from_todos(
-        &mut self,
-        session: SessionId,
-        block: Option<usize>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.close_todos(cx);
-        if self.active_workspace.is_some() {
-            self.sidebar
-                .update(cx, |sidebar, cx| sidebar.activate_workspace(None, cx));
-            self.activate_saved_workspace(None, window, cx);
-        }
-        self.window_store
-            .write()
-            .expect("session store lock poisoned")
-            .select(session);
+    /// A note or session chosen on the To-dos page. Closing the page alone
+    /// would uncover whatever was on screen, and a saved layout would then
+    /// select its own focused agent again. Select, then take the sidebar's
+    /// path: it closes To-dos, focuses the session's pane when a layout holds
+    /// it, leaves a layout that does not, and dismisses the launcher.
+    fn show_from_todos(&mut self, session: SessionId, block: Option<usize>, cx: &mut Context<Self>) {
+        let note_id = {
+            let mut store = self.window_store.write().expect("session store lock poisoned");
+            store.select(session.clone());
+            store
+                .sessions()
+                .get(&session)
+                .and_then(|session| session.note_id.clone())
+        };
         if let (Some(block), Some(terminal)) = (block, &self.terminal) {
-            terminal.update(cx, |terminal, _| terminal.reveal_note_block(block));
+            // Tie the caret to this note, so a different note uncovered
+            // first does not take it.
+            terminal.update(cx, |terminal, _| match note_id {
+                Some(note_id) => terminal.reveal_block_in_note(note_id, block),
+                None => terminal.reveal_note_block(block),
+            });
         }
-        self.focus_active_terminal(window, cx);
-        cx.notify();
+        self.sidebar
+            .update(cx, |_, cx| cx.emit(SidebarEvent::SessionActivated));
     }
 
     fn close_todos(&mut self, cx: &mut Context<Self>) {
@@ -8170,23 +8168,41 @@ mod tests {
                 terminal.update(cx, |terminal, _| terminal.set_note_pane_for_test(pane));
             }
             root.open_todos(window, cx);
-            root.show_from_todos(SessionId::new("s_note"), Some(0), window, cx);
+            // Through the page's own event, so the subscription is covered.
+            let page = root.todos_page.clone().expect("To-dos page");
+            page.update(cx, |_, cx| {
+                cx.emit(crate::notes::todos::TodosEvent::OpenNote {
+                    session: SessionId::new("s_note"),
+                    block: 0,
+                })
+            });
+        });
+        cx.run_until_parked();
+        let selected = |root: &RootView| {
+            root.window_store
+                .read()
+                .unwrap()
+                .selected_session_id()
+                .map(|id| id.0.clone())
+        };
+        root.read_with(cx, |root, _| {
+            assert!(!root.todos_open);
+            // Like a sidebar click, the Engine is asked to place the note in
+            // a layout first. The layout must not take the selection back.
+            assert_eq!(selected(root).as_deref(), Some("s_note"));
+        });
+        // This note has no layout to join, so the layout gives way.
+        root.update_in(cx, |root, _, cx| {
+            root.sidebar
+                .update(cx, |_, cx| cx.emit(SidebarEvent::ProjectLayoutUnavailable));
         });
         cx.run_until_parked();
         root.read_with(cx, |root, _| {
-            assert!(!root.todos_open);
             assert!(
                 root.active_workspace.is_none(),
                 "the note replaces the layout that To-dos was covering"
             );
-            assert_eq!(
-                root.window_store
-                    .read()
-                    .unwrap()
-                    .selected_session_id()
-                    .map(|id| id.0.as_str()),
-                Some("s_note")
-            );
+            assert_eq!(selected(root).as_deref(), Some("s_note"));
         });
     }
 
