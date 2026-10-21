@@ -126,10 +126,10 @@ impl Drop for MenuShortcuts {
                 .item
                 .setKeyEquivalentModifierMask(saved.modifiers);
         }
-        if let Some((window, was)) = &self.miniaturizable {
-            if *was {
-                window.setStyleMask(window.styleMask().union(NSWindowStyleMask::Miniaturizable));
-            }
+        if let Some((window, was)) = &self.miniaturizable
+            && *was
+        {
+            window.setStyleMask(window.styleMask().union(NSWindowStyleMask::Miniaturizable));
         }
     }
 }

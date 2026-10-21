@@ -947,6 +947,7 @@ fn modifiers_from_bits(flags: u64) -> Modifiers {
     }
 }
 
+#[cfg(any(test, target_os = "macos"))]
 enum CapturedRoute {
     Flags,
     Key { name: String, code: u16 },
@@ -954,6 +955,7 @@ enum CapturedRoute {
 
 /// A letter typed with both Command keys sometimes arrives as a modifier
 /// event or a flags change. If it names a key, record that key.
+#[cfg(any(test, target_os = "macos"))]
 fn route_captured(flags_changed: bool, code: u16, letters: Option<char>) -> CapturedRoute {
     // Both Command keys down can report the letter on the command key's code.
     if HeldModifier::from_code(code).is_some() {
@@ -982,6 +984,7 @@ fn route_captured(flags_changed: bool, code: u16, letters: Option<char>) -> Capt
     CapturedRoute::Key { name, code }
 }
 
+#[cfg(any(test, target_os = "macos"))]
 fn special_key_name(code: u16) -> Option<&'static str> {
     Some(match code {
         0x35 => "escape",
@@ -999,6 +1002,7 @@ fn special_key_name(code: u16) -> Option<&'static str> {
 }
 
 /// Hardware key codes are positions, so Option+O stays `o` instead of Ó.
+#[cfg(any(test, target_os = "macos"))]
 fn ansi_key_name(code: u16) -> Option<&'static str> {
     Some(match code {
         0x00 => "a",
@@ -1041,6 +1045,7 @@ fn ansi_key_name(code: u16) -> Option<&'static str> {
     })
 }
 
+#[cfg(any(test, target_os = "macos"))]
 fn ansi_code_for_char(letter: char) -> Option<u16> {
     let letter = letter.to_ascii_lowercase();
     Some(match letter {
