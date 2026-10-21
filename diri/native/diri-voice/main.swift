@@ -406,16 +406,38 @@ func runPress(_ arguments: [String]) {
     }
     let modifiers = Set((values("--modifiers", in: arguments).first ?? "").split(separator: ",").map(String.init))
     var flags = CGEventFlags()
-    for (name, flag) in [("cmd", CGEventFlags.maskCommand), ("ctrl", .maskControl), ("alt", .maskAlternate),
-                         ("shift", .maskShift), ("fn", .maskSecondaryFn)] where modifiers.contains(name) {
+    let generic: [(String, CGEventFlags)] = [
+        ("cmd", .maskCommand), ("ctrl", .maskControl), ("alt", .maskAlternate),
+        ("shift", .maskShift), ("fn", .maskSecondaryFn),
+    ]
+    // Device-dependent bits from IOLLEvent.h. They share the flag word with
+    // the generic masks above and are how a listener tells the keys apart.
+    let sided: [(String, UInt64, CGEventFlags)] = [
+        ("cmd-left", 0x0000_0008, .maskCommand),
+        ("cmd-right", 0x0000_0010, .maskCommand),
+        ("ctrl-left", 0x0000_0001, .maskControl),
+        ("ctrl-right", 0x0000_2000, .maskControl),
+        ("alt-left", 0x0000_0020, .maskAlternate),
+        ("alt-right", 0x0000_0040, .maskAlternate),
+        ("shift-left", 0x0000_0002, .maskShift),
+        ("shift-right", 0x0000_0004, .maskShift),
+    ]
+    for (name, flag) in generic where modifiers.contains(name) {
         flags.insert(flag)
     }
+    for (name, bit, flag) in sided where modifiers.contains(name) {
+        flags.insert(flag)
+        flags = CGEventFlags(rawValue: flags.rawValue | bit)
+    }
+    // A shortcut that is itself a modifier (right Option) has to go back up
+    // with the flag cleared. A normal key keeps its modifiers on both events.
+    let modifierKey: Set<UInt16> = [0x36, 0x37, 0x38, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F]
     let source = CGEventSource(stateID: .hidSystemState)
     for down in [true, false] {
         guard let event = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: down) else {
             fail("could not create the key event")
         }
-        event.flags = flags
+        event.flags = down || !modifierKey.contains(code) ? flags : CGEventFlags()
         event.post(tap: .cghidEventTap)
         usleep(20_000)
     }

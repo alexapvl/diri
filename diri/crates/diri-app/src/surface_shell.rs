@@ -1925,6 +1925,7 @@ impl UtilitySurfaces {
                 return;
             }
             let _ = self.update_prefs(|_| {});
+            self.stop_dictation_recording();
             self.surface = Surface::None;
             self.clear_account_continuation();
             self.usage_share_theme_hover = None;
@@ -2058,6 +2059,9 @@ impl UtilitySurfaces {
         }
         if self.settings_tab != tab {
             self.settings_scroll.set_offset(point(px(0.0), px(0.0)));
+        }
+        if tab != SettingsTab::Voice {
+            self.stop_dictation_recording();
         }
         self.settings_tab = tab;
         if tab == SettingsTab::WhatsNew {
@@ -3533,6 +3537,46 @@ impl UtilitySurfaces {
                                                 }
                                             },
                                         ))
+                                        .child(surface_button(
+                                            t("settings.phone.new_code"),
+                                            "phone-new-code",
+                                            colors,
+                                            cx,
+                                            |this, cx| {
+                                                // Stop serving the old code
+                                                // before it is replaced.
+                                                this.phone_access = None;
+                                                this.phone_loading = true;
+                                                this.phone_error = None;
+                                                let client =
+                                                    Arc::clone(this.store_runtime.client());
+                                                let task = this.runtime.spawn(async move {
+                                                    crate::phone_access::PhoneAccess::reset_pairing()?;
+                                                    crate::phone_access::PhoneAccess::start(client)
+                                                        .await
+                                                });
+                                                cx.spawn(async move |this, cx| {
+                                                    let result = task
+                                                        .await
+                                                        .map_err(|error| error.to_string())
+                                                        .and_then(|result| result);
+                                                    let _ = this.update(cx, |this, cx| {
+                                                        this.phone_loading = false;
+                                                        match result {
+                                                            Ok(access) => {
+                                                                this.phone_access = Some(access)
+                                                            }
+                                                            Err(error) => {
+                                                                this.phone_error = Some(error)
+                                                            }
+                                                        }
+                                                        cx.notify();
+                                                    });
+                                                })
+                                                .detach();
+                                                cx.notify();
+                                            },
+                                        ))
                                         .child(settings_danger_button(
                                             t("settings.phone.turn_off"),
                                             "phone-disable",
@@ -3854,12 +3898,17 @@ impl UtilitySurfaces {
                         && self.prefs.talk_with_agent
                         && self.prefs.talk_dictation,
                     |section| {
-                        section.child(setting_divider(colors)).child(setting_row(
-                            t("settings.general.talk_answer_with"),
-                            t("settings.general.talk_answer_with_detail"),
-                            self.talk_answer_dropdown(cx),
-                            colors,
-                        ))
+                        section.child(setting_divider(colors)).child(
+                            // Three lines of detail, so the shared 50px row
+                            // leaves this text on the dividers. The shorter
+                            // rows above get that gap from the minimum height.
+                            div().py(px(8.0)).child(setting_row(
+                                t("settings.general.talk_answer_with"),
+                                t("settings.general.talk_answer_with_detail"),
+                                self.talk_answer_dropdown(cx),
+                                colors,
+                            )),
+                        )
                     },
                 )
                 .when(
@@ -3868,12 +3917,14 @@ impl UtilitySurfaces {
                         && self.prefs.talk_dictation
                         && self.prefs.talk_answer == crate::store::TalkAnswer::Shortcut,
                     |section| {
-                        section.child(setting_divider(colors)).child(setting_row(
-                            t("settings.general.talk_shortcut"),
-                            t("settings.general.talk_shortcut_detail"),
-                            self.dictation_shortcut_field(cx),
-                            colors,
-                        ))
+                        section.child(setting_divider(colors)).child(
+                            div().py(px(8.0)).child(setting_row(
+                                t("settings.general.talk_shortcut"),
+                                t("settings.general.talk_shortcut_detail"),
+                                self.dictation_shortcut_field(cx),
+                                colors,
+                            )),
+                        )
                     },
                 ),
                 colors,
@@ -7421,6 +7472,9 @@ impl Render for UtilitySurfaces {
             .track_focus(&self.focus)
             .key_context(UTILITY_CONTEXT)
             .on_key_down(cx.listener(Self::key_down))
+            .on_modifiers_changed(cx.listener(|this, event, _, cx| {
+                this.dictation_modifiers_changed(event, cx);
+            }))
             .on_action(cx.listener(|this, _: &OpenWorktrees, _, cx| {
                 this.open_worktrees(cx);
             }))

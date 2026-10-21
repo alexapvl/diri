@@ -43,14 +43,14 @@ struct SessionRowView: View {
 
             VStack(alignment: .leading, spacing: 1) {
                 Text(displayTitle)
-                    .font(selected ? Tokens.Typo.rowEmphasized : Tokens.Typo.row)
-                    .foregroundStyle(Tokens.Ink.primary.opacity(selected ? 1.0 : 0.75))
+                    .font(.system(size: 15, weight: selected ? .semibold : .regular))
+                    .foregroundStyle(Tokens.Ink.primary.opacity(selected ? 1.0 : 0.86))
                     .lineLimit(1)
                     .truncationMode(.tail)
 
                 if let subtitle {
                     Text(subtitle)
-                        .font(Tokens.Typo.meta)
+                        .font(.system(size: 12))
                         .foregroundStyle(Tokens.Ink.tertiary)
                         .lineLimit(1)
                         .truncationMode(.middle)
@@ -60,10 +60,10 @@ struct SessionRowView: View {
 
             trailing
         }
-        .padding(.horizontal, Tokens.Space.rowH)
-        .frame(height: Tokens.Metrics.rowHeight)
+        .padding(.horizontal, 10)
+        .frame(height: 52)
         .background(
-            RoundedRectangle(cornerRadius: Tokens.Radius.row, style: .continuous)
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .fill(selected ? RowFill.selected.color : RowFill.clear.color)
         )
         // Archived and hibernated rows are dimmed rather than hidden — the same
@@ -72,6 +72,8 @@ struct SessionRowView: View {
         .animation(reduceMotion ? nil : Tokens.Motion.rowSelect, value: selected)
         .accessibilityElement(children: .combine)
         .accessibilityLabel(displayTitle)
+        .accessibilityIdentifier("session-row-\(session.id)")
+        .accessibilityAddTraits(selected ? .isSelected : [])
         .accessibilityValue(session.statusState.label)
     }
 
@@ -94,26 +96,33 @@ struct SessionRowView: View {
         return name.isEmpty ? nil : name
     }
 
+    /// One quiet word for the states worth reading from across the list;
+    /// the glyph's colour already carries the rest.
     @ViewBuilder
     private var trailing: some View {
-        HStack(spacing: 4) {
+        HStack(spacing: 6) {
             if row.pinned {
                 Image(systemName: "pin.fill")
                     .font(.system(size: 9))
                     .foregroundStyle(Tokens.Ink.tertiary)
             }
-            if let host = session.host, !host.isEmpty {
-                RowChip(text: host, tint: Tokens.Ink.secondary)
-            }
-            if session.hasEnded {
-                RowChip(text: "ended", tint: Tokens.Ink.primary.opacity(0.35))
-            }
-            if row.hasChildren, row.collapsed {
-                // A folded subtree still has to declare that it exists.
-                RowChip(text: "•••", tint: Tokens.Ink.tertiary)
+            if let word = statusWord {
+                Text(word.text)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(word.color)
             }
         }
         .fixedSize()
+    }
+
+    private var statusWord: (text: String, color: Color)? {
+        if session.hasEnded { return ("ended", Tokens.Ink.tertiary) }
+        switch session.statusState {
+        case let .needsInput(destructive): return ("needs you", destructive ? Tokens.Ink.danger : Tokens.Ink.attention)
+        case .doneUnseen: return ("done", Tokens.Ink.fresh)
+        case .working: return ("working", Tokens.Ink.tertiary)
+        default: return nil
+        }
     }
 }
 
@@ -141,25 +150,5 @@ struct IndentRails: View {
                     .frame(width: Tokens.Space.indent, height: Tokens.Metrics.rowHeight, alignment: .top)
             }
         }
-    }
-}
-
-/// The row's shared chip: one state, in the smallest space that still reads.
-/// Every chip on a row is the same shape so they scan as one lane.
-struct RowChip: View {
-    let text: String
-    var tint: Color = Tokens.Ink.secondary
-
-    var body: some View {
-        Text(text)
-            .font(Tokens.Typo.meta)
-            .foregroundStyle(tint)
-            .lineLimit(1)
-            .padding(.horizontal, 5)
-            .padding(.vertical, 2)
-            .background(
-                RoundedRectangle(cornerRadius: Tokens.Radius.chip, style: .continuous)
-                    .fill(Tokens.Ink.primary.opacity(Tokens.Fill.subtle))
-            )
     }
 }

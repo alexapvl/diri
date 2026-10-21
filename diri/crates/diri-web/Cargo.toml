@@ -10,6 +10,7 @@ name = "diri-web"
 path = "src/main.rs"
 
 [dependencies]
+base64.workspace = true
 diri-platform = { workspace = true, features = ["async"] }
 diri-client.workspace = true
 diri-proto.workspace = true
@@ -19,4 +20,5 @@ serde_json.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+diri-engine.workspace = true
 tempfile.workspace = true

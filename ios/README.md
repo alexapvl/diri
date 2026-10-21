@@ -57,8 +57,11 @@ to install or launch. Its bind is Tailscale-only, not your public/LAN address.
 The [Tailscale CLI](https://tailscale.com/docs/reference/tailscale-cli?tab=macos)
 is probed read-only with `TAILSCALE_BE_CLI=1`; Diri does not change VPN settings.
 The pairing code controls all sessions exposed by this Mac: do not share it.
-Turning access off closes existing connections; enabling again produces a new
-code, and the phone must be paired again. Quitting Diri turns access off.
+Turning access off closes existing connections. The code is kept owner-only
+(`0600`) in Diri's application-support directory, so enabling again, or
+relaunching Diri, keeps existing phones paired. **New pairing code** in the
+same settings page replaces it and every phone must be paired again. Quitting
+Diri turns access off.
 
 On the phone, **New session** lets you choose this Mac or a configured SSH
 host, a known project or a browsable folder, and an agent installed on that
@@ -68,10 +71,83 @@ or fallback to the currently checked-out feature branch occurs. Use **Branch
 options** for a different base. The original checkout is left unchanged.
 Remote SSH hosts and agent login should first be initialized from the Mac.
 
-The session menu offers **Review changes** (tracked diff against HEAD) and
-**Follow output**. Network errors preserve the prompt draft and show a stale
-screen warning. Mutations are never automatically retried: after a dropped
+The session menu offers **Review changes** (tracked diff against HEAD), **Fit
+text to width** and **Resize session to this phone**. Network errors preserve
+the prompt draft. Mutations are never automatically retried: after a dropped
 connection, inspect the session before sending or starting again.
+
+## Terminal
+
+A session opens on its terminal, drawn from `diri-web`'s grid stream
+(`/grid`, `/history`, `/stream`; see `Terminal/GridModel.swift`): colours,
+bold/dim/italic/underline/inverse/strike, the cursor, and wide characters
+placed on the cell grid. It is a `UIScrollView` of recycled line layers drawn
+with Core Text; a layer is redrawn only when its line changes.
+
+Scrollback lives in an on-device cache (`LineCache`, 256-line pages, 40k lines,
+least-recently-used pages evicted). The newest 10k lines are fetched on open,
+and while scrolling the pages ahead of the fling are requested, up to four at a
+time. Scrolling never waits for the network: an uncached line draws blank
+until its page lands. Only the session on screen streams; the last eight keep
+their cache and scroll position for switching back.
+
+The session keeps its own columns. With no size chosen, text is scaled to fit
+them (down to 7.5 pt, then the view scrolls sideways); pinch sets a size that
+sticks. **Resize session to this phone** is the only path that calls
+`/resize`. An older gateway without the stream falls back to polling `/screen`
+as plain text.
+
+Tapping the terminal (or the keyboard button) types straight into the PTY via
+`/input`. The row above the keyboard has esc, tab, a sticky ctrl, arrows, `/`
+and `|`. A hardware keyboard sends ctrl and option combos, arrows, esc and
+tab; ⌘V pastes (bracketed when the program asked for it), ⌘K switches
+session, ⌘[ / ⌘] go to the previous / next one, ⌘N starts one. The message
+field below the terminal still sends whole prompts through `/send`.
+
+Sessions are grouped by computer. On a narrow screen the list is a drawer
+(left-edge swipe or the sidebar button); at 700 pt and wider it is a sidebar.
+
+`-flingBenchmark` (with `-session <id>`) flings through the whole scrollback
+and logs `DIRI_FRAME_PROBE` with frame intervals, dropped frames, main-thread
+layout+draw time per frame and how many lines showed blank.
+
+## Several computers
+
+Pair more than one gateway (your Mac, `forge`) with **connection menu → Add a
+computer…**. Gateways are kept in Keychain in priority order (older builds'
+single pairing is migrated on first launch). On launch, on returning to the
+foreground, on every network change and every 15 s, all of them are probed
+(`/api/health`, 3 s timeout) at once. The highest-priority reachable one is
+*live* — shown in the toolbar and used for new sessions — and sessions from
+every reachable gateway are listed together, tagged with the gateway's name.
+Writes always go to the gateway that owns the session. **Prefer this
+computer** moves a gateway to the top.
+
+## Voice mode
+
+The waveform button in a session's message field opens voice mode, a glass
+panel over the bottom of the terminal, for use with AirPods and the screen
+locked. When the agent finishes a turn (`turn_finished`
+on the event stream) it is read aloud — the agent's own `spoken` summary if
+there is one, otherwise the last agent turn from `/transcript`, with code and
+markup stripped and cut at a sentence near 600 characters. Then it listens
+(on-device: `SpeechAnalyzer` on iOS 26+, otherwise `SFSpeechRecognizer` with
+`requiresOnDeviceRecognition`) and sends after 1.5 s of silence. The **Talk**
+capsule (or a tap anywhere on the panel) interrupts speech, sends early, or
+starts talking; **Repeat** and **Mute** sit beside it. Mute stops reading aloud and the automatic listening
+after it. While voice mode is open the Mac's `readAloud` setting is on and is
+restored on close; the screen poll pauses. Sends are never retried — a failed
+one is shown and left to you.
+
+The microphone stays open for as long as voice mode is: an iOS app with the
+`audio` background mode is suspended once its audio session goes idle, and
+voice mode must still hear the next turn with the screen locked.
+
+DEBUG builds read two launch-environment hooks for UI tests:
+`DIRI_VOICE_TEST_AUDIO` (dictate this audio file instead of the microphone;
+speech is then synthesized at zero volume) and `DIRI_E2E_CWD` (prefill the new
+session folder). The opt-in end-to-end test is
+`DiriPhoneUITests/EndToEndTests.swift`; its header documents the variables.
 
 ## Developer CLI / standalone gateway
 
@@ -90,7 +166,7 @@ can start and kill processes on a real machine, so it does not go in
 For the simulator, two launch arguments skip the setup screen:
 
 ```sh
-xcrun simctl launch booted com.cristicretu.diri.phone \
+xcrun simctl launch booted dev.dirijor.ios \
   -endpoint 'http://forge:7380/?token=…' \
   -session s_1ab7417f0c93          # optional: open straight into one session
 ```
@@ -113,15 +189,15 @@ The agent marks parse the same 24×24 SVG path data the desktop parses, rather
 than shipping rasterised copies that would silently go stale when the artwork
 changes.
 
-**One deliberate departure.** The desktop row is 28pt, which is a mouse target;
-a finger needs 44. The row grows and nothing inside it does — type sizes, the
-16pt glyph, the 12pt indent and the 7pt corner radius are all unchanged — so the
-row reads identically and simply breathes more. `Tokens.Metrics.desktopRowHeight`
-keeps the original value visible next to it.
+**Deliberate departures.** The desktop row is 28pt, which is a mouse target;
+the phone row is 52pt with a 15pt title, read at arm's length. Rows are grouped
+by computer rather than project (the branch is the second line), and a quiet
+status word ("needs you", "done", "working") stands in for the desktop's chips.
+The glyphs, colours and ordering are unchanged.
 
 ## What it does
 
-- Sessions grouped by project, ordered exactly as the desktop orders them:
+- Sessions grouped by computer, then ordered exactly as the desktop orders them:
   pinned first, then manual rank, then arrival; siblings by creation time
   *ascending*.
 - Spawn lineage drawn with the same rails — a full-height line while an ancestor
@@ -130,8 +206,8 @@ keeps the original value visible next to it.
 - Per-agent status marks tinted by attention: working in the agent's own colour,
   needs-input amber (red when the pending tool call is destructive), done-unseen
   green, idle and ended progressively dimmer.
-- Tap a session for its live screen, a composer, and a key row that writes raw
-  terminal bytes so permission prompts and menus are answerable.
+- Tap a session for its live terminal, typed into directly, plus a message
+  field for whole prompts.
 - Swipe to mark seen or kill; long-press for the same actions plus fold.
 - Pull to refresh, with an SSE stream for liveness and a 15s polling backstop
   for when that stream dies quietly.
@@ -140,9 +216,8 @@ keeps the original value visible next to it.
 
 - **Push notifications when a session needs input.** The highest-value missing
   piece: today you have to open the app to discover that something is waiting.
-- **Colour and cursor in the terminal.** The view renders `read_screen`'s plain
-  text. The daemon also exposes `read_scrollback_cells` and a grid protocol, so
-  a faithful renderer is available, just not written.
+- **Mouse reporting and text selection in the terminal.** Taps focus the
+  keyboard; they are not sent to programs that asked for the mouse.
 - **Archived bucket, rename, drag-to-reorder.** The projection already computes
   the archived list and honours a manual order; no UI reaches them.
 

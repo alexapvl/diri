@@ -56,21 +56,31 @@ pub struct DictationShortcut {
 
 impl DictationShortcut {
     /// The modifiers in the label, as `diri-voice press` takes them.
+    ///
+    /// A side is kept (`alt-right`, `cmd-left`) so a bare right Option key is
+    /// not pressed as whichever Option happens to be the generic one.
     pub fn modifiers(&self) -> Vec<&'static str> {
-        let parts: Vec<&str> = self.label.split('-').collect();
-        let held = &parts[..parts.len().saturating_sub(1)];
-        [
-            ("cmd", "cmd"),
-            ("ctrl", "ctrl"),
-            ("alt", "alt"),
-            ("shift", "shift"),
-            ("fn", "fn"),
-        ]
-        .into_iter()
-        .filter(|(name, _)| held.contains(name))
-        .map(|(_, flag)| flag)
-        .collect()
+        self.label.split('-').filter_map(press_modifier).collect()
     }
+}
+
+fn press_modifier(part: &str) -> Option<&'static str> {
+    Some(match part {
+        "cmd" => "cmd",
+        "leftcmd" => "cmd-left",
+        "rightcmd" => "cmd-right",
+        "ctrl" => "ctrl",
+        "leftctrl" => "ctrl-left",
+        "rightctrl" => "ctrl-right",
+        "alt" => "alt",
+        "leftalt" => "alt-left",
+        "rightalt" => "alt-right",
+        "shift" => "shift",
+        "leftshift" => "shift-left",
+        "rightshift" => "shift-right",
+        "fn" => "fn",
+        _ => return None,
+    })
 }
 
 impl Serialize for UiLanguage {

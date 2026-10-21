@@ -190,6 +190,10 @@ pub struct ControlServer {
     /// Each session's spoken summary (Diri's `speak` tool) and the turn it
     /// was given in, until the app's reader collects it.
     spoken: Mutex<SpokenSummaries>,
+    /// A phone voice client asked for spoken summaries (`voice.phone_reader`).
+    /// In memory: it lasts until the phone turns it off or the Engine exits,
+    /// and needs no app preferences file, so headless Engines honour it too.
+    phone_reads_aloud: std::sync::atomic::AtomicBool,
     /// Where note Sessions keep their files; `None` resolves the standard
     /// notes directory (tests pin a temporary one).
     notes_dir: Option<PathBuf>,
@@ -317,6 +321,7 @@ impl ControlServer {
             agent_scans: Arc::new(Mutex::new(std::collections::HashMap::new())),
             hook_reports: hook_queue::HookQueue::new(),
             spoken: Mutex::new(SpokenSummaries::default()),
+            phone_reads_aloud: std::sync::atomic::AtomicBool::new(false),
             notes_dir: None,
             scheduler: Arc::new(schedules::Scheduler::default()),
         }
@@ -1215,6 +1220,8 @@ impl ControlServer {
             }),
             Method::VOICE_SPEAK => self.voice_speak(params),
             Method::VOICE_SPOKEN => self.voice_spoken(params),
+            Method::VOICE_LATEST_SPOKEN => self.voice_latest_spoken(params),
+            Method::VOICE_PHONE_READER => self.voice_phone_reader(params),
             Method::SESSION_RESUME => self.session_resume(params),
             Method::SESSION_PROCESS_INFO => self.session_process_info(params),
             Method::SESSION_RECONNECT => self.session_reconnect(params),
@@ -1444,7 +1451,10 @@ impl ControlServer {
                     self.mcp_http_url_for(&descriptor),
                 );
                 launch_args.extend(injected.argv);
-                launch_args.extend(spoken_summary_args(&descriptor.injection, &id));
+                launch_args.extend(spoken_summary_args(
+                    &descriptor.injection,
+                    self.reads_session_aloud(&id),
+                ));
                 mcp_http_token = injected
                     .mcp_http
                     .then(|| self.mcp_http.get().map(|endpoint| endpoint.token(&id)))
@@ -3509,7 +3519,14 @@ impl ControlServer {
         };
         let session_end = p.kind == "claude-hook" && p.event.as_deref() == Some("SessionEnd");
         let prompt = p.kind == "claude-hook" && p.event.as_deref() == Some("UserPromptSubmit");
-        let speak = prompt && reads_session_aloud(&session_id.0);
+        let context = prompt
+            .then(|| {
+                let phone = self
+                    .phone_reads_aloud
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                prompt_hook_context(phone, app_prefs().as_deref(), &session_id.0)
+            })
+            .flatten();
         // Never wait on the Registry here: the Agent is blocked on this reply.
         self.hook_reports
             .submit(
@@ -3523,8 +3540,8 @@ impl ControlServer {
                 },
             )
             .map_err(poisoned)?;
-        if speak {
-            return Ok(json!({ "additionalContext": diri_proto::voice::SPOKEN_INSTRUCTION }));
+        if let Some(context) = context {
+            return Ok(json!({ "additionalContext": context }));
         }
         Ok(json!({}))
     }
@@ -3534,7 +3551,7 @@ impl ControlServer {
     /// session aloud.
     fn voice_speak(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
         let p: diri_proto::voice::SpeakParams = decode(params)?;
-        if !reads_session_aloud(&p.session_id) {
+        if !self.reads_session_aloud(&p.session_id) {
             return Ok(json!({
                 "spoken": false,
                 "note": "Diri is not reading this session aloud; there is no need to call speak."
@@ -3575,6 +3592,41 @@ impl ControlServer {
             .map_err(poisoned)?
             .take(&p.session_id, p.turn);
         encode(&diri_proto::voice::SpokenResult { text })
+    }
+
+    /// The newest summary a session gave, collected by the app or not, for
+    /// the phone's reader. Never consumes it: the app still reads it once.
+    fn voice_latest_spoken(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        let p: diri_proto::voice::LatestSpokenParams = decode(params)?;
+        let latest = self.spoken.lock().map_err(poisoned)?.latest(&p.session_id);
+        encode(&diri_proto::voice::LatestSpokenResult {
+            turn: latest.as_ref().map(|(turn, _)| *turn),
+            text: latest.map(|(_, text)| text),
+        })
+    }
+
+    /// Reads, and with `readAloud` sets, whether a phone wants spoken
+    /// summaries. While it does, every session is asked to call `speak`.
+    fn voice_phone_reader(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
+        use std::sync::atomic::Ordering;
+        let p: diri_proto::voice::PhoneReaderParams = match params {
+            None | Some(JsonValue::Null) => Default::default(),
+            params => decode(params)?,
+        };
+        if let Some(read_aloud) = p.read_aloud {
+            self.phone_reads_aloud.store(read_aloud, Ordering::Relaxed);
+        }
+        encode(&diri_proto::voice::PhoneReaderResult {
+            read_aloud: self.phone_reads_aloud.load(Ordering::Relaxed),
+        })
+    }
+
+    /// Whether `session_id` is asked for a spoken summary: the app reads it
+    /// aloud, or a phone voice client wants every session's summary.
+    fn reads_session_aloud(&self, session_id: &str) -> bool {
+        self.phone_reads_aloud
+            .load(std::sync::atomic::Ordering::Relaxed)
+            || app_reads_session_aloud(session_id)
     }
 
     fn session_process_info(&self, params: Option<JsonValue>) -> Result<JsonValue, ControlError> {
@@ -4356,7 +4408,10 @@ impl ControlServer {
                 self.mcp_http_url_for(&descriptor),
             );
             launch_args.extend(injected.argv);
-            launch_args.extend(spoken_summary_args(&descriptor.injection, id));
+            launch_args.extend(spoken_summary_args(
+                &descriptor.injection,
+                self.reads_session_aloud(id),
+            ));
             mcp_http_token = injected
                 .mcp_http
                 .then(|| self.mcp_http.get().map(|endpoint| endpoint.token(id)))
@@ -7105,27 +7160,72 @@ fn verification_probe(prompt: &str, before: &str) -> Option<String> {
 const MIN_PROBE_CHARS: usize = 4;
 const MAX_PROBE_CHARS: usize = 20;
 
-/// The latest spoken summary per session, with the turn it belongs to. A
-/// newer one replaces it; asking for another turn leaves it.
+/// The latest spoken summary per session, with the turn it belongs to and
+/// whether the app has collected it. A newer one replaces it; asking for
+/// another turn leaves it. One bounded entry per session.
 #[derive(Default)]
-struct SpokenSummaries(std::collections::HashMap<String, (u64, String)>);
+struct SpokenSummaries(std::collections::HashMap<String, Spoken>);
+
+struct Spoken {
+    turn: u64,
+    text: String,
+    collected: bool,
+}
 
 impl SpokenSummaries {
     fn keep(&mut self, session: String, turn: u64, text: String) {
-        self.0.insert(session, (turn, text));
+        self.0.insert(
+            session,
+            Spoken {
+                turn,
+                text,
+                collected: false,
+            },
+        );
     }
 
+    /// The app's reader: the summary for `turn`, once.
     fn take(&mut self, session: &str, turn: u64) -> Option<String> {
-        if self.0.get(session).is_some_and(|(kept, _)| *kept == turn) {
-            return self.0.remove(session).map(|(_, text)| text);
+        let spoken = self.0.get_mut(session)?;
+        if spoken.turn != turn || spoken.collected {
+            return None;
         }
-        None
+        spoken.collected = true;
+        Some(spoken.text.clone())
+    }
+
+    /// Other readers (the phone): the newest summary, collected or not.
+    fn latest(&self, session: &str) -> Option<(u64, String)> {
+        self.0
+            .get(session)
+            .map(|spoken| (spoken.turn, spoken.text.clone()))
     }
 }
 
 #[cfg(test)]
 mod spoken_summary_tests {
-    use super::SpokenSummaries;
+    use super::{SpokenSummaries, prompt_hook_context};
+
+    #[test]
+    fn only_tabs_i_pick_adds_no_prompt_context_to_an_unpicked_tab() {
+        let only_picked = br#"{"talkWithAgent":true,"talkReadsByDefault":false,"talkExceptions":[],"talkDictation":true,"talkAnswer":"wisprFlow"}"#;
+        assert_eq!(prompt_hook_context(false, Some(only_picked), "s_a"), None);
+
+        let picked =
+            br#"{"talkWithAgent":true,"talkReadsByDefault":false,"talkExceptions":["s_a"]}"#;
+        assert_eq!(
+            prompt_hook_context(false, Some(picked), "s_a"),
+            Some(diri_proto::voice::SPOKEN_INSTRUCTION)
+        );
+        assert_eq!(prompt_hook_context(false, Some(picked), "s_b"), None);
+
+        let every_tab = br#"{"talkWithAgent":true,"talkReadsByDefault":true,"talkExceptions":[]}"#;
+        assert!(prompt_hook_context(false, Some(every_tab), "s_b").is_some());
+        assert_eq!(prompt_hook_context(false, None, "s_a"), None);
+        // A phone in voice mode asks every session, whatever the app picked.
+        assert!(prompt_hook_context(true, None, "s_a").is_some());
+        assert!(prompt_hook_context(true, Some(only_picked), "s_a").is_some());
+    }
 
     #[test]
     fn a_summary_is_read_once_and_only_for_its_turn() {
@@ -7139,14 +7239,27 @@ mod spoken_summary_tests {
         spoken.keep("s_a".into(), 4, "Second.".into());
         assert_eq!(spoken.take("s_a", 4).as_deref(), Some("Second."));
     }
+
+    #[test]
+    fn the_phone_sees_the_latest_summary_without_collecting_it() {
+        let mut spoken = SpokenSummaries::default();
+        assert_eq!(spoken.latest("s_a"), None);
+        spoken.keep("s_a".into(), 3, "Fixed it.".into());
+        assert_eq!(spoken.latest("s_a"), Some((3, "Fixed it.".into())));
+        // Peeking leaves it for the app, and the app collecting it leaves
+        // it for the phone.
+        assert_eq!(spoken.take("s_a", 3).as_deref(), Some("Fixed it."));
+        assert_eq!(spoken.latest("s_a"), Some((3, "Fixed it.".into())));
+        assert_eq!(spoken.take("s_a", 3), None);
+    }
 }
 
 /// Codex has no prompt hook, so while "Talk with your agent" is on its
 /// launch carries the request for a closing `Spoken:` paragraph as
 /// developer instructions, which add to its own rather than replace them.
 /// It applies from the next launch; Claude Code is asked on every prompt.
-fn spoken_summary_args(injection: &crate::agent::InjectionSpec, session_id: &str) -> Vec<String> {
-    if !injection.codex_notify || !reads_session_aloud(session_id) {
+fn spoken_summary_args(injection: &crate::agent::InjectionSpec, reads_aloud: bool) -> Vec<String> {
+    if !injection.codex_notify || !reads_aloud {
         return Vec::new();
     }
     vec![
@@ -7163,8 +7276,19 @@ fn talk_with_agent_enabled() -> bool {
 
 /// Whether the app reads this session's turns aloud (the setting, the tab's
 /// speaker and its mute), so only that session is asked for a summary.
-fn reads_session_aloud(session_id: &str) -> bool {
+fn app_reads_session_aloud(session_id: &str) -> bool {
     app_prefs().is_some_and(|prefs| diri_proto::voice::reads_session_aloud(&prefs, session_id))
+}
+
+/// What Claude Code's prompt hook adds for this session: the speak request
+/// only when the app reads that tab aloud, or a phone reads every session.
+fn prompt_hook_context(
+    phone: bool,
+    prefs: Option<&[u8]>,
+    session_id: &str,
+) -> Option<&'static str> {
+    (phone || prefs.is_some_and(|prefs| diri_proto::voice::reads_session_aloud(prefs, session_id)))
+        .then_some(diri_proto::voice::SPOKEN_INSTRUCTION)
 }
 
 fn app_prefs() -> Option<Vec<u8>> {
@@ -9732,6 +9856,117 @@ mod tests {
                 .as_deref(),
             Some("uuid-3")
         );
+    }
+
+    /// A phone voice client has no app preferences file (forge's headless
+    /// Engine), so its in-memory flag alone must ask sessions to `speak`,
+    /// and its reader must see the summary without stealing the app's.
+    #[test]
+    fn a_phone_reader_asks_for_spoken_summaries_without_app_prefs() {
+        let temp = tempfile::tempdir().expect("temp");
+        let registry = Arc::new(Mutex::new(Registry::new(
+            engine(),
+            temp.path().join("state.json"),
+        )));
+        registry
+            .lock()
+            .expect("registry")
+            .insert_record(test_record("s_phone"));
+        let server = Arc::new(ControlServer::new(
+            registry,
+            temp.path().join("daemon.sock"),
+        ));
+        let prompt = || {
+            ok_of(call(
+                &server,
+                "hook.report",
+                Some(json!({
+                    "kind": "claude-hook", "dirijorSessionID": "s_phone",
+                    "event": "UserPromptSubmit",
+                    "payload": {"session_id": "uuid-phone", "prompt": "go"},
+                })),
+            ))
+        };
+        // The developer's own app prefs may read every tab aloud already.
+        let app_reads = app_reads_session_aloud("s_phone");
+
+        assert_eq!(
+            ok_of(call(&server, "voice.phone_reader", None)),
+            json!({"readAloud": false})
+        );
+        if !app_reads {
+            assert_eq!(prompt().get("additionalContext"), None);
+            assert_eq!(
+                ok_of(call(
+                    &server,
+                    "voice.speak",
+                    Some(json!({"sessionID": "s_phone", "text": "ignored"})),
+                ))["spoken"],
+                false
+            );
+        }
+
+        assert_eq!(
+            ok_of(call(
+                &server,
+                "voice.phone_reader",
+                Some(json!({"readAloud": true})),
+            )),
+            json!({"readAloud": true})
+        );
+        assert_eq!(
+            prompt()["additionalContext"],
+            diri_proto::voice::SPOKEN_INSTRUCTION
+        );
+        assert_eq!(
+            ok_of(call(
+                &server,
+                "voice.speak",
+                Some(json!({"sessionID": "s_phone", "text": "  All green.  "})),
+            ))["spoken"],
+            true
+        );
+        let latest = ok_of(call(
+            &server,
+            "voice.latest_spoken",
+            Some(json!({"sessionID": "s_phone"})),
+        ));
+        assert_eq!(latest["text"], "All green.");
+        let turn = latest["turn"].as_u64().expect("turn");
+        // The app still collects it once, and the phone still sees it after.
+        assert_eq!(
+            ok_of(call(
+                &server,
+                "voice.spoken",
+                Some(json!({"sessionID": "s_phone", "turn": turn})),
+            ))["text"],
+            "All green."
+        );
+        assert_eq!(
+            ok_of(call(
+                &server,
+                "voice.latest_spoken",
+                Some(json!({"sessionID": "s_phone"})),
+            ))["text"],
+            "All green."
+        );
+        assert_eq!(
+            ok_of(call(
+                &server,
+                "voice.latest_spoken",
+                Some(json!({"sessionID": "s_other"})),
+            )),
+            json!({"turn": null, "text": null})
+        );
+
+        ok_of(call(
+            &server,
+            "voice.phone_reader",
+            Some(json!({"readAloud": false})),
+        ));
+        if !app_reads {
+            assert_eq!(prompt().get("additionalContext"), None);
+        }
     }
 
     #[test]

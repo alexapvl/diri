@@ -8,16 +8,16 @@ struct DiriPhoneApp: App {
     var body: some Scene {
         WindowGroup {
             Group {
-                if model.endpoint == nil {
+                if !model.hasGateways {
                     ConnectView()
                 } else {
-                    SidebarView()
+                    RootView()
                 }
             }
             .environment(model)
             .preferredColorScheme(.dark)
             .tint(Tokens.Ink.clay)
-            .onChange(of: scenePhase) { _, phase in model.setActive(phase == .active) }
+            .onChange(of: scenePhase) { _, phase in model.setActive(phase != .background) }
         }
     }
 }

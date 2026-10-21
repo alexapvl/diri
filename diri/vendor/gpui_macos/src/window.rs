@@ -2209,8 +2209,11 @@ extern "C" fn handle_key_event(this: &Object, native_event: id, key_equivalent: 
 
     // Scope physical identity across this synchronous dispatch, including IME
     // doCommand callbacks; logical GPUI keystrokes are never rewritten.
-    let _native_key =
-        crate::native_key::NativeKeyDispatch::enter(&event, unsafe { native_event.keyCode() });
+    let _native_key = crate::native_key::NativeKeyDispatch::enter_with_flags(
+        &event,
+        unsafe { native_event.keyCode() },
+        unsafe { native_event.modifierFlags().bits() },
+    );
 
     let run_callback = |event: PlatformInput| -> BOOL {
         let mut callback = window_state.as_ref().lock().event_callback.take();
@@ -2481,6 +2484,18 @@ extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: id) {
 
         if let Some(mut callback) = lock.event_callback.take() {
             drop(lock);
+            // Flags-changed is how a bare Option or Command key arrives. Its
+            // hardware code is the only way to tell left from right.
+            let _physical = match &event {
+                PlatformInput::ModifiersChanged(_) => Some(unsafe {
+                    crate::native_key::NativeKeyDispatch::enter_with_flags(
+                        &event,
+                        native_event.keyCode(),
+                        native_event.modifierFlags().bits(),
+                    )
+                }),
+                _ => None,
+            };
             callback(event);
             window_state.lock().event_callback = Some(callback);
         }

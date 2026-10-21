@@ -18,8 +18,16 @@
 
 mod api;
 mod auth;
+#[cfg(test)]
+mod bench;
 mod http;
+mod terminal;
+#[cfg(test)]
+mod testing;
+mod turns;
 mod ui;
+
+pub use terminal::{TerminalPalette, set_terminal_palette};
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -272,11 +280,34 @@ async fn serve(config: Config, auth: Auth, minted: bool) -> Result<(), String> {
     serve_connections(listener, api).await
 }
 
-/// App-owned gateway with a fresh in-memory credential on each enable.
+/// Where the Mac app keeps its phone pairing token: owner-only, in the app's
+/// support directory, so re-enabling access keeps phones paired.
+#[must_use]
+pub fn phone_token_path() -> PathBuf {
+    let home = diri_platform::home_dir()
+        .map(|p| p.into_os_string())
+        .map_or_else(|| PathBuf::from("."), PathBuf::from);
+    DirijorPaths::app_support(home).join(PHONE_TOKEN_FILE)
+}
+
+const PHONE_TOKEN_FILE: &str = "phone-access.token";
+
+/// Mints a new pairing code at `token_path`. Every phone paired with the old
+/// one must pair again; a running gateway keeps the old code until restarted.
+pub fn reset_phone_pairing(token_path: &std::path::Path) -> Result<(), String> {
+    Auth::rotate(token_path)
+        .map(drop)
+        .map_err(|error| format!("Cannot create a new pairing code: {error}"))
+}
+
+/// App-owned gateway. Its credential persists at `token_path` (created
+/// owner-only on first enable), so turning access off and on again, or
+/// restarting Diri, keeps existing phone pairings.
 pub async fn start_phone_access(
     address: std::net::Ipv4Addr,
     client: Arc<DaemonClient>,
     label: String,
+    token_path: &std::path::Path,
 ) -> Result<(String, tokio::task::JoinHandle<Result<(), String>>), String> {
     let [a, b, _, _] = address.octets();
     if a != 100 || !(64..=127).contains(&b) {
@@ -289,7 +320,8 @@ pub async fn start_phone_access(
     let listener = TcpListener::bind((address, DEFAULT_PORT))
         .await
         .map_err(|error| format!("Cannot enable phone access: {error}"))?;
-    let auth = Auth::temporary().map_err(|error| error.to_string())?;
+    let (auth, _) = Auth::load_or_create(token_path)
+        .map_err(|error| format!("Cannot read the phone pairing code: {error}"))?;
     let url = enrolment_url(&SocketAddr::from((address, DEFAULT_PORT)), auth.token());
     let api = Arc::new(Api {
         client,
@@ -358,6 +390,16 @@ async fn handle(stream: TcpStream, api: Arc<Api>) -> std::io::Result<()> {
             }
             return stream_events(&mut write_half, &api).await;
         }
+        if request.method == "GET"
+            && let ["api", "session", id, "stream"] = request.segments().as_slice()
+        {
+            if !api.auth.authorizes(&request) {
+                let _ = http::write_response(&mut write_half, None, auth::unauthorized()).await;
+                return Ok(());
+            }
+            let id = diri_proto::SessionId((*id).to_owned());
+            return stream_terminal(&mut reader, &mut write_half, &api, id).await;
+        }
 
         let response = respond(&request, &api).await;
         if !http::write_response(&mut write_half, Some(&request), response).await? || !authenticated
@@ -392,6 +434,75 @@ async fn respond(request: &Request, api: &Api) -> Response {
     }
 }
 
+/// One phone terminal view: a read-only Engine preview republished as
+/// `snapshot`/`diff`/`exit` SSE. The stream task owns the terminal state;
+/// this loop only writes finished frames, so a slow socket never stalls the
+/// preview. Dropping either end closes the preview, which removes its Engine
+/// sink.
+async fn stream_terminal<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    api: &Api,
+    session: diri_proto::SessionId,
+) -> std::io::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncReadExt as _;
+    // Subscribed before the seed so an exit cannot fall in between.
+    let events = match api.client.subscribe_events().await {
+        Ok(receiver) => receiver,
+        Err(_) => api.client.events(),
+    };
+    let (preview, mirror) = match terminal::open(&api.client, &session).await {
+        Ok(opened) => opened,
+        Err(error) => {
+            let _ = http::write_response(writer, None, api::open_error(&error)).await;
+            return Ok(());
+        }
+    };
+    http::begin_event_stream(writer).await?;
+    let (out, mut frames) = tokio::sync::mpsc::channel(terminal::OUT_QUEUE);
+    let task = tokio::spawn(terminal::pump(
+        preview,
+        mirror,
+        Arc::clone(&api.client),
+        session,
+        events,
+        out,
+    ));
+    let _abort = AbortOnDrop(task);
+    let mut scratch = [0_u8; 512];
+    loop {
+        tokio::select! {
+            frame = frames.recv() => {
+                let Some(frame) = frame else { return Ok(()) };
+                writer.write_all(frame.as_bytes()).await?;
+                writer.flush().await?;
+            }
+            // The phone sends nothing on a stream; EOF is its disconnect.
+            read = reader.read(&mut scratch) => {
+                if read.map_or(true, |read| read == 0) {
+                    return Ok(());
+                }
+            }
+            () = tokio::time::sleep(HEARTBEAT) => {
+                writer.write_all(b": ping\n\n").await?;
+                writer.flush().await?;
+            }
+        }
+    }
+}
+
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Republishes the daemon's event feed as SSE.
 ///
 /// The frontend uses this only as a *hint to refetch*: the payloads are the
@@ -410,6 +521,9 @@ where
         Err(_) => api.client.events(),
     };
     let mut connection = api.client.connection_state();
+    // Subscribed first, then seeded, so no completion falls in between.
+    let mut turns = turns::TurnWatcher::default();
+    api.seed_turns(&mut turns).await;
 
     http::write_event(
         writer,
@@ -428,10 +542,15 @@ where
                         &serde_json::json!({ "seq": event.seq, "params": event.params }),
                     )
                     .await?;
+                    if let Some((session, turn)) = turns.observe(&event.name, &event.params) {
+                        let finished = api.turn_finished(session, turn).await;
+                        http::write_event(writer, turns::TURN_FINISHED, &finished).await?;
+                    }
                 }
                 // Lagged: the phone was backgrounded and missed events. Tell
                 // it to refetch wholesale rather than pretending it is current.
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    api.seed_turns(&mut turns).await;
                     http::write_event(writer, "resync", &serde_json::json!({})).await?;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
@@ -440,7 +559,11 @@ where
                 if changed.is_err() {
                     return Ok(());
                 }
+                let connected = matches!(*connection.borrow(), diri_client::ConnectionState::Connected(_));
                 let state = format!("{:?}", *connection.borrow());
+                if connected {
+                    api.seed_turns(&mut turns).await;
+                }
                 http::write_event(writer, "daemon", &serde_json::json!({ "state": state })).await?;
             }
             () = tokio::time::sleep(HEARTBEAT) => {
@@ -456,6 +579,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[tokio::test]
     async fn phone_entry_point_refuses_lan_and_public_addresses() {
@@ -463,11 +587,19 @@ mod tests {
             let client = Arc::new(DaemonClient::with_socket_path(
                 "/nonexistent/diri-phone-test.sock",
             ));
+            let token = tempfile::tempdir().unwrap();
             assert!(
-                start_phone_access(address.parse().unwrap(), client, "test".into())
-                    .await
-                    .is_err()
+                start_phone_access(
+                    address.parse().unwrap(),
+                    client,
+                    "test".into(),
+                    &token.path().join("phone.token"),
+                )
+                .await
+                .is_err()
             );
+            // Refused before anything is written.
+            assert!(!token.path().join("phone.token").exists());
         }
     }
 
@@ -508,6 +640,323 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(TcpStream::connect(address).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn the_event_stream_announces_a_finished_turn() {
+        use diri_proto::Method;
+        use tokio::io::{AsyncBufReadExt as _, BufReader as TokioBufReader};
+        let engine = crate::testing::fake_engine(|method, _| match method {
+            Method::EVENTS_SUBSCRIBE => json!({"subscribed": true}),
+            Method::VOICE_LATEST_SPOKEN => json!({"turn": 2, "text": "Tests pass."}),
+            _ => json!({}),
+        })
+        .await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let auth = Auth::temporary().unwrap();
+        let token = auth.token().to_owned();
+        let api = Arc::new(Api {
+            client: Arc::clone(&engine.client),
+            auth,
+            host_label: "test".into(),
+        });
+        let server = tokio::spawn(serve_connections(listener, api));
+        let stream = TcpStream::connect(address).await.unwrap();
+        let (read_half, mut write_half) = stream.into_split();
+        write_half
+            .write_all(
+                format!(
+                    "GET /api/events HTTP/1.1\r\nHost: {address}\r\nX-Diri-Token: {token}\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut lines = TokioBufReader::new(read_half).lines();
+        let mut next_data = async |event: &str| loop {
+            let line = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+                .await
+                .expect("event in time")
+                .unwrap()
+                .expect("stream open");
+            if line == format!("event: {event}") {
+                let data = lines.next_line().await.unwrap().unwrap();
+                let data = data.strip_prefix("data: ").expect("data line");
+                break serde_json::from_str::<serde_json::Value>(data).unwrap();
+            }
+        };
+        next_data("ready").await;
+
+        let attention = |sequence: u64, working: bool, completed: bool| {
+            json!({
+                "id": "s_a",
+                "attentionState": {
+                    "version": 1, "epoch": "e", "sequence": sequence, "turn": 2,
+                    "working": working,
+                    "events": if completed { json!([{
+                        "sequence": sequence, "turn": 2, "kind": "completion",
+                        "occurredAt": 0.0, "resolved": false, "blocking": false,
+                        "detail": null,
+                    }]) } else { json!([]) },
+                },
+            })
+        };
+        for (sequence, working, completed) in [(1, true, false), (2, false, true)] {
+            engine
+                .events
+                .send((
+                    diri_proto::EventName::SESSION_UPDATED.into(),
+                    attention(sequence, working, completed),
+                ))
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            next_data("turn_finished").await,
+            json!({"sessionID": "s_a", "turn": 2, "spoken": "Tests pass."})
+        );
+        server.abort();
+    }
+
+    fn grid_frame(update: &diri_proto::grid::GridUpdate) -> Vec<u8> {
+        use diri_proto::frames::{Frame, FrameCodec};
+        FrameCodec::encode(&Frame::grid(update).unwrap()).unwrap()
+    }
+
+    fn grid_update(full: bool, rows: &[(u16, &str)]) -> diri_proto::grid::GridUpdate {
+        use diri_proto::grid::{ChangedRow, GridCell, TermColor, TermStyle};
+        diri_proto::grid::GridUpdate {
+            cols: 10,
+            rows: 4,
+            cursor_col: 2,
+            cursor_row: 1,
+            cursor_visible: true,
+            is_full_snapshot: full,
+            changed_rows: rows
+                .iter()
+                .map(|(y, text)| {
+                    let mut cells: Vec<GridCell> = text
+                        .chars()
+                        .map(|ch| {
+                            GridCell::new(
+                                ch as u32,
+                                TermColor::Ansi(1),
+                                TermColor::DefaultInverted,
+                                TermStyle::BOLD,
+                            )
+                        })
+                        .collect();
+                    cells.resize(10, GridCell::BLANK);
+                    ChangedRow::new(*y, cells)
+                })
+                .collect(),
+        }
+    }
+
+    async fn serve_engine(
+        engine: &crate::testing::FakeEngine,
+    ) -> (
+        SocketAddr,
+        String,
+        tokio::task::JoinHandle<Result<(), String>>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let auth = Auth::temporary().unwrap();
+        let token = auth.token().to_owned();
+        let api = Arc::new(Api {
+            client: Arc::clone(&engine.client),
+            auth,
+            host_label: "test".into(),
+        });
+        (
+            address,
+            token,
+            tokio::spawn(serve_connections(listener, api)),
+        )
+    }
+
+    /// The phone's terminal stream end to end: an Engine preview's seed
+    /// becomes `snapshot`, its next update a `diff` of only the changed row,
+    /// the session's exit an `exit`, and hanging up closes the preview.
+    #[tokio::test]
+    async fn the_terminal_stream_turns_a_preview_into_snapshot_diff_and_exit() {
+        use diri_proto::Method;
+        use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, BufReader as TokioBufReader};
+        let mut engine = crate::testing::fake_engine(|method, _| match method {
+            Method::EVENTS_SUBSCRIBE => json!({"subscribed": true}),
+            Method::SESSION_READ_SCROLLBACK_CELLS => json!({
+                "payload": "", "firstRow": 0, "rowCount": 0, "totalRows": 46,
+                "liveStartRow": 42, "cols": 10, "contentSeq": 1,
+            }),
+            _ => json!({}),
+        })
+        .await;
+        let (address, token, server) = serve_engine(&engine).await;
+
+        // No credential, no preview.
+        let mut anonymous = TcpStream::connect(address).await.unwrap();
+        anonymous
+            .write_all(b"GET /api/session/s_a/stream HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        let mut refused = String::new();
+        anonymous.read_to_string(&mut refused).await.unwrap();
+        assert!(refused.starts_with("HTTP/1.1 401"), "{refused}");
+
+        let stream = TcpStream::connect(address).await.unwrap();
+        let (read_half, mut write_half) = stream.into_split();
+        write_half
+            .write_all(
+                format!(
+                    "GET /api/session/s_a/stream HTTP/1.1\r\nHost: {address}\r\nX-Diri-Token: {token}\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let (id, mut preview) =
+            tokio::time::timeout(Duration::from_secs(5), engine.previews.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(id, "s_a");
+        assert!(
+            engine.previews.try_recv().is_err(),
+            "one preview per stream"
+        );
+        preview
+            .write_all(&grid_frame(&grid_update(true, &[(0, "hello")])))
+            .await
+            .unwrap();
+        let modes = diri_proto::frames::Frame::modes_with_bracketed_paste(
+            true,
+            true,
+            diri_proto::terminal::MouseModes::OFF,
+        );
+        preview
+            .write_all(&diri_proto::frames::FrameCodec::encode(&modes).unwrap())
+            .await
+            .unwrap();
+
+        let mut lines = TokioBufReader::new(read_half).lines();
+        let mut next = async |event: &str| loop {
+            let line = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+                .await
+                .expect("event in time")
+                .unwrap()
+                .expect("stream open");
+            if line == format!("event: {event}") {
+                let data = lines.next_line().await.unwrap().unwrap();
+                break serde_json::from_str::<serde_json::Value>(
+                    data.strip_prefix("data: ").unwrap(),
+                )
+                .unwrap();
+            }
+            assert!(!line.starts_with("event:"), "expected {event}, got {line}");
+        };
+        let snapshot = next("snapshot").await;
+        assert_eq!(snapshot["cols"], 10);
+        assert_eq!(snapshot["rows"], 4);
+        assert_eq!(snapshot["historySize"], 42);
+        assert_eq!(
+            snapshot["cursor"],
+            json!({"x": 2, "y": 1, "visible": true, "shape": "block"})
+        );
+        assert_eq!(
+            snapshot["modes"],
+            json!({"altScreen": true, "appCursor": false, "bracketedPaste": true, "mouse": false})
+        );
+        assert_eq!(snapshot["palette"]["ansi"].as_array().unwrap().len(), 16);
+        assert_eq!(
+            snapshot["lines"][0],
+            json!({"runs": [{"t": "hello", "fg": 1, "bg": null, "a": 1}], "wrapped": false})
+        );
+        assert_eq!(snapshot["lines"][3], json!({"runs": [], "wrapped": false}));
+
+        preview
+            .write_all(&grid_frame(&grid_update(false, &[(2, "next")])))
+            .await
+            .unwrap();
+        let diff = next("diff").await;
+        assert_eq!(
+            diff["lines"],
+            json!({"2": {"runs": [{"t": "next", "fg": 1, "bg": null, "a": 1}], "wrapped": false}})
+        );
+        assert!(diff["seq"].as_u64() > snapshot["seq"].as_u64());
+        assert_eq!(diff["historySize"], 42);
+
+        let exited: diri_proto::ExitInfo =
+            serde_json::from_value(json!({"reason": "exited", "code": 3})).unwrap();
+        engine
+            .events
+            .send((
+                diri_proto::EventName::SESSION_UPDATED.into(),
+                json!({
+                    "id": "s_a",
+                    "status": diri_proto::SessionStatus::Exited(exited),
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(next("exit").await, json!({"code": 3}));
+
+        // The stream is over; its preview must not outlive it.
+        drop(write_half);
+        let mut rest = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), preview.read_to_end(&mut rest))
+            .await
+            .expect("preview closed")
+            .unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn closing_the_phone_closes_the_preview() {
+        use diri_proto::Method;
+        use tokio::io::AsyncReadExt as _;
+        let mut engine = crate::testing::fake_engine(|method, _| match method {
+            Method::EVENTS_SUBSCRIBE => json!({"subscribed": true}),
+            _ => json!({}),
+        })
+        .await;
+        let (address, token, server) = serve_engine(&engine).await;
+        let mut phone = TcpStream::connect(address).await.unwrap();
+        phone
+            .write_all(
+                format!(
+                    "GET /api/session/s_b/stream HTTP/1.1\r\nHost: {address}\r\nX-Diri-Token: {token}\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let (_, mut preview) = engine.previews.recv().await.unwrap();
+        preview
+            .write_all(&grid_frame(&grid_update(true, &[])))
+            .await
+            .unwrap();
+        preview
+            .write_all(
+                &diri_proto::frames::FrameCodec::encode(&diri_proto::frames::Frame::modes(
+                    false,
+                    diri_proto::terminal::MouseModes::OFF,
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut head = [0; 64];
+        let read = phone.read(&mut head).await.unwrap();
+        assert!(head[..read].starts_with(b"HTTP/1.1 200"));
+        drop(phone);
+        let mut rest = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), preview.read_to_end(&mut rest))
+            .await
+            .expect("preview closed when the phone hung up")
+            .unwrap();
+        server.abort();
     }
 
     fn arguments(raw: &[&str]) -> Vec<String> {
