@@ -3030,22 +3030,13 @@ impl RootView {
             let runtime = Arc::clone(&self.services.store);
             let model = crate::notes::todos::TodosModel::global(&runtime, cx);
             let page = cx.new(|cx| crate::notes::todos::TodosPage::new(runtime, model, cx));
-            cx.subscribe_in(&page, window, |this, _, event, window, cx| {
+            cx.subscribe(&page, |this, _, event, cx| {
                 use crate::notes::todos::TodosEvent;
                 let (session, block) = match event {
                     TodosEvent::OpenNote { session, block } => (session.clone(), Some(*block)),
                     TodosEvent::OpenSession(session) => (session.clone(), None),
                 };
-                this.close_todos(cx);
-                this.window_store
-                    .write()
-                    .expect("session store lock poisoned")
-                    .select(session);
-                if let (Some(block), Some(terminal)) = (block, &this.terminal) {
-                    terminal.update(cx, |terminal, _| terminal.reveal_note_block(block));
-                }
-                this.focus_active_terminal(window, cx);
-                cx.notify();
+                this.show_from_todos(session, block, cx);
             })
             .detach();
             self.todos_page = Some(page);
@@ -3074,6 +3065,32 @@ impl RootView {
         }
         self.focus_active_terminal(window, cx);
         cx.notify();
+    }
+
+    /// A note or session chosen on the To-dos page. Closing the page alone
+    /// would uncover whatever was on screen, and a saved layout would then
+    /// select its own focused agent again. Select, then take the sidebar's
+    /// path: it closes To-dos, focuses the session's pane when a layout holds
+    /// it, leaves a layout that does not, and dismisses the launcher.
+    fn show_from_todos(&mut self, session: SessionId, block: Option<usize>, cx: &mut Context<Self>) {
+        let note_id = {
+            let mut store = self.window_store.write().expect("session store lock poisoned");
+            store.select(session.clone());
+            store
+                .sessions()
+                .get(&session)
+                .and_then(|session| session.note_id.clone())
+        };
+        if let (Some(block), Some(terminal)) = (block, &self.terminal) {
+            // Tie the caret to this note, so a different note uncovered
+            // first does not take it.
+            terminal.update(cx, |terminal, _| match note_id {
+                Some(note_id) => terminal.reveal_block_in_note(note_id, block),
+                None => terminal.reveal_note_block(block),
+            });
+        }
+        self.sidebar
+            .update(cx, |_, cx| cx.emit(SidebarEvent::SessionActivated));
     }
 
     fn close_todos(&mut self, cx: &mut Context<Self>) {
@@ -8091,6 +8108,105 @@ mod tests {
         cx.executor().advance_clock(Duration::from_secs(4));
         cx.run_until_parked();
         root.read_with(cx, |root, _| assert!(root.toast.current().is_none()));
+    }
+
+    #[gpui::test]
+    fn clicking_a_todo_note_leaves_the_layout_for_that_note(cx: &mut gpui::TestAppContext) {
+        let services = test_services();
+        let fixture = SidebarPreviewFixture::make(PreviewScenario::Typical);
+        let agent = fixture.selected_session_id.clone().expect("selected session");
+        {
+            let mut store = services.store.store.write().unwrap();
+            store.hydrate(fixture.list);
+            store.select(agent.clone());
+            use diri_proto::workspace::*;
+            let workspace = WorkspaceId::new("todos-workspace");
+            let tab = TabId::new("todos-tab");
+            let pane = PaneId::new("todos-pane");
+            store.seed_workspace_snapshot_for_test(WorkspaceSnapshot {
+                revision: 1,
+                workspaces: vec![WorkspaceRecord {
+                    project_id: None,
+                    id: workspace.clone(),
+                    name: "Todos".into(),
+                    selected_tab: Some(tab.clone()),
+                    tabs: vec![WorkspaceTab {
+                        id: tab,
+                        title: None,
+                        focused_pane: pane.clone(),
+                        zoomed_pane: None,
+                        layout: LayoutNode::Pane {
+                            id: pane,
+                            session_id: agent.clone(),
+                        },
+                    }],
+                }],
+                ..Default::default()
+            });
+            store
+                .update_preferences(|prefs| prefs.active_workspace = Some(workspace))
+                .unwrap();
+            let mut note = (**store.sessions().get(&agent).expect("agent")).clone();
+            note.id = SessionId::new("s_note");
+            note.kind = AgentKind::NOTE;
+            note.title = "Launch plan".into();
+            note.note_id = Some("n_launch".into());
+            note.parent = None;
+            note.archived_at = None;
+            store.upsert_session(note);
+        }
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            RootView::new(services, false, PreviewScenario::Empty, window, cx)
+        });
+        cx.run_until_parked();
+        root.update_in(cx, |root, window, cx| {
+            assert!(root.active_workspace.is_some(), "the layout is on screen");
+            // Showing the note builds a pane. A live directory watcher runs on
+            // its own thread and aborts the deterministic test scheduler.
+            let runtime = Arc::clone(&root.services.store);
+            let pane = cx.new(|cx| {
+                crate::notes::NotePane::with_store(runtime, None, false, cx)
+            });
+            if let Some(terminal) = &root.terminal {
+                terminal.update(cx, |terminal, _| terminal.set_note_pane_for_test(pane));
+            }
+            root.open_todos(window, cx);
+            // Through the page's own event, so the subscription is covered.
+            let page = root.todos_page.clone().expect("To-dos page");
+            page.update(cx, |_, cx| {
+                cx.emit(crate::notes::todos::TodosEvent::OpenNote {
+                    session: SessionId::new("s_note"),
+                    block: 0,
+                })
+            });
+        });
+        cx.run_until_parked();
+        let selected = |root: &RootView| {
+            root.window_store
+                .read()
+                .unwrap()
+                .selected_session_id()
+                .map(|id| id.0.clone())
+        };
+        root.read_with(cx, |root, _| {
+            assert!(!root.todos_open);
+            // Like a sidebar click, the Engine is asked to place the note in
+            // a layout first. The layout must not take the selection back.
+            assert_eq!(selected(root).as_deref(), Some("s_note"));
+        });
+        // This note has no layout to join, so the layout gives way.
+        root.update_in(cx, |root, _, cx| {
+            root.sidebar
+                .update(cx, |_, cx| cx.emit(SidebarEvent::ProjectLayoutUnavailable));
+        });
+        cx.run_until_parked();
+        root.read_with(cx, |root, _| {
+            assert!(
+                root.active_workspace.is_none(),
+                "the note replaces the layout that To-dos was covering"
+            );
+            assert_eq!(selected(root).as_deref(), Some("s_note"));
+        });
     }
 
     #[gpui::test]
