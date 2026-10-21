@@ -14,6 +14,13 @@ pub(super) struct VoiceFieldsState {
     /// Swallows key bindings while a shortcut is being recorded, so ⌘K is
     /// captured instead of opening the palette.
     recording_guard: Option<Subscription>,
+    /// Which recorded modifier is showing its Left / Right / Any menu.
+    side_menu: Option<usize>,
+    /// Keeps the chord from running while it is recorded. On macOS this is
+    /// a session event tap when Accessibility is already granted, and a
+    /// local monitor otherwise.
+    #[cfg(target_os = "macos")]
+    capture: Option<crate::macos::shortcut_capture::Capture>,
     gesture: DictationGesture,
 }
 
@@ -53,6 +60,12 @@ impl UtilitySurfaces {
     ) -> bool {
         if self.surface != Surface::Settings || self.settings_tab != SettingsTab::Voice {
             return false;
+        }
+        if self.voice_fields.side_menu.is_some() && event.keystroke.key == "escape" {
+            self.voice_fields.side_menu = None;
+            cx.stop_propagation();
+            cx.notify();
+            return true;
         }
         if self.voice_fields.recording_shortcut {
             if !event.is_held {
@@ -121,6 +134,7 @@ impl UtilitySurfaces {
         let outcome = self.voice_fields.gesture.on_flags(event.modifiers, key_code);
         self.apply_dictation_outcome(outcome, cx);
         cx.stop_propagation();
+        cx.notify();
         true
     }
 
@@ -133,11 +147,59 @@ impl UtilitySurfaces {
                 cx.stop_propagation();
             }
         }));
+        #[cfg(target_os = "macos")]
+        if let Some((capture, mut events)) = crate::macos::shortcut_capture::begin() {
+            self.voice_fields.capture = Some(capture);
+            cx.spawn(async move |this, cx| {
+                while let Some(event) = events.recv().await {
+                    if this
+                        .update(cx, |this, cx| this.note_captured_key(event, cx))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn note_captured_key(
+        &mut self,
+        event: crate::macos::shortcut_capture::CapturedKey,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.voice_fields.recording_shortcut {
+            return;
+        }
+        let modifiers = modifiers_from_bits(event.flags);
+        let outcome = match route_captured(event.flags_changed, event.code, event.letters) {
+            CapturedRoute::Flags => {
+                if event.repeat {
+                    return;
+                }
+                self.voice_fields
+                    .gesture
+                    .on_flags(modifiers, Some(event.code))
+            }
+            CapturedRoute::Key { name, code } => self
+                .voice_fields
+                .gesture
+                .on_key(&name, modifiers, Some(code), event.flags),
+        };
+        self.apply_dictation_outcome(outcome, cx);
+        cx.notify();
     }
 
     fn stop_dictation_recording(&mut self) {
         self.voice_fields.recording_shortcut = false;
         self.voice_fields.recording_guard = None;
+        self.voice_fields.side_menu = None;
+        #[cfg(target_os = "macos")]
+        {
+            self.voice_fields.capture = None;
+        }
         self.voice_fields.gesture = DictationGesture::default();
     }
 
@@ -188,29 +250,255 @@ impl UtilitySurfaces {
             .child(content)
     }
 
-    pub(super) fn dictation_shortcut_field(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn dictation_shortcut_field(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let colors = self.settings_colors();
         let recording = self.voice_fields.recording_shortcut;
-        let label = if recording {
-            t("settings.general.talk_shortcut_recording").to_owned()
+        let live = recording
+            .then(|| self.voice_fields.gesture.preview())
+            .flatten();
+        let saved = self.prefs.talk_answer_shortcut.is_some();
+        let begin = cx.listener(|this, _, window, cx| {
+            this.deactivate_privacy_name();
+            this.voice_fields.command_active = false;
+            this.arm_dictation_recording(cx);
+            this.settings_search_active = false;
+            this.focus.focus(window, cx);
+            cx.notify();
+        });
+        // The saved chord is a row of menus, not a clipped text box, so the
+        // Left / Right / Any list can open past the row.
+        if !recording && live.is_none() && saved {
+            return div()
+                .id("dictation-shortcut-sides")
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .cursor_pointer()
+                .on_click(begin)
+                .child(self.dictation_shortcut_parts(colors, cx))
+                .child(self.dictation_shortcut_clear(colors, cx))
+                .into_any_element();
+        }
+        let child = if let Some(label) = live {
+            div()
+                .child(dictation_shortcut_label(&label))
+                .into_any_element()
         } else {
-            self.prefs
-                .talk_answer_shortcut
-                .as_ref()
-                .map(|shortcut| dictation_shortcut_label(&shortcut.label))
-                .unwrap_or_else(|| t("settings.general.talk_shortcut_record").to_owned())
+            div()
+                .text_color(if recording {
+                    colors.primary
+                } else {
+                    colors.tertiary
+                })
+                .child(if recording {
+                    t("settings.general.talk_shortcut_recording")
+                } else {
+                    t("settings.general.talk_shortcut_record")
+                })
+                .into_any_element()
         };
-        settings_text_box("talk-dictation-shortcut", 154.0, recording, colors)
+        settings_text_box("talk-dictation-shortcut", 236.0, recording, colors)
             .cursor_pointer()
-            .on_click(cx.listener(|this, _, window, cx| {
-                this.deactivate_privacy_name();
-                this.voice_fields.command_active = false;
-                this.arm_dictation_recording(cx);
-                this.settings_search_active = false;
-                this.focus.focus(window, cx);
+            .on_click(begin)
+            .child(child)
+            .into_any_element()
+    }
+
+    /// Each modifier opens a Left / Right / Any menu. The other key, and the
+    /// gaps around these menus, start a new recording.
+    fn dictation_shortcut_parts(
+        &self,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let Some(shortcut) = self.prefs.talk_answer_shortcut.clone() else {
+            return div().into_any_element();
+        };
+        let parts: Vec<String> = shortcut.label.split('-').map(str::to_owned).collect();
+        let mut row = div().flex().items_center().gap(px(4.0));
+        for (index, part) in parts.iter().enumerate() {
+            if index > 0 {
+                row = row.child(div().text_color(colors.tertiary).child("+"));
+            }
+            row = row.child(self.dictation_side_menu(index, part, colors, cx));
+        }
+        row.into_any_element()
+    }
+
+    fn dictation_side_menu(
+        &self,
+        index: usize,
+        token: &str,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let open = self.voice_fields.side_menu == Some(index);
+        let current = token_side(token).flatten();
+        let mut control = div()
+            .relative()
+            .child(self.dictation_side_button(index, &part_symbol(token), open, colors, cx));
+        if open {
+            let mut options = div().p(px(4.0)).flex().flex_col();
+            if token_side(token).is_some() {
+                options = options
+                    .child(self.dictation_side_choice(index, None, current.is_none(), colors, cx))
+                    .child(self.dictation_side_choice(
+                        index,
+                        Some(KeySide::Left),
+                        current == Some(KeySide::Left),
+                        colors,
+                        cx,
+                    ))
+                    .child(self.dictation_side_choice(
+                        index,
+                        Some(KeySide::Right),
+                        current == Some(KeySide::Right),
+                        colors,
+                        cx,
+                    ));
+            }
+            options = options.child(settings_choice_row(
+                format!("dictation-side-{index}-remove"),
+                t("settings.general.talk_side_remove"),
+                false,
+                colors,
+                cx,
+                move |this, cx| {
+                    this.voice_fields.side_menu = None;
+                    this.remove_dictation_part(index);
+                    cx.stop_propagation();
+                    cx.notify();
+                },
+            ));
+            control = control.child(settings_dropdown(options, 148.0, colors));
+        }
+        control.into_any_element()
+    }
+
+    fn dictation_side_button(
+        &self,
+        index: usize,
+        label: &str,
+        open: bool,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        div()
+            .id(SharedString::from(format!("dictation-side-{index}")))
+            .h(px(26.0))
+            .px(px(8.0))
+            .rounded(px(Radius::BADGE))
+            .border_1()
+            .border_color(colors.primary.alpha(if open { 0.20 } else { 0.10 }))
+            .bg(colors.primary.alpha(if open { 0.08 } else { 0.04 }))
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .cursor_pointer()
+            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.voice_fields.side_menu = if this.voice_fields.side_menu == Some(index) {
+                    None
+                } else {
+                    Some(index)
+                };
+                this.settings_menu = None;
+                cx.stop_propagation();
                 cx.notify();
             }))
-            .child(label)
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(colors.primary)
+                    .child(label.to_owned()),
+            )
+            .child(sf_symbol_weighted(
+                if open { "chevron.up" } else { "chevron.down" },
+                8.0,
+                SymbolWeight::Semibold,
+                colors.tertiary,
+            ))
+            .into_any_element()
+    }
+
+    fn dictation_side_choice(
+        &self,
+        index: usize,
+        side: Option<KeySide>,
+        selected: bool,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let label = match side {
+            None => t("settings.general.talk_side_any"),
+            Some(KeySide::Left) => t("settings.general.talk_side_left"),
+            Some(KeySide::Right) => t("settings.general.talk_side_right"),
+        };
+        settings_choice_row(
+            format!("dictation-side-{index}-{:?}", side),
+            label,
+            selected,
+            colors,
+            cx,
+            move |this, cx| {
+                this.voice_fields.side_menu = None;
+                this.set_dictation_side(index, side);
+                cx.stop_propagation();
+                cx.notify();
+            },
+        )
+        .into_any_element()
+    }
+
+    fn dictation_shortcut_clear(
+        &self,
+        colors: SemanticColors,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        div()
+            .id("clear-dictation-shortcut")
+            .size(px(26.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(Radius::BADGE))
+            .cursor_pointer()
+            .hover(|style| style.bg(colors.primary.alpha(0.07)))
+            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.voice_fields.side_menu = None;
+                this.stop_dictation_recording();
+                this.update_prefs(|prefs| prefs.talk_answer_shortcut = None);
+                cx.stop_propagation();
+                cx.notify();
+            }))
+            .child(sf_symbol("xmark", 10.0, colors.tertiary))
+            .into_any_element()
+    }
+
+    fn set_dictation_side(&mut self, index: usize, side: Option<KeySide>) {
+        let Some(shortcut) = self.prefs.talk_answer_shortcut.clone() else {
+            return;
+        };
+        let Some(next) = shortcut_with_side(&shortcut, index, side) else {
+            return;
+        };
+        self.update_prefs(move |prefs| prefs.talk_answer_shortcut = Some(next));
+    }
+
+    fn remove_dictation_part(&mut self, index: usize) {
+        let Some(shortcut) = self.prefs.talk_answer_shortcut.clone() else {
+            return;
+        };
+        match shortcut_without_part(&shortcut, index) {
+            None => {
+                self.update_prefs(|prefs| prefs.talk_answer_shortcut = None);
+            }
+            Some(next) => {
+                self.update_prefs(move |prefs| prefs.talk_answer_shortcut = Some(next));
+            }
+        }
     }
 
     /// Which tabs are read: every tab, or only the ones turned on with a
@@ -392,6 +680,14 @@ impl DictationGesture {
         GestureOutcome::Listening
     }
 
+    fn preview(&self) -> Option<String> {
+        if self.held.is_empty() {
+            None
+        } else {
+            Some(shortcut_from_held(&self.held).label)
+        }
+    }
+
     fn on_key(
         &mut self,
         key: &str,
@@ -422,43 +718,38 @@ impl DictationGesture {
 
 fn shortcut_from_held(held: &[HeldModifier]) -> DictationShortcut {
     let key_code = held.last().map(|item| item.code).unwrap_or_default();
-    let mut tokens = Vec::new();
-    for kind in [
-        ModifierKind::Function,
-        ModifierKind::Control,
-        ModifierKind::Alt,
-        ModifierKind::Command,
-        ModifierKind::Shift,
-    ] {
-        if let Some(item) = held.iter().rev().find(|item| item.kind == kind) {
-            tokens.push(modifier_token(*item));
-        }
-    }
-    DictationShortcut {
-        label: tokens.join("-"),
-        key_code,
-    }
+    let label = held
+        .iter()
+        .copied()
+        .map(modifier_token)
+        .collect::<Vec<_>>()
+        .join("-");
+    DictationShortcut { label, key_code }
 }
 
 fn label_for_key(key: &str, modifiers: Modifiers, held: &[HeldModifier], flags: u64) -> String {
-    let mut tokens = Vec::new();
-    if modifiers.function {
-        tokens.push("fn");
-    }
-    if modifiers.control {
-        tokens.push(sided_token(ModifierKind::Control, held, flags));
-    }
-    if modifiers.alt {
-        tokens.push(sided_token(ModifierKind::Alt, held, flags));
-    }
-    if modifiers.platform {
-        tokens.push(sided_token(ModifierKind::Command, held, flags));
-    }
-    if modifiers.shift {
-        tokens.push(sided_token(ModifierKind::Shift, held, flags));
-    }
+    let mut tokens = modifier_tokens(held, modifiers, flags);
     tokens.push(key);
     tokens.join("-")
+}
+
+/// Every held key is kept, so left Option and right Option can both be in
+/// the shortcut. A modifier that is down but was not seen as its own key
+/// is added once, from the flags.
+fn modifier_tokens(held: &[HeldModifier], modifiers: Modifiers, flags: u64) -> Vec<&'static str> {
+    let mut tokens: Vec<&str> = held.iter().copied().map(modifier_token).collect();
+    for (down, kind) in [
+        (modifiers.function, ModifierKind::Function),
+        (modifiers.control, ModifierKind::Control),
+        (modifiers.alt, ModifierKind::Alt),
+        (modifiers.platform, ModifierKind::Command),
+        (modifiers.shift, ModifierKind::Shift),
+    ] {
+        if down && !held.iter().any(|item| item.kind == kind) {
+            tokens.push(sided_token(kind, held, flags));
+        }
+    }
+    tokens
 }
 
 fn sided_token(kind: ModifierKind, held: &[HeldModifier], flags: u64) -> &'static str {
@@ -528,24 +819,269 @@ fn physical_key() -> (Option<u16>, u64) {
     }
 }
 
-/// How the recorded shortcut reads in the field. Sided modifiers stay
-/// distinct; an older unsided label keeps the normal shortcut spelling.
+/// How the recorded shortcut reads in the field, with a plus between keys.
 fn dictation_shortcut_label(label: &str) -> String {
-    let parts: Vec<&str> = label.split('-').collect();
-    if !parts.iter().any(|part| sided_symbol(part).is_some()) {
-        return crate::commands::keystroke_label(label);
+    label.split('-').map(part_symbol).collect::<Vec<_>>().join(" + ")
+}
+
+fn part_symbol(part: &str) -> String {
+    sided_symbol(part)
+        .map(str::to_owned)
+        .or_else(|| generic_symbol(part).map(str::to_owned))
+        .unwrap_or_else(|| key_symbol(part))
+}
+
+/// `None` is either physical key. `None` returned from the function means
+/// this token is not a modifier with a left and a right.
+fn token_side(token: &str) -> Option<Option<KeySide>> {
+    Some(match token {
+        "leftcmd" | "leftalt" | "leftshift" | "leftctrl" => Some(KeySide::Left),
+        "rightcmd" | "rightalt" | "rightshift" | "rightctrl" => Some(KeySide::Right),
+        "cmd" | "alt" | "shift" | "ctrl" => None,
+        _ => return None,
+    })
+}
+
+fn token_with_side(token: &str, side: Option<KeySide>) -> Option<&'static str> {
+    let kind = token_kind(token)?;
+    if kind == ModifierKind::Function {
+        return None;
     }
-    let mut out = String::new();
-    for (index, part) in parts.iter().enumerate() {
-        if let Some(symbol) = sided_symbol(part) {
-            out.push_str(symbol);
-        } else if let Some(symbol) = generic_symbol(part) {
-            out.push_str(symbol);
-        } else if index + 1 == parts.len() {
-            out.push_str(&key_symbol(part));
+    Some(modifier_token(HeldModifier {
+        code: 0,
+        kind,
+        side,
+    }))
+}
+
+fn shortcut_with_side(
+    shortcut: &DictationShortcut,
+    index: usize,
+    side: Option<KeySide>,
+) -> Option<DictationShortcut> {
+    let parts: Vec<String> = shortcut.label.split('-').map(str::to_owned).collect();
+    let previous = parts.get(index)?.clone();
+    let next = token_with_side(&previous, side)?;
+    let kind = token_kind(&previous);
+    let mut kept = Vec::new();
+    for (i, part) in parts.iter().enumerate() {
+        if i == index {
+            kept.push(next.to_owned());
+        } else if side.is_none() && kind.is_some_and(|kind| token_kind(part) == Some(kind)) {
+            continue;
+        } else {
+            kept.push(part.clone());
         }
     }
-    out
+    Some(DictationShortcut {
+        label: kept.join("-"),
+        key_code: key_code_after_edit(shortcut.key_code, &previous, &kept),
+    })
+}
+
+/// `None` means nothing is left, so the shortcut is cleared.
+fn shortcut_without_part(shortcut: &DictationShortcut, index: usize) -> Option<DictationShortcut> {
+    let mut parts: Vec<String> = shortcut.label.split('-').map(str::to_owned).collect();
+    let Some(removed) = parts.get(index).cloned() else {
+        return Some(shortcut.clone());
+    };
+    parts.remove(index);
+    if parts.is_empty() {
+        return None;
+    }
+    Some(DictationShortcut {
+        label: parts.join("-"),
+        key_code: key_code_after_edit(shortcut.key_code, &removed, &parts),
+    })
+}
+
+fn key_code_after_edit(key_code: u16, edited: &str, parts: &[String]) -> u16 {
+    let edited_kind = token_kind(edited);
+    let key_was_that_modifier = edited_kind.is_some_and(|kind| {
+        HeldModifier::from_code(key_code).is_some_and(|held| held.kind == kind)
+    });
+    if !key_was_that_modifier {
+        return key_code;
+    }
+    parts
+        .iter()
+        .rev()
+        .find_map(|part| key_code_for_token(part))
+        .unwrap_or(key_code)
+}
+
+fn token_kind(token: &str) -> Option<ModifierKind> {
+    Some(match token {
+        "leftctrl" | "rightctrl" | "ctrl" => ModifierKind::Control,
+        "leftalt" | "rightalt" | "alt" => ModifierKind::Alt,
+        "leftshift" | "rightshift" | "shift" => ModifierKind::Shift,
+        "leftcmd" | "rightcmd" | "cmd" => ModifierKind::Command,
+        "fn" => ModifierKind::Function,
+        _ => return None,
+    })
+}
+
+fn key_code_for_token(token: &str) -> Option<u16> {
+    Some(match token {
+        "leftctrl" | "ctrl" => 0x3B,
+        "rightctrl" => 0x3E,
+        "leftalt" | "alt" => 0x3A,
+        "rightalt" => 0x3D,
+        "leftshift" | "shift" => 0x38,
+        "rightshift" => 0x3C,
+        "leftcmd" | "cmd" => 0x37,
+        "rightcmd" => 0x36,
+        "fn" => 0x3F,
+        _ => return None,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn modifiers_from_bits(flags: u64) -> Modifiers {
+    Modifiers {
+        shift: flags & 0x0002_0000 != 0,
+        control: flags & 0x0004_0000 != 0,
+        alt: flags & 0x0008_0000 != 0,
+        platform: flags & 0x0010_0000 != 0,
+        function: flags & 0x0080_0000 != 0,
+    }
+}
+
+enum CapturedRoute {
+    Flags,
+    Key { name: String, code: u16 },
+}
+
+/// A letter typed with both Command keys sometimes arrives as a modifier
+/// event or a flags change. If it names a key, record that key.
+fn route_captured(flags_changed: bool, code: u16, letters: Option<char>) -> CapturedRoute {
+    // Both Command keys down can report the letter on the command key's code.
+    if HeldModifier::from_code(code).is_some() {
+        if let Some(letter) = letters.filter(|letter| letter.is_ascii_alphanumeric()) {
+            let name = letter.to_ascii_lowercase();
+            let code = ansi_code_for_char(name).unwrap_or(code);
+            return CapturedRoute::Key {
+                name: name.to_string(),
+                code,
+            };
+        }
+        return CapturedRoute::Flags;
+    }
+    if flags_changed && letters.is_none_or(|letter| !letter.is_ascii_alphanumeric()) {
+        return CapturedRoute::Flags;
+    }
+    let name = ansi_key_name(code)
+        .map(str::to_owned)
+        .or_else(|| {
+            letters
+                .filter(|letter| letter.is_ascii_alphanumeric())
+                .map(|letter| letter.to_ascii_lowercase().to_string())
+        })
+        .or_else(|| special_key_name(code).map(str::to_owned))
+        .unwrap_or_else(|| "unknown".to_owned());
+    CapturedRoute::Key { name, code }
+}
+
+fn special_key_name(code: u16) -> Option<&'static str> {
+    Some(match code {
+        0x35 => "escape",
+        0x33 => "backspace",
+        0x75 => "delete",
+        0x24 | 0x4C => "enter",
+        0x30 => "tab",
+        0x31 => "space",
+        0x7B => "left",
+        0x7C => "right",
+        0x7D => "down",
+        0x7E => "up",
+        _ => return None,
+    })
+}
+
+/// Hardware key codes are positions, so Option+O stays `o` instead of Ó.
+fn ansi_key_name(code: u16) -> Option<&'static str> {
+    Some(match code {
+        0x00 => "a",
+        0x0B => "b",
+        0x08 => "c",
+        0x02 => "d",
+        0x0E => "e",
+        0x03 => "f",
+        0x05 => "g",
+        0x04 => "h",
+        0x22 => "i",
+        0x26 => "j",
+        0x28 => "k",
+        0x25 => "l",
+        0x2E => "m",
+        0x2D => "n",
+        0x1F => "o",
+        0x23 => "p",
+        0x0C => "q",
+        0x0F => "r",
+        0x01 => "s",
+        0x11 => "t",
+        0x20 => "u",
+        0x09 => "v",
+        0x0D => "w",
+        0x07 => "x",
+        0x10 => "y",
+        0x06 => "z",
+        0x1D => "0",
+        0x12 => "1",
+        0x13 => "2",
+        0x14 => "3",
+        0x15 => "4",
+        0x17 => "5",
+        0x16 => "6",
+        0x1A => "7",
+        0x1C => "8",
+        0x19 => "9",
+        _ => return None,
+    })
+}
+
+fn ansi_code_for_char(letter: char) -> Option<u16> {
+    let letter = letter.to_ascii_lowercase();
+    Some(match letter {
+        'a' => 0x00,
+        'b' => 0x0B,
+        'c' => 0x08,
+        'd' => 0x02,
+        'e' => 0x0E,
+        'f' => 0x03,
+        'g' => 0x05,
+        'h' => 0x04,
+        'i' => 0x22,
+        'j' => 0x26,
+        'k' => 0x28,
+        'l' => 0x25,
+        'm' => 0x2E,
+        'n' => 0x2D,
+        'o' => 0x1F,
+        'p' => 0x23,
+        'q' => 0x0C,
+        'r' => 0x0F,
+        's' => 0x01,
+        't' => 0x11,
+        'u' => 0x20,
+        'v' => 0x09,
+        'w' => 0x0D,
+        'x' => 0x07,
+        'y' => 0x10,
+        'z' => 0x06,
+        '0' => 0x1D,
+        '1' => 0x12,
+        '2' => 0x13,
+        '3' => 0x14,
+        '4' => 0x15,
+        '5' => 0x17,
+        '6' => 0x16,
+        '7' => 0x1A,
+        '8' => 0x1C,
+        '9' => 0x19,
+        _ => return None,
+    })
 }
 
 fn sided_symbol(part: &str) -> Option<&'static str> {
@@ -672,7 +1208,7 @@ mod tests {
         assert_eq!(shortcut.key_code, 2);
         assert_eq!(shortcut.label, "rightalt-d");
         assert_eq!(shortcut.modifiers(), vec!["alt-right"]);
-        assert_eq!(dictation_shortcut_label(&shortcut.label), "Right ⌥D");
+        assert_eq!(dictation_shortcut_label(&shortcut.label), "Right ⌥ + D");
     }
 
     #[test]
@@ -696,8 +1232,8 @@ mod tests {
         ));
         let shortcut = recorded(gesture.on_flags(Modifiers::default(), Some(0x3D)));
         assert_eq!(shortcut.key_code, 0x3D);
-        assert_eq!(shortcut.label, "rightalt-leftcmd");
-        assert_eq!(shortcut.modifiers(), vec!["alt-right", "cmd-left"]);
+        assert_eq!(shortcut.label, "leftcmd-rightalt");
+        assert_eq!(shortcut.modifiers(), vec!["cmd-left", "alt-right"]);
     }
 
     #[test]
@@ -715,10 +1251,92 @@ mod tests {
     }
 
     #[test]
-    fn an_unsided_shortcut_keeps_the_normal_label() {
+    fn keys_are_shown_with_a_plus_as_they_are_held() {
+        let mut gesture = DictationGesture::default();
+        assert_eq!(gesture.preview(), None);
+        gesture.on_flags(mods(true, false), Some(0x3D));
         assert_eq!(
-            dictation_shortcut_label("cmd-alt-d"),
-            crate::commands::keystroke_label("cmd-alt-d")
+            gesture.preview().as_deref().map(dictation_shortcut_label),
+            Some("Right ⌥".to_owned())
         );
+        gesture.on_flags(mods(true, true), Some(0x37));
+        assert_eq!(
+            gesture.preview().as_deref().map(dictation_shortcut_label),
+            Some("Right ⌥ + Left ⌘".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_modifier_can_be_set_to_left_right_or_any() {
+        let shortcut = DictationShortcut {
+            label: "leftcmd-d".into(),
+            key_code: 2,
+        };
+        let any = shortcut_with_side(&shortcut, 0, None).expect("cmd has a side");
+        assert_eq!(any.label, "cmd-d");
+        assert_eq!(any.key_code, 2);
+        let right = shortcut_with_side(&any, 0, Some(KeySide::Right)).expect("cmd has a side");
+        assert_eq!(right.label, "rightcmd-d");
+        let shortcut = DictationShortcut {
+            label: "rightalt".into(),
+            key_code: 0x3D,
+        };
+        let any = shortcut_with_side(&shortcut, 0, None).expect("option has a side");
+        assert_eq!(any.label, "alt");
+        assert_eq!(any.key_code, 0x3A);
+        let left = shortcut_with_side(&any, 0, Some(KeySide::Left)).expect("option has a side");
+        assert_eq!(left.label, "leftalt");
+        assert_eq!(left.key_code, 0x3A);
+    }
+
+    #[test]
+    fn both_option_keys_stay_until_one_is_set_to_any() {
+        let mut gesture = DictationGesture::default();
+        gesture.on_flags(mods(true, false), Some(0x3A));
+        gesture.on_flags(mods(true, false), Some(0x3D));
+        let shortcut = recorded(gesture.on_flags(Modifiers::default(), Some(0x3D)));
+        assert_eq!(shortcut.label, "leftalt-rightalt");
+        let any = shortcut_with_side(&shortcut, 0, None).expect("option has a side");
+        assert_eq!(any.label, "alt");
+        assert_eq!(dictation_shortcut_label(&any.label), "⌥");
+    }
+
+    #[test]
+    fn removing_the_last_part_clears_the_shortcut() {
+        let shortcut = DictationShortcut {
+            label: "leftalt-o".into(),
+            key_code: 0x1F,
+        };
+        let left = shortcut_without_part(&shortcut, 1).expect("the option remains");
+        assert_eq!(left.label, "leftalt");
+        assert!(shortcut_without_part(&left, 0).is_none());
+    }
+
+    #[test]
+    fn a_letter_with_both_command_keys_is_still_a_letter() {
+        // The command key's own code, but the character is the letter they hit.
+        match route_captured(false, 0x37, Some('d')) {
+            CapturedRoute::Key { name, code } => {
+                assert_eq!(name, "d");
+                assert_eq!(code, 0x02);
+            }
+            CapturedRoute::Flags => panic!("letter was treated as a modifier"),
+        }
+        match route_captured(true, 0x02, Some('d')) {
+            CapturedRoute::Key { name, code } => {
+                assert_eq!(name, "d");
+                assert_eq!(code, 0x02);
+            }
+            CapturedRoute::Flags => panic!("letter was treated as a modifier"),
+        }
+        assert!(matches!(
+            route_captured(true, 0x36, None),
+            CapturedRoute::Flags
+        ));
+    }
+
+    #[test]
+    fn an_unsided_shortcut_keeps_each_key() {
+        assert_eq!(dictation_shortcut_label("cmd-alt-d"), "⌘ + ⌥ + D");
     }
 }

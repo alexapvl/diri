@@ -3854,12 +3854,17 @@ impl UtilitySurfaces {
                         && self.prefs.talk_with_agent
                         && self.prefs.talk_dictation,
                     |section| {
-                        section.child(setting_divider(colors)).child(setting_row(
-                            t("settings.general.talk_answer_with"),
-                            t("settings.general.talk_answer_with_detail"),
-                            self.talk_answer_dropdown(cx),
-                            colors,
-                        ))
+                        section.child(setting_divider(colors)).child(
+                            // Three lines of detail, so the shared 50px row
+                            // leaves this text on the dividers. The shorter
+                            // rows above get that gap from the minimum height.
+                            div().py(px(8.0)).child(setting_row(
+                                t("settings.general.talk_answer_with"),
+                                t("settings.general.talk_answer_with_detail"),
+                                self.talk_answer_dropdown(cx),
+                                colors,
+                            )),
+                        )
                     },
                 )
                 .when(
@@ -3868,12 +3873,14 @@ impl UtilitySurfaces {
                         && self.prefs.talk_dictation
                         && self.prefs.talk_answer == crate::store::TalkAnswer::Shortcut,
                     |section| {
-                        section.child(setting_divider(colors)).child(setting_row(
-                            t("settings.general.talk_shortcut"),
-                            t("settings.general.talk_shortcut_detail"),
-                            self.dictation_shortcut_field(cx),
-                            colors,
-                        ))
+                        section.child(setting_divider(colors)).child(
+                            div().py(px(8.0)).child(setting_row(
+                                t("settings.general.talk_shortcut"),
+                                t("settings.general.talk_shortcut_detail"),
+                                self.dictation_shortcut_field(cx),
+                                colors,
+                            )),
+                        )
                     },
                 ),
                 colors,
