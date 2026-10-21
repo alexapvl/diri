@@ -52,6 +52,12 @@ impl UtilitySurfaces {
         self.voice_fields.recording_shortcut
     }
 
+    /// Recording belongs to the Voice page. Once that page is gone, the
+    /// capture must not keep taking keys.
+    fn dictation_recorder_visible(&self) -> bool {
+        self.surface == Surface::Settings && self.settings_tab == SettingsTab::Voice
+    }
+
     /// Typing into the speech command, or recording the dictation shortcut.
     pub(super) fn handle_voice_fields_key(
         &mut self,
@@ -69,15 +75,9 @@ impl UtilitySurfaces {
         }
         if self.voice_fields.recording_shortcut {
             if !event.is_held {
-                let (key_code, flags) = physical_key();
-                let outcome =
-                    self.voice_fields
-                        .gesture
-                        .on_key(&event.keystroke.key, event.keystroke.modifiers, key_code, flags);
-                self.apply_dictation_outcome(outcome, cx);
+                self.record_dictation_keystroke(&event.keystroke, cx);
             }
             cx.stop_propagation();
-            cx.notify();
             return true;
         }
         if !self.voice_fields.command_active {
@@ -130,8 +130,11 @@ impl UtilitySurfaces {
         {
             return false;
         }
-        let (key_code, _) = physical_key();
-        let outcome = self.voice_fields.gesture.on_flags(event.modifiers, key_code);
+        let (key_code, flags) = physical_key();
+        let outcome = self
+            .voice_fields
+            .gesture
+            .on_flags(event.modifiers, key_code, flags);
         self.apply_dictation_outcome(outcome, cx);
         cx.stop_propagation();
         cx.notify();
@@ -142,10 +145,15 @@ impl UtilitySurfaces {
         self.stop_dictation_recording();
         self.voice_fields.recording_shortcut = true;
         let entity = cx.entity();
-        self.voice_fields.recording_guard = Some(cx.intercept_keystrokes(move |_event, _window, cx| {
-            if entity.read(cx).voice_fields.recording_shortcut {
-                cx.stop_propagation();
+        // Stopping propagation here skips bindings and key listeners alike,
+        // so the key is recorded from the interceptor itself.
+        self.voice_fields.recording_guard = Some(cx.intercept_keystrokes(move |event, _window, cx| {
+            if !entity.read(cx).voice_fields.recording_shortcut {
+                return;
             }
+            cx.stop_propagation();
+            let keystroke = event.keystroke.clone();
+            entity.update(cx, |this, cx| this.record_dictation_keystroke(&keystroke, cx));
         }));
         #[cfg(target_os = "macos")]
         if let Some((capture, mut events)) = crate::macos::shortcut_capture::begin() {
@@ -164,6 +172,21 @@ impl UtilitySurfaces {
         }
     }
 
+    fn record_dictation_keystroke(&mut self, keystroke: &gpui::Keystroke, cx: &mut Context<Self>) {
+        if !self.dictation_recorder_visible() {
+            self.stop_dictation_recording();
+            cx.notify();
+            return;
+        }
+        let (key_code, flags) = physical_key();
+        let outcome =
+            self.voice_fields
+                .gesture
+                .on_key(&keystroke.key, keystroke.modifiers, key_code, flags);
+        self.apply_dictation_outcome(outcome, cx);
+        cx.notify();
+    }
+
     #[cfg(target_os = "macos")]
     fn note_captured_key(
         &mut self,
@@ -171,6 +194,11 @@ impl UtilitySurfaces {
         cx: &mut Context<Self>,
     ) {
         if !self.voice_fields.recording_shortcut {
+            return;
+        }
+        if !self.dictation_recorder_visible() {
+            self.stop_dictation_recording();
+            cx.notify();
             return;
         }
         let modifiers = modifiers_from_bits(event.flags);
@@ -181,7 +209,7 @@ impl UtilitySurfaces {
                 }
                 self.voice_fields
                     .gesture
-                    .on_flags(modifiers, Some(event.code))
+                    .on_flags(modifiers, Some(event.code), event.flags)
             }
             CapturedRoute::Key { name, code } => self
                 .voice_fields
@@ -192,7 +220,7 @@ impl UtilitySurfaces {
         cx.notify();
     }
 
-    fn stop_dictation_recording(&mut self) {
+    pub(super) fn stop_dictation_recording(&mut self) {
         self.voice_fields.recording_shortcut = false;
         self.voice_fields.recording_guard = None;
         self.voice_fields.side_menu = None;
@@ -640,7 +668,19 @@ impl HeldModifier {
         })
     }
 
-    fn is_down(self, modifiers: Modifiers) -> bool {
+    /// The device bits tell the two sides apart, so letting go of one
+    /// Option while the other is held is a release. Without them, only the
+    /// logical flag is known.
+    fn is_down(self, modifiers: Modifiers, flags: u64) -> bool {
+        if let Some((left, right)) = device_bits(self.kind)
+            && flags & (left | right) != 0
+        {
+            return match self.side {
+                Some(KeySide::Left) => flags & left != 0,
+                Some(KeySide::Right) => flags & right != 0,
+                None => true,
+            };
+        }
         match self.kind {
             ModifierKind::Control => modifiers.control,
             ModifierKind::Alt => modifiers.alt,
@@ -654,7 +694,6 @@ impl HeldModifier {
 #[derive(Default)]
 struct DictationGesture {
     held: Vec<HeldModifier>,
-    saw_key: bool,
 }
 
 #[derive(Debug)]
@@ -666,15 +705,16 @@ enum GestureOutcome {
 }
 
 impl DictationGesture {
-    fn on_flags(&mut self, modifiers: Modifiers, key_code: Option<u16>) -> GestureOutcome {
+    fn on_flags(&mut self, modifiers: Modifiers, key_code: Option<u16>, flags: u64) -> GestureOutcome {
         if let Some(held) = key_code.and_then(HeldModifier::from_code)
-            && held.is_down(modifiers)
+            && held.is_down(modifiers, flags)
         {
-            self.held.retain(|item| item.code != held.code);
-            self.held.push(held);
+            if !self.held.iter().any(|item| item.code == held.code) {
+                self.held.push(held);
+            }
             return GestureOutcome::Listening;
         }
-        if !modifiers.modified() && !self.saw_key && !self.held.is_empty() {
+        if !modifiers.modified() && !self.held.is_empty() {
             return GestureOutcome::Record(shortcut_from_held(&self.held));
         }
         GestureOutcome::Listening
@@ -708,7 +748,6 @@ impl DictationGesture {
         let Some(key_code) = key_code else {
             return GestureOutcome::Listening;
         };
-        self.saw_key = true;
         GestureOutcome::Record(DictationShortcut {
             label: label_for_key(key, modifiers, &self.held, flags),
             key_code,
@@ -784,14 +823,19 @@ fn modifier_token(held: HeldModifier) -> &'static str {
     }
 }
 
-fn side_from_flags(kind: ModifierKind, flags: u64) -> Option<KeySide> {
-    let (left, right) = match kind {
+/// The left and right device bits macOS sets in an event's modifier flags.
+fn device_bits(kind: ModifierKind) -> Option<(u64, u64)> {
+    Some(match kind {
         ModifierKind::Control => (0x1, 0x2000),
         ModifierKind::Alt => (0x20, 0x40),
         ModifierKind::Shift => (0x2, 0x4),
         ModifierKind::Command => (0x8, 0x10),
         ModifierKind::Function => return None,
-    };
+    })
+}
+
+fn side_from_flags(kind: ModifierKind, flags: u64) -> Option<KeySide> {
+    let (left, right) = device_bits(kind)?;
     match (flags & left != 0, flags & right != 0) {
         (true, false) => Some(KeySide::Left),
         (false, true) => Some(KeySide::Right),
@@ -826,7 +870,6 @@ fn dictation_shortcut_label(label: &str) -> String {
 
 fn part_symbol(part: &str) -> String {
     sided_symbol(part)
-        .map(str::to_owned)
         .or_else(|| generic_symbol(part).map(str::to_owned))
         .unwrap_or_else(|| key_symbol(part))
 }
@@ -896,11 +939,14 @@ fn shortcut_without_part(shortcut: &DictationShortcut, index: usize) -> Option<D
 }
 
 fn key_code_after_edit(key_code: u16, edited: &str, parts: &[String]) -> u16 {
-    let edited_kind = token_kind(edited);
-    let key_was_that_modifier = edited_kind.is_some_and(|kind| {
-        HeldModifier::from_code(key_code).is_some_and(|held| held.kind == kind)
-    });
-    if !key_was_that_modifier {
+    let code_kind = HeldModifier::from_code(key_code).map(|held| held.kind);
+    // The code is the edited part when that part is the modifier it names,
+    // or when it is the one key that is not a modifier.
+    let code_was_edited = match token_kind(edited) {
+        Some(kind) => code_kind == Some(kind),
+        None => code_kind.is_none(),
+    };
+    if !code_was_edited {
         return key_code;
     }
     parts
@@ -997,6 +1043,42 @@ fn special_key_name(code: u16) -> Option<&'static str> {
         0x7C => "right",
         0x7D => "down",
         0x7E => "up",
+        0x73 => "home",
+        0x77 => "end",
+        0x74 => "pageup",
+        0x79 => "pagedown",
+        0x7A => "f1",
+        0x78 => "f2",
+        0x63 => "f3",
+        0x76 => "f4",
+        0x60 => "f5",
+        0x61 => "f6",
+        0x62 => "f7",
+        0x64 => "f8",
+        0x65 => "f9",
+        0x6D => "f10",
+        0x67 => "f11",
+        0x6F => "f12",
+        0x69 => "f13",
+        0x6B => "f14",
+        0x71 => "f15",
+        0x6A => "f16",
+        0x40 => "f17",
+        0x4F => "f18",
+        0x50 => "f19",
+        0x5A => "f20",
+        // Named, not typed, because `-` separates the label's parts.
+        0x1B => "minus",
+        0x18 => "=",
+        0x21 => "[",
+        0x1E => "]",
+        0x2A => "\\",
+        0x29 => ";",
+        0x27 => "'",
+        0x2B => ",",
+        0x2F => ".",
+        0x2C => "/",
+        0x32 => "`",
         _ => return None,
     })
 }
@@ -1089,18 +1171,19 @@ fn ansi_code_for_char(letter: char) -> Option<u16> {
     })
 }
 
-fn sided_symbol(part: &str) -> Option<&'static str> {
-    Some(match part {
-        "leftalt" => "Left ⌥",
-        "rightalt" => "Right ⌥",
-        "leftshift" => "Left ⇧",
-        "rightshift" => "Right ⇧",
-        "leftctrl" => "Left ⌃",
-        "rightctrl" => "Right ⌃",
-        "leftcmd" => "Left ⌘",
-        "rightcmd" => "Right ⌘",
-        _ => return None,
-    })
+fn sided_symbol(part: &str) -> Option<String> {
+    let side = token_side(part)??;
+    let kind = token_kind(part)?;
+    let symbol = generic_symbol(modifier_token(HeldModifier {
+        code: 0,
+        kind,
+        side: None,
+    }))?;
+    let side = match side {
+        KeySide::Left => t("settings.general.talk_side_left"),
+        KeySide::Right => t("settings.general.talk_side_right"),
+    };
+    Some(format!("{side} {symbol}"))
 }
 
 fn generic_symbol(part: &str) -> Option<&'static str> {
@@ -1126,6 +1209,11 @@ fn key_symbol(key: &str) -> String {
         "down" => "↓".into(),
         "left" => "←".into(),
         "right" => "→".into(),
+        "minus" => "-".into(),
+        "pageup" => "⇞".into(),
+        "pagedown" => "⇟".into(),
+        "home" => "↖".into(),
+        "end" => "↘".into(),
         other => other.to_ascii_uppercase(),
     }
 }
@@ -1181,10 +1269,10 @@ mod tests {
     fn releasing_right_option_records_that_key() {
         let mut gesture = DictationGesture::default();
         assert!(matches!(
-            gesture.on_flags(mods(true, false), Some(0x3D)),
+            gesture.on_flags(mods(true, false), Some(0x3D), 0),
             GestureOutcome::Listening
         ));
-        let shortcut = recorded(gesture.on_flags(Modifiers::default(), Some(0x3D)));
+        let shortcut = recorded(gesture.on_flags(Modifiers::default(), Some(0x3D), 0));
         assert_eq!(shortcut.key_code, 0x3D);
         assert_eq!(shortcut.label, "rightalt");
         assert_eq!(shortcut.modifiers(), vec!["alt-right"]);
@@ -1194,11 +1282,11 @@ mod tests {
     #[test]
     fn left_and_right_option_stay_distinct() {
         let mut left = DictationGesture::default();
-        left.on_flags(mods(true, false), Some(0x3A));
-        let left = recorded(left.on_flags(Modifiers::default(), Some(0x3A)));
+        left.on_flags(mods(true, false), Some(0x3A), 0);
+        let left = recorded(left.on_flags(Modifiers::default(), Some(0x3A), 0));
         let mut right = DictationGesture::default();
-        right.on_flags(mods(true, false), Some(0x3D));
-        let right = recorded(right.on_flags(Modifiers::default(), Some(0x3D)));
+        right.on_flags(mods(true, false), Some(0x3D), 0);
+        let right = recorded(right.on_flags(Modifiers::default(), Some(0x3D), 0));
         assert_eq!(left.key_code, 0x3A);
         assert_eq!(left.modifiers(), vec!["alt-left"]);
         assert_eq!(dictation_shortcut_label(&left.label), "Left ⌥");
@@ -1208,7 +1296,7 @@ mod tests {
     #[test]
     fn a_chord_keeps_the_option_side_from_the_held_key() {
         let mut gesture = DictationGesture::default();
-        gesture.on_flags(mods(true, false), Some(0x3D));
+        gesture.on_flags(mods(true, false), Some(0x3D), 0);
         let shortcut = recorded(gesture.on_key("d", mods(true, false), Some(2), 0));
         assert_eq!(shortcut.key_code, 2);
         assert_eq!(shortcut.label, "rightalt-d");
@@ -1229,13 +1317,13 @@ mod tests {
     #[test]
     fn two_modifiers_record_when_the_last_one_is_released() {
         let mut gesture = DictationGesture::default();
-        gesture.on_flags(mods(false, true), Some(0x37));
-        gesture.on_flags(mods(true, true), Some(0x3D));
+        gesture.on_flags(mods(false, true), Some(0x37), 0);
+        gesture.on_flags(mods(true, true), Some(0x3D), 0);
         assert!(matches!(
-            gesture.on_flags(mods(true, false), Some(0x37)),
+            gesture.on_flags(mods(true, false), Some(0x37), 0),
             GestureOutcome::Listening
         ));
-        let shortcut = recorded(gesture.on_flags(Modifiers::default(), Some(0x3D)));
+        let shortcut = recorded(gesture.on_flags(Modifiers::default(), Some(0x3D), 0));
         assert_eq!(shortcut.key_code, 0x3D);
         assert_eq!(shortcut.label, "leftcmd-rightalt");
         assert_eq!(shortcut.modifiers(), vec!["cmd-left", "alt-right"]);
@@ -1259,12 +1347,12 @@ mod tests {
     fn keys_are_shown_with_a_plus_as_they_are_held() {
         let mut gesture = DictationGesture::default();
         assert_eq!(gesture.preview(), None);
-        gesture.on_flags(mods(true, false), Some(0x3D));
+        gesture.on_flags(mods(true, false), Some(0x3D), 0);
         assert_eq!(
             gesture.preview().as_deref().map(dictation_shortcut_label),
             Some("Right ⌥".to_owned())
         );
-        gesture.on_flags(mods(true, true), Some(0x37));
+        gesture.on_flags(mods(true, true), Some(0x37), 0);
         assert_eq!(
             gesture.preview().as_deref().map(dictation_shortcut_label),
             Some("Right ⌥ + Left ⌘".to_owned())
@@ -1297,9 +1385,9 @@ mod tests {
     #[test]
     fn both_option_keys_stay_until_one_is_set_to_any() {
         let mut gesture = DictationGesture::default();
-        gesture.on_flags(mods(true, false), Some(0x3A));
-        gesture.on_flags(mods(true, false), Some(0x3D));
-        let shortcut = recorded(gesture.on_flags(Modifiers::default(), Some(0x3D)));
+        gesture.on_flags(mods(true, false), Some(0x3A), 0);
+        gesture.on_flags(mods(true, false), Some(0x3D), 0);
+        let shortcut = recorded(gesture.on_flags(Modifiers::default(), Some(0x3D), 0));
         assert_eq!(shortcut.label, "leftalt-rightalt");
         let any = shortcut_with_side(&shortcut, 0, None).expect("option has a side");
         assert_eq!(any.label, "alt");
@@ -1314,6 +1402,8 @@ mod tests {
         };
         let left = shortcut_without_part(&shortcut, 1).expect("the option remains");
         assert_eq!(left.label, "leftalt");
+        // The key code has to follow, or the helper still presses Option+O.
+        assert_eq!(left.key_code, 0x3A);
         assert!(shortcut_without_part(&left, 0).is_none());
     }
 
@@ -1343,5 +1433,33 @@ mod tests {
     #[test]
     fn an_unsided_shortcut_keeps_each_key() {
         assert_eq!(dictation_shortcut_label("cmd-alt-d"), "⌘ + ⌥ + D");
+    }
+
+    #[test]
+    fn releasing_one_option_while_the_other_is_held_is_a_release() {
+        let mut gesture = DictationGesture::default();
+        // Device bits: left Option 0x20, right Option 0x40.
+        gesture.on_flags(mods(true, false), Some(0x3D), 0x40);
+        gesture.on_flags(mods(true, false), Some(0x3A), 0x60);
+        // Right Option goes up while left is still down.
+        assert!(matches!(
+            gesture.on_flags(mods(true, false), Some(0x3D), 0x20),
+            GestureOutcome::Listening
+        ));
+        let shortcut = recorded(gesture.on_flags(Modifiers::default(), Some(0x3A), 0));
+        assert_eq!(shortcut.label, "rightalt-leftalt");
+        assert_eq!(shortcut.key_code, 0x3A);
+    }
+
+    #[test]
+    fn function_and_punctuation_keys_are_named() {
+        for (code, name) in [(0x60, "f5"), (0x2C, "/"), (0x1B, "minus")] {
+            match route_captured(false, code, None) {
+                CapturedRoute::Key { name: got, .. } => assert_eq!(got, name),
+                CapturedRoute::Flags => panic!("{name} was treated as a modifier"),
+            }
+        }
+        assert_eq!(dictation_shortcut_label("cmd-minus"), "⌘ + -");
+        assert_eq!(dictation_shortcut_label("ctrl-f5"), "⌃ + F5");
     }
 }

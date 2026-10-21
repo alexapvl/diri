@@ -44,8 +44,8 @@ struct Tap {
 
 pub(crate) fn begin() -> Option<(Capture, Receiver<CapturedKey>)> {
     let (sender, receiver) = mpsc::channel(32);
-    let mut sender = Box::new(sender);
-    let tap = install_tap(sender.as_mut());
+    let sender = Box::new(sender);
+    let tap = install_tap(&sender);
     // Command chords are often handled before a session tap sees them.
     // The monitor still records a letter that reaches the app.
     let monitor = install_monitor(sender.as_ref().clone());
@@ -118,19 +118,26 @@ fn clear_equivalents(menu: &NSMenu, saved: &mut Vec<SavedEquivalent>) {
     }
 }
 
-impl Drop for MenuShortcuts {
-    fn drop(&mut self) {
-        for saved in &self.items {
+impl MenuShortcuts {
+    /// Puts every cleared shortcut back. Running it twice does nothing.
+    fn restore(&mut self) {
+        for saved in self.items.drain(..) {
             saved.item.setKeyEquivalent(&saved.equivalent);
             saved
                 .item
                 .setKeyEquivalentModifierMask(saved.modifiers);
         }
-        if let Some((window, was)) = &self.miniaturizable
-            && *was
+        if let Some((window, was)) = self.miniaturizable.take()
+            && was
         {
             window.setStyleMask(window.styleMask().union(NSWindowStyleMask::Miniaturizable));
         }
+    }
+}
+
+impl Drop for MenuShortcuts {
+    fn drop(&mut self) {
+        self.restore();
     }
 }
 
@@ -138,12 +145,7 @@ impl Drop for Capture {
     fn drop(&mut self) {
         // Restore menu shortcuts before the monitor stops, so a key that is
         // still down is not delivered twice.
-        self.menu.items.clear();
-        if let Some((window, was)) = self.menu.miniaturizable.take()
-            && was
-        {
-            window.setStyleMask(window.styleMask().union(NSWindowStyleMask::Miniaturizable));
-        }
+        self.menu.restore();
         if let Some(monitor) = self.monitor.take() {
             // SAFETY: this token came from addLocalMonitor on this thread.
             unsafe { NSEvent::removeMonitor(&monitor) };
@@ -169,15 +171,24 @@ fn install_monitor(sender: Sender<CapturedKey>) -> Option<Retained<AnyObject>> {
         if kind != NSEventType::KeyDown && !flags_changed {
             return event.as_ptr();
         }
-        let letters = native
-            .charactersIgnoringModifiers()
-            .and_then(|text| text.to_string().chars().next());
+        // AppKit throws when a flags-changed event is asked for its
+        // characters or repeat state.
+        let (letters, repeat) = if flags_changed {
+            (None, false)
+        } else {
+            (
+                native
+                    .charactersIgnoringModifiers()
+                    .and_then(|text| text.to_string().chars().next()),
+                native.isARepeat(),
+            )
+        };
         let _ = sender.try_send(CapturedKey {
             code: native.keyCode(),
             flags: native.modifierFlags().bits() as u64,
             letters,
             flags_changed,
-            repeat: native.isARepeat(),
+            repeat,
         });
         // The app must not also run the chord. System shortcuts are a
         // separate path, covered by the event tap when it is installed.
@@ -197,7 +208,7 @@ struct TapState {
     port: *mut c_void,
 }
 
-fn install_tap(sender: &mut Sender<CapturedKey>) -> Option<Tap> {
+fn install_tap(sender: &Sender<CapturedKey>) -> Option<Tap> {
     if !trusted() {
         return None;
     }
@@ -206,7 +217,9 @@ fn install_tap(sender: &mut Sender<CapturedKey>) -> Option<Tap> {
         port: ptr::null_mut(),
     });
     let state = Box::into_raw(state);
-    let mask = (1u64 << 10) | (1u64 << 11) | (1u64 << 12);
+    // Key-down and flags-changed only. Key-ups pass through, so a key held
+    // from before recording is not left stuck in another app.
+    let mask = (1u64 << 10) | (1u64 << 12);
     // SAFETY: the callback only reads the event and sends on the channel.
     // The state box stays alive until the tap is removed. HID is tried
     // first so a letter held with both Command keys is seen before AppKit
@@ -258,6 +271,10 @@ unsafe extern "C" fn tap_callback(
         unsafe { CGEventTapEnable(state.port, true) };
         return event;
     }
+    // The tap is system-wide. Keys meant for another app are not ours.
+    if !app_is_active() {
+        return event;
+    }
     let code = unsafe { CGEventGetIntegerValueField(event, 9) } as u16;
     let flags = unsafe { CGEventGetFlags(event) };
     let repeat = unsafe { CGEventGetIntegerValueField(event, 8) } != 0;
@@ -278,6 +295,12 @@ unsafe extern "C" fn tap_callback(
     });
     // Drop the event so dictation and Diri both miss it.
     ptr::null_mut()
+}
+
+fn app_is_active() -> bool {
+    // The tap's run loop source is on the main run loop.
+    MainThreadMarker::new()
+        .is_some_and(|mtm| NSApplication::sharedApplication(mtm).isActive())
 }
 
 fn trusted() -> bool {

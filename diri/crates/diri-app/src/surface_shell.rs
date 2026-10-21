@@ -1925,6 +1925,7 @@ impl UtilitySurfaces {
                 return;
             }
             let _ = self.update_prefs(|_| {});
+            self.stop_dictation_recording();
             self.surface = Surface::None;
             self.clear_account_continuation();
             self.usage_share_theme_hover = None;
@@ -2058,6 +2059,9 @@ impl UtilitySurfaces {
         }
         if self.settings_tab != tab {
             self.settings_scroll.set_offset(point(px(0.0), px(0.0)));
+        }
+        if tab != SettingsTab::Voice {
+            self.stop_dictation_recording();
         }
         self.settings_tab = tab;
         if tab == SettingsTab::WhatsNew {
