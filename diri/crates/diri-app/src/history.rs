@@ -2,21 +2,33 @@
 //!
 //! Local history stays available while the Engine connects. Streaming reads
 //! stop at useful metadata; unchanged transcripts are reused between scans.
-//! Provider files are never modified.
+//! Search covers every prompt the user typed, read from the providers' own
+//! prompt logs instead of transcript bodies. Provider files are never modified.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, Metadata};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::fuzzy::{FuzzyMatcher, FuzzyQuery, PreparedText};
 use diri_client::{ClientError, DaemonClient};
 use diri_proto::{AgentKind, DateMillis, HistoryEntry};
+use serde::Deserialize;
 use serde_json::Value;
 
 const CLAUDE_HEAD_CAP: usize = 8 << 20;
-const CLAUDE_TAIL_BYTES: usize = 16 << 10;
+/// Claude rewrites `ai-title` throughout a conversation; across a real store
+/// the newest one sat at most 34 KiB from the end, so 16 KiB missed 40%.
+const CLAUDE_TAIL_BYTES: usize = 64 << 10;
+/// Both providers append every typed prompt to `history.jsonl` (6 MB for
+/// two thousand Claude conversations). Older prompts past the cap are dropped.
+const PROMPT_LOG_CAP: u64 = 64 << 20;
+/// Searchable prompt text kept per conversation.
+const PROMPT_INDEX_BYTES: usize = 64 << 10;
+const FUZZY_FLOOR_PER_CHAR: u32 = 22;
 const CODEX_FIRST_LINE_CAP: usize = 512 << 10;
 const CODEX_FIRST_PROMPT_CAP: usize = 8 << 20;
 
@@ -54,6 +66,24 @@ pub fn scan(roots: &HistoryRoots, tracked: &HashSet<String>) -> Vec<HistoryEntry
 pub struct HistoryScanner {
     files: HashMap<PathBuf, CachedTranscript>,
     visited: HashSet<PathBuf>,
+    logs: HashMap<PathBuf, PromptLog>,
+    search_text: Arc<HashMap<String, SearchText>>,
+}
+
+/// What a conversation can be found by besides its title and folder.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SearchText {
+    /// Git branch and `pr #N owner/repo`, the labels Claude's picker matches.
+    pub labels: String,
+    /// Every prompt the user typed, newline separated.
+    pub prompts: String,
+}
+
+/// Transcript-derived search facts, cached with the entry they belong to.
+#[derive(Clone, Debug, Default)]
+struct TranscriptFacts {
+    first_prompt: Option<String>,
+    labels: String,
 }
 
 struct CachedTranscript {
@@ -61,6 +91,23 @@ struct CachedTranscript {
     len: u64,
     provider_title: Option<String>,
     entry: Option<HistoryEntry>,
+    facts: TranscriptFacts,
+}
+
+/// One provider prompt log, reread only when it changes.
+struct PromptLog {
+    modified: Option<SystemTime>,
+    len: u64,
+    prompts: HashMap<String, Vec<String>>,
+}
+
+/// Claude logs `{sessionId, display}`, Codex `{session_id, text}`.
+#[derive(Deserialize)]
+struct LoggedPrompt<'a> {
+    #[serde(borrow, rename = "sessionId", alias = "session_id")]
+    session: Option<Cow<'a, str>>,
+    #[serde(borrow, rename = "display", alias = "text")]
+    text: Option<Cow<'a, str>>,
 }
 
 impl HistoryScanner {
@@ -69,6 +116,7 @@ impl HistoryScanner {
         let mut entries = scan_claude(&roots.claude, self);
         entries.extend(scan_codex(&roots.codex, self));
         self.files.retain(|path, _| self.visited.contains(path));
+        self.index_prompts(roots);
 
         let mut seen = tracked.clone();
         entries.retain(|entry| seen.insert(entry.id.clone()));
@@ -82,11 +130,73 @@ impl HistoryScanner {
         entries
     }
 
+    /// Search text per conversation id, for [`HistorySearch::set_search_text`].
+    pub fn search_text(&self) -> Arc<HashMap<String, SearchText>> {
+        Arc::clone(&self.search_text)
+    }
+
+    fn index_prompts(&mut self, roots: &HistoryRoots) {
+        let logs = [&roots.claude, &roots.codex]
+            .into_iter()
+            .filter_map(|root| Some(root.parent()?.join("history.jsonl")))
+            .collect::<Vec<_>>();
+        self.logs.retain(|path, _| logs.contains(path));
+        for path in &logs {
+            let Ok(metadata) = fs::symlink_metadata(path) else {
+                self.logs.remove(path);
+                continue;
+            };
+            let modified = metadata.modified().ok();
+            if !metadata.is_file()
+                || self.logs.get(path).is_some_and(|log| {
+                    modified.is_some() && log.modified == modified && log.len == metadata.len()
+                })
+            {
+                continue;
+            }
+            let prompts = read_prompt_log(path).unwrap_or_default();
+            self.logs.insert(
+                path.clone(),
+                PromptLog {
+                    modified,
+                    len: metadata.len(),
+                    prompts,
+                },
+            );
+        }
+
+        let mut index = HashMap::<String, SearchText>::new();
+        let append = |index: &mut HashMap<String, SearchText>, id: &str, prompt: &str| {
+            let text = &mut index.entry(id.to_owned()).or_default().prompts;
+            if text.len() + prompt.len() < PROMPT_INDEX_BYTES && !text.contains(prompt) {
+                text.push_str(prompt);
+                text.push('\n');
+            }
+        };
+        for cached in self.files.values() {
+            let Some(entry) = &cached.entry else {
+                continue;
+            };
+            index.entry(entry.id.clone()).or_default().labels = cached.facts.labels.clone();
+            if let Some(prompt) = &cached.facts.first_prompt {
+                append(&mut index, &entry.id, prompt);
+            }
+        }
+        for log in self.logs.values() {
+            for (id, prompts) in &log.prompts {
+                for prompt in prompts {
+                    append(&mut index, id, prompt);
+                }
+            }
+        }
+        self.search_text = Arc::new(index);
+    }
+
     fn read(
         &mut self,
         path: &Path,
         titles: Option<&HashMap<String, String>>,
-        read: impl FnOnce() -> Option<HistoryEntry>,
+        read: impl FnOnce() -> Option<(HistoryEntry, TranscriptFacts)>,
     ) -> Option<HistoryEntry> {
         let metadata = fs::symlink_metadata(path).ok()?;
         if !metadata.is_file() {
@@ -108,7 +218,7 @@ impl HistoryScanner {
             entry.cwd_exists = Path::new(&entry.cwd).is_dir();
             return Some(entry);
         }
-        let entry = read();
+        let (entry, facts) = read().unzip();
         let provider_title = entry
             .as_ref()
             .and_then(|entry| titles.and_then(|titles| titles.get(&entry.id)))
@@ -120,6 +230,7 @@ impl HistoryScanner {
                 len: metadata.len(),
                 provider_title,
                 entry: entry.clone(),
+                facts: facts.unwrap_or_default(),
             },
         );
         entry
@@ -169,46 +280,122 @@ pub async fn resume(
 
 #[derive(Default)]
 pub struct HistorySearch {
-    candidates: Vec<PreparedText>,
+    candidates: Vec<SearchCandidate>,
+    search_text: Arc<HashMap<String, SearchText>>,
     matcher: FuzzyMatcher,
 }
 
+/// Lowercased fields, prepared once per scan rather than per keystroke.
+struct SearchCandidate {
+    title: String,
+    place: String,
+    prompts: String,
+    label: PreparedText,
+}
+
 impl HistorySearch {
+    pub fn set_search_text(&mut self, search_text: Arc<HashMap<String, SearchText>>) {
+        self.search_text = search_text;
+    }
+
     pub fn rebuild(&mut self, entries: &[HistoryEntry]) {
         self.candidates = entries
             .iter()
             .map(|entry| {
-                PreparedText::new(&format!(
-                    "{} {} {} {}",
-                    entry.title.as_deref().unwrap_or_default(),
-                    entry.cwd,
-                    entry.kind.id(),
-                    entry.id
-                ))
+                let title = entry.title.as_deref().unwrap_or_default();
+                let place = format!("{} {}", folder_name(&entry.cwd), entry.kind.id());
+                let text = self.search_text.get(&entry.id);
+                SearchCandidate {
+                    label: PreparedText::new(&format!("{title} {place}")),
+                    title: title.to_lowercase(),
+                    place: format!("{place} {}", text.map_or("", |text| &text.labels))
+                        .to_lowercase(),
+                    prompts: text
+                        .map(|text| text.prompts.to_lowercase())
+                        .unwrap_or_default(),
+                }
             })
             .collect();
     }
 
-    /// Query parsing and candidate preparation happen once, outside rendering.
-    /// Stable ties preserve newest-first order; words can match in any order.
+    /// Every word must appear in the title, folder, agent, branch, PR, or a
+    /// prompt the user typed; `!word` excludes by any of those but prompts.
+    /// Title hits outrank folder/branch/PR hits, which outrank prompt hits, and equal ranks keep
+    /// newest-first order. Only a query nothing contains falls back to fuzzy
+    /// title matching, so typos still land without subsequence noise.
     pub fn rank(&mut self, query: &str) -> Vec<usize> {
-        let query = FuzzyQuery::new(query);
-        if query.is_empty() {
+        let query = query.to_lowercase();
+        let (excluded, included): (Vec<&str>, Vec<&str>) = query
+            .split_whitespace()
+            .partition(|word| word.len() > 1 && word.starts_with('!'));
+        let excluded = excluded.iter().map(|word| &word[1..]).collect::<Vec<_>>();
+        if included.is_empty() && excluded.is_empty() {
             return (0..self.candidates.len()).collect();
         }
         let mut matches = self
             .candidates
             .iter()
             .enumerate()
+            .filter(|(_, candidate)| {
+                !excluded
+                    .iter()
+                    .any(|word| candidate.title.contains(word) || candidate.place.contains(word))
+            })
             .filter_map(|(index, candidate)| {
-                query
-                    .score(candidate, &mut self.matcher)
+                included
+                    .iter()
+                    .map(|word| candidate.relevance(word))
+                    .try_fold(0u32, |total, rank| Some(total + rank?))
                     .map(|score| (index, score))
             })
             .collect::<Vec<_>>();
+        if matches.is_empty() && !included.is_empty() {
+            // Abbreviations like "hpal" score 24-28 per query character; a
+            // query scattered across a long title scores 16-20.
+            let floor = FUZZY_FLOOR_PER_CHAR
+                * included
+                    .iter()
+                    .map(|word| word.chars().count() as u32)
+                    .sum::<u32>();
+            let fuzzy = FuzzyQuery::new(&included.join(" "));
+            matches = self
+                .candidates
+                .iter()
+                .enumerate()
+                .filter_map(|(index, candidate)| {
+                    fuzzy
+                        .score(&candidate.label, &mut self.matcher)
+                        .filter(|score| *score >= floor)
+                        .map(|score| (index, score))
+                })
+                .collect();
+        }
         matches.sort_by_key(|(_, score)| std::cmp::Reverse(*score));
         matches.into_iter().map(|(index, _)| index).collect()
     }
+}
+
+impl SearchCandidate {
+    fn relevance(&self, word: &str) -> Option<u32> {
+        if starts_word(&self.title, word) {
+            Some(4)
+        } else if self.title.contains(word) {
+            Some(3)
+        } else if self.place.contains(word) {
+            Some(2)
+        } else {
+            self.prompts.contains(word).then_some(1)
+        }
+    }
+}
+
+fn starts_word(haystack: &str, word: &str) -> bool {
+    haystack.match_indices(word).any(|(at, _)| {
+        haystack[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|before| !before.is_alphanumeric())
+    })
 }
 
 /// One conversation looked up by the agent's own id, for importers that know
@@ -234,6 +421,7 @@ pub(crate) fn conversation(
                 .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
                 .then(|| claude_entry(&path))
                 .flatten()
+                .map(|(entry, _)| entry)
         }),
         AgentKind::CODEX_ID => {
             let suffix = format!("-{id}.jsonl");
@@ -257,7 +445,7 @@ pub(crate) fn conversation(
                                     |name| name.starts_with("rollout-") && name.ends_with(&suffix),
                                 );
                             if named
-                                && let Some(entry) = codex_entry(&path, &titles)
+                                && let Some((entry, _)) = codex_entry(&path, &titles)
                                 && entry.id == id
                             {
                                 return Some(entry);
@@ -291,7 +479,7 @@ fn scan_claude(root: &Path, scanner: &mut HistoryScanner) -> Vec<HistoryEntry> {
     result
 }
 
-fn claude_entry(path: &Path) -> Option<HistoryEntry> {
+fn claude_entry(path: &Path) -> Option<(HistoryEntry, TranscriptFacts)> {
     let id = path.file_stem()?.to_str()?.to_owned();
     if id.len() < 32 {
         return None;
@@ -299,7 +487,10 @@ fn claude_entry(path: &Path) -> Option<HistoryEntry> {
     let metadata = fs::metadata(path).ok()?;
     let mut cwd = None;
     let mut first_prompt = None;
-    let provider_title = latest_claude_ai_title(path);
+    let ClaudeTail {
+        title: provider_title,
+        labels,
+    } = claude_tail(path).unwrap_or_default();
     for line in capped_lines(path, CLAUDE_HEAD_CAP)
         .ok()?
         .map_while(Result::ok)
@@ -315,27 +506,25 @@ fn claude_entry(path: &Path) -> Option<HistoryEntry> {
         {
             cwd = Some(value.to_owned());
         }
-        if cwd.is_some() && (first_prompt.is_some() || provider_title.is_some()) {
+        if cwd.is_some() && first_prompt.is_some() {
             break;
         }
     }
     let cwd = cwd?;
-    let title = provider_title
-        .or_else(|| first_prompt.map(title_from_prompt))
-        .or_else(|| {
-            Some(format!(
-                "Claude · {} · {}",
-                folder_name(&cwd),
-                id.chars().take(8).collect::<String>()
-            ))
-        });
-    Some(history_entry(
-        id,
-        AgentKind::CLAUDE_CODE,
-        cwd,
-        title,
-        path,
-        &metadata,
+    let title = provider_title.or_else(|| first_prompt.clone()).or_else(|| {
+        Some(format!(
+            "Claude · {} · {}",
+            folder_name(&cwd),
+            id.chars().take(8).collect::<String>()
+        ))
+    });
+    let entry = history_entry(id, AgentKind::CLAUDE_CODE, cwd, title, path, &metadata);
+    Some((
+        entry,
+        TranscriptFacts {
+            first_prompt,
+            labels,
+        },
     ))
 }
 
@@ -356,7 +545,15 @@ fn claude_user_text(object: &Value) -> Option<String> {
     })
 }
 
-fn latest_claude_ai_title(path: &Path) -> Option<String> {
+#[derive(Default)]
+struct ClaudeTail {
+    title: Option<String>,
+    labels: String,
+}
+
+/// The newest title, branch, and linked PR from the bounded transcript tail,
+/// which is where Claude's own picker reads them.
+fn claude_tail(path: &Path) -> Option<ClaudeTail> {
     let mut file = File::open(path).ok()?;
     let end = file.seek(SeekFrom::End(0)).ok()?;
     let start = end.saturating_sub(CLAUDE_TAIL_BYTES as u64);
@@ -366,9 +563,22 @@ fn latest_claude_ai_title(path: &Path) -> Option<String> {
         .read_to_end(&mut bytes)
         .ok()?;
 
+    let text = String::from_utf8_lossy(&bytes);
+    let mut labels = last_string_field(&text, "gitBranch").unwrap_or_default();
+    if let Some(number) = last_field(&text, "prNumber")
+        .map(str::trim_start)
+        .and_then(|value| value.split(|ch: char| !ch.is_ascii_digit()).next())
+        .filter(|number| !number.is_empty())
+    {
+        labels.push_str(&format!(" pr #{number}"));
+        if let Some(repository) = last_string_field(&text, "prRepository") {
+            labels.push(' ');
+            labels.push_str(&repository);
+        }
+    }
     let mut newest = None;
     let mut custom = None;
-    for line in String::from_utf8_lossy(&bytes).lines() {
+    for line in text.lines() {
         if !line.contains("\"ai-title\"") && !line.contains("\"custom-title\"") {
             continue;
         }
@@ -392,7 +602,26 @@ fn latest_claude_ai_title(path: &Path) -> Option<String> {
             newest = Some(title);
         }
     }
-    custom.or(newest)
+    Some(ClaudeTail {
+        title: custom.or(newest),
+        labels,
+    })
+}
+
+/// The text after the last `"field":` in `text`.
+fn last_field<'a>(text: &'a str, field: &str) -> Option<&'a str> {
+    let key = format!("\"{field}\":");
+    text.rfind(&key).map(|at| &text[at + key.len()..])
+}
+
+/// The last JSON string value of `field`, without parsing whole lines.
+fn last_string_field(text: &str, field: &str) -> Option<String> {
+    let value = last_field(text, field)?;
+    serde_json::Deserializer::from_str(value.trim_start())
+        .into_iter::<String>()
+        .next()?
+        .ok()
+        .filter(|value| !value.is_empty())
 }
 
 fn scan_codex(root: &Path, scanner: &mut HistoryScanner) -> Vec<HistoryEntry> {
@@ -414,9 +643,9 @@ fn scan_codex(root: &Path, scanner: &mut HistoryScanner) -> Vec<HistoryEntry> {
                     }
                     // Names can change without the transcript changing. The
                     // index revision participates in cache invalidation below.
-                    if let Some(entry) =
-                        scanner.read(&path, Some(&titles), || codex_entry(&path, &titles))
-                    {
+                    if let Some(entry) = scanner.read(&path, Some(&titles), || {
+                        codex_entry(&path, &titles)
+                    }) {
                         result.push(entry);
                     }
                 }
@@ -426,7 +655,10 @@ fn scan_codex(root: &Path, scanner: &mut HistoryScanner) -> Vec<HistoryEntry> {
     result
 }
 
-fn codex_entry(path: &Path, titles: &HashMap<String, String>) -> Option<HistoryEntry> {
+fn codex_entry(
+    path: &Path,
+    titles: &HashMap<String, String>,
+) -> Option<(HistoryEntry, TranscriptFacts)> {
     let first = read_first_line(path, CODEX_FIRST_LINE_CAP).ok()??;
     let object: Value = serde_json::from_str(&first).ok()?;
     if object.get("type").and_then(Value::as_str) != Some("session_meta") {
@@ -456,13 +688,17 @@ fn codex_entry(path: &Path, titles: &HashMap<String, String>) -> Option<HistoryE
                 id.chars().take(8).collect::<String>()
             ))
         });
-    Some(history_entry(
-        id,
-        AgentKind::CODEX,
-        cwd,
-        title,
-        path,
-        &metadata,
+    let labels = payload
+        .pointer("/git/branch")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    Some((
+        history_entry(id, AgentKind::CODEX, cwd, title, path, &metadata),
+        TranscriptFacts {
+            first_prompt: None,
+            labels,
+        },
     ))
 }
 
@@ -590,6 +826,38 @@ fn useful_prompt(text: &str) -> Option<String> {
         text = text[end..].trim();
     }
     (!text.is_empty()).then(|| title_from_prompt(text.to_owned()))
+}
+
+/// Every prompt typed into each conversation, oldest first, from the bounded
+/// tail of a provider prompt log. Pasted content is logged as a placeholder.
+fn read_prompt_log(path: &Path) -> io::Result<HashMap<String, Vec<String>>> {
+    let mut file = File::open(path)?;
+    let end = file.seek(SeekFrom::End(0))?;
+    let start = end.saturating_sub(PROMPT_LOG_CAP);
+    file.seek(SeekFrom::Start(start))?;
+    let mut lines = BufReader::new(file.take(PROMPT_LOG_CAP)).lines();
+    if start > 0 {
+        lines.next();
+    }
+    let mut prompts = HashMap::<String, Vec<String>>::new();
+    for line in lines.map_while(Result::ok) {
+        let Ok(LoggedPrompt {
+            session: Some(session),
+            text: Some(text),
+        }) = serde_json::from_str::<LoggedPrompt>(&line)
+        else {
+            continue;
+        };
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        if text.is_empty() {
+            continue;
+        }
+        let list = prompts.entry(session.into_owned()).or_default();
+        if list.last() != Some(&text) {
+            list.push(text);
+        }
+    }
+    Ok(prompts)
 }
 
 /// Read provider names in batches, once per scan, rather than once per rollout.
@@ -888,10 +1156,101 @@ mod tests {
         };
         let mut search = HistorySearch::default();
         search.rebuild(&[entry]);
-        assert_eq!(search.rank("hpal"), [0]);
+        assert_eq!(search.rank("hpal"), [0], "fuzzy fallback for typos");
         assert_eq!(search.rank("diri"), [0]);
-        assert_eq!(search.rank("claude tmp history"), [0]);
+        assert_eq!(search.rank("claude dirijor history"), [0]);
         assert!(search.rank("zebra").is_empty());
+    }
+
+    fn entry(id: &str, title: &str, cwd: &str, age: f64) -> HistoryEntry {
+        HistoryEntry {
+            id: id.to_owned(),
+            kind: AgentKind::CLAUDE_CODE,
+            cwd: cwd.to_owned(),
+            title: Some(title.to_owned()),
+            transcript_path: String::new(),
+            last_active_at: DateMillis(1e12 - age),
+            created_at: None,
+            cwd_exists: true,
+        }
+    }
+
+    #[test]
+    fn search_ranks_title_then_folder_then_prompts_newest_first() {
+        let entries = [
+            entry("a", "Sidebar polish", "/w/app", 0.0),
+            entry("b", "Fix ssh askpass", "/w/app", 1.0),
+            entry("c", "Session shell history", "/w/app", 2.0),
+            entry("d", "Refactor", "/w/ssh-tools", 3.0),
+            entry("e", "Old ssh bootstrap", "/w/app", 4.0),
+        ];
+        let mut search = HistorySearch::default();
+        search.set_search_text(Arc::new(HashMap::from([
+            (
+                "a".to_owned(),
+                SearchText {
+                    labels: "polish/sidebar pr #812 cristicretu/diri".to_owned(),
+                    prompts: "why does SSH reconnect hang\n".to_owned(),
+                },
+            ),
+            (
+                "b".to_owned(),
+                SearchText {
+                    labels: "fix/askpass-prompt".to_owned(),
+                    prompts: String::new(),
+                },
+            ),
+        ])));
+        search.rebuild(&entries);
+        // "ssh" is a subsequence of "Session shell" but not a word in it.
+        assert_eq!(search.rank("ssh"), [1, 4, 3, 0]);
+        assert_eq!(search.rank("ssh reconnect"), [0]);
+        assert_eq!(search.rank("ssh !askpass"), [4, 3, 0]);
+        assert_eq!(search.rank("SIDEBAR"), [0]);
+        assert_eq!(search.rank("pr #812"), [0], "Claude's PR label");
+        assert_eq!(search.rank("fix/"), [1], "git branch");
+        assert_eq!(search.rank("sbar"), [0], "abbreviations fall back to fuzzy");
+        assert!(search.rank("ahsbr").is_empty(), "scattered letters do not");
+    }
+
+    #[test]
+    fn prompt_logs_make_every_typed_prompt_searchable() {
+        let temp = TempDir::new().unwrap();
+        let roots = fixture_roots(&temp);
+        let id = "0123456789abcdef0123456789abcdef";
+        let project = roots.claude.join("-tmp");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(
+            project.join(format!("{id}.jsonl")),
+            format!(
+                "{}\n{}\n{}\n",
+                serde_json::json!({"type":"user","cwd":"/tmp","message":{"content":"first ask"}}),
+                serde_json::json!({"type":"ai-title","aiTitle":"Generated","gitBranch":"feat/history"}),
+                serde_json::json!({"type":"pr-link","prNumber":819,"prRepository":"cristicretu/diri"}),
+            ),
+        )
+        .unwrap();
+        fs::write(
+            temp.path().join("history.jsonl"),
+            format!(
+                "{}\n{}\nnot json\n",
+                serde_json::json!({"display":"later   follow-up","sessionId":id,"pastedContents":{}}),
+                serde_json::json!({"session_id":"thread","text":"codex prompt"}),
+            ),
+        )
+        .unwrap();
+        let mut scanner = HistoryScanner::default();
+        let entries = scanner.scan(&roots, &HashSet::new());
+        assert_eq!(entries[0].title.as_deref(), Some("Generated"));
+        let prompts = scanner.search_text();
+        assert_eq!(prompts[id].prompts, "first ask\nlater follow-up\n");
+        assert_eq!(prompts[id].labels, "feat/history pr #819 cristicretu/diri");
+        assert_eq!(prompts["thread"].prompts, "codex prompt\n");
+        let mut search = HistorySearch::default();
+        search.set_search_text(prompts);
+        search.rebuild(&entries);
+        assert_eq!(search.rank("follow-up"), [0]);
+        assert_eq!(search.rank("first ask"), [0]);
     }
 
     #[test]
