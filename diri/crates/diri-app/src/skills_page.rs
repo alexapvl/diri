@@ -105,9 +105,13 @@ impl SkillsPage {
         let generation = self.generation;
         self.loading = true;
         self.clear_copy_feedback();
-        self.selected = None;
+        // Detail-view targets (Back/Copy/Show file) mean nothing in the list.
+        if self.selected.take().is_some() {
+            self.keyboard_target = 6;
+        }
         self.document = None;
         self.instructions = None;
+        self.detail_error = None;
         self.detail_task = None;
         let home = diri_platform::home_dir()
             .map(|p| p.into_os_string())
@@ -208,6 +212,7 @@ impl SkillsPage {
             return;
         };
         cx.write_to_clipboard(ClipboardItem::new_string(instructions.clone()));
+        self.keyboard_target = 1;
         self.copied = true;
         // Replacing the task cancels the previous reset, extending feedback
         // from the most recent copy without an old timer clearing a new one.
@@ -333,6 +338,17 @@ impl SkillsPage {
         target: usize,
         colors: SemanticColors,
     ) -> gpui::Stateful<gpui::Div> {
+        self.button_with(id, label, label, target, colors)
+    }
+
+    fn button_with(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        content: impl IntoElement,
+        target: usize,
+        colors: SemanticColors,
+    ) -> gpui::Stateful<gpui::Div> {
         div()
             .id(id)
             .role(gpui::Role::Button)
@@ -353,7 +369,7 @@ impl SkillsPage {
             .cursor_pointer()
             .hover(move |style| style.bg(colors.primary.alpha(0.07)))
             .active(move |style| style.bg(colors.primary.alpha(0.11)))
-            .child(label)
+            .child(content)
     }
 }
 
@@ -395,26 +411,35 @@ impl Render for SkillsPage {
                         .on_click(cx.listener(|this, _, _, cx| this.back(cx))),
                 )
                 .child(
-                    self.button(
+                    // Both labels are laid out and the hidden one collapses to
+                    // zero height, so the button is as wide as the longer one
+                    // in any locale and never moves when the label swaps. The
+                    // accessible name stays the action, not the feedback.
+                    self.button_with(
                         "skills-copy",
-                        if self.copied {
-                            t("settings.privacy.copied")
-                        } else {
-                            t("settings.skills.copy")
-                        },
+                        t("settings.skills.copy"),
+                        div()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .child(
+                                div()
+                                    .child(t("settings.skills.copy"))
+                                    .when(self.copied, |label| label.invisible().h_0()),
+                            )
+                            .child(
+                                div()
+                                    .child(t("settings.skills.copied"))
+                                    .when(!self.copied, |label| label.invisible().h_0()),
+                            ),
                         1,
                         colors,
                     )
                     .debug_selector(|| "skills-copy".into())
-                    // Reserve room for both labels in every supported locale.
-                    .w(px(160.0))
                     .flex_shrink_0()
                     .justify_center()
                     .when(self.instructions.is_none(), |button| button.opacity(0.45))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.keyboard_target = 1;
-                        this.copy_instructions(cx);
-                    })),
+                    .on_click(cx.listener(|this, _, _, cx| this.copy_instructions(cx))),
                 )
                 .child(
                     self.button("skills-reveal", t("settings.skills.show_file"), 2, colors)
@@ -786,8 +811,13 @@ mod tests {
                 cx.notify();
             });
             cx.write_to_clipboard(ClipboardItem::new_string("unchanged".into()));
+            page.update(cx, |page, _| page.keyboard_target = 0);
             let copy = cx.debug_bounds("skills-copy").unwrap().center();
             cx.simulate_click(copy, Modifiers::default());
+            cx.run_until_parked();
+            // A dimmed Copy that copied nothing does not take the focus ring.
+            assert_eq!(page.read_with(cx, |page, _| page.keyboard_target), 0);
+            page.update(cx, |page, _| page.keyboard_target = 1);
             cx.simulate_keystrokes("enter space");
             cx.run_until_parked();
             assert_eq!(
@@ -802,5 +832,22 @@ mod tests {
         cx.executor().advance_clock(Duration::from_secs(3));
         cx.run_until_parked();
         assert!(!page.read_with(cx, |page, _| page.copied));
+    }
+
+    #[gpui::test]
+    fn refresh_from_a_skill_returns_focus_to_the_list(cx: &mut TestAppContext) {
+        let (page, cx) = preview(cx);
+        page.update(cx, |page, cx| {
+            page.keyboard_target = 1;
+            page.detail_error = Some("Unreadable sample skill".to_owned());
+            page.refresh(cx);
+            // The fixture catalog is not on disk; keep it instead of scanning.
+            page.scan_task = None;
+        });
+        page.read_with(cx, |page, _| {
+            assert!(page.selected.is_none());
+            assert!(page.detail_error.is_none());
+            assert_eq!(page.keyboard_target, 6);
+        });
     }
 }
