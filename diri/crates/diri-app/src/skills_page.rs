@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use diri_ui::{Icon, IconName, IconSize, SemanticColors};
 use gpui::{
@@ -35,6 +36,8 @@ pub struct SkillsPage {
     instructions: Option<String>,
     detail_error: Option<String>,
     detail_task: Option<Task<()>>,
+    copied: bool,
+    copy_feedback_task: Option<Task<()>>,
     list_scroll: UniformListScrollHandle,
     detail_scroll: ScrollHandle,
 }
@@ -83,6 +86,8 @@ impl SkillsPage {
             instructions: None,
             detail_error: None,
             detail_task: None,
+            copied: false,
+            copy_feedback_task: None,
             list_scroll: UniformListScrollHandle::new(),
             detail_scroll: ScrollHandle::new(),
         }
@@ -99,6 +104,7 @@ impl SkillsPage {
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
         self.loading = true;
+        self.clear_copy_feedback();
         self.selected = None;
         self.document = None;
         self.instructions = None;
@@ -157,6 +163,7 @@ impl SkillsPage {
             return;
         };
         let path = skill.path.clone();
+        self.clear_copy_feedback();
         self.selected = Some(index);
         self.document = None;
         self.instructions = None;
@@ -191,7 +198,31 @@ impl SkillsPage {
         cx.notify();
     }
 
+    fn clear_copy_feedback(&mut self) {
+        self.copied = false;
+        self.copy_feedback_task = None;
+    }
+
+    fn copy_instructions(&mut self, cx: &mut Context<Self>) {
+        let Some(instructions) = &self.instructions else {
+            return;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(instructions.clone()));
+        self.copied = true;
+        // Replacing the task cancels the previous reset, extending feedback
+        // from the most recent copy without an old timer clearing a new one.
+        self.copy_feedback_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_secs(2)).await;
+            let _ = this.update(cx, |this, cx| {
+                this.copied = false;
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
     fn back(&mut self, cx: &mut Context<Self>) {
+        self.clear_copy_feedback();
         self.selected = None;
         self.document = None;
         self.instructions = None;
@@ -222,11 +253,7 @@ impl SkillsPage {
             "enter" | "space" if self.selected.is_some() => {
                 match self.keyboard_target {
                     0 => self.back(cx),
-                    1 => {
-                        if let Some(instructions) = &self.instructions {
-                            cx.write_to_clipboard(ClipboardItem::new_string(instructions.clone()));
-                        }
-                    }
+                    1 => self.copy_instructions(cx),
                     _ => {
                         if let Some(index) = self.selected {
                             cx.reveal_path(&self.catalog.skills[index].path);
@@ -368,15 +395,26 @@ impl Render for SkillsPage {
                         .on_click(cx.listener(|this, _, _, cx| this.back(cx))),
                 )
                 .child(
-                    self.button("skills-copy", t("settings.skills.copy"), 1, colors)
-                        .when(self.document.is_none(), |button| button.opacity(0.45))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            if let Some(instructions) = &this.instructions {
-                                cx.write_to_clipboard(ClipboardItem::new_string(
-                                    instructions.clone(),
-                                ));
-                            }
-                        })),
+                    self.button(
+                        "skills-copy",
+                        if self.copied {
+                            t("settings.privacy.copied")
+                        } else {
+                            t("settings.skills.copy")
+                        },
+                        1,
+                        colors,
+                    )
+                    .debug_selector(|| "skills-copy".into())
+                    // Reserve room for both labels in every supported locale.
+                    .w(px(160.0))
+                    .flex_shrink_0()
+                    .justify_center()
+                    .when(self.instructions.is_none(), |button| button.opacity(0.45))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.keyboard_target = 1;
+                        this.copy_instructions(cx);
+                    })),
                 )
                 .child(
                     self.button("skills-reveal", t("settings.skills.show_file"), 2, colors)
@@ -667,5 +705,102 @@ impl Render for SkillsPage {
                 .text_color(colors.tertiary)
                 .child(t("settings.skills.plugin_note")),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{Modifiers, TestAppContext, size};
+    use std::time::Duration;
+
+    fn preview(
+        cx: &mut TestAppContext,
+    ) -> (gpui::Entity<SkillsPage>, &mut gpui::VisualTestContext) {
+        let (store, _) = SessionStore::headless(Default::default());
+        let (page, cx) = cx.add_window_view(move |window, cx| {
+            let mut page = SkillsPage::new(Arc::new(RwLock::new(store)), cx);
+            page.seed_preview(true);
+            page.focus.focus(window, cx);
+            page
+        });
+        cx.simulate_resize(size(px(900.0), px(700.0)));
+        cx.run_until_parked();
+        (page, cx)
+    }
+
+    #[gpui::test]
+    fn pointer_enter_and_space_copy_without_moving_the_control(cx: &mut TestAppContext) {
+        let (page, cx) = preview(cx);
+        let bounds = cx.debug_bounds("skills-copy").unwrap();
+        let instructions = page.read_with(cx, |page, _| page.instructions.clone().unwrap());
+        for activation in ["pointer", "enter", "space"] {
+            if activation == "pointer" {
+                cx.simulate_click(bounds.center(), Modifiers::default());
+            } else {
+                cx.simulate_keystrokes(activation);
+            }
+            cx.run_until_parked();
+            assert_eq!(
+                cx.read_from_clipboard().and_then(|item| item.text()),
+                Some(instructions.clone())
+            );
+            assert!(page.read_with(cx, |page, _| page.copied));
+            assert_eq!(page.read_with(cx, |page, _| page.keyboard_target), 1);
+            assert_eq!(cx.debug_bounds("skills-copy").unwrap(), bounds);
+            // Each activation restarts the timer, rather than the first copy clearing it.
+            cx.executor().advance_clock(Duration::from_millis(1500));
+            cx.run_until_parked();
+            assert!(page.read_with(cx, |page, _| page.copied));
+        }
+        cx.executor().advance_clock(Duration::from_millis(501));
+        cx.run_until_parked();
+        assert!(!page.read_with(cx, |page, _| page.copied));
+        assert_eq!(cx.debug_bounds("skills-copy").unwrap(), bounds);
+        // Focus stays on the copy action even after the feedback expires.
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert!(page.read_with(cx, |page, _| page.copied));
+    }
+
+    #[gpui::test]
+    fn navigation_clears_feedback_and_unavailable_instructions_never_copy(cx: &mut TestAppContext) {
+        let (page, cx) = preview(cx);
+        let copy = cx.debug_bounds("skills-copy").unwrap().center();
+        cx.simulate_click(copy, Modifiers::default());
+        cx.run_until_parked();
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(!page.read_with(cx, |page, _| page.copied));
+        assert!(page.read_with(cx, |page, _| page.selected.is_none()));
+        // A fixture-only path is never read: cancel the load before driving the UI.
+        page.update(cx, |page, cx| {
+            page.open_skill(1, cx);
+            page.detail_task = None;
+        });
+        cx.run_until_parked();
+        assert!(!page.read_with(cx, |page, _| page.copied));
+        for error in [None, Some("Unreadable sample skill".to_owned())] {
+            page.update(cx, |page, cx| {
+                page.detail_error = error;
+                cx.notify();
+            });
+            cx.write_to_clipboard(ClipboardItem::new_string("unchanged".into()));
+            let copy = cx.debug_bounds("skills-copy").unwrap().center();
+            cx.simulate_click(copy, Modifiers::default());
+            cx.simulate_keystrokes("enter space");
+            cx.run_until_parked();
+            assert_eq!(
+                cx.read_from_clipboard()
+                    .and_then(|item| item.text())
+                    .as_deref(),
+                Some("unchanged")
+            );
+            assert!(!page.read_with(cx, |page, _| page.copied));
+            assert!(page.read_with(cx, |page, _| page.selected == Some(1)));
+        }
+        cx.executor().advance_clock(Duration::from_secs(3));
+        cx.run_until_parked();
+        assert!(!page.read_with(cx, |page, _| page.copied));
     }
 }
