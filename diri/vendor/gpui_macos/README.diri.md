@@ -91,3 +91,9 @@ implementation, so upstream behavior is unchanged. It runs only when an
 accessibility client asks. `diri-app`'s `terminal_accessibility_appkit` test
 installs this exact method on a plain view and checks the window's focused
 element.
+
+The glyph raster style patch (see `vendor/gpui/DIRI_PATCHES.md`) adds a
+second `CGTextStroke` pass when `RenderGlyphParams::stroke` is non-zero, with
+one more device pixel of raster margin, and a `font_faces` listing plus a
+sub-1.0 weight snap in `font_id`. With `stroke == 0` the rasterizer runs
+upstream's single fill unchanged.
