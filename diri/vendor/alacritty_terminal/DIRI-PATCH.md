@@ -278,6 +278,19 @@ produced. Both are O(1) unless the limit drops below the rows held. No wire,
 checkpoint or protocol change; the parser source is part of the Remote Helper
 Build ID. Test: `a_resize_at_capacity_keeps_every_retained_line`.
 
+## Byte-bounded history depth
+
+With compact history the configured `scrolling_history` is only a ceiling.
+`Grid::bound_history_storage(budget, ceiling)` lowers the row limit to the rows
+retained once the byte budget evicts, so new lines recycle the oldest row as at
+a fixed cap, and restores the ceiling when stored history falls 1/16 below the
+budget. `Term::resize` restores the ceiling before reflow so rows are never
+dropped by count that the byte budget would keep. Growing history reuses the
+cells of the newest sealed block (`RowCodec::clear_row`). Column changes keep
+stored rows when only the oldest block is partial, and the deferred line index
+reserves exact capacity and tracks its extras' heap incrementally (the history
+bound measures storage after every eviction).
+
 ## Program colors: a generation, and RIS resets them
 
 `Term` keeps `colors_generation`, advanced whenever `set_color` or
