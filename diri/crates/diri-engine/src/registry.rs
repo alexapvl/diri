@@ -2633,6 +2633,12 @@ fn fold_session_view(record: &mut SessionRecord, view: &SessionView) {
     record.remote_connection = view.remote_connection;
     record.terminal_progress = view.terminal_progress;
     fold_session_status(record, view);
+    if let Some(run) = record.command_run.as_mut()
+        && run.ran_ms.is_none()
+        && let Some(ran) = view.ran
+    {
+        run.ran_ms = Some(u64::try_from(ran.as_millis()).unwrap_or(u64::MAX));
+    }
     // cursor-agent (and similar) stamp a brand/status OSC title as soon as
     // they are idle. That must not freeze the record as AgentProvided, or
     // the first real prompt can never name the session.
@@ -3051,6 +3057,7 @@ fn recovered_record(capsule: diri_proto::recovery::SessionRecoveryCapsule) -> Se
     let now = DateMillis::from(std::time::SystemTime::now());
     let project_id = session_project_id(&capsule.cwd, None);
     SessionRecord {
+        command_run: None,
         attention_state: None,
         id: capsule.session_id,
         kind: AgentKind::new(capsule.manifest_id),
@@ -3293,6 +3300,7 @@ mod tests {
 
     fn record(id: &str) -> SessionRecord {
         SessionRecord {
+            command_run: None,
             attention_state: None,
             id: SessionId(id.into()),
             kind: AgentKind::SHELL,
@@ -4684,6 +4692,7 @@ mod tests {
     #[test]
     fn a_shell_is_named_after_its_foreground_program_or_directory() {
         let view = |program: Option<&str>, agent: Option<&str>, title: Option<&str>| SessionView {
+            ran: None,
             remote_connection: None,
             foreground_program: program.map(str::to_owned),
             foreground_agent: agent.map(str::to_owned),
@@ -4770,6 +4779,7 @@ mod tests {
             process_name: "node".to_owned(),
         };
         let view = |program: Option<&str>, ports: Vec<diri_proto::PortInfo>| SessionView {
+            ran: None,
             remote_connection: None,
             foreground_program: program.map(str::to_owned),
             foreground_agent: None,
@@ -4860,6 +4870,7 @@ mod tests {
     #[test]
     fn pty_titles_are_filtered_fallbacks_and_never_override_user_renames() {
         let view = SessionView {
+            ran: None,
             remote_connection: None,
             foreground_program: None,
             foreground_agent: None,
@@ -5025,6 +5036,7 @@ mod tests {
         // A newly attached Session has no captured prompt. Its first input can
         // be a follow-up to the conversation whose title was already saved.
         let view = SessionView {
+            ran: None,
             remote_connection: None,
             foreground_program: None,
             foreground_agent: None,
@@ -5146,6 +5158,7 @@ mod tests {
             session.title = "Fix chat naming".into();
             session.title_source = TitleSource::FirstPrompt;
             let view = SessionView {
+                ran: None,
                 remote_connection: None,
                 foreground_program: None,
                 foreground_agent: None,
@@ -5175,6 +5188,7 @@ mod tests {
         session.kind = AgentKind::CODEX;
         session.cwd = "/work/anara".into();
         let mut view = SessionView {
+            ran: None,
             remote_connection: None,
             foreground_program: None,
             foreground_agent: None,
@@ -5716,6 +5730,7 @@ mod tests {
         session.kind = AgentKind::CLAUDE_CODE;
         session.status = SessionStatus::Working;
         let view = SessionView {
+            ran: None,
             remote_connection: None,
             foreground_program: None,
             foreground_agent: None,
@@ -5812,6 +5827,7 @@ mod tests {
         after.load().expect("load");
         let mut adopted = after.record("shell").expect("record");
         let unsampled = SessionView {
+            ran: None,
             remote_connection: None,
             foreground_program: None,
             foreground_ports: Vec::new(),
