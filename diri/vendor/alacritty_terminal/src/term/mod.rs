@@ -507,6 +507,19 @@ pub enum Osc52 {
 }
 
 impl<T> Term<T> {
+    /// Release the primary grid's history caches once output is idle.
+    #[cfg(feature = "compact-history")]
+    pub fn release_idle_history(&mut self) {
+        if self.mode.contains(TermMode::ALT_SCREEN) {
+            self.inactive_grid
+                .as_mut()
+                .expect("primary grid")
+                .release_idle_history();
+        } else {
+            self.grid.release_idle_history();
+        }
+    }
+
     /// DIRI PATCH: history rows of the primary screen, also while the
     /// alternate screen is shown.
     pub fn primary_history_size(&self) -> usize {
