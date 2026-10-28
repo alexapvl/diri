@@ -623,6 +623,7 @@ impl Render for ActionHarness {
             CompactDensity,
             OpenSettings,
             ToggleNotifications,
+            ToggleActivity,
             ToggleReadAloud,
             CheckForUpdates,
             ShowWhatsNew,
