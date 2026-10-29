@@ -1,11 +1,15 @@
 # Golden digests for benches/vt_workloads.rs. Do not edit by hand.
 #
-# Reference: diri 0b54ea089 (origin/main, with #921's live-byte history
-# budget, #925's style hash and #843's query replies) and only the
-# passive `bench-verify` observers added (no parser change), built in
+# Reference: diri 589d0a46c (origin/main, with #921's live-byte history
+# budget, #925's style hash, #843's query replies, #927's observers,
+# #924's LZ skip and #922/#923's parser paths; no other change), built in
 # release and fed one byte per read with the OSC checksum on. The
 # generated digests are identical to the first reference (3fc4feb66 with
-# #921's c23006a27); the kitten capture digests are carried over from it:
+# #921's c23006a27); the kitten capture digests are carried over from it.
+# The generated ascii and unicode digests cover the newest rows that
+# `DECLARED_HISTORY_ROWS` declares (62,961 and 53,648; the reference kept
+# 63,313 and 54,128), regenerated at the same reference with that
+# declaration:
 #
 #   cargo build --release -p diri-terminal-state --features bench-verify --bench vt_workloads
 #   DIRI_VT_BENCH_GOLDEN=$PWD/crates/diri-terminal-state/benches/vt_workloads.golden <bench binary> --bench
@@ -21,12 +25,12 @@ bytes_fed = 67109280
 clipboard = 0 sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 cursor = (9, 79, true)
 grid_sha256 = 0bdd638dfe0da16daa647ea76e34c74502b6ba23ca84afd27820cb74733c1365
-history_rows_checked = 63537
-history_rows_reference = 63537
+history_rows_checked = 62961
+history_rows_reference = 63313
 images_held_bytes = 0
 images_stored = count=0
 keyboard = KeyboardState { enhancements: Some(KeyboardEnhancements(0)), application_cursor_keys: false, application_keypad: false }
-links = 0 sha256=42475689862da2c92a584e37de737353bca43690b4633004b93ed4e0e4ace183
+links = 0 sha256=c58a7b23515c472e9b1dc539a3ae0c0c64575274ba53dbf277b92b222df15156
 modes = alt=false paste=false focus=false mouse=MouseModes { tracking: Off, encoding: Legacy } cursor=CursorStyle { shape: Block, steady: false }
 notifications = 0 sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 osc_checksum = cbf29ce484222325
@@ -37,8 +41,8 @@ program_status = None
 progress = None
 replies = 0B sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 reps = 32
-scrollback_cells_sha256 = 97eced81f8740707a7955c5a142daaa0dadfff8dd4a9aa2bef75e3784580f744
-scrollback_metadata_sha256 = ae5d8149f73fa80acfebb3b8e7355eb70e6125d44edbd44b9cb853a7d4b0dbd4
+scrollback_cells_sha256 = 68f5476174468b60e2c80ad6e4e71324d392e4849b49ff227c4d01ca5a620229
+scrollback_metadata_sha256 = dff6a3a2bbf39717be1fc087eb2d5b997341a050242e64b528c2f130590907e5
 scrollback_text_sha256 = f41b74c9c18597b11893115fb7d25addce8c3d68445445ee02b4593e4993d8d9
 size = 120x80
 synchronized = completed_any=false open=false
@@ -137,12 +141,12 @@ bytes_fed = 68308992
 clipboard = 0 sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 cursor = (119, 79, true)
 grid_sha256 = e92d906246c828031f21a118c93fd783e7bdf357f1383f6ec35554e82d93b0b9
-history_rows_checked = 54608
-history_rows_reference = 54608
+history_rows_checked = 53648
+history_rows_reference = 54128
 images_held_bytes = 0
 images_stored = count=0
 keyboard = KeyboardState { enhancements: Some(KeyboardEnhancements(0)), application_cursor_keys: false, application_keypad: false }
-links = 0 sha256=7c5533c308170a081b6ed8049b7ee47b449dd2ed7911d31f66c669664966ebec
+links = 0 sha256=5d1767e9eda3c97b840bc97f1e7a0b4baa164eb9dfdd629fa03fbae48bf8efd8
 modes = alt=false paste=false focus=false mouse=MouseModes { tracking: Off, encoding: Legacy } cursor=CursorStyle { shape: Block, steady: false }
 notifications = 0 sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 osc_checksum = cbf29ce484222325
@@ -153,8 +157,8 @@ program_status = None
 progress = None
 replies = 0B sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 reps = 36
-scrollback_cells_sha256 = 47c95b57d98a9d0c5e31685a1770f9054cc45725f296963a5409af5f9e2ca9b3
-scrollback_metadata_sha256 = cb89a788cfd9974ca01d96202b2d751d7ee528bb13a057cb83e088942bdf44b5
+scrollback_cells_sha256 = fb4b8ae2f70ef440c80ebfd15c6443e9e4bf0c19757d7768955bbbe840afadeb
+scrollback_metadata_sha256 = 9284f11ba0dde714b8b8400d83618d9346edd59a0eea6b7ab7e0c92504e67cab
 scrollback_text_sha256 = 47785b37a4c0760c70feb71e774bcec734b7cdab859c504493ed660051ce2b69
 size = 120x80
 synchronized = completed_any=false open=false
