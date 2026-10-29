@@ -79,11 +79,11 @@ pub(super) fn read_row(pages: &Pages, line: i32, out: &mut Vec<GridCell>) {
     let cols = pages.cols;
     let (p, r) = pages.locate_line(line);
     let page = pages.page(p);
-    let meta = page.meta[r];
+    let meta = pages.meta(p, r);
     let occ = meta.occ as usize;
     let mut linked = Vec::new();
     out.clear();
-    pages.read(p, |cells, clusters| {
+    pages.read(p, |_, cells, clusters| {
         for x in 0..cols {
             let cell = if x < occ {
                 cells[r * cols + x]

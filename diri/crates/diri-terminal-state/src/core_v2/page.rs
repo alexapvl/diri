@@ -53,11 +53,17 @@ pub struct StyleTable {
 }
 
 impl StyleTable {
-    #[inline]
+    #[inline(always)]
     pub fn intern(&mut self, style: &Style) -> u16 {
-        if *style == Style::default() {
+        debug_assert_eq!(style.is_default(), *style == Style::default());
+        if style.is_default() {
             return 0;
         }
+        self.intern_other(style)
+    }
+
+    #[inline(never)]
+    fn intern_other(&mut self, style: &Style) -> u16 {
         if self.table.is_empty() {
             self.table.push(Style::default());
         }
@@ -142,9 +148,15 @@ impl Clusters {
         self.chars.clear();
     }
 
-    fn release(&mut self) {
-        self.spans = Vec::new();
-        self.chars = Vec::new();
+    /// Empties the arena for the next page, keeping a small one's
+    /// capacity (a page of marks takes a few KiB) and freeing a large one.
+    fn reuse(&mut self) {
+        const KEEP: usize = 16 << 10;
+        if self.spans.capacity() * 8 + self.chars.capacity() * 4 > KEEP {
+            *self = Clusters::default();
+        } else {
+            self.clear();
+        }
     }
 
     /// A new cluster holding `chars`; returns its index.
@@ -170,7 +182,7 @@ impl Clusters {
         self.spans[index].1 += 1;
     }
 
-    fn full(&self) -> bool {
+    pub fn full(&self) -> bool {
         self.spans.len() >= 0xFFFF || self.chars.len() >= 1 << 20
     }
 }
@@ -300,20 +312,119 @@ impl TextLog {
             let index = cp - CJK_BASE;
             self.extend(row, &[CJK_LEADS[(index >> 8) as usize], index as u8]);
         } else {
-            self.extend(row, utf8);
+            self.small(row, utf8);
         }
     }
 
-    /// Tokens of `cps`, three-byte characters whose UTF-8 is `utf8`.
+    /// One to four bytes, without a call to `memcpy`.
     #[inline(always)]
-    pub fn chars3(&mut self, row: usize, cps: &[u32], utf8: &[u8]) {
-        debug_assert_eq!(utf8.len(), cps.len() * 3);
-        self.bytes.reserve(utf8.len());
+    fn small(&mut self, row: usize, bytes: &[u8]) {
+        debug_assert!((1..=4).contains(&bytes.len()));
+        self.bytes.reserve(4);
         let len = self.bytes.len();
-        // SAFETY: at most three bytes per character were reserved.
+        // SAFETY: four bytes are reserved past `len`; only `bytes.len()` of
+        // them become part of the vector.
+        let mut word = 0u32;
+        for (k, &b) in bytes.iter().enumerate() {
+            word |= (b as u32) << (8 * k);
+        }
+        unsafe {
+            (self.bytes.as_mut_ptr().add(len) as *mut u32).write_unaligned(word.to_le());
+            self.bytes.set_len(len + bytes.len());
+        }
+        self.spans[row].1 += bytes.len() as u32;
+    }
+
+    // ---- the text path's writers ----
+    //
+    // `write_text_segment` reserves room for every cell it may still write
+    // ([`TextLog::reserve_cells`]), writes tokens without capacity checks,
+    // and adds the bytes to the row once ([`TextLog::add_to_row`]). A
+    // character takes at most four bytes per cell; a mark reserves again.
+
+    /// Room for the tokens of `cells` more cells (four bytes each).
+    #[inline(always)]
+    pub fn reserve_cells(&mut self, cells: usize) {
+        self.bytes.reserve(4 * cells + 32);
+    }
+
+    /// Bytes in the arena.
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    /// Whether the arena is empty.
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    /// Counts the `bytes` written since the arena held `from` towards `row`.
+    #[inline(always)]
+    pub fn add_to_row(&mut self, row: usize, from: usize) {
+        self.spans[row].1 += (self.bytes.len() - from) as u32;
+    }
+
+    /// A character's token (see [`TextLog::char`]) for the character
+    /// whose UTF-8 starts `utf8` (which may run on past it), covering one
+    /// or two cells.
+    ///
+    /// # Safety
+    /// [`TextLog::reserve_cells`] covered the cells written since.
+    #[inline(always)]
+    pub unsafe fn put_char(&mut self, cp: u64, utf8: &[u8]) {
+        debug_assert!(self.bytes.capacity() - self.bytes.len() >= 4);
+        let len = self.bytes.len();
+        let index = cp.wrapping_sub(CJK_BASE);
+        let (word, n) = if index < CJK_END - CJK_BASE {
+            (
+                CJK_LEADS[(index >> 8) as usize] as u32 | (index as u32 & 0xFF) << 8,
+                2,
+            )
+        } else if let Some(&word) = utf8.first_chunk::<4>() {
+            // The bytes after the character are written past it and
+            // overwritten later (or left past the vector's end).
+            (u32::from_le_bytes(word), len_of(utf8[0]))
+        } else {
+            let n = len_of(utf8[0]);
+            let mut word = 0u32;
+            for (k, &b) in utf8[..n].iter().enumerate() {
+                word |= (b as u32) << (8 * k);
+            }
+            (word, n)
+        };
+        // SAFETY: four bytes of room (the caller's reservation); `n` of
+        // them join the vector.
+        unsafe {
+            (self.bytes.as_mut_ptr().add(len) as *mut u32).write_unaligned(word.to_le());
+            self.bytes.set_len(len + n);
+        }
+    }
+
+    /// Tokens of `cps`, two-column three-byte characters whose UTF-8 is
+    /// `utf8`.
+    ///
+    /// # Safety
+    /// As [`TextLog::put_char`]: their `2 * cps.len()` cells are reserved.
+    #[inline(always)]
+    pub unsafe fn put_chars3(&mut self, cps: &[u32; 16], n: usize, utf8: &[u8]) {
+        debug_assert!(n <= 16 && utf8.len() >= 3 * n);
+        let len = self.bytes.len();
+        debug_assert!(self.bytes.capacity() - len >= 8 * n);
+        // SAFETY: 8 * n bytes of room; at most 3 * n are written, or 32
+        // when n >= 4.
         let ptr = unsafe { self.bytes.as_mut_ptr().add(len) };
+        #[cfg(target_arch = "aarch64")]
+        if n >= 4
+            && let Some(()) = unsafe { cjk_codes16(cps, ptr) }
+        {
+            // SAFETY: 2 * n of the 32 bytes written are tokens.
+            unsafe { self.bytes.set_len(len + 2 * n) };
+            return;
+        }
         let mut w = 0;
-        for (k, &cp) in cps.iter().enumerate() {
+        for (k, &cp) in cps[..n].iter().enumerate() {
             let index = (cp as u64).wrapping_sub(CJK_BASE);
             unsafe {
                 if index < CJK_END - CJK_BASE {
@@ -328,7 +439,15 @@ impl TextLog {
         }
         // SAFETY: `w` bytes were written within the reserved capacity.
         unsafe { self.bytes.set_len(len + w) };
-        self.spans[row].1 += w as u32;
+    }
+
+    /// A zero-width mark (its UTF-8) on the cell before; keeps room for
+    /// `cells` more cells.
+    #[inline]
+    pub fn put_mark(&mut self, utf8: &[u8], cells: usize) {
+        self.bytes.push(T_MARK);
+        self.bytes.extend_from_slice(utf8);
+        self.reserve_cells(cells);
     }
 
     pub fn leading(&mut self, row: usize) {
@@ -345,6 +464,80 @@ impl TextLog {
         self.spans.fill((INVALID, 0));
     }
 }
+
+/// The length of the UTF-8 sequence led by valid lead byte `b0`.
+#[inline(always)]
+fn len_of(b0: u8) -> usize {
+    1 + (b0 >= 0xC0) as usize + (b0 >= 0xE0) as usize + (b0 >= 0xF0) as usize
+}
+
+/// Writes the two-byte codes of sixteen characters, all of them from
+/// U+4E00 on (see [`CJK_LEADS`]), as 32 bytes at `out`; `None` (writing
+/// nothing) when any is outside that range.
+///
+/// # Safety
+/// `out` has room for 32 bytes.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn cjk_codes16(cps: &[u32; 16], out: *mut u8) -> Option<()> {
+    use std::arch::aarch64::*;
+    // SAFETY: NEON is baseline on aarch64; the loads read `cps` and the
+    // lead table, the store writes the caller's 32 bytes.
+    unsafe {
+        let base = vdupq_n_u32(CJK_BASE as u32);
+        let span = vdupq_n_u32((CJK_END - CJK_BASE) as u32);
+        let p = cps.as_ptr();
+        let (a, b, c, d) = (
+            vsubq_u32(vld1q_u32(p), base),
+            vsubq_u32(vld1q_u32(p.add(4)), base),
+            vsubq_u32(vld1q_u32(p.add(8)), base),
+            vsubq_u32(vld1q_u32(p.add(12)), base),
+        );
+        let inside = vandq_u32(
+            vandq_u32(vcltq_u32(a, span), vcltq_u32(b, span)),
+            vandq_u32(vcltq_u32(c, span), vcltq_u32(d, span)),
+        );
+        if vminvq_u32(inside) == 0 {
+            return None;
+        }
+        let narrow = |x: uint32x4_t, y: uint32x4_t| vcombine_u16(vmovn_u32(x), vmovn_u32(y));
+        let (lo16, hi16) = (narrow(a, b), narrow(c, d));
+        let low = vcombine_u8(vmovn_u16(lo16), vmovn_u16(hi16));
+        let high = vcombine_u8(vshrn_n_u16::<8>(lo16), vshrn_n_u16::<8>(hi16));
+        let t = CJK_LEADS_PADDED.as_ptr();
+        let first = uint8x16x4_t(
+            vld1q_u8(t),
+            vld1q_u8(t.add(16)),
+            vld1q_u8(t.add(32)),
+            vld1q_u8(t.add(48)),
+        );
+        let second = uint8x16x3_t(
+            vld1q_u8(t.add(64)),
+            vld1q_u8(t.add(80)),
+            vld1q_u8(t.add(96)),
+        );
+        // Indices 0..64 read the first table, 64..100 the second (an
+        // index past a table reads as zero).
+        let lead = vorrq_u8(
+            vqtbl4q_u8(first, high),
+            vqtbl3q_u8(second, vsubq_u8(high, vdupq_n_u8(64))),
+        );
+        vst2q_u8(out, uint8x16x2_t(lead, low));
+        Some(())
+    }
+}
+
+/// [`CJK_LEADS`] padded to 112 bytes for table lookups.
+#[cfg(target_arch = "aarch64")]
+const CJK_LEADS_PADDED: [u8; 112] = {
+    let mut t = [0u8; 112];
+    let mut i = 0;
+    while i < 100 {
+        t[i] = CJK_LEADS[i];
+        i += 1;
+    }
+    t
+};
 
 /// An OSC 8 hyperlink: an explicit id, if the program gave one, and the URI.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -388,6 +581,10 @@ const T_BLANKS: u8 = 4;
 /// A leading spacer: a blank with LEADING, before a wide character that
 /// wrapped to the next row.
 const T_LEADING: u8 = 5;
+/// In a text row: a zero-width mark (its UTF-8 follows) joining the cluster
+/// of the cell before (its character, when that is a spacer). 0xC1 starts
+/// no other token, in text or general rows (never UTF-8, not a CJK lead).
+const T_MARK: u8 = 0xC1;
 /// The next cell has a hyperlink: u16 index into the page's link table.
 /// (0xC0 never starts UTF-8.)
 const T_LINK: u8 = 0xC0;
@@ -672,13 +869,23 @@ fn pack_text_row(cells: &[Cell], meta: &RowMeta, out: &mut Vec<u8>) -> bool {
     true
 }
 
-/// Decodes text-row tokens at `data[*at..]` into the `occ` cells of a row
-/// whose first `lead` cells are blanks of style `fill`.
-fn decode_text_row(data: &[u8], at: &mut usize, fill: u16, lead: usize, occ: usize) -> Vec<Cell> {
+/// Decodes text-row tokens at `data[*at..]` into `cells`, the occupied
+/// cells of a row whose first `lead` are blanks of style `fill`, adding
+/// marks to `clusters`.
+fn decode_text_row(
+    data: &[u8],
+    at: &mut usize,
+    fill: u16,
+    lead: usize,
+    cells: &mut [Cell],
+    clusters: &mut Clusters,
+) {
     let fill = (fill as u64) << STYLE_SHIFT;
-    let mut cells = vec![Cell(fill); occ];
+    let occ = cells.len();
+    cells.fill(Cell(fill));
     let mut x = lead;
-    while x < occ {
+    // A mark may follow the row's last cell.
+    while x < occ || data.get(*at) == Some(&T_MARK) {
         let byte = data[*at];
         *at += 1;
         let cp = match CJK_HIGH[byte as usize] {
@@ -691,6 +898,15 @@ fn decode_text_row(data: &[u8], at: &mut usize, fill: u16, lead: usize, occ: usi
                 let n = data[*at] as usize;
                 *at += 1;
                 x += n;
+                continue;
+            }
+            _ if byte == T_MARK => {
+                let c = char::from_u32(read_utf8(data, at) as u32).expect("a mark");
+                let mut base = x - 1;
+                if cells[base].has(SPACER) {
+                    base -= 1;
+                }
+                push_mark(cells, clusters, base, c);
                 continue;
             }
             0xFF if byte < 0x80 => byte as u64,
@@ -713,7 +929,19 @@ fn decode_text_row(data: &[u8], at: &mut usize, fill: u16, lead: usize, occ: usi
             x += 1;
         }
     }
-    cells
+}
+
+/// Adds `c` to the cluster of `cells[index]`, starting one when the cell
+/// has none. The caller makes sure the arena is not [`Clusters::full`].
+#[inline]
+pub fn push_mark(cells: &mut [Cell], clusters: &mut Clusters, index: usize, c: char) {
+    let cell = cells[index];
+    if cell.has(GRAPHEME) {
+        clusters.push((cell.0 >> CLUSTER_SHIFT) as usize, c);
+    } else {
+        let k = clusters.add(&[c]);
+        cells[index] = Cell((cell.0 & !CLUSTER) | GRAPHEME | k << CLUSTER_SHIFT);
+    }
 }
 
 /// Unchecked byte output into reserved capacity, with pending blanks.
@@ -826,7 +1054,7 @@ fn unpack_meta(data: &[u8], metas: &mut [RowMeta]) -> usize {
 }
 
 /// Dense buffers a packed page leaves behind, reused by the next tail page.
-type DenseBuffers = (Box<[Cell]>, Box<[RowMeta]>, TextLog);
+type DenseBuffers = (Box<[Cell]>, Box<[RowMeta]>, TextLog, Clusters);
 
 impl Page {
     fn new(
@@ -836,11 +1064,12 @@ impl Page {
         dense: Option<DenseBuffers>,
         logging: bool,
     ) -> Page {
-        let (cells, meta, text) = dense.unwrap_or_else(|| {
+        let (cells, meta, text, clusters) = dense.unwrap_or_else(|| {
             (
                 vec![Cell::default(); rows * cols].into_boxed_slice(),
                 vec![RowMeta::default(); rows].into_boxed_slice(),
                 TextLog::new(rows, logging),
+                Clusters::default(),
             )
         });
         Page {
@@ -849,7 +1078,7 @@ impl Page {
             cells,
             meta,
             styles: StyleTable::default(),
-            clusters: Clusters::default(),
+            clusters,
             text,
             links: None,
             packed: None,
@@ -905,13 +1134,7 @@ impl Page {
         if self.clusters.full() {
             self.compact_clusters();
         }
-        let cell = self.cells[index];
-        if cell.has(GRAPHEME) {
-            self.clusters.push((cell.0 >> CLUSTER_SHIFT) as usize, c);
-        } else {
-            let k = self.clusters.add(&[c]);
-            self.cells[index] = Cell((cell.0 & !CLUSTER) | GRAPHEME | k << CLUSTER_SHIFT);
-        }
+        push_mark(&mut self.cells, &mut self.clusters, index, c);
     }
 
     /// Rebuilds the arena from the clusters cells still name.
@@ -953,26 +1176,6 @@ impl Page {
             if occ > 0
                 && let Some(tokens) = self.text.get(row)
             {
-                let meta = &self.meta[row];
-                debug_assert_eq!(
-                    decode_text_row(&tokens[2..], &mut 0, meta.fill, meta.lead as usize, occ).len(),
-                    occ
-                );
-                debug_assert!(
-                    {
-                        let mut at = 0;
-                        let mut lead = tokens[1] as usize;
-                        let mut skip = 2;
-                        if lead == 255 {
-                            lead = u16::from_le_bytes([tokens[2], tokens[3]]) as usize;
-                            skip = 4;
-                        }
-                        lead == meta.lead as usize
-                            && decode_text_row(&tokens[skip..], &mut at, meta.fill, lead, occ)
-                                == cells
-                    },
-                    "text log of row {row}"
-                );
                 out.extend_from_slice(tokens);
                 continue;
             }
@@ -1118,7 +1321,6 @@ impl Page {
         }
         #[cfg(not(debug_assertions))]
         let _ = cols;
-        self.clusters.release();
         self.styles.freeze();
         if let Some(links) = &mut self.links {
             links.map = HashMap::new();
@@ -1126,7 +1328,9 @@ impl Page {
         let text = std::mem::replace(&mut self.text, TextLog::new(0, false));
         let cells = std::mem::take(&mut self.cells);
         let meta = std::mem::take(&mut self.meta);
-        (cells, meta, text)
+        let mut clusters = std::mem::take(&mut self.clusters);
+        clusters.reuse();
+        (cells, meta, text, clusters)
     }
 
     /// Decodes a packed page into `metas` (its rows), `cells` (rows *
@@ -1158,8 +1362,7 @@ impl Page {
                     at += 2;
                 }
                 metas[row].lead = lead as u16;
-                let row_cells = decode_text_row(data, &mut at, metas[row].fill, lead, occ);
-                cells.copy_from_slice(&row_cells);
+                decode_text_row(data, &mut at, metas[row].fill, lead, cells, clusters);
                 continue;
             }
             let mut x = 0;
@@ -1530,11 +1733,11 @@ impl Pages {
             }
             let cols = self.cols;
             let page = &mut self.pages[self.sealed];
-            let (cells, meta, mut text) = page.pack(cols, &mut self.scratch);
+            let (cells, meta, mut text, clusters) = page.pack(cols, &mut self.scratch);
             self.packed_bytes += page.stored_bytes();
             if self.spare_dense.len() < 2 {
                 text.clear();
-                self.spare_dense.push((cells, meta, text));
+                self.spare_dense.push((cells, meta, text, clusters));
             }
             self.sealed += 1;
         }
@@ -1660,17 +1863,20 @@ impl Pages {
             return;
         }
         let (cols, rows) = (self.cols, self.rows_per_page());
-        let mut cells = self
-            .spare_dense
-            .pop()
-            .map(|(cells, _)| cells)
-            .unwrap_or_else(|| vec![Cell::default(); rows * cols].into_boxed_slice());
-        let mut clusters = Clusters::default();
+        let (mut cells, mut meta, _, mut clusters) = self.spare_dense.pop().unwrap_or_else(|| {
+            (
+                vec![Cell::default(); rows * cols].into_boxed_slice(),
+                vec![RowMeta::default(); rows].into_boxed_slice(),
+                TextLog::new(rows, false),
+                Clusters::default(),
+            )
+        });
         let mut map = HashMap::new();
         let page = &mut self.pages[p];
         self.packed_bytes -= page.stored_bytes();
-        page.unpack(cols, &mut cells, &mut clusters, &mut map);
+        page.unpack(cols, &mut meta, &mut cells, &mut clusters, &mut map);
         page.cells = cells;
+        page.meta = meta;
         page.clusters = clusters;
         if !map.is_empty() {
             page.links.get_or_insert_with(Default::default).map = map;
@@ -1692,12 +1898,16 @@ impl Pages {
         if page.is_packed() {
             return;
         }
-        let (cells, _) = page.pack(cols, &mut self.scratch);
+        let (cells, meta, _, clusters) = page.pack(cols, &mut self.scratch);
         self.packed_bytes += page.stored_bytes();
         if self.spare_dense.len() < 2 {
             let logging = self.budget.is_some();
-            self.spare_dense
-                .push((cells, TextLog::new(self.rows_per_page(), logging)));
+            self.spare_dense.push((
+                cells,
+                meta,
+                TextLog::new(self.rows_per_page(), logging),
+                clusters,
+            ));
         }
     }
 }
