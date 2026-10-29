@@ -53,11 +53,13 @@
 //! commit in the file's header. Captured payloads are matched by SHA-256, so
 //! a different capture has no golden digest and is refused.
 //!
-//! A change that alters how many history rows the budget holds (a codec
-//! that compresses differently) declares its count per payload in
-//! `DECLARED_HISTORY_ROWS`, and the golden is regenerated at the reference
-//! with that declaration: the content of the rows kept is still checked
-//! against the reference, and their number against the declaration.
+//! Any PR that changes history retention (how many rows the budget keeps,
+//! or what they hold) must regenerate the golden in the same PR, generated
+//! and kitten sections both, and declare the row delta per workload.
+//! The delta is declared in `DECLARED_HISTORY_ROWS` and the golden is
+//! regenerated at the reference with that declaration: the content of the
+//! rows kept is still checked against the reference, and their number
+//! against the declaration.
 //!
 //! `DIRI_VT_BENCH_WRITE=<dir>` writes the payloads it uses there and exits,
 //! for `diri-engine`'s `vtbench` (the same workloads through Holder and
@@ -258,6 +260,19 @@ fn sha256(bytes: &[u8]) -> String {
     hex
 }
 
+/// The visible grid without where history stands (#905's `grid-history-v1`
+/// position, the snapshot's last field). Its origin counts evicted rows, so
+/// it follows retention, which `history_rows_checked` already compares
+/// against the reference or the declared count; a declared retention change
+/// would otherwise change the grid digest too. Snapshots from before #905
+/// have no such field and hash as they always did.
+fn without_history_position(mut text: String) -> String {
+    if let Some(at) = text.rfind(", history: ") {
+        text.replace_range(at..text.len() - " }".len(), "");
+    }
+    text
+}
+
 /// Image anchors name a per-screen store nonce; only the rest must match.
 fn without_store_nonce(text: String) -> String {
     const ANCHOR: &str = "diri-image:";
@@ -295,6 +310,15 @@ const DECLARED_HISTORY_ROWS: &[(&str, usize)] = &[
     ),
     (
         "unicode 33d19ab233c8bb6434f594a1afa41aec58f12bc44005b87e0c059b11ced0033b",
+        53_648,
+    ),
+    // The kitten 0.48 captures.
+    (
+        "ascii af0751e04c0301ae668fb64fee70eb53a45637e32ec2d5999c6367df6d10d515",
+        63_217,
+    ),
+    (
+        "unicode d5c85baa3324d1f35a7ac69f020494d7ec82fd281ceaf72bafa17ae871679c4a",
         53_648,
     ),
 ];
@@ -412,7 +436,10 @@ fn digest(
     let screen = &mut run.screen;
     put(
         "grid_sha256",
-        sha256(without_store_nonce(format!("{:?}", screen.full_snapshot())).as_bytes()),
+        sha256(
+            without_history_position(without_store_nonce(format!("{:?}", screen.full_snapshot())))
+                .as_bytes(),
+        ),
     );
     let kept = screen.history_rows();
     let checked =
