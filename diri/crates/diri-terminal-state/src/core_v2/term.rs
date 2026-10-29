@@ -22,7 +22,7 @@ use super::cell::{
     fill_cells,
 };
 use super::ops::{Inactive, Saved};
-use super::page::{Clusters, Link, Pages, RowMeta, push_mark};
+use super::page::{Clusters, Link, Pages, RowMeta, TextLog, push_mark};
 use super::text::{Tables, tables};
 
 pub struct Core {
@@ -709,7 +709,7 @@ impl Core {
     /// cursor row, from `bytes` (validated here); returns `(bytes
     /// consumed, columns)`. Stops at ASCII, invalid UTF-8, a character the
     /// general path must place, or a wide character in the way.
-    #[inline(always)]
+    #[inline(never)]
     fn write_text_segment(&mut self, bytes: &[u8]) -> (usize, usize) {
         let x0 = self.col;
         let cols = self.cols;
@@ -736,6 +736,10 @@ impl Core {
         if log {
             text.reserve_cells(cols - x0);
         }
+        // SAFETY (every use of `cur`): the cursor stays within the room
+        // reserved for the row's remaining cells, and is committed before
+        // anything else touches the arena.
+        let mut cur = text.cursor();
         let mut x = x0;
         let mut i = 0;
         let mut marked = false;
@@ -766,7 +770,7 @@ impl Core {
                     }
                     if log {
                         // SAFETY: room for the row's cells was reserved.
-                        unsafe { text.put_chars3(&cps, fits, &bytes[i..]) };
+                        cur = unsafe { TextLog::put_chars3(cur, &cps, fits, &bytes[i..]) };
                     }
                     x += 2 * fits;
                     i += 3 * fits;
@@ -809,7 +813,9 @@ impl Core {
                         push_mark(row, &mut page.clusters, base, c);
                         marked = true;
                         if log {
+                            unsafe { text.commit(cur) };
                             text.put_mark(&bytes[i..i + len], cols - x);
+                            cur = text.cursor();
                         }
                         i += len;
                         continue;
@@ -837,12 +843,13 @@ impl Core {
             }
             if log {
                 // SAFETY: room for the row's cells was reserved.
-                unsafe { text.put_char(cp as u64, &bytes[i..]) };
+                cur = unsafe { TextLog::put_char(cur, cp as u64, &bytes[i..]) };
             }
             x += width;
             i += len;
         }
         if log {
+            unsafe { text.commit(cur) };
             text.add_to_row(r, log_from);
         }
         if x > x0 || x0 > occ || marked {
@@ -867,7 +874,7 @@ impl Core {
     }
 
     /// Printable ASCII bytes.
-    #[inline(always)]
+    #[inline(never)]
     fn ascii_run(&mut self, bytes: &[u8]) {
         let mut i = 0;
         while i < bytes.len() {
