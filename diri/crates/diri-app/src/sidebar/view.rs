@@ -3,6 +3,7 @@ mod activity;
 mod arrivals;
 mod filter;
 mod hover_linger;
+mod hover_status;
 #[cfg(test)]
 mod hue_tests;
 mod lineage;
@@ -11,6 +12,7 @@ mod project_picker;
 mod question_lines;
 mod rename_input;
 mod rows;
+mod split_mark;
 mod strip_tabs;
 mod tabs;
 pub(crate) use tabs::DraggedTab;
@@ -3726,6 +3728,7 @@ impl Sidebar {
             held_hint,
             hover_linger,
             look,
+            ref split,
             ..
         } = *props;
         let drop = drop.clone();
@@ -3758,7 +3761,7 @@ impl Sidebar {
         ) - if loading { 60.0 } else { 0.0 }
             - if scheduled_run.is_some() { 18.0 } else { 0.0 }
             - if panes > 1 {
-                PANE_COUNT_WIDTH + 8.0
+                split_mark::WIDTH + 8.0
             } else {
                 0.0
             }
@@ -4193,9 +4196,10 @@ impl Sidebar {
                 // This session's agent runs on another machine.
                 element.child(remote_mark(colors))
             })
-            .when(panes > 1, |element| {
-                // A split tab is still one row; this says how many panes.
-                element.child(pane_count_mark(&id, panes, colors))
+            .when_some(split.as_ref(), |element, split| {
+                // A split tab is still one row; this draws its layout with
+                // each pane's state, so you can see which pane asks.
+                element.child(split.render(format!("session-panes:{}", id.0)))
             })
             .when_some(lineage, |element, role| {
                 element.child(lineage_glyph(&id, role, colors))
@@ -6810,11 +6814,21 @@ impl Sidebar {
     ) -> Option<(gpui::Stateful<gpui::Div>, Bounds<Pixels>)> {
         let id = self.ui.hover_card.as_ref()?;
         let row = *self.row_bounds.borrow().get(id)?;
-        let (session, project) = {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0.0, |elapsed| elapsed.as_secs_f64() * 1000.0);
+        let (session, project, status) = {
             let store = self.store.read().expect("session store lock poisoned");
             let session = store.sessions().get(id)?.clone();
             let project = store.projects().get(&session.project_id).cloned();
-            (session, project)
+            let status = hover_status::HoverStatus::of(
+                &session,
+                store.split_layout_of(id),
+                |pane| store.sessions().get(pane).cloned(),
+                store.migrating().contains(id),
+                now_ms,
+            );
+            (session, project, status)
         };
         let mut details = div().flex().flex_col().gap(px(5.0));
         if session.hibernation.is_some() {
@@ -6872,6 +6886,7 @@ impl Sidebar {
                     .text_color(colors.primary)
                     .child(display_title(&session)),
             )
+            .when_some(status, |card, status| card.child(status.render(now_ms, colors)))
             .child(details);
         Some((card, row))
     }
@@ -9054,34 +9069,6 @@ fn archive_count(count: usize, colors: SemanticColors) -> AnyElement {
 /// rather than the host's name: the name repeated down a whole project reads
 /// as a wall of chips, while one small server mark says "not this machine"
 /// without competing with the titles.
-const PANE_COUNT_WIDTH: f32 = 24.0;
-
-/// A split tab's pane count: a quiet two-column glyph and the number.
-fn pane_count_mark(id: &SessionId, panes: usize, colors: SemanticColors) -> AnyElement {
-    div()
-        .debug_selector({
-            let id = id.clone();
-            move || format!("session-panes:{}", id.0)
-        })
-        .id(format!("session-panes:{}", id.0))
-        .role(Role::Image)
-        .aria_label(tf("session.pane_count", &[("count", &panes)]))
-        .flex_none()
-        .w(px(PANE_COUNT_WIDTH))
-        .flex()
-        .items_center()
-        .justify_end()
-        .gap(px(2.0))
-        .child(sf_symbol("rectangle.split.2x1", 9.0, colors.tertiary))
-        .child(
-            div()
-                .text_size(px(Typo::META.size))
-                .text_color(colors.tertiary)
-                .child(panes.to_string()),
-        )
-        .into_any_element()
-}
-
 fn remote_mark(colors: SemanticColors) -> AnyElement {
     div()
         .debug_selector(|| "remote-mark".to_owned())
@@ -12553,6 +12540,454 @@ mod tests {
             .unwrap()
             .save(output)
             .unwrap();
+    }
+
+    /// Gives `preview-claude` a tab it shares with two of its terminals:
+    /// a test run reporting 40 % and an idle dev server, stacked on the
+    /// right of the Agent.
+    fn seed_split_tab(store: &mut crate::store::SessionStore) {
+        use diri_proto::workspace::*;
+        let shell = (**store.sessions().get(&SessionId::new("preview-shell")).unwrap()).clone();
+        let pane_shell = |id: &str, title: &str| {
+            let mut pane = shell.clone();
+            pane.id = SessionId::new(id);
+            pane.title = title.into();
+            pane.parent = Some(SessionId::new("preview-claude"));
+            pane.listening_ports = None;
+            pane
+        };
+        let mut tests = pane_shell("pane-tests", "cargo test -p diri-app");
+        tests.status = diri_proto::SessionStatus::Working;
+        tests.terminal_progress = Some(diri_proto::TerminalProgress {
+            state: diri_proto::TerminalProgressState::Normal,
+            percent: 40,
+        });
+        store.upsert_session(tests);
+        store.upsert_session(pane_shell("pane-server", "pnpm dev · website"));
+        let leaf = |id: &str, session: &str| LayoutNode::Pane {
+            id: PaneId::new(id),
+            session_id: SessionId::new(session),
+        };
+        store.seed_workspace_snapshot_for_test(WorkspaceSnapshot {
+            revision: 3,
+            workspaces: vec![WorkspaceRecord {
+                project_id: None,
+                id: WorkspaceId::new("hover-workspace"),
+                name: "diri".into(),
+                selected_tab: Some(TabId::new("release")),
+                tabs: vec![WorkspaceTab {
+                    id: TabId::new("release"),
+                    title: None,
+                    focused_pane: PaneId::new("agent"),
+                    zoomed_pane: None,
+                    layout: LayoutNode::Split {
+                        id: SplitId::new("columns"),
+                        axis: LayoutAxis::Horizontal,
+                        fraction: 0.58,
+                        first: Box::new(leaf("agent", "preview-claude")),
+                        second: Box::new(LayoutNode::Split {
+                            id: SplitId::new("stack"),
+                            axis: LayoutAxis::Vertical,
+                            fraction: 0.55,
+                            first: Box::new(leaf("tests", "pane-tests")),
+                            second: Box::new(leaf("server", "pane-server")),
+                        }),
+                    },
+                }],
+            }],
+            ..Default::default()
+        });
+    }
+
+    #[gpui::test]
+    fn session_preview_says_what_each_pane_is_doing(cx: &mut TestAppContext) {
+        for split in [false, true] {
+            let (view, cx) = cx.add_window_view(|_, cx| {
+                let sidebar = cx.new(|cx| Sidebar::new(None, true, PreviewScenario::Typical, cx));
+                if split {
+                    seed_split_tab(&mut sidebar.read(cx).store.write().unwrap());
+                }
+                SidebarPopoverHarness { sidebar }
+            });
+            let sidebar = view.read_with(cx, |harness, _| harness.sidebar.clone());
+            cx.update(|window, _| window.activate_window());
+            cx.run_until_parked();
+            let row = row_bounds(&sidebar, cx, "preview-claude");
+            cx.simulate_mouse_move(row.center(), None, Modifiers::default());
+            cx.run_until_parked();
+            cx.executor().advance_clock(Duration::from_secs(1));
+            cx.run_until_parked();
+            assert!(cx.debug_bounds("session-hover-card").is_some(), "split={split}");
+            // One shape per tab: a single line for one pane, pane lines
+            // (and no single line) for a split.
+            assert_eq!(cx.debug_bounds("session-hover-state").is_some(), !split);
+            assert_eq!(cx.debug_bounds("session-hover-panes").is_some(), split);
+            if split {
+                let panes = cx.debug_bounds("session-hover-panes").unwrap();
+                let card = cx.debug_bounds("session-hover-card").unwrap();
+                assert!(panes.right() <= card.right(), "pane lines stay in the card");
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn session_preview_follows_a_status_change_while_it_shows(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let sidebar = cx.new(|cx| Sidebar::new(None, true, PreviewScenario::Typical, cx));
+            SidebarPopoverHarness { sidebar }
+        });
+        let sidebar = view.read_with(cx, |harness, _| harness.sidebar.clone());
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        let row = row_bounds(&sidebar, cx, "preview-shell");
+        cx.simulate_mouse_move(row.center(), None, Modifiers::default());
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("session-hover-card").is_some());
+        assert!(
+            cx.debug_bounds("session-hover-state").is_none(),
+            "a shell at its prompt has nothing to add"
+        );
+        sidebar.update(cx, |sidebar, cx| {
+            let mut store = sidebar.store.write().unwrap();
+            let mut shell = (**store.sessions().get(&SessionId::new("preview-shell")).unwrap()).clone();
+            shell.terminal_progress = Some(diri_proto::TerminalProgress {
+                state: diri_proto::TerminalProgressState::Normal,
+                percent: 25,
+            });
+            store.upsert_session(shell);
+            drop(store);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("session-hover-state").is_some(),
+            "the open card picks up the job's progress"
+        );
+    }
+
+    /// Two split tabs for the split presentation shots. Codex works beside
+    /// a test run at 40 % and a deploy script asking a question; Cursor
+    /// has finished beside a build at 75 %.
+    fn seed_split_presentation(store: &mut crate::store::SessionStore) {
+        use diri_proto::workspace::*;
+        let shell = (**store.sessions().get(&SessionId::new("preview-shell")).unwrap()).clone();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0.0, |elapsed| elapsed.as_secs_f64() * 1000.0);
+        let pane_shell = |id: &str, owner: &str, title: &str| {
+            let mut pane = shell.clone();
+            pane.id = SessionId::new(id);
+            pane.title = title.into();
+            pane.parent = Some(SessionId::new(owner));
+            pane.listening_ports = None;
+            pane
+        };
+        let mut tests = pane_shell("pane-tests", "preview-codex", "cargo test -p diri-app");
+        tests.status = diri_proto::SessionStatus::Working;
+        tests.terminal_progress = Some(diri_proto::TerminalProgress {
+            state: diri_proto::TerminalProgressState::Normal,
+            percent: 40,
+        });
+        store.upsert_session(tests);
+        let mut deploy = pane_shell("pane-deploy", "preview-codex", "./deploy.sh staging");
+        deploy.status =
+            diri_proto::SessionStatus::NeedsInput(diri_proto::NeedsInputKind::Question);
+        deploy.needs_input = Some(diri_proto::NeedsInputDetail {
+            kind: diri_proto::NeedsInputKind::Question,
+            source: diri_proto::NeedsInputSource::ProgramStatus,
+            tool_name: None,
+            summary: "Allow deploy to staging?".into(),
+            prompt_excerpt: None,
+            options: None,
+            risk_hint: diri_proto::RiskHint::Neutral,
+            secret: false,
+            occurred_at: diri_proto::DateMillis(now - 30_000.0),
+        });
+        store.upsert_session(deploy);
+        let mut build = pane_shell("pane-build", "preview-cursor", "pnpm build");
+        build.status = diri_proto::SessionStatus::Working;
+        build.terminal_progress = Some(diri_proto::TerminalProgress {
+            state: diri_proto::TerminalProgressState::Normal,
+            percent: 75,
+        });
+        store.upsert_session(build);
+        let leaf = |id: &str, session: &str| LayoutNode::Pane {
+            id: PaneId::new(id),
+            session_id: SessionId::new(session),
+        };
+        let tab = |id: &str, focused: &str, layout: LayoutNode| WorkspaceTab {
+            id: TabId::new(id),
+            title: None,
+            focused_pane: PaneId::new(focused),
+            zoomed_pane: None,
+            layout,
+        };
+        store.seed_workspace_snapshot_for_test(WorkspaceSnapshot {
+            revision: 3,
+            workspaces: vec![WorkspaceRecord {
+                project_id: None,
+                id: WorkspaceId::new("split-workspace"),
+                name: "diri".into(),
+                selected_tab: Some(TabId::new("sidebar-craft")),
+                tabs: vec![
+                    tab(
+                        "sidebar-craft",
+                        "codex",
+                        LayoutNode::Split {
+                            id: SplitId::new("columns"),
+                            axis: LayoutAxis::Horizontal,
+                            fraction: 0.58,
+                            first: Box::new(leaf("codex", "preview-codex")),
+                            second: Box::new(LayoutNode::Split {
+                                id: SplitId::new("stack"),
+                                axis: LayoutAxis::Vertical,
+                                fraction: 0.5,
+                                first: Box::new(leaf("tests", "pane-tests")),
+                                second: Box::new(leaf("deploy", "pane-deploy")),
+                            }),
+                        },
+                    ),
+                    tab(
+                        "focus-fix",
+                        "cursor",
+                        LayoutNode::Split {
+                            id: SplitId::new("focus-columns"),
+                            axis: LayoutAxis::Horizontal,
+                            fraction: 0.5,
+                            first: Box::new(leaf("cursor", "preview-cursor")),
+                            second: Box::new(leaf("build", "pane-build")),
+                        },
+                    ),
+                ],
+            }],
+            ..Default::default()
+        });
+        store.select(SessionId::new("preview-codex"));
+    }
+
+    /// Paints only the horizontal strip, as the app does while horizontal
+    /// tabs hide the sidebar panel.
+    struct SplitStripShot {
+        sidebar: Entity<Sidebar>,
+    }
+
+    impl Render for SplitStripShot {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let background = self.sidebar.read(cx).colors().background;
+            div()
+                .size_full()
+                .bg(background)
+                .pt(px(7.0))
+                .child(self.sidebar.update(cx, |sidebar, cx| {
+                    sidebar.render_horizontal_tabs(720.0, None, window, cx)
+                }))
+        }
+    }
+
+    #[gpui::test]
+    fn a_split_strip_tab_marks_its_waiting_pane_and_draws_its_layout(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_asset_source_for_test(diri_ui::IconAssets));
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let sidebar = cx.new(|cx| {
+                let mut sidebar = Sidebar::new(None, true, PreviewScenario::Typical, cx);
+                seed_split_presentation(&mut sidebar.store.write().unwrap());
+                sidebar
+                    .set_tab_orientation(crate::store::TabOrientation::Horizontal, cx)
+                    .unwrap();
+                sidebar
+            });
+            SplitStripShot { sidebar }
+        });
+        cx.run_until_parked();
+        let sidebar = view.read_with(cx, |view, _| view.sidebar.clone());
+        let (title, question, state) = sidebar.read_with(cx, |sidebar, cx| {
+            let props = sidebar.strip_tab_views[&SessionId::new("preview-codex")]
+                .read(cx)
+                .props_for_test();
+            (props.title.clone(), props.question.clone(), props.state)
+        });
+        // Codex itself is working; the deploy pane beside it is asking. The
+        // tab keeps its title, shows the pane's state, and its tooltip asks
+        // the pane's question.
+        assert_eq!(title, "Polish the left sidebar hierarchy");
+        assert_eq!(question.as_deref(), Some("Allow deploy to staging?"));
+        assert!(matches!(state, StatusState::NeedsInput { .. }));
+        assert!(
+            cx.debug_bounds("horizontal-tab-panes-preview-codex")
+                .is_some()
+        );
+        assert!(
+            cx.debug_bounds("horizontal-tab-panes-preview-spawned-deep")
+                .is_none(),
+            "a single-pane tab keeps its plain close button"
+        );
+    }
+
+    /// Split tabs in the sidebar and in the horizontal strip, at rest and
+    /// with the pointer on the selected tab. Writes
+    /// `split-{sidebar,strip,strip-hover}-{dark,light}.png` to
+    /// `DIRI_VISUAL_OUTPUT`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes split presentation PNGs to DIRI_VISUAL_OUTPUT"]
+    fn render_split_presentation_screenshots() {
+        let output =
+            PathBuf::from(std::env::var_os("DIRI_VISUAL_OUTPUT").expect("set DIRI_VISUAL_OUTPUT"));
+        std::fs::create_dir_all(&output).unwrap();
+        for (surface, horizontal, hover) in [
+            ("sidebar", false, false),
+            ("strip", true, false),
+            ("strip-hover", true, true),
+        ] {
+            for light in [false, true] {
+                let platform = gpui_platform::current_platform(true);
+                let mut cx = HeadlessAppContext::with_platform(
+                    platform.text_system(),
+                    Arc::new(diri_ui::IconAssets),
+                    gpui_platform::current_headless_renderer,
+                );
+                cx.update(|cx| {
+                    crate::fonts::init(cx);
+                    cx.set_reduce_motion(true);
+                });
+                let new_sidebar = move |cx: &mut Context<Sidebar>| {
+                    let mut sidebar = Sidebar::new(None, true, PreviewScenario::Typical, cx);
+                    {
+                        let mut store = sidebar.store.write().unwrap();
+                        store
+                            .update_preferences(|prefs| {
+                                prefs.terminal_theme =
+                                    if light { "dirijor-light" } else { "dirijor-dark" }.into();
+                            })
+                            .unwrap();
+                        seed_split_presentation(&mut store);
+                    }
+                    if horizontal {
+                        sidebar
+                            .set_tab_orientation(crate::store::TabOrientation::Horizontal, cx)
+                            .unwrap();
+                    }
+                    sidebar
+                };
+                let window_size = if horizontal {
+                    size(px(720.0), px(44.0))
+                } else {
+                    size(px(300.0), px(330.0))
+                };
+                let window: gpui::AnyWindowHandle = if horizontal {
+                    cx.open_window(window_size, |_, cx| {
+                        let sidebar = cx.new(new_sidebar);
+                        cx.new(|_| SplitStripShot { sidebar })
+                    })
+                    .unwrap()
+                    .into()
+                } else {
+                    cx.open_window(window_size, |_, cx| {
+                        let sidebar = cx.new(new_sidebar);
+                        cx.new(|_| SidebarPopoverHarness { sidebar })
+                    })
+                    .unwrap()
+                    .into()
+                };
+                cx.run_until_parked();
+                cx.update_window(window, |_, window, _| window.activate_window())
+                    .unwrap();
+                cx.run_until_parked();
+                if hover {
+                    // The pointer on the selected (first) tab.
+                    cx.update_window(window, |_, window, cx| {
+                        window.simulate_mouse_move(point(px(190.0), px(22.0)), cx)
+                    })
+                    .unwrap();
+                    cx.run_until_parked();
+                }
+                cx.advance_clock(Duration::from_secs(1));
+                cx.update_window(window, |_, window, _| window.refresh())
+                    .unwrap();
+                cx.run_until_parked();
+                let appearance = if light { "light" } else { "dark" };
+                cx.capture_screenshot(window)
+                    .unwrap()
+                    .save(output.join(format!("split-{surface}-{appearance}.png")))
+                    .unwrap();
+                cx.update_window(window, |_, window, _| window.remove_window())
+                    .unwrap();
+                cx.run_until_parked();
+            }
+        }
+    }
+
+    /// The hover card's status section, rendered for the PR: a blocked
+    /// Agent alone, and the same Agent in a split tab with two terminals.
+    /// Writes `hover-{single,split}-{dark,light}.png` to `DIRI_VISUAL_OUTPUT`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes hover status PNGs to DIRI_VISUAL_OUTPUT"]
+    fn render_session_hover_status_screenshots() {
+        let output =
+            PathBuf::from(std::env::var_os("DIRI_VISUAL_OUTPUT").expect("set DIRI_VISUAL_OUTPUT"));
+        std::fs::create_dir_all(&output).unwrap();
+        for (name, split) in [("single", false), ("split", true)] {
+            for light in [false, true] {
+                let platform = gpui_platform::current_platform(true);
+                let mut cx = HeadlessAppContext::with_platform(
+                    platform.text_system(),
+                    Arc::new(diri_ui::IconAssets),
+                    gpui_platform::current_headless_renderer,
+                );
+                cx.update(|cx| {
+                    crate::fonts::init(cx);
+                    cx.set_reduce_motion(true);
+                });
+                let window = cx
+                    .open_window(size(px(640.0), px(420.0)), |_, cx| {
+                        let sidebar = cx.new(|cx| {
+                            let sidebar = Sidebar::new(None, true, PreviewScenario::Typical, cx);
+                            let mut store = sidebar.store.write().unwrap();
+                            store
+                                .update_preferences(|prefs| {
+                                    prefs.terminal_theme =
+                                        if light { "dirijor-light" } else { "dirijor-dark" }.into();
+                                })
+                                .unwrap();
+                            if split {
+                                seed_split_tab(&mut store);
+                            }
+                            drop(store);
+                            sidebar
+                        });
+                        cx.new(|_| SidebarPopoverHarness { sidebar })
+                    })
+                    .unwrap();
+                cx.run_until_parked();
+                cx.update_window(window.into(), |_, window, _| window.activate_window())
+                    .unwrap();
+                cx.run_until_parked();
+                cx.update_window(window.into(), |view, window, cx| {
+                    let view = view.downcast::<SidebarPopoverHarness>().unwrap();
+                    let sidebar = view.read(cx).sidebar.clone();
+                    let row = sidebar.read(cx).row_bounds.borrow()[&SessionId::new("preview-claude")];
+                    window.simulate_mouse_move(row.center(), cx);
+                })
+                .unwrap();
+                cx.run_until_parked();
+                cx.advance_clock(Duration::from_secs(1));
+                cx.run_until_parked();
+                cx.update_window(window.into(), |_, window, _| window.refresh())
+                    .unwrap();
+                cx.run_until_parked();
+                let appearance = if light { "light" } else { "dark" };
+                cx.capture_screenshot(window.into())
+                    .unwrap()
+                    .save(output.join(format!("hover-{name}-{appearance}.png")))
+                    .unwrap();
+                cx.update_window(window.into(), |_, window, _| window.remove_window())
+                    .unwrap();
+                cx.run_until_parked();
+            }
+        }
     }
 
     /// Hovers `DIRI_LINEAGE_TARGET` (default `preview-cursor`) with one
