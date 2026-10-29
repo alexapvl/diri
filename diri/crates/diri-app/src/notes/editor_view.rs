@@ -115,6 +115,14 @@ actions!(
     ]
 );
 
+actions!(
+    diri_notes,
+    [
+        /// ⌘B bolded in a note instead of toggling the sidebar.
+        BoldShortcutUsed
+    ]
+);
+
 // Table shortcuts, shared by the keymap and the table menu that prints them.
 // ⌃⇧ arrows are free app-wide; outside a table they fall through.
 const KEY_TABLE_ROW_ABOVE: &str = "ctrl-shift-up";
@@ -1819,8 +1827,10 @@ impl NoteEditorView {
         cx.notify();
     }
 
-    fn bold(&mut self, _: &Bold, _: &mut Window, cx: &mut Context<Self>) {
+    fn bold(&mut self, _: &Bold, window: &mut Window, cx: &mut Context<Self>) {
         self.style(Style::Bold, cx);
+        // ⌘B is also Toggle Sidebar: the app may say how to reach it.
+        window.dispatch_action(Box::new(BoldShortcutUsed), cx);
     }
     fn italic(&mut self, _: &Italic, _: &mut Window, cx: &mut Context<Self>) {
         self.style(Style::Italic, cx);

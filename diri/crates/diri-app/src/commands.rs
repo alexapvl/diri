@@ -913,16 +913,21 @@ pub const COMMANDS: &[CommandSpec] = &[
         "gearshape",
         "preferences config options"
     ),
-    spec!(
-        ToggleSidebar,
-        "toggle-sidebar",
-        Some("cmd-b"),
-        Some("⌘B"),
-        Some(APP_CONTEXT),
-        "command.toggle_sidebar.palette_title",
-        "sidebar.left",
-        "hide show panel sidebar horizontal vertical tabs top bar"
-    ),
+    // ⌘B is Bold while the caret is in a note; ⌃⌘S, the Mac's own Show
+    // Sidebar key, reaches the sidebar from anywhere.
+    CommandSpec {
+        id: CommandId::ToggleSidebar,
+        stable_id: "toggle-sidebar",
+        keystroke: Some("cmd-b"),
+        alternate_keystrokes: &["ctrl-cmd-s"],
+        shortcut: Some("⌘B"),
+        context: Some(APP_CONTEXT),
+        palette: Some(PaletteMetadata {
+            title_id: "command.toggle_sidebar.palette_title",
+            system_image: "sidebar.left",
+            keywords: "hide show panel sidebar horizontal vertical tabs top bar",
+        }),
+    },
     spec!(
         ToggleTabOrientation,
         "toggle-tab-orientation",
@@ -2969,7 +2974,8 @@ mod tests {
     fn recorded_shortcuts_layer_over_defaults_and_reset_back_to_them() {
         let defaults = ShortcutOverrides::new();
         let sidebar = command(CommandId::ToggleSidebar);
-        assert_eq!(sidebar.effective_keystrokes(&defaults), vec![test_chords("cmd-b")]);
+        let both = vec![test_chords("cmd-b"), test_chords("ctrl-cmd-s")];
+        assert_eq!(sidebar.effective_keystrokes(&defaults), both);
 
         let rebound = assign_shortcut(
             &defaults,
@@ -2988,13 +2994,13 @@ mod tests {
 
         let reset = reset_shortcut(&unbound, CommandId::ToggleSidebar);
         assert!(reset.is_empty(), "a reset leaves no user entry behind");
-        assert_eq!(sidebar.effective_keystrokes(&reset), vec![test_chords("cmd-b")]);
+        assert_eq!(sidebar.effective_keystrokes(&reset), both);
 
-        // Recording the default itself is not a change either.
-        assert!(
+        // Recording ⌘B alone gives up ⌃⌘S, which is a change.
+        assert_eq!(
             assign_shortcut(&rebound, CommandId::ToggleSidebar, &test_chords("cmd-b"), None)
-                .unwrap()
-                .is_empty()
+                .unwrap(),
+            ShortcutOverrides::from([("toggle-sidebar".into(), Some(test_chords("cmd-b")))])
         );
     }
 
@@ -3083,7 +3089,14 @@ mod tests {
             Some(ShortcutResolution::Swap),
         )
         .unwrap();
-        assert!(back.is_empty(), "{back:?}");
+        // The launcher has its key back; Sidebar holds ⌘B alone until a
+        // reset returns its ⌃⌘S as well.
+        assert_eq!(
+            back,
+            ShortcutOverrides::from([("toggle-sidebar".into(), Some(test_chords("cmd-b")))])
+        );
+        let reset = reset_shortcut(&back, CommandId::ToggleSidebar);
+        assert!(reset.is_empty(), "{reset:?}");
     }
 
     #[test]
@@ -3099,19 +3112,23 @@ mod tests {
         .unwrap();
         assert_eq!(
             sidebar.effective_keystrokes(&added),
-            vec![test_chords("cmd-b"), test_chords("cmd-alt-y")]
+            vec![
+                test_chords("cmd-b"),
+                test_chords("ctrl-cmd-s"),
+                test_chords("cmd-alt-y")
+            ]
         );
         // Only the added key is stored, in an entry older builds ignore.
         assert_eq!(
             added,
             ShortcutOverrides::from([(
-                "toggle-sidebar#2".into(),
+                "toggle-sidebar#3".into(),
                 Some(test_chords("cmd-alt-y"))
             )])
         );
         assert!(sidebar.is_overridden(&added));
-        // Both keys are bound and both clash for other commands.
-        assert_eq!(sidebar.key_bindings(&added).len(), 2);
+        // Every key is bound and each clashes for other commands.
+        assert_eq!(sidebar.key_bindings(&added).len(), 3);
         assert_eq!(
             shortcut_conflict(CommandId::OpenLauncher, &test_chords("cmd-alt-y"), &added)
                 .map(|holder| holder.id),
@@ -3133,6 +3150,7 @@ mod tests {
             sidebar.effective_keystrokes(&replaced),
             vec![
                 test_chords("cmd-b"),
+                test_chords("ctrl-cmd-s"),
                 test_chords("cmd-alt-i"),
                 test_chords("cmd-alt-u")
             ]
@@ -3142,9 +3160,13 @@ mod tests {
         let removed = remove_shortcut_key(&replaced, CommandId::ToggleSidebar, &test_chords("cmd-b"));
         assert_eq!(
             sidebar.effective_keystrokes(&removed),
-            vec![test_chords("cmd-alt-i"), test_chords("cmd-alt-u")]
+            vec![
+                test_chords("ctrl-cmd-s"),
+                test_chords("cmd-alt-i"),
+                test_chords("cmd-alt-u")
+            ]
         );
-        assert!(command(CommandId::ToggleSidebar).key_bindings(&removed).len() == 2);
+        assert!(command(CommandId::ToggleSidebar).key_bindings(&removed).len() == 3);
 
         // Reset drops every recorded key at once.
         assert!(reset_shortcut(&removed, CommandId::ToggleSidebar).is_empty());
@@ -3187,7 +3209,11 @@ mod tests {
         .unwrap();
         assert_eq!(
             command(sidebar).effective_keystrokes(&taken),
-            vec![test_chords("cmd-b"), test_chords("cmd-n")]
+            vec![
+                test_chords("cmd-b"),
+                test_chords("ctrl-cmd-s"),
+                test_chords("cmd-n")
+            ]
         );
         assert!(command(CommandId::OpenLauncher).effective_keystrokes(&taken).is_empty());
 
@@ -3200,7 +3226,10 @@ mod tests {
             Some(ShortcutResolution::Replace),
         )
         .unwrap();
-        assert_eq!(command(sidebar).effective_keystrokes(&claimed), vec![test_chords("cmd-b")]);
+        assert_eq!(
+            command(sidebar).effective_keystrokes(&claimed),
+            vec![test_chords("cmd-b"), test_chords("ctrl-cmd-s")]
+        );
         assert!(claimed.is_empty(), "{claimed:?}");
     }
 
@@ -3214,7 +3243,12 @@ mod tests {
         ]);
         assert_eq!(
             command(CommandId::ToggleSidebar).effective_keystrokes(&overrides),
-            vec![test_chords("cmd-b"), test_chords("cmd-alt-y"), test_chords("cmd-alt-u")]
+            vec![
+                test_chords("cmd-b"),
+                test_chords("ctrl-cmd-s"),
+                test_chords("cmd-alt-y"),
+                test_chords("cmd-alt-u")
+            ]
         );
     }
 
@@ -3230,10 +3264,10 @@ mod tests {
         )
         .unwrap();
         let reset = reset_shortcut(&taken, CommandId::ToggleSidebar);
-        assert!(
-            command(CommandId::ToggleSidebar)
-                .effective_keystrokes(&reset)
-                .is_empty()
+        // Its other default, still free, is kept.
+        assert_eq!(
+            command(CommandId::ToggleSidebar).effective_keystrokes(&reset),
+            vec![test_chords("ctrl-cmd-s")]
         );
         assert_eq!(
             command(CommandId::OpenLauncher).effective_keystrokes(&reset),
