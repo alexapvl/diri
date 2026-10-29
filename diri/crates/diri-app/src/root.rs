@@ -12345,7 +12345,7 @@ mod tests {
                                 let len = view.editor.block(cell).text.len();
                                 view.editor.set_caret(Pos::new(cell, len));
                                 window.focus(&view.focus_handle(cx), cx);
-                                view.open_table_menu(cx);
+                                view.open_table_menu(None, cx);
                             } else {
                                 view.editor.set_caret(Pos::new(0, 0));
                             }
