@@ -88,6 +88,11 @@ use lineage::{LineageRole, LineageSession, lineage_anchor, lineage_marks};
 const INSERT_BAND: f32 = Metrics::ROW_HEIGHT / 4.0;
 
 const PREVIEW_USAGE: f64 = 4.82;
+/// How often the remaining-quota footer re-reads its expiry and freshness.
+const QUOTA_TICK: Duration = Duration::from_secs(60);
+/// Limits older than this are refetched while the footer shows quota, well
+/// inside the six minutes after which `footer_quota` reads them as stale.
+const QUOTA_REFRESH_AFTER: i64 = 180;
 
 // Keep the navigation chrome on one quiet, predictable rhythm. The action
 // slots are fixed-width so revealing hover affordances never moves the title
@@ -719,6 +724,10 @@ pub struct Sidebar {
     hover_task: Option<Task<()>>,
     hover_keystrokes: Option<gpui::Subscription>,
     usage: Option<UsageSnapshot>,
+    /// Runs only while the footer shows remaining quota; see `sync_quota_refresh`.
+    quota_refresh: Option<Task<()>>,
+    quota_requested_at: i64,
+    quota_shown: Option<f64>,
     number_flows: crate::number_flow::Bank,
     accounts: accounts::MenuAccounts,
     update: UpdateState,
@@ -952,6 +961,9 @@ impl Sidebar {
             hover_task: None,
             hover_keystrokes: None,
             usage: None,
+            quota_refresh: None,
+            quota_requested_at: 0,
+            quota_shown: None,
             number_flows: crate::number_flow::Bank::default(),
             accounts: accounts::MenuAccounts::new(preview),
             update: UpdateState::default(),
@@ -997,6 +1009,7 @@ impl Sidebar {
             Ok("account") => sidebar.ui.popover = Some(Popover::Account),
             _ => {}
         }
+        sidebar.sync_quota_refresh(cx);
         sidebar
     }
 
@@ -1134,16 +1147,78 @@ impl Sidebar {
         {
             cx.emit(SidebarEvent::RefreshUsageLimits);
         }
-        // Most refreshes only advance `updated_at`, which the sidebar does not
-        // show; redrawing for them costs a frame every few seconds.
+        // Timestamp-only ticks normally need no frame, except when the visible
+        // quota crosses freshness/reset expiry. Reuse incoming ticks, not a timer
+        // or another credential fetch, to invalidate that percentage.
+        let show_quota = self
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .preferences()
+            .sidebar_usage_indicator
+            == crate::store::SidebarUsageIndicator::RemainingQuota;
         let changed = self.usage.as_ref().is_none_or(|usage| {
-            UsageSnapshot {
-                updated_at: snapshot.updated_at,
-                ..usage.clone()
-            } != snapshot
+            (show_quota
+                && crate::usage::limits::footer_quota(&usage.limits, usage.updated_at)
+                    != crate::usage::limits::footer_quota(&snapshot.limits, snapshot.updated_at))
+                || UsageSnapshot {
+                    updated_at: snapshot.updated_at,
+                    ..usage.clone()
+                } != snapshot
         });
         self.usage = Some(snapshot);
         if changed {
+            cx.notify();
+        }
+    }
+
+    /// Limits are otherwise fetched only when the account menu opens, and usage
+    /// ticks only arrive with transcript activity, so a remaining-quota footer
+    /// read `—` from launch until the menu opened and again six minutes later.
+    /// Choosing that mode is the opt-in to these background limit reads; the
+    /// other modes keep the menu as the only trigger and start no timer.
+    fn sync_quota_refresh(&mut self, cx: &mut Context<Self>) {
+        let wanted = !self.preview
+            && self
+                .store
+                .read()
+                .expect("session store lock poisoned")
+                .preferences()
+                .sidebar_usage_indicator
+                == crate::store::SidebarUsageIndicator::RemainingQuota;
+        if wanted == self.quota_refresh.is_some() {
+            return;
+        }
+        self.quota_refresh = wanted.then(|| {
+            cx.spawn(async move |this, cx| {
+                loop {
+                    if this.update(cx, |this, cx| this.quota_tick(cx)).is_err() {
+                        return;
+                    }
+                    cx.background_executor().timer(QUOTA_TICK).await;
+                }
+            })
+        });
+    }
+
+    fn quota_tick(&mut self, cx: &mut Context<Self>) {
+        let now = crate::usage::Clock::read(&crate::usage::SystemClock).unix_seconds;
+        let limits = self
+            .usage
+            .as_ref()
+            .map_or(&[][..], |usage| usage.limits.as_slice());
+        let mut live = limits.iter().filter(|limits| limits.live).peekable();
+        let stale = live.peek().is_none()
+            || live.any(|limits| now - limits.checked_at >= QUOTA_REFRESH_AFTER);
+        let shown = crate::usage::limits::footer_quota(limits, now)
+            .map(|quota| quota.remaining_percent.floor());
+        if stale && now - self.quota_requested_at >= QUOTA_REFRESH_AFTER {
+            self.quota_requested_at = now;
+            cx.emit(SidebarEvent::RefreshUsageLimits);
+        }
+        // An idle footer must still turn to `—` once its data expires.
+        if shown != self.quota_shown {
+            self.quota_shown = shown;
             cx.notify();
         }
     }
@@ -4858,7 +4933,15 @@ impl Sidebar {
     fn account_footer(&self, colors: SemanticColors, cx: &mut Context<Self>) -> AnyElement {
         let hovered = self.ui.hovered_control == Some("account");
         let account_label = local_account_label(self.preview);
-        let cost = if self.preview {
+        let indicator = self
+            .store
+            .read()
+            .expect("session store lock poisoned")
+            .preferences()
+            .sidebar_usage_indicator;
+        let cost = if indicator != crate::store::SidebarUsageIndicator::EstimatedCost {
+            None
+        } else if self.preview {
             Some(PREVIEW_USAGE)
         } else {
             self.usage
@@ -4866,6 +4949,32 @@ impl Sidebar {
                 .map(|snapshot| snapshot.today().cost)
                 .filter(|cost| *cost > 0.0)
         };
+        let quota = (indicator == crate::store::SidebarUsageIndicator::RemainingQuota).then(|| {
+            let preview;
+            let limits = if self.preview {
+                preview = crate::usage::limits::preview();
+                preview.as_slice()
+            } else {
+                self.usage
+                    .as_ref()
+                    .map_or(&[][..], |usage| usage.limits.as_slice())
+            };
+            let now = crate::usage::Clock::read(&crate::usage::SystemClock).unix_seconds;
+            match crate::usage::limits::footer_quota(limits, now) {
+                Some(quota) => (
+                    format!("{:.0}%", quota.remaining_percent.floor()),
+                    tf(
+                        "sidebar.usage.quota_tooltip",
+                        &[
+                            ("agent", &quota.provider),
+                            ("account", &quota.account),
+                            ("window", &quota.window),
+                        ],
+                    ),
+                ),
+                None => ("—".to_owned(), t("sidebar.usage.unavailable").to_owned()),
+            }
+        });
         div()
             .flex_none()
             .px(px(Space::INSET))
@@ -4920,15 +5029,39 @@ impl Sidebar {
                             .child(account_label),
                     )
                     .when_some(cost, |row, cost| {
-                        row.child(self.number_flows.show_font(
-                            "sidebar-today",
-                            cost,
-                            UsageFormat::money(cost),
-                            Typo::META_MONO.size,
-                            colors.tertiary,
-                            FontWeight::NORMAL,
-                            Some(SharedString::from(crate::fonts::mono_family())),
+                        row.child(div().debug_selector(|| "sidebar-cost".into()).child(
+                            self.number_flows.show_font(
+                                "sidebar-today",
+                                cost,
+                                UsageFormat::money(cost),
+                                Typo::META_MONO.size,
+                                colors.tertiary,
+                                FontWeight::NORMAL,
+                                Some(SharedString::from(crate::fonts::mono_family())),
+                            ),
                         ))
+                    })
+                    .when_some(quota, |row, (label, tooltip)| {
+                        row.child(
+                            div()
+                                .id("sidebar-quota")
+                                .debug_selector(|| "sidebar-quota".into())
+                                .flex_none()
+                                .font_family(crate::fonts::mono_family())
+                                .text_size(px(Typo::META_MONO.size))
+                                .text_color(colors.tertiary)
+                                .aria_label(tooltip.clone())
+                                .child(label)
+                                .warm_tooltip(move |_, cx| {
+                                    cx.new(|_| {
+                                        crate::palette_chrome::PaletteTooltip(
+                                            tooltip.clone(),
+                                            colors,
+                                        )
+                                    })
+                                    .into()
+                                }),
+                        )
                     })
                     .child(
                         div()
@@ -7007,6 +7140,7 @@ impl Sidebar {
     /// One publication from the shared store.
     pub(crate) fn store_changed(&mut self, cx: &mut Context<Self>) {
         self.store.write().expect("store").reconcile();
+        self.sync_quota_refresh(cx);
         // Rows read the store only through their props.
         self.notify_without_staling_rows(cx);
     }
@@ -13181,6 +13315,25 @@ mod tests {
                             units..units,
                         );
                     }
+                    // `DIRI_VISUAL_USAGE_INDICATOR=hidden|cost|quota` picks the
+                    // footer metric; `DIRI_VISUAL_QUOTA_UNKNOWN=1` leaves quota
+                    // mode without limits so the footer shows its `—`.
+                    if let Ok(mode) = std::env::var("DIRI_VISUAL_USAGE_INDICATOR") {
+                        let choice = match mode.as_str() {
+                            "hidden" => crate::store::SidebarUsageIndicator::Hidden,
+                            "quota" => crate::store::SidebarUsageIndicator::RemainingQuota,
+                            _ => crate::store::SidebarUsageIndicator::EstimatedCost,
+                        };
+                        sidebar
+                            .store
+                            .write()
+                            .expect("preview session store")
+                            .update_preferences(|prefs| prefs.sidebar_usage_indicator = choice)
+                            .expect("preview preferences");
+                    }
+                    if std::env::var_os("DIRI_VISUAL_QUOTA_UNKNOWN").is_some() {
+                        sidebar.preview = false;
+                    }
                     let now = wall_clock_millis();
                     let mut store = sidebar.store.write().expect("preview session store");
                     let mut sessions: Vec<_> = store
@@ -14124,6 +14277,214 @@ mod tests {
                 }
             }
         });
+    }
+
+    #[gpui::test]
+    fn footer_modes_preserve_account_menu_and_refresh(cx: &mut TestAppContext) {
+        let (sidebar, _, cx) = drag_harness(cx);
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("sidebar-cost").is_some(),
+            "default retains estimated cost"
+        );
+        assert!(cx.debug_bounds("sidebar-quota").is_none());
+        let refreshes = Rc::new(std::cell::Cell::new(0));
+        let observed = Rc::clone(&refreshes);
+        let _subscription = cx.update(|_, cx| {
+            cx.subscribe(&sidebar, move |_, event, _| {
+                if matches!(event, SidebarEvent::RefreshUsageLimits) {
+                    observed.set(observed.get() + 1);
+                }
+            })
+        });
+        for choice in crate::store::SidebarUsageIndicator::ALL {
+            sidebar.update(cx, |sidebar, cx| {
+                sidebar
+                    .store
+                    .write()
+                    .unwrap()
+                    .update_preferences(|prefs| {
+                        prefs.sidebar_usage_indicator = choice;
+                    })
+                    .unwrap();
+                cx.notify();
+            });
+            cx.run_until_parked();
+            assert_eq!(
+                cx.debug_bounds("sidebar-cost").is_some(),
+                choice == crate::store::SidebarUsageIndicator::EstimatedCost
+            );
+            assert_eq!(
+                cx.debug_bounds("sidebar-quota").is_some(),
+                choice == crate::store::SidebarUsageIndicator::RemainingQuota
+            );
+            assert_eq!(
+                refreshes.get(),
+                0,
+                "changing a preference never fetches credentials"
+            );
+            // Leaving preview after construction exercises the production click
+            // handler over an isolated preview store, never the real preferences.
+            sidebar.update(cx, |sidebar, _| sidebar.preview = false);
+            let account = cx
+                .debug_bounds("account")
+                .expect("account row survives every mode");
+            cx.simulate_click(account.center(), Modifiers::default());
+            cx.run_until_parked();
+            assert!(sidebar.read_with(cx, |sidebar, _| sidebar.ui.popover
+                == Some(Popover::Account)));
+            assert_eq!(
+                refreshes.get(),
+                1,
+                "opening the menu keeps its existing refresh"
+            );
+            cx.simulate_click(account.center(), Modifiers::default());
+            cx.run_until_parked();
+            assert_eq!(refreshes.get(), 1, "closing the menu does not refresh");
+            sidebar.update(cx, |sidebar, _| sidebar.preview = true);
+            refreshes.set(0);
+        }
+    }
+
+    /// Quota mode must not wait for the account menu: it fetches limits on its
+    /// own, no more than once per `QUOTA_REFRESH_AFTER`, and only in that mode.
+    #[gpui::test]
+    fn footer_quota_mode_refreshes_limits_without_the_menu(cx: &mut TestAppContext) {
+        let (sidebar, _, cx) = drag_harness(cx);
+        cx.run_until_parked();
+        let refreshes = Rc::new(std::cell::Cell::new(0));
+        let observed = Rc::clone(&refreshes);
+        let _subscription = cx.update(|_, cx| {
+            cx.subscribe(&sidebar, move |_, event, _| {
+                if matches!(event, SidebarEvent::RefreshUsageLimits) {
+                    observed.set(observed.get() + 1);
+                }
+            })
+        });
+        let set_mode = |choice, cx: &mut VisualTestContext| {
+            sidebar.update(cx, |sidebar, cx| {
+                sidebar.preview = false;
+                sidebar
+                    .store
+                    .write()
+                    .unwrap()
+                    .update_preferences(|prefs| prefs.sidebar_usage_indicator = choice)
+                    .unwrap();
+                sidebar.sync_quota_refresh(cx);
+            });
+            cx.run_until_parked();
+        };
+
+        set_mode(crate::store::SidebarUsageIndicator::EstimatedCost, cx);
+        cx.executor().advance_clock(QUOTA_TICK * 10);
+        cx.run_until_parked();
+        assert_eq!(refreshes.get(), 0, "cost mode keeps the menu as the trigger");
+
+        set_mode(crate::store::SidebarUsageIndicator::RemainingQuota, cx);
+        assert_eq!(refreshes.get(), 1, "no limits yet: fetch at once");
+        cx.executor().advance_clock(QUOTA_TICK * 2);
+        cx.run_until_parked();
+        assert_eq!(refreshes.get(), 1, "rate limited to one per window");
+
+        let now = crate::usage::Clock::read(&crate::usage::SystemClock).unix_seconds;
+        let mut snapshot = UsageSnapshot {
+            updated_at: now,
+            limits: vec![crate::usage::limits::AccountLimits {
+                provider: "Claude",
+                profile_id: None,
+                plan: None,
+                account: "Fixture".into(),
+                live: true,
+                windows: vec![crate::usage::limits::LimitWindow {
+                    label: "Weekly".into(),
+                    used_percent: 25.0,
+                    resets_at: None,
+                }],
+                checked_at: now,
+                error: None,
+                signing_in: false,
+            }],
+            ..UsageSnapshot::default()
+        };
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar.set_usage(snapshot.clone(), cx);
+            sidebar.quota_requested_at = 0;
+        });
+        cx.executor().advance_clock(QUOTA_TICK);
+        cx.run_until_parked();
+        assert_eq!(refreshes.get(), 1, "fresh limits need no fetch");
+
+        snapshot.limits[0].checked_at = now - QUOTA_REFRESH_AFTER;
+        sidebar.update(cx, |sidebar, cx| sidebar.set_usage(snapshot.clone(), cx));
+        cx.executor().advance_clock(QUOTA_TICK);
+        cx.run_until_parked();
+        assert_eq!(refreshes.get(), 2, "aging limits are refetched before expiry");
+
+        set_mode(crate::store::SidebarUsageIndicator::Hidden, cx);
+        sidebar.update(cx, |sidebar, _| sidebar.quota_requested_at = 0);
+        cx.executor().advance_clock(QUOTA_TICK * 10);
+        cx.run_until_parked();
+        assert_eq!(refreshes.get(), 2, "leaving quota mode stops the timer");
+        assert!(sidebar.read_with(cx, |sidebar, _| sidebar.quota_refresh.is_none()));
+    }
+
+    #[gpui::test]
+    fn footer_quota_timestamp_ticks_invalidate_only_on_expiry(cx: &mut TestAppContext) {
+        let (sidebar, _, cx) = drag_harness(cx);
+        cx.run_until_parked();
+        let notifications = Rc::new(std::cell::Cell::new(0));
+        let observed = Rc::clone(&notifications);
+        let _subscription =
+            cx.update(|_, cx| cx.observe(&sidebar, move |_, _| observed.set(observed.get() + 1)));
+        for reset in [None, Some(1_010)] {
+            let mut snapshot = UsageSnapshot {
+                updated_at: 1_000,
+                limits: vec![crate::usage::limits::AccountLimits {
+                    provider: "Claude",
+                    profile_id: None,
+                    plan: None,
+                    account: "Fixture".into(),
+                    live: true,
+                    windows: vec![crate::usage::limits::LimitWindow {
+                        label: "Weekly".into(),
+                        used_percent: 25.0,
+                        resets_at: reset,
+                    }],
+                    checked_at: 1_000,
+                    error: None,
+                    signing_in: false,
+                }],
+                ..UsageSnapshot::default()
+            };
+            sidebar.update(cx, |sidebar, cx| {
+                sidebar
+                    .store
+                    .write()
+                    .unwrap()
+                    .update_preferences(|prefs| {
+                        prefs.sidebar_usage_indicator =
+                            crate::store::SidebarUsageIndicator::RemainingQuota;
+                    })
+                    .unwrap();
+                sidebar.set_usage(snapshot.clone(), cx);
+            });
+            cx.run_until_parked();
+            notifications.set(0);
+            snapshot.updated_at = if reset.is_some() { 1_009 } else { 1_360 };
+            sidebar.update(cx, |sidebar, cx| sidebar.set_usage(snapshot.clone(), cx));
+            cx.run_until_parked();
+            assert_eq!(notifications.get(), 0, "a fresh timestamp needs no frame");
+            snapshot.updated_at += 1;
+            sidebar.update(cx, |sidebar, cx| sidebar.set_usage(snapshot.clone(), cx));
+            cx.run_until_parked();
+            assert!(
+                notifications.get() > 0,
+                "expiry must invalidate the displayed percentage"
+            );
+            assert!(
+                crate::usage::limits::footer_quota(&snapshot.limits, snapshot.updated_at).is_none()
+            );
+        }
     }
 
     #[gpui::test]
