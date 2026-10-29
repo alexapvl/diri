@@ -61,6 +61,14 @@ impl Feeder {
         }
     }
 
+    /// Per-character input instead of runs: the unoptimized reference.
+    pub fn per_character(cols: usize, rows: usize) -> Self {
+        Self {
+            screen: screen(cols, rows).with_per_character_input(),
+            ..Self::new(cols, rows)
+        }
+    }
+
     /// One read, handled the way the Engine pump handles it.
     pub fn feed(&mut self, bytes: &[u8]) {
         self.screen.feed(bytes);

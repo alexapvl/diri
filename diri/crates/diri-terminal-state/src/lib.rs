@@ -692,6 +692,16 @@ impl HeadlessScreen {
         self.term.release_primary_history_spare_rows();
     }
 
+    /// Parses printable text one character at a time, through the
+    /// emulator's per-character input, instead of as runs. The resulting
+    /// state is identical; benches and tests use it as the reference the
+    /// run paths are checked against.
+    #[doc(hidden)]
+    pub fn with_per_character_input(mut self) -> Self {
+        self.parser.set_per_character_print(true);
+        self
+    }
+
     /// Answer `OSC 7501` support queries among this terminal's replies, in
     /// stream order with the emulator's own, and interpret no other product
     /// OSC. For a remote Holder (`query-replies-v1`), which answers its
