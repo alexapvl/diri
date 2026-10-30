@@ -1335,7 +1335,8 @@ fn wheel_gestures_keep_to_their_axis(cx: &mut gpui::TestAppContext) {
 /// Text under the reader moves exactly as far as the scroll. Regression:
 /// a long note opens at its end, and scrolling up swapped each block's
 /// estimated height for its measured one as it entered the layout window,
-/// so the text jumped by a line or two every few steps.
+/// so the text jumped by a line or two every few steps. The backlinks under
+/// the note move with it, not one frame behind the correction.
 #[gpui::test]
 fn scrolling_up_a_long_note_never_jumps(cx: &mut gpui::TestAppContext) {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -1358,7 +1359,12 @@ fn scrolling_up_a_long_note_never_jumps(cx: &mut gpui::TestAppContext) {
         view.editor.blocks().iter().map(|b| b.id).collect()
     });
     let mut steps = 0;
+    let mut footer_steps = 0;
     while page.offset().y < px(-40.0) {
+        let footer = cx
+            .debug_bounds("note-footer")
+            .map(|bounds| bounds.top())
+            .filter(|top| *top < px(700.0));
         // A row in the middle of the viewport, before and after one step.
         let (selector, top) = ids
             .iter()
@@ -1377,9 +1383,20 @@ fn scrolling_up_a_long_note_never_jumps(cx: &mut gpui::TestAppContext) {
             (moved - px(40.0)).abs() < px(0.5),
             "step {steps}: the text moved {moved:?} for a 40px scroll"
         );
+        if let Some(top) = footer
+            && let Some(after) = cx.debug_bounds("note-footer")
+        {
+            let moved = after.top() - top;
+            assert!(
+                (moved - px(40.0)).abs() < px(0.5),
+                "step {steps}: the backlinks moved {moved:?} for a 40px scroll"
+            );
+            footer_steps += 1;
+        }
         steps += 1;
     }
     assert!(steps > 50);
+    assert!(footer_steps > 0, "the backlinks were on screen at the end");
 }
 
 /// Only the row under the pointer builds its `+` and grip, and the handle

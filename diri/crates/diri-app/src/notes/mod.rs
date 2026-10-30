@@ -838,18 +838,32 @@ impl NotePane {
         if unchanged {
             return;
         }
+        // The pane shows another note (or none) by the time this lands, so
+        // the error names the note it is about.
+        let title = if ours.doc.title.trim().is_empty() {
+            crate::i18n::t("notes.untitled").to_owned()
+        } else {
+            ours.doc.title.clone()
+        };
         let write = self.writes.spawn(cx, move || {
             write_closed(&store, &id, ours, expected, landing.as_deref())
         });
         cx.spawn(async move |this, cx| {
-            let error = match write.await {
+            let failed = |err: &dyn std::fmt::Display| {
+                crate::i18n::tf(
+                    "notes.error.closed_save",
+                    &[("title", &title), ("error", &err)],
+                )
+            };
+            let error: SharedString = match write.await {
                 Ok(ClosedWrite::Saved) => return,
-                Ok(ClosedWrite::Moved) => crate::i18n::t("notes.error.moved_outside").into(),
-                Ok(ClosedWrite::Busy) => {
-                    let busy = std::io::Error::other("the note kept changing");
-                    crate::i18n::tf("notes.error.save", &[("error", &busy)]).into()
+                Ok(ClosedWrite::Moved) => {
+                    crate::i18n::tf("notes.error.closed_moved", &[("title", &title)]).into()
                 }
-                Err(err) => crate::i18n::tf("notes.error.save", &[("error", &err)]).into(),
+                Ok(ClosedWrite::Busy) => {
+                    failed(&std::io::Error::other("the note kept changing")).into()
+                }
+                Err(err) => failed(&err).into(),
             };
             let _ = this.update(cx, |this, cx| {
                 this.error = Some(error);

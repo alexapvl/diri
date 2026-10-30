@@ -35,6 +35,9 @@ pub(super) struct AnchorState {
     content: u64,
     /// The column's width when last laid out.
     width: Pixels,
+    /// How far this frame's correction moved the column up, for the
+    /// elements after it on the page to [`follow`].
+    shift: Pixels,
 }
 
 pub(super) type ScrollAnchor = Rc<RefCell<AnchorState>>;
@@ -59,6 +62,7 @@ impl AnchorState {
         }
         self.layout = None;
         self.tops.clear();
+        self.shift = px(0.0);
     }
 
     /// Records a laid-out row's top, from its prepaint.
@@ -168,6 +172,7 @@ impl Element for Anchored {
         let viewport_top = self.scroll.bounds().top();
         let mut state = self.state.borrow_mut();
         state.width = bounds.size.width;
+        state.shift = shift;
         state.choose(viewport_top, bounds.top() - shift);
     }
 
@@ -240,6 +245,80 @@ impl Element for Probe {
         cx: &mut App,
     ) {
         self.child.prepaint(window, cx);
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut (),
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.child.paint(window, cx);
+    }
+}
+
+/// An element below the note column, moved with it by this frame's
+/// correction: laid out under the column, it would otherwise paint one frame
+/// where the column was.
+pub(super) struct Follow {
+    child: AnyElement,
+    state: ScrollAnchor,
+}
+
+pub(super) fn follow(child: impl IntoElement, state: ScrollAnchor) -> Follow {
+    Follow {
+        child: child.into_any_element(),
+        state,
+    }
+}
+
+impl IntoElement for Follow {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for Follow {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, ()) {
+        (self.child.request_layout(window, cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let shift = self.state.borrow().shift;
+        window.with_element_offset(point(px(0.0), -shift), |window| {
+            self.child.prepaint(window, cx)
+        });
     }
 
     fn paint(

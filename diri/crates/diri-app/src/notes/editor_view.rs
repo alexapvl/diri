@@ -2759,9 +2759,12 @@ impl Render for NoteEditorView {
         // longer sizes their spacers. The anchor keeps the text still while
         // they are measured again.
         let width = self.anchor.borrow().width();
+        // The first frame's width is a first measurement, not a new width.
         if width != self.heights_width {
+            if self.heights_width > px(0.0) {
+                self.row_heights.borrow_mut().clear();
+            }
             self.heights_width = width;
-            self.row_heights.borrow_mut().clear();
         }
         self.anchor.borrow_mut().begin(content);
         let held = self.anchor.borrow().held();
@@ -3501,7 +3504,9 @@ impl Render for NoteEditorView {
                                     ))
                                     .child(overlay),
                             )
-                            .children(footer),
+                            .children(
+                                footer.map(|footer| anchor::follow(footer, Rc::clone(&self.anchor))),
+                            ),
                     ),
             )
             .children(slash_menu)
