@@ -3725,8 +3725,8 @@ mod tests {
     }
 
     #[test]
-    // Reusing moved rows' fingerprints needs the current core's content
-    // sources; core v2 reports none and hashes damaged rows again.
+    // Core v2 reports rows a region scroll moved as changed (it tracks
+    // only rows moved by appends), so it hashes one row more here.
     #[cfg(not(feature = "core-v2-screen"))]
     fn scrolling_fingerprints_only_rows_that_changed() {
         let mut screen = HeadlessScreen::new(40, 10);
@@ -4495,7 +4495,7 @@ mod tests {
     }
 
     /// Line numbers still held anywhere in history or on the screen.
-    #[cfg(all(feature = "compact-history", not(feature = "core-v2-screen")))]
+    #[cfg(feature = "compact-history")]
     fn retained_ids(screen: &mut HeadlessScreen) -> Vec<usize> {
         screen
             .link_source(usize::MAX)
@@ -4511,9 +4511,8 @@ mod tests {
     /// could not bring them back. A reference multiplexer keeps every line.
     #[cfg(feature = "compact-history")]
     #[test]
-    // Core v2 keeps fewer rows of these repetitive lines in the 4 MiB
-    // budget (a byte per ASCII cell; the current core LZ-compresses each
-    // row), so the depth asserted here is the current core's.
+    // Core v2 re-wraps history at once (step 5) and holds no raised row
+    // limit for it, so a narrowing at capacity drops rows past the limit.
     #[cfg(not(feature = "core-v2-screen"))]
     fn a_resize_at_capacity_keeps_every_retained_line() {
         let lines = HISTORY_ROW_CEILING + 20_000;
@@ -4542,11 +4541,6 @@ mod tests {
     /// widening returns the limit to its base.
     #[cfg(feature = "compact-history")]
     #[test]
-    // Core v2 keeps fewer rows of these repetitive lines in the 4 MiB
-    // budget (a byte per ASCII cell; the current core LZ-compresses each
-    // row), so narrowing never re-wraps them past the base limit, which
-    // this asserts first.
-    #[cfg(not(feature = "core-v2-screen"))]
     fn a_raised_history_limit_follows_history_back_down() {
         let burst = HISTORY_ROW_CEILING;
         let mut screen = HeadlessScreen::new(80, 24);
@@ -4586,10 +4580,6 @@ mod tests {
     /// debug builds tests and development apps run).
     #[cfg(feature = "compact-history")]
     #[test]
-    // Core v2 keeps fewer rows of these repetitive lines in the 4 MiB
-    // budget (a byte per ASCII cell; the current core LZ-compresses each
-    // row), so the depth asserted here is the current core's.
-    #[cfg(not(feature = "core-v2-screen"))]
     fn lines_after_narrowing_a_full_history_cost_what_they_did_before() {
         fn per_line(screen: &mut HeadlessScreen, next: &mut usize) -> std::time::Duration {
             let mut batches: Vec<_> = (0..5)
@@ -5052,9 +5042,8 @@ mod tests {
 
     #[cfg(feature = "compact-history")]
     #[test]
-    // Core v2 keeps fewer rows of these repetitive lines in the 4 MiB
-    // budget (a byte per ASCII cell; the current core LZ-compresses each
-    // row), so the depth asserted here is the current core's.
+    // Core v2 re-wraps history at once (step 5) and holds no raised row
+    // limit for it, so a narrowing at capacity drops rows past the limit.
     #[cfg(not(feature = "core-v2-screen"))]
     fn a_column_change_at_capacity_keeps_hard_line_history() {
         let mut screen = HeadlessScreen::new(80, 24);
@@ -5080,10 +5069,6 @@ mod tests {
 
     #[cfg(feature = "compact-history")]
     #[test]
-    // Core v2 keeps fewer rows of these repetitive lines in the 4 MiB
-    // budget (a byte per ASCII cell; the current core LZ-compresses each
-    // row), so the depth asserted here is the current core's.
-    #[cfg(not(feature = "core-v2-screen"))]
     fn find_and_fetch_work_at_depth() {
         let mut screen = HeadlessScreen::new(80, 24);
         let lines = 100_000;

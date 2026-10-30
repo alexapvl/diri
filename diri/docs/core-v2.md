@@ -262,7 +262,7 @@ Each PR lands on its own, behind the single `core-v2` cargo feature of `diri-ter
        - Damage is the rows with `RowMeta::dirty` plus the cursor rows; it is full when rows moved (a row appended, history cleared, a screen swap). No content sources: moved rows are hashed again.
        - Checkpoint writes convert back to page cells. A packed history page is thawed for the edit and packed again before rows move or history is bounded.
        - Resize to another size panics ("resize needs reflow, step 5"); the tests that resize are ignored with the switch on.
-       - Rows kept at the budget: on repetitive output (numbered log lines) v2 keeps a third to a half of the current core's rows in 4 MiB, because it stores a byte per ASCII cell where the current core LZ-compresses each row. The four depth tests are gated to the current core; step 6 owns that gap.
+       - Rows kept at the budget: see step 6 (v2 now keeps at least the current core's rows).
 5. **Reflow.** Page rewrap plus deferred cold reflow. Run the resize tests, and the #921 narrowing test on both cores.
    - Status: rewrap done on `core/v2-step5`; deferred cold reflow is not.
      - `core_v2/resize.rs` is a port of `Term::resize` and `Grid::resize`. Each screen's rows stream oldest first through the current core's algorithm, as current-core rows, so `Row::shrink`, `is_clear` and `Cell::is_empty` are the vendored functions. The rows are written into new pages of the new size.
@@ -278,13 +278,13 @@ Each PR lands on its own, behind the single `core-v2` cargo feature of `diri-ter
        - The comparison covers cells, cursor, history and origin after every step, and the saved cursors, the other screen, tab stops and the scroll region through probes at the end.
        - Every `HeadlessScreen` resize test runs with `core-v2-screen` on, and so does diri-term's suite.
      - **One deliberate difference.** At one column, the current core never finishes narrowing a wide character: each round pushes another row. v2 leaves the character in the column and wraps its spacer to the next row. The differential tests use at least two columns whenever wide characters are present.
-     - Still gated with the switch on:
-       - `a_raised_history_limit_follows_history_back_down`, with the four depth tests: v2 keeps fewer rows at the budget (step 6).
-       - The cold-paging test (#958).
-       - Moved-row fingerprints (no content sources).
-6. **Cold-page packing and the budget.** Prototyped here: it measures 4.7× and 3.7× the Engine (ASCII and Unicode) at budget, and is deterministic under the split tests.
-   - Remaining: close the 1.5% gap in rows kept against today's Engine.
-   - Then wire packing through the `HeadlessScreen` adapter, and pass the regenerated full-history golden (#921).
+     - The tests step 5 left gated (`a_raised_history_limit_follows_history_back_down` and the four depth tests, the cold-paging test, moved-row fingerprints) run with the switch on since step 6.
+6. **History parity** (`core/v2-history`). The rule: v2 keeps at least as many history rows as the current core in the same 4 MiB of live bytes.
+   - **LZ under budget pressure.** Sealed pages are packed as tokens. When history passes its budget, the oldest pages not yet considered are compressed with the current core's LZ codec (`grid::compact::lz`), before any page is dropped. An `LzPolicy` compresses every page while pages shrink by a third, and otherwise probes a 1 KiB sample of every 8th page. Text that barely repeats (the kitten ASCII and Unicode captures) therefore costs about 1% more instructions, not a full LZ pass. What is compressed depends only on the sequence of sealed pages, so the history kept is the same for any read split, and with or without paging.
+   - **Packed layout.** A packed page is its row metadata, then the style ids of its style changes as their own stream, then the row tokens, then its style table. A page keeps no table outside its bytes, so a styled page costs what its text and styles compress to. Ids and characters repeat at different rates (a colour per cell, text shifting between rows); kept apart, both repeat, and LZ finds them. A capture coloured cell by cell keeps 119,921 rows on v2 against 106,769 on the current core.
+   - **Cold paging (#958).** Packed pages older than the newest `keep_rows` history rows move to the `ColdStore` (`Pages::page_out`, through `Emulator::page_out_history`). A stored page counts its full length against the budget, reads load it into the one-page cache, a store failure reads as blank rows, and a page is released with its screen.
+   - **Moved-row fingerprints.** `Emulator::moved_line_sources` reports, for each screen line, the line its cells came from when rows only moved by appends. Dirty and new rows report `CONTENT_CHANGED`. `fingerprints_after_scrolling_match_the_cells` now runs on v2 and checks this is exact.
+   - **Golden on v2.** `vt_workloads` with `core-v2-screen` requires at least the golden's rows and compares the newest of them exactly. `core_v2_bench` compares every row v2 keeps, cell for cell.
 7. **Inline images and checkpoints** on v2, with the existing image and checkpoint tests.
 7b. **The Engine and the Remote Helper on v2.** Status: done on `core/v2-helper`.
    - With `diri-terminal-state/core-v2-screen` on, the Remote Helper's whole suite passes (`diri-remote`), and so does the Engine's: attach, mirrors, checkpoints and sessions.
